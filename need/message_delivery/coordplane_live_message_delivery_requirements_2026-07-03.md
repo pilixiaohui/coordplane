@@ -296,6 +296,14 @@ Backend 必须记录：
 | backend 重启 | 从数据库恢复 pending mailbox 和 delivery attempts，不依赖内存 |
 | trigger_turn=false 且目标 idle | mailbox 保持 pending，不强制启动 turn；可由 wait/watch 或后续 resume 处理 |
 | trigger_turn=true 且目标 idle | 创建 runner/resume 工作项，启动或恢复目标会话 |
+| 同一 mailbox 重复 fallback | 允许幂等复用 queue item，不产生重复副作用 |
+| 同一 route 收到不同 pending mailbox | 不得因 route 已 resume 过而吞掉新 mailbox；必须再次 resume，或 coalesced 到包含全部 pending mailbox id 的 resume prompt |
+
+resume 幂等边界：
+
+- 幂等键最小粒度必须覆盖 mailbox id 或等价 pending notification set，不能只按 session route 去重。
+- `runtime.resume` queue item 完成不代表 mailbox 已处理；mailbox 只有在 `mailbox.resolve` 成功或明确 terminal policy 下才能关闭。
+- 如果 adapter 不支持 same-turn steer，active route 只能作为 resume 目标引用，不能被当作真实 live process 的证明。
 
 ## 14. 测试边界
 
@@ -319,6 +327,8 @@ Backend 必须记录：
 - 无 active turn 时，mailbox 保持 pending，创建 resume request。
 - adapter 不支持 steer 时，不丢 mailbox。
 - steer 失败后，DeliveryAttempt 记录 failed，mailbox 仍可通过 resume 处理。
+- 同一路由连续收到两个不同 mailbox 时，第二个 mailbox 必须产生新的 resume 调用或被包含在 coalesced resume payload 中。
+- 完成 resume queue item 后 mailbox 仍为 pending，直到 Agent 调用 `mailbox.resolve`。
 
 ### 14.4 Scope 测试
 

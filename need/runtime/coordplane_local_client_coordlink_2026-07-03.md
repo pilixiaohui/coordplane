@@ -107,6 +107,8 @@ coordlink
 - 其他 Agent 的 workspace。
 - 未裁剪的团队全量状态文件。
 - 可以绕过 backend 的调度文件或控制 socket。
+- 宿主机 canonical repo 真实路径。
+- Docker socket 或可间接控制宿主 Docker daemon 的 socket / credential。
 
 Docker 网络要求：
 
@@ -119,6 +121,13 @@ Docker 网络要求：
 - `/home/agent` 或等价 volume 必须跨容器重建保留。
 - CLI 原生 session cache、认证配置和 resume 所需状态保存在持久 home。
 - 项目 workspace 可以按策略重新 clone 或缓存，但不能作为调度真相源。
+
+路径边界要求：
+
+- 容器内 Agent 只能看到容器路径或逻辑路径，例如 `/workspace/project`、`workspace_id`、`repo_id`。
+- Backend / runner 可以保存宿主机路径，但这些字段属于控制面内部数据，不得出现在普通 Agent-facing response、skill 内容、release artifact 或 redacted inspect 中。
+- Docker Agent 不得通过 `repo_path`、`workspace_root` 或类似字段请求 backend 访问任意宿主机路径。
+- 如果必须支持 operator 以 host path 注册仓库，该入口必须是 operator/debug capability，并记录审计事件；普通 Agent 后续只能使用注册后的 `repo_id` 或 repo alias。
 
 ## 6. External runtime 需求
 
@@ -178,6 +187,8 @@ External runtime 用于开发和协议验证，不启动 Docker 容器，但必�
 行为：
 
 - capability schema 来自 backend。
+- `coordlink capability list`、`coordlink skill list`、`coordlink skill read` 和 `coordlink call` 都必须携带 runtime token。
+- `coordlink` 可以发送本地注入的 agent/runtime/lease 字段，但 backend 必须用 token 绑定校验这些字段；字段不一致时返回 rejected。
 - skill 内容来自 backend skill registry。
 - `coordlink call` 转发到 backend 对应 capability handler。
 - `coordlink skill read` 转发到 backend skill handler。

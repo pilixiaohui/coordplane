@@ -258,6 +258,19 @@ DeliverySignal 是实时性优化，不是正确性前提。正确性来自 dura
 
 DeliverySignal 可以包含已授权 envelope 摘要或很短正文，帮助 Agent 判断是否需要立刻读取；不能包含未授权内容、长正文、完整合同正文、完整验证详情或 artifact 内容。
 
+resume 去重要求：
+
+- 同一 session route 可以被多个不同 mailbox 唤醒。
+- 重复处理同一个 mailbox 的 resume request 可以幂等跳过。
+- 不同 mailbox 不得因为该 route 曾经发生过 `session.resumed` 而被跳过。
+- 如果实现采用 coalescing，resume prompt 或 signal payload 必须列出被合并的 mailbox id 集合，并记录审计事件。
+
+active turn 真实性要求：
+
+- `session_routes.state=active` 只能表示存在可递送或可恢复的 route，不能单独证明 CLI 进程当前仍在运行。
+- 对于同步 `--print` / one-shot command CLI，CLI 子进程退出后不得继续作为 same-turn steer 目标；后续异步反馈必须走 fallback resume。
+- Runner/adapter 必须记录 CLI session start/resume/exit 事实，delivery service 判断 same-turn steer 时必须结合 adapter capability 和 live turn 状态。
+
 ## 8. 会话后处理
 
 会话结束后，CoordPlane 必须做事实收敛和资源处理。
@@ -473,6 +486,8 @@ coordlink 是会话中的 Agent-facing capability 入口。Skills 是 Agent-faci
 - mailbox feedback 到达且 active turn 可 steer 时，runner/adapter 收到 DeliverySignal。
 - mailbox feedback 到达但不可 steer 时，保留 pending mailbox 并 fallback resume 原 session route。
 - same-turn steer 失败不影响 durable mailbox 正确性；下一轮 resume 仍能读取同一 envelope。
+- 同一 route 第一次 mailbox 已 resume 后，第二个不同 mailbox 到达时仍能唤醒或 coalesced 到下一次 resume。
+- one-shot command CLI 退出后不再被 same-turn steer；新反馈通过 fallback resume 进入同一逻辑会话。
 
 ### 14.5 后处理测试
 

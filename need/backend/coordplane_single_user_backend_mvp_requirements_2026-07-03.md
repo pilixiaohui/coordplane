@@ -69,6 +69,23 @@ workspace_id = "default_workspace"
 - raw DB / raw event log 写入
 - 其他 Agent token 或 mailbox 读取
 
+### 3.1 Agent runtime 认证边界
+
+所有普通 Agent-facing 入口都必须以 runtime token 作为身份真相源，包括：
+
+- `POST /call`
+- `GET /capabilities`
+- `GET /skills`
+- `GET /skills/{name}`
+- schema-derived tool adapter 调用
+- `coordlink` fallback 命令
+
+请求体、HTTP header、query string 中的 `agent_id`、`runtime_id`、`workspace_id`、`lease_id` 只能作为一致性校验输入，不能覆盖 runtime token 绑定的身份。Backend 必须从 token 绑定记录 canonicalize subject 和 lease scope；如果请求声明身份与 token 绑定不一致，必须返回 rejected response，且不得产生 capability side effect。
+
+Operator/debug 入口可以绕过普通 Agent token，但必须使用 `subject_kind=operator` 或等价显式身份，并记录审计事件；不得伪装成普通 Agent。
+
+普通 Agent 缺少 token 时，不允许通过 TeamConfig capability policy 单独放行。TeamConfig 决定某个 Agent 理论上能使用哪些 capability，runtime token 决定当前请求是否确实来自该 Agent 的活动 runtime/session。
+
 ## 4. Policy 接口
 
 MVP 使用 `SingleUserPolicy`，默认允许同一 `tenant_id=default` 下的合法 scope 操作。
@@ -86,6 +103,8 @@ CanUseCapability(ctx, subject, capability_name, scope) -> Decision
 - 所有 service handler 必须经过 policy。
 - MVP policy 可以简单，但不能绕过 policy 直接访问 store。
 - 后续替换成 RBAC 时，handler 主流程不应修改。
+- Policy 之前必须先完成 runtime token 认证和 subject canonicalization；policy 不得信任请求方自填的 subject。
+- Capability discovery、skill list/read 与 capability call 使用同一认证模型，不能成为未认证的身份探测或 skill 泄露入口。
 
 ## 5. Store 和事件模型
 

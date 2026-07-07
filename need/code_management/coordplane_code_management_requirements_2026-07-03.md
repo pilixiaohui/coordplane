@@ -92,6 +92,8 @@ Backend 负责：
 - 执行或调度 runner 执行 Git 命令。
 - 记录每次 Git 操作的 before_ref、after_ref、stdout、stderr、exit_code。
 - 把冲突、失败和可修复下一步返回给 Agent。
+- 维护受控 repo registry；普通 Agent 只能引用已注册 `repo_id` 或 repo alias。
+- 对 Agent-facing 输出做路径裁剪；不得向普通 Agent 暴露宿主机 repo path、integration path、runtime root 或其他 Agent workspace path。
 
 Agent 负责：
 
@@ -106,6 +108,8 @@ Runner 负责：
 - 在正确 workspace 中执行受控 Git 命令。
 - 保证命令运行环境和 Agent CLI 所在 workspace 一致。
 - 不替 Agent 做业务决策。
+- 为每次 GitOperation 记录 execution_location，例如 `runtime_container`、`git_sandbox` 或 `backend_control_plane`。
+- 如果 Git worktree 操作在 Docker Agent 的项目 workspace 上执行，必须作用于该 Agent 的 runtime workspace 或等价受控 Git sandbox；不得默默在 backend 当前工作目录或任意宿主机路径执行。
 
 coordlink 负责：
 
@@ -218,6 +222,9 @@ coordlink 负责：
 
 - 准备或恢复 Agent 私有 workspace。
 - 返回 workspace id、base ref、逻辑路径和当前状态。
+- 普通 Agent 输入只能使用 `repo_id` 或 repo alias；不得传入 raw host `repo_path`。
+- `repo_path` 只能由 operator/debug repo registration 入口使用，且必须落入配置允许的仓库根目录。
+- 返回给普通 Agent 的 workspace path 必须是容器路径或逻辑路径，不能是宿主机真实路径。
 
 `workspace.status`
 
@@ -294,6 +301,8 @@ coordlink 负责：
 
 - 按 operation id、changeset id 或 rollback point 回退。
 - 已发布远端的变更不得 rewrite history，必须生成 revert ChangeSet。
+- 本地 canonical branch 未发布且满足 expected old ref 时，可以使用 reset/update-ref 回到 rollback point。
+- 已进入远端或被标记为 published 的变更只能通过 revert ChangeSet 或后续修复提交回滚。
 
 `git.abort`
 
@@ -483,6 +492,8 @@ CoordPlane 应借鉴 Multica 的 runtime 和 worktree 工程经验，但必须�
 - 两个 Agent 准备同一 repo 时得到不同私有 workspace。
 - Agent A 无法访问 Agent B workspace。
 - workspace.status 能识别 dirty、clean、stale_base。
+- 普通 Agent 调用 `workspace.prepare` 传 raw host `repo_path` 必须 rejected。
+- `workspace.prepare`、`workspace.status`、`git.log` 返回内容不得包含宿主机真实路径。
 
 ### 14.2 Commit 测试
 
@@ -507,11 +518,19 @@ CoordPlane 应借鉴 Multica 的 runtime 和 worktree 工程经验，但必须�
 - 未合并 ChangeSet abandon 后不影响 canonical branch。
 - integration ref 回滚释放 integration lock。
 - 已发布提交 rollback 生成 revert ChangeSet，不 rewrite history。
+- 未发布 rollback 必须校验 expected old ref，目标 ref 已变化时 rejected。
 
 ### 14.6 Crash Recovery 测试
 
 - GitOperation running 时进程崩溃，recoverer 能根据 lock 和 ref 状态恢复。
 - DB 成功但 Git ref 未更新时，状态变为 failed/retryable。
+- merge/resolve 临时目录在 operation terminal 后有可审计清理路径；active GitOperation 的临时目录不得被清理。
+
+### 14.7 Docker Git 执行边界测试
+
+- Docker Agent 的 `git.status`、`git.diff`、`git.commit` 必须绑定该 Agent 的 runtime/workspace。
+- GitOperation evidence 必须包含 execution_location、runtime_id、workspace_id。
+- release artifact 和 redacted inspect 不得泄露 host repo path、integration path、runtime root、Docker socket。
 - Git ref 更新但 DB 未提交时，recoverer 能发现并补齐或告警。
 
 ## 15. 开发落地建议

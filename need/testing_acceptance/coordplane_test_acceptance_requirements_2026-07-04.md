@@ -73,6 +73,11 @@ Mocks/Fakes: 允许 fake 什么，不允许 fake 什么
 | INV-11 | Git/code operation 必须在 Agent 会话中返回可修复反馈，不在会话结束后后台静默合并 |
 | INV-12 | retry、duplicate call、crash recovery 不产生重复合同、重复 mailbox、重复 commit 或 orphan event |
 | INV-13 | AgentCommunicationEnvelope 是 Agent 间 message、task、result、repair、budget attention 的统一通信对象；backend 不用自然语言猜测任务语义 |
+| INV-14 | Runtime token 是普通 Agent 身份真相源；请求自填 subject/header/query 不能扩大权限 |
+| INV-15 | 普通 Agent-facing 输出不得泄露 host repo path、runtime root、DB path、Docker socket 或 CLI 私有配置目录 |
+| INV-16 | workspace.prepare 只能引用已注册 repo；raw host repo_path 只允许 operator/debug 注册入口使用 |
+| INV-17 | 同一路由不同 pending mailbox 不得被 route-level resume 幂等吞掉 |
+| INV-18 | CLI transcript evidence 与完整行为 telemetry 必须明确区分；声明 detailed behavior log complete 时必须有结构化事件流 |
 
 ## 6. 测试场景矩阵
 
@@ -156,6 +161,34 @@ Forbidden side effects:
 
 - backend 根据硬编码角色名判断权限。
 - rejected response 泄露其他 Agent 的私有信息。
+
+### TA-03B Runtime Token Canonical Identity
+
+Invariant: `INV-05`、`INV-14`
+
+Layer: Public service contract + adapter conformance
+
+Boundary: `/call`、`/capabilities`、`/skills`、`coordlink`
+
+Setup: Agent A 和 Agent B 都有 active runtime token，TeamConfig 授权不同 capability 和 skill。
+
+Steps:
+
+1. 使用 Agent A token，请求体或 header 伪造 Agent B subject 调用 `mailbox.get`、`workspace.prepare`、`git.status`、`contract.current`。
+2. 使用 Agent A token 查询 `/capabilities?agent_id=agent-b`。
+3. 使用 Agent A token 查询 `/skills?agent_id=agent-b` 和 `/skills/{agent-b-only-skill}`。
+4. 不带 token 重复上述请求。
+
+Assertions:
+
+- 所有伪造身份请求返回 rejected，错误码表达 subject/token mismatch 或 token required。
+- 不产生 mailbox claim、workspace prepare、GitOperation、contract state change 等副作用。
+- capability discovery 和 skill read/list 只按 token 绑定 Agent 返回。
+
+Forbidden side effects:
+
+- handler 使用 query/header 中的 agent_id 作为普通 Agent 身份真相源。
+- 未认证请求可枚举其他 Agent skill 或 capability。
 
 ### TA-04 Contract 派发、等待和反馈
 
@@ -274,6 +307,35 @@ Forbidden side effects:
 - steer 失败后丢消息。
 - delivery service 直接修改合同业务状态。
 
+### TA-06B Distinct Mailbox Resume 不丢消息
+
+Invariant: `INV-17`
+
+Layer: State machine / storage + adapter conformance
+
+Boundary: Delivery service、`runtime.resume` queue、Runner `ResumeRoute`
+
+Setup: 同一 Agent 的同一 session route；CLI adapter 不支持 same-turn steer；两个不同 pending mailbox。
+
+Steps:
+
+1. mailbox-1 触发 fallback resume 并处理到 `session.resumed` event。
+2. mailbox-1 仍未 `mailbox.resolve`。
+3. mailbox-2 到达同一 route 并触发 delivery。
+4. runner 处理新的 resume queue item。
+
+Assertions:
+
+- mailbox-2 不得因为 route 曾经 resume 过而被跳过。
+- 第二次处理必须调用 adapter resume，或生成包含 mailbox-1、mailbox-2 的 coalesced resume payload。
+- mailbox-1 和 mailbox-2 在 Agent 调用 `mailbox.resolve` 前都保持 pending。
+- events 能区分 duplicate same mailbox 和 distinct mailbox resume。
+
+Forbidden side effects:
+
+- `session.resumed` route-level 存在即吞掉所有后续 mailbox。
+- runtime.resume queue item done 直接把 mailbox 标记 resolved。
+
 ### TA-07 Runtime 准备和隔离
 
 Invariant: `INV-09`、`INV-10`
@@ -302,6 +364,35 @@ Forbidden side effects:
 - 容器通过文件读取调度真相。
 - external debug 权限静默扩大到普通 Agent。
 
+### TA-07B Docker Path 和 Repo 隔离
+
+Invariant: `INV-15`、`INV-16`
+
+Layer: Runtime boundary + public service contract
+
+Boundary: Docker mounts、`workspace.prepare`、redacted inspect、release artifact
+
+Setup: Docker Agent 有 active runtime token；backend 有一个 operator 注册 repo；宿主机另有一个未注册 Git repo。
+
+Steps:
+
+1. Agent 使用 `repo_id` 调用 `workspace.prepare`。
+2. Agent 尝试传入未注册宿主机 `repo_path` 调用 `workspace.prepare`。
+3. Agent 查询 workspace/git 状态。
+4. 生成 redacted inspect 和 release artifact。
+
+Assertions:
+
+- 第一步成功且返回容器路径或逻辑路径。
+- 第二步 rejected，且无 workspace/GitOperation side effect。
+- 普通 Agent-facing response 不包含 host repo path、runtime root、DB path、Docker socket。
+- Docker mount 列表不包含 backend DB、host runtime root、其他 Agent workspace。
+
+Forbidden side effects:
+
+- Docker Agent 能诱导 backend clone 任意 host Git worktree。
+- release evidence 出现 `/home/...`、`/tmp/...runtime...`、`.db`、Docker socket。
+
 ### TA-08 Session Pin 和容器重建 Resume
 
 Invariant: `INV-08`、`INV-09`
@@ -329,6 +420,33 @@ Forbidden side effects:
 
 - session route 只存在容器临时文件里。
 - 容器销毁后需要新会话从零开始。
+
+### TA-08B One-shot CLI Active Turn Truth
+
+Invariant: `INV-08`、`INV-17`
+
+Layer: Runtime boundary + adapter conformance
+
+Boundary: command-style CLI adapter、session route projection、Delivery active route lookup
+
+Setup: CLI backend 使用同步 `--print` / one-shot command 适配器，adapter 声明不支持 same-turn steer。
+
+Steps:
+
+1. Runner 启动 CLI，CLI 子进程正常退出并保存 transcript。
+2. route 仍可用于 resume。
+3. 新 mailbox 到达。
+
+Assertions:
+
+- 新 mailbox 走 fallback resume，而不是 same-turn steer。
+- DB projection 能区分 `resumable route` 和 `live active turn`。
+- CLI session start/resume/exit 都有 durable event 或 session row。
+
+Forbidden side effects:
+
+- 已退出 one-shot 进程被当作 live same-turn steer target。
+- 只有 route state active，没有 adapter capability/live-turn 证据。
 
 ### TA-09 Queue / Retry / Crash Recovery
 
@@ -414,6 +532,40 @@ Forbidden side effects:
 - 冲突只写到本地文件，不反馈给 Agent。
 - rollback 删除无关提交或无关工作区文件。
 
+### TA-11B Controlled Git Repo、Path 和 Rollback 边界
+
+Invariant: `INV-11`、`INV-15`、`INV-16`
+
+Layer: Runtime boundary + real Git repo + storage
+
+Boundary: repo registry、GitOperation evidence、rollback policy、integration cleanup
+
+Setup: operator 注册 canonical repo；两个 Docker Agent 各自准备 workspace；远端 published 标记可模拟。
+
+Steps:
+
+1. 普通 Agent 使用 raw host `repo_path` 调用 `workspace.prepare`。
+2. 普通 Agent 使用已注册 `repo_id` 准备 workspace 并执行 `git.status`、`git.commit`。
+3. merge preview/apply 后创建 rollback point。
+4. 对未发布变更执行 rollback。
+5. 对已发布变更请求 rollback。
+6. operation terminal 后执行 cleanup/recovery 检查。
+
+Assertions:
+
+- 第一步 rejected，且无 host path 读取副作用。
+- GitOperation evidence 包含 execution_location、runtime_id、workspace_id、before_ref、after_ref。
+- Agent-facing response 不包含 host repo path 或 integration path。
+- 未发布 rollback 使用 expected old ref；ref 已变化时 rejected。
+- 已发布 rollback 生成 revert ChangeSet，不 rewrite history。
+- merge/resolve 临时目录 terminal 后可清理；active GitOperation 的目录不被清理。
+
+Forbidden side effects:
+
+- backend host cwd 被当作 Agent workspace。
+- 普通 Agent response 暴露 source_path/integration_path。
+- rollback 对 published ref 执行 reset/update-ref rewrite。
+
 ### TA-12 Inspect 和可观测性
 
 Invariant: `INV-01`、`INV-05`
@@ -439,6 +591,33 @@ Forbidden side effects:
 
 - inspect 读取 transcript 文件作为状态真相。
 - 普通 Agent 通过 inspect 获取全局团队状态。
+
+### TA-12B CLI 日志语义和结构化行为流
+
+Invariant: `INV-18`
+
+Layer: Storage + release health check
+
+Boundary: CLI session transcript、structured event capture、release acceptance summary
+
+Setup: CLI adapter 产生 stdout/stderr transcript；可选产生结构化 stream event。
+
+Steps:
+
+1. 运行一次 CLI start/resume，保存 transcript。
+2. release summary 声明 `cli_transcript_evidence`。
+3. 如果配置声明 `detailed_behavior_log_complete=true`，再要求结构化事件流。
+
+Assertions:
+
+- 仅保存 stdout/stderr 时，只能声明 transcript evidence complete。
+- detailed behavior log complete 必须包含 start/resume、prompt ref、tool call、tool result、stdout/stderr chunk、exit、redaction status。
+- 结构化日志和 transcript 只能通过 object ref 暴露，公开证据不泄露 secret 或未授权正文。
+
+Forbidden side effects:
+
+- 只有 stdout/stderr transcript 却宣称完整行为日志。
+- 公开 release artifact 内联完整 transcript、token 或私有路径。
 
 ### TA-13 End-to-end Fake CLI Protocol Gate
 
