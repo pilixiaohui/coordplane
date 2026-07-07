@@ -1,0 +1,105 @@
+team_id: cp-accept-001-three-agent-docker
+version: 1
+runtime_profiles:
+  docker-default:
+    kind: docker
+    image: alpine:3.20
+    workspace_mode: isolated
+termination:
+  terminal_contract_type: root
+  accepted_by_capability: validation.assessment
+communication:
+  allow_direct_message: true
+  allow_followup_task: true
+  task_requires_contract: true
+  signal_summary_max_bytes: 160
+  signal_body_max_bytes: 240
+  default_trigger_turn:
+    message: true
+    task: true
+    result: true
+    repair: true
+agents:
+  - id: coordinator
+    role_prompt: |-
+      Coordinate CP-ACCEPT-001 through explicit contracts, mailbox review, and concise release evidence.
+      Delegate implementation and verification work only through CoordPlane capabilities.
+    runtime_profile: docker-default
+    cli_backend: fake
+    skills:
+      - contract-delegation
+      - coordplane-service
+    capabilities:
+      - assignment.next
+      - assignment.watch
+      - communication.read
+      - contract.add
+      - contract.complete
+      - contract.context
+      - contract.current
+      - contract.wait
+      - mailbox.get
+      - mailbox.list
+      - mailbox.resolve
+      - message.send
+      - object.inspect
+      - object.read
+      - report.submit
+  - id: developer
+    role_prompt: |-
+      Claim the developer contract, produce implementation evidence through controlled Git, and complete with a concise report.
+      Work only through assigned CoordPlane capabilities and assigned workspace state.
+    runtime_profile: docker-default
+    cli_backend: fake
+    skills:
+      - controlled-git
+      - coordplane-service
+    capabilities:
+      - assignment.next
+      - assignment.watch
+      - changeset.abandon
+      - changeset.submit
+      - command.run
+      - communication.read
+      - contract.complete
+      - contract.context
+      - contract.current
+      - git.abort
+      - git.commit
+      - git.conflicts
+      - git.diff
+      - git.log
+      - git.merge_apply
+      - git.merge_preview
+      - git.recover
+      - git.resolve
+      - git.rollback
+      - git.status
+      - object.inspect
+      - object.read
+      - report.submit
+      - workspace.prepare
+      - workspace.status
+      - workspace.sync
+  - id: verifier
+    role_prompt: |-
+      Verify CP-ACCEPT-001 from contract context, mailbox evidence, object references, and validation state.
+      Submit the validation assessment before the coordinator closes the root contract.
+    runtime_profile: docker-default
+    cli_backend: fake
+    skills:
+      - coordplane-service
+    capabilities:
+      - assignment.next
+      - assignment.watch
+      - communication.read
+      - contract.complete
+      - contract.context
+      - contract.current
+      - mailbox.get
+      - mailbox.list
+      - mailbox.resolve
+      - object.inspect
+      - object.read
+      - report.submit
+      - validation.assessment
