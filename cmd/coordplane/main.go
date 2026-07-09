@@ -30,6 +30,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "serve":
 		return runServe(args[1:])
+	case "codemap":
+		return runCodemap(args[1:], os.Stdout, os.Stderr)
 	case "release-health":
 		return runReleaseHealth(args[1:])
 	case "-h", "--help", "help":
@@ -213,6 +215,9 @@ func usageError(message string) error {
 func printUsage() {
 	fmt.Fprintln(os.Stderr, "usage:")
 	fmt.Fprintln(os.Stderr, "  coordplane serve --db /path/to/coordplane.db --listen :8080 [--teamconfig team.yaml] [--coordlink /path/to/coordlink] [--docker-network coordplane-release-health] [--claude-bin /usr/local/bin/claude] [--claude-env ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL,ANTHROPIC_MODEL]")
+	fmt.Fprintln(os.Stderr, "  coordplane codemap index --root PATH [--out FILE]")
+	fmt.Fprintln(os.Stderr, "  coordplane codemap validate --snapshot FILE")
+	fmt.Fprintln(os.Stderr, "  coordplane codemap check --root PATH --snapshot FILE")
 	fmt.Fprintln(os.Stderr, "  coordplane release-health cp-accept-001 [--db .coordplane-release-health/coordplane.db] [--coordlink .coordplane-release-health/bin/coordlink] [--root-contract ctr_root]")
 	fmt.Fprintln(os.Stderr, "  coordplane release-health cp-probe-001 [--db .coordplane-release-health/coordplane.db] [--workdir .coordplane-release-health] [--docker-teamconfig team_config/fixtures/cp_probe_001_docker_claude.yaml] [--coordlink .coordplane-release-health/bin/coordlink]")
 }
