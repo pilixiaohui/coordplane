@@ -229,7 +229,7 @@ UPDATE session_routes SET state = 'active', updated_at = ? WHERE id = ?`,
 	if err != nil {
 		return ResumeResult{}, err
 	}
-	return ResumeResult{AttemptID: attempt.ID, RouteID: route.ID, State: "resumed", MailboxIDs: append([]string(nil), in.MailboxIDs...)}, nil
+	return ResumeResult{AttemptID: attempt.ID, RouteID: route.ID, State: "resumed", MailboxIDs: append([]string(nil), in.MailboxIDs...), Env: cloneStringMap(env)}, nil
 }
 
 func (r *Runner) ProcessResumeQueue(ctx context.Context, owner string) (ResumeQueueResult, error) {
@@ -286,6 +286,7 @@ func (r *Runner) ProcessResumeQueue(ctx context.Context, owner string) (ResumeQu
 		MailboxID:   mailboxID,
 		RouteID:     resumed.RouteID,
 		State:       resumed.State,
+		Env:         cloneStringMap(resumed.Env),
 	}, nil
 }
 

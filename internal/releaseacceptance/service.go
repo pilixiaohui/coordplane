@@ -243,6 +243,9 @@ func (s *Service) predicateBackendDurable(ctx context.Context) PredicateResult {
 		"011_validation_assessments",
 		"012_release_acceptances",
 		"013_contract_team_scopes",
+		"014_agent_communication_envelopes",
+		"015_controlled_git_operation_evidence",
+		"016_controlled_git_operation_subject_kind",
 	}
 	for _, migration := range requiredMigrations {
 		if !applied[migration] {

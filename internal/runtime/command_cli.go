@@ -20,13 +20,23 @@ import (
 
 const defaultCommandCLITimeout = 2 * time.Minute
 
+const (
+	providerPolicyModeEnv       = "COORDPLANE_PROVIDER_POLICY_MODE"
+	providerPolicyModeStrict    = "strict_coordlink_call"
+	providerPolicyAllowlistEnv  = "COORDPLANE_PROVIDER_ALLOWED_CAPABILITIES"
+	providerPolicyAuditTraceEnv = "COORDPLANE_PROVIDER_AUDIT_TRACE_ID"
+	providerPolicyAuditAgentEnv = "COORDPLANE_PROVIDER_AUDIT_AGENT_ID"
+	providerPolicyAuditLeaseEnv = "COORDPLANE_PROVIDER_AUDIT_LEASE_ID"
+)
+
 type CommandCLIProfile struct {
-	Name       string
-	Backend    string
-	Binary     string
-	StartArgs  []string
-	ResumeArgs []string
-	Timeout    time.Duration
+	Name                   string
+	Backend                string
+	Binary                 string
+	StartArgs              []string
+	ResumeArgs             []string
+	Timeout                time.Duration
+	RuntimeCommandPolicies map[string]RuntimeCommandPolicy
 }
 
 type CommandCLIAdapterConfig struct {
@@ -40,6 +50,14 @@ type CommandCLIAdapter struct {
 	objects  *objects.Store
 	profile  CommandCLIProfile
 	executor ContainerExecutor
+}
+
+type preparedStartCommand struct {
+	Instance         RuntimeInstance
+	SessionNativeID  string
+	Prompt           string
+	Command          []string
+	PersistedCommand []string
 }
 
 type ContainerExecutor interface {
@@ -101,26 +119,20 @@ func (a *CommandCLIAdapter) Capabilities() CLIAdapterCapabilities {
 	return CLIAdapterCapabilities{SupportsSameTurnSteer: false}
 }
 
+func (a *CommandCLIAdapter) PreflightStart(ctx context.Context, req StartRequest) error {
+	_, err := a.prepareStartCommand(ctx, req)
+	return err
+}
+
 func (a *CommandCLIAdapter) Start(ctx context.Context, req StartRequest) (StartResult, error) {
-	if req.CLIBackend != "" && req.CLIBackend != a.profile.Backend {
-		return StartResult{}, fmt.Errorf("command cli: request backend %q does not match profile %q", req.CLIBackend, a.profile.Backend)
-	}
-	if err := validateCommandRuntime(req.RuntimeID, req.AttemptID, req.AgentID, req.Workspace, req.HomeDir, req.Env); err != nil {
-		return StartResult{}, err
-	}
-	instance, err := a.runtimeInstance(ctx, req.RuntimeID, req.AttemptID)
+	prepared, err := a.prepareStartCommand(ctx, req)
 	if err != nil {
 		return StartResult{}, err
 	}
-	sessionID, err := newNativeSessionID()
-	if err != nil {
-		return StartResult{}, err
-	}
-	prompt := composeStartPrompt(req.BootstrapPrompt)
-	command, persistedCommand, _ := renderCommand(a.profile.Binary, a.profile.StartArgs, renderVars{
-		SessionID: sessionID,
-		Prompt:    prompt,
-	})
+	instance := prepared.Instance
+	sessionID := prepared.SessionNativeID
+	prompt := prepared.Prompt
+	command := prepared.Command
 	sessionRow, err := a.insertSession(ctx, commandSessionInput{
 		AttemptID:       req.AttemptID,
 		RuntimeID:       req.RuntimeID,
@@ -130,7 +142,7 @@ func (a *CommandCLIAdapter) Start(ctx context.Context, req StartRequest) (StartR
 		ContainerName:   instance.ContainerName,
 		StartReason:     "start",
 		State:           "starting",
-		Command:         persistedCommand,
+		Command:         prepared.PersistedCommand,
 		EnvKeys:         commandEnvKeys(req.Env),
 	})
 	if err != nil {
@@ -150,6 +162,11 @@ func (a *CommandCLIAdapter) Start(ctx context.Context, req StartRequest) (StartR
 		_ = a.markSessionFailed(ctx, sessionRow.ID, err)
 		return StartResult{}, err
 	}
+	if cause, ok := a.approvalFailureCause(instance, result); ok {
+		transcriptRef := a.failureTranscriptRef(ctx, sessionRow.ID, cause)
+		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
+		return StartResult{}, cause
+	}
 	if cause, ok := a.authFailureCause(result); ok {
 		transcriptRef := a.failureTranscriptRef(ctx, sessionRow.ID, cause)
 		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
@@ -165,10 +182,53 @@ func (a *CommandCLIAdapter) Start(ctx context.Context, req StartRequest) (StartR
 		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
 		return StartResult{}, cause
 	}
+	if cause := a.requireProviderPolicyProgress(ctx, instance, command, req.Env); cause != nil {
+		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
+		return StartResult{}, cause
+	}
 	if err := a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, nil); err != nil {
 		return StartResult{}, err
 	}
 	return StartResult{SessionNativeID: sessionID, TranscriptRef: transcriptRef}, nil
+}
+
+func (a *CommandCLIAdapter) prepareStartCommand(ctx context.Context, req StartRequest) (preparedStartCommand, error) {
+	if req.CLIBackend != "" && req.CLIBackend != a.profile.Backend {
+		return preparedStartCommand{}, fmt.Errorf("command cli: request backend %q does not match profile %q", req.CLIBackend, a.profile.Backend)
+	}
+	if err := validateCommandRuntime(req.RuntimeID, req.AttemptID, req.AgentID, req.Workspace, req.HomeDir, req.Env); err != nil {
+		return preparedStartCommand{}, err
+	}
+	instance, err := a.runtimeInstance(ctx, req.RuntimeID, req.AttemptID)
+	if err != nil {
+		return preparedStartCommand{}, err
+	}
+	sessionID := req.SessionNativeID
+	if sessionID == "" {
+		sessionID, err = newNativeSessionID()
+		if err != nil {
+			return preparedStartCommand{}, err
+		}
+	}
+	prompt := composeStartPrompt(req.BootstrapPrompt)
+	command, persistedCommand, _ := renderCommand(a.profile.Binary, a.profile.StartArgs, renderVars{
+		SessionID: sessionID,
+		Prompt:    prompt,
+	})
+	command, persistedCommand, err = a.withProviderCommandPolicy(instance, command, persistedCommand)
+	if err != nil {
+		return preparedStartCommand{}, err
+	}
+	if err := a.enforceCommandPolicy(instance, command); err != nil {
+		return preparedStartCommand{}, err
+	}
+	return preparedStartCommand{
+		Instance:         instance,
+		SessionNativeID:  sessionID,
+		Prompt:           prompt,
+		Command:          command,
+		PersistedCommand: persistedCommand,
+	}, nil
 }
 
 func (a *CommandCLIAdapter) Resume(ctx context.Context, req ResumeRequest) error {
@@ -187,6 +247,13 @@ func (a *CommandCLIAdapter) Resume(ctx context.Context, req ResumeRequest) error
 		SessionID: req.Route.SessionNativeID,
 		Prompt:    prompt,
 	})
+	command, persistedCommand, err = a.withProviderCommandPolicy(instance, command, persistedCommand)
+	if err != nil {
+		return err
+	}
+	if err := a.enforceCommandPolicy(instance, command); err != nil {
+		return err
+	}
 	resumeOf, _ := a.firstSessionID(ctx, req.Route.AttemptID, req.Route.SessionNativeID)
 	sessionRow, err := a.insertSession(ctx, commandSessionInput{
 		AttemptID:       req.Route.AttemptID,
@@ -218,6 +285,11 @@ func (a *CommandCLIAdapter) Resume(ctx context.Context, req ResumeRequest) error
 		_ = a.markSessionFailed(ctx, sessionRow.ID, err)
 		return err
 	}
+	if cause, ok := a.approvalFailureCause(instance, result); ok {
+		transcriptRef := a.failureTranscriptRef(ctx, sessionRow.ID, cause)
+		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
+		return cause
+	}
 	if cause, ok := a.authFailureCause(result); ok {
 		transcriptRef := a.failureTranscriptRef(ctx, sessionRow.ID, cause)
 		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
@@ -230,6 +302,10 @@ func (a *CommandCLIAdapter) Resume(ctx context.Context, req ResumeRequest) error
 	}
 	if result.ExitCode != 0 {
 		cause := fmt.Errorf("command cli: %s resume exited with code %d", a.profile.Backend, result.ExitCode)
+		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
+		return cause
+	}
+	if cause := a.requireProviderPolicyProgress(ctx, instance, command, req.Env); cause != nil {
 		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
 		return cause
 	}
@@ -449,6 +525,9 @@ func (a *CommandCLIAdapter) exec(ctx context.Context, sessionID string, instance
 		execEnv[key] = value
 	}
 	execEnv["HOME"] = ContainerHomePath
+	if err := a.addProviderPolicyEnv(instance, command, execEnv); err != nil {
+		return ContainerExecResult{}, err
+	}
 	if err := a.markProcessStarted(ctx, sessionID, command, commandEnvKeys(execEnv)); err != nil {
 		return ContainerExecResult{}, err
 	}
@@ -467,6 +546,29 @@ func (a *CommandCLIAdapter) exec(ctx context.Context, sessionID string, instance
 	return result, nil
 }
 
+func (a *CommandCLIAdapter) addProviderPolicyEnv(instance RuntimeInstance, command []string, env map[string]string) error {
+	if a.profile.Backend != "claude" || isCoordlinkCommand(command) {
+		return nil
+	}
+	policy, ok := a.runtimeCommandPolicy(instance.RuntimeProfile)
+	if !ok {
+		return nil
+	}
+	if _, err := claudeProviderPermissionArgs(policy); err != nil {
+		return err
+	}
+	allowed := allowedProviderCapabilities(policy)
+	if len(allowed) == 0 {
+		return NewRuntimeApprovalPolicyUnavailable("claude command runtime provider policy has no safe coordlink allowlist")
+	}
+	env[providerPolicyModeEnv] = providerPolicyModeStrict
+	env[providerPolicyAllowlistEnv] = strings.Join(allowed, ",")
+	env[providerPolicyAuditTraceEnv] = env["COORDPLANE_TRACE_ID"]
+	env[providerPolicyAuditAgentEnv] = instance.AgentID
+	env[providerPolicyAuditLeaseEnv] = instance.LeaseID
+	return nil
+}
+
 func (a *CommandCLIAdapter) requireAuthProbe(instance RuntimeInstance) error {
 	if a.profile.Backend != "claude" {
 		return nil
@@ -479,6 +581,231 @@ func (a *CommandCLIAdapter) requireAuthProbe(instance RuntimeInstance) error {
 	return nil
 }
 
+func (a *CommandCLIAdapter) enforceCommandPolicy(instance RuntimeInstance, command []string) error {
+	policy, ok := a.runtimeCommandPolicy(instance.RuntimeProfile)
+	if !ok {
+		return nil
+	}
+	if a.profile.Backend == "claude" && !isCoordlinkCommand(command) {
+		providerArgs, err := claudeProviderPermissionArgs(policy)
+		if err != nil {
+			return err
+		}
+		if !commandContainsClaudeProviderPolicy(command, providerArgs) {
+			return NewRuntimeApprovalPolicyUnavailable("claude command runtime command_policy was not converted to an auditable provider approval configuration")
+		}
+		return nil
+	}
+	return EvaluateCommandPolicy(command, policy)
+}
+
+func (a *CommandCLIAdapter) withProviderCommandPolicy(instance RuntimeInstance, command, persisted []string) ([]string, []string, error) {
+	if a.profile.Backend != "claude" || isCoordlinkCommand(command) {
+		return command, persisted, nil
+	}
+	policy, ok := a.runtimeCommandPolicy(instance.RuntimeProfile)
+	if !ok {
+		return command, persisted, nil
+	}
+	args, err := claudeProviderPermissionArgs(policy)
+	if err != nil {
+		return nil, nil, err
+	}
+	command = append(append([]string(nil), command...), args...)
+	persisted = append(append([]string(nil), persisted...), args...)
+	return command, persisted, nil
+}
+
+func claudeProviderPermissionArgs(policy RuntimeCommandPolicy) ([]string, error) {
+	if !policy.NonInteractiveApproval || len(policy.AllowCoordlinkCapabilities) == 0 {
+		return nil, NewRuntimeApprovalPolicyUnavailable("claude command runtime requires runtime profile command_policy with non_interactive_approval and coordlink allowlist")
+	}
+	allowed := allowedProviderCapabilities(policy)
+	rules := make([]string, 0, len(allowed))
+	for _, capabilityName := range allowed {
+		if !safeProviderCapabilityName(capabilityName) {
+			return nil, NewRuntimeApprovalPolicyUnavailable("claude command runtime cannot safely express command_policy capability in provider permissions")
+		}
+		rules = append(rules, "Bash("+ContainerCoordlinkPath+" call "+capabilityName+" *)")
+	}
+	sort.Strings(rules)
+	denyRules := []string{
+		"Bash(sh *)",
+		"Bash(bash *)",
+		"Bash(dash *)",
+		"Bash(zsh *)",
+		"Bash(fish *)",
+		"Bash(env *)",
+		"Bash(printenv *)",
+		"Bash(cat *)",
+		"Bash(head *)",
+		"Bash(tail *)",
+		"Bash(grep *)",
+		"Bash(find *)",
+		"Bash(ls *)",
+		"Bash(pwd)",
+		"Bash(stat *)",
+		"Bash(sqlite3 *)",
+		"Bash(psql *)",
+		"Bash(mysql *)",
+		"Bash(docker *)",
+		"Bash(podman *)",
+		"Bash(curl *)",
+		"Bash(wget *)",
+		"Bash(nc *)",
+		"Bash(netcat *)",
+		"Bash(ssh *)",
+		"Bash(python *)",
+		"Bash(python3 *)",
+		"Bash(node *)",
+	}
+	sort.Strings(denyRules)
+	return []string{
+		"--safe-mode",
+		"--disable-slash-commands",
+		"--strict-mcp-config",
+		"--permission-mode", "dontAsk",
+		"--tools", "Bash",
+		"--allowedTools", strings.Join(rules, ","),
+		"--disallowedTools", strings.Join(denyRules, ","),
+	}, nil
+}
+
+func allowedProviderCapabilities(policy RuntimeCommandPolicy) []string {
+	seen := make(map[string]bool, len(policy.AllowCoordlinkCapabilities))
+	out := make([]string, 0, len(policy.AllowCoordlinkCapabilities))
+	for _, capabilityName := range policy.AllowCoordlinkCapabilities {
+		capabilityName = strings.TrimSpace(capabilityName)
+		if capabilityName == "" || seen[capabilityName] {
+			continue
+		}
+		seen[capabilityName] = true
+		out = append(out, capabilityName)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func safeProviderCapabilityName(name string) bool {
+	if name == "" || strings.TrimSpace(name) != name || strings.HasPrefix(name, "-") {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '.', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return strings.Contains(name, ".")
+}
+
+func commandContainsClaudeProviderPolicy(command, providerArgs []string) bool {
+	if len(providerArgs) == 0 {
+		return false
+	}
+	for _, arg := range providerArgs {
+		if !containsCommandArg(command, arg) {
+			return false
+		}
+	}
+	return !containsCommandArg(command, "bypassPermissions") &&
+		!containsCommandArg(command, "--dangerously-skip-permissions") &&
+		!containsCommandArg(command, "--allow-dangerously-skip-permissions")
+}
+
+func containsCommandArg(command []string, want string) bool {
+	for _, arg := range command {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *CommandCLIAdapter) requireProviderPolicyProgress(ctx context.Context, instance RuntimeInstance, command []string, env map[string]string) error {
+	if a.profile.Backend != "claude" || isCoordlinkCommand(command) {
+		return nil
+	}
+	policy, ok := a.runtimeCommandPolicy(instance.RuntimeProfile)
+	if !ok {
+		return nil
+	}
+	if _, err := claudeProviderPermissionArgs(policy); err != nil {
+		return err
+	}
+	traceID := strings.TrimSpace(env["COORDPLANE_TRACE_ID"])
+	if traceID == "" {
+		return NewRuntimeApprovalPolicyUnavailable("claude command runtime provider policy could not audit accepted coordlink capability calls without trace id")
+	}
+	if strings.TrimSpace(instance.LeaseID) == "" {
+		return NewRuntimeApprovalPolicyUnavailable("claude command runtime provider policy could not audit accepted coordlink capability calls without lease id")
+	}
+	allowed := make(map[string]bool, len(policy.AllowCoordlinkCapabilities))
+	for _, capabilityName := range allowedProviderCapabilities(policy) {
+		allowed[capabilityName] = true
+	}
+	rows, err := a.db.QueryContext(ctx, `
+SELECT capability_name, scope_json
+FROM capability_calls
+WHERE trace_id = ? AND subject_kind = 'agent' AND subject_id = ? AND status = 'accepted'`,
+		traceID, instance.AgentID,
+	)
+	if err != nil {
+		return fmt.Errorf("command cli: audit accepted provider policy capability calls: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var capabilityName, scopeJSON string
+		if err := rows.Scan(&capabilityName, &scopeJSON); err != nil {
+			return err
+		}
+		if allowed[capabilityName] && scopeMatchesLease(scopeJSON, instance.LeaseID) {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return NewRuntimeApprovalPolicyUnavailable("claude command runtime provider exited without an accepted allowlisted coordlink capability call")
+}
+
+func scopeMatchesLease(scopeJSON, leaseID string) bool {
+	if strings.TrimSpace(leaseID) == "" {
+		return false
+	}
+	var values map[string]any
+	if err := json.Unmarshal([]byte(scopeJSON), &values); err != nil {
+		return false
+	}
+	value, _ := values["lease_id"].(string)
+	return value == leaseID
+}
+
+func (a *CommandCLIAdapter) runtimeCommandPolicy(runtimeProfile string) (RuntimeCommandPolicy, bool) {
+	if a == nil || len(a.profile.RuntimeCommandPolicies) == 0 {
+		return RuntimeCommandPolicy{}, false
+	}
+	policy, ok := a.profile.RuntimeCommandPolicies[runtimeProfile]
+	if !ok {
+		return RuntimeCommandPolicy{}, true
+	}
+	return policy, true
+}
+
+func (a *CommandCLIAdapter) approvalFailureCause(instance RuntimeInstance, result ContainerExecResult) (error, bool) {
+	if _, ok := a.runtimeCommandPolicy(instance.RuntimeProfile); !ok {
+		return nil, false
+	}
+	if looksLikeInteractiveApprovalPrompt(result.Stdout) || looksLikeInteractiveApprovalPrompt(result.Stderr) {
+		return NewRuntimeApprovalPolicyUnavailable("command CLI provider requested interactive approval for a runtime command"), true
+	}
+	return nil, false
+}
+
 func (a *CommandCLIAdapter) authFailureCause(result ContainerExecResult) (error, bool) {
 	if a.profile.Backend != "claude" || result.ExitCode == 0 {
 		return nil, false
@@ -487,6 +814,28 @@ func (a *CommandCLIAdapter) authFailureCause(result ContainerExecResult) (error,
 		return errors.New("CLAUDE_AUTH_REQUIRED: claude authentication required for non-interactive command CLI"), true
 	}
 	return nil, false
+}
+
+func looksLikeInteractiveApprovalPrompt(raw []byte) bool {
+	lower := strings.ToLower(string(raw))
+	if lower == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"do you want to proceed",
+		"requires approval",
+		"needs approval",
+		"request approval",
+		"approval required",
+		"permission required",
+		"allow this command",
+		"approve this command",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *CommandCLIAdapter) markProcessStarted(ctx context.Context, sessionID string, command []string, envKeys []string) error {

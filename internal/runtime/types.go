@@ -131,6 +131,7 @@ type StartRequest struct {
 	AssignmentID    string
 	LeaseID         string
 	ContractID      string
+	SessionNativeID string
 	RuntimeID       string
 	CLIBackend      string
 	Workspace       string
@@ -166,18 +167,20 @@ type ResumeRouteInput struct {
 }
 
 type ResumeResult struct {
-	AttemptID  string   `json:"attempt_id"`
-	RouteID    string   `json:"route_id"`
-	State      string   `json:"state"`
-	MailboxIDs []string `json:"mailbox_ids,omitempty"`
+	AttemptID  string            `json:"attempt_id"`
+	RouteID    string            `json:"route_id"`
+	State      string            `json:"state"`
+	MailboxIDs []string          `json:"mailbox_ids,omitempty"`
+	Env        map[string]string `json:"-"`
 }
 
 type ResumeQueueResult struct {
-	QueueItemID string `json:"queue_item_id,omitempty"`
-	MailboxID   string `json:"mailbox_id,omitempty"`
-	RouteID     string `json:"route_id,omitempty"`
-	State       string `json:"state"`
-	Idle        bool   `json:"idle"`
+	QueueItemID string            `json:"queue_item_id,omitempty"`
+	MailboxID   string            `json:"mailbox_id,omitempty"`
+	RouteID     string            `json:"route_id,omitempty"`
+	State       string            `json:"state"`
+	Idle        bool              `json:"idle"`
+	Env         map[string]string `json:"-"`
 }
 
 type SteerRequest struct {

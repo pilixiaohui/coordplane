@@ -107,6 +107,21 @@ var migrations = []migration{
 		Name:    "canonical agent communication envelopes and mailbox projection",
 		SQL:     agentCommunicationEnvelopeSchemaSQL,
 	},
+	{
+		Version: "015_controlled_git_operation_evidence",
+		Name:    "controlled Git repository aliases and operation execution evidence",
+		SQL:     controlledGitOperationEvidenceSchemaSQL,
+	},
+	{
+		Version: "016_controlled_git_operation_subject_kind",
+		Name:    "controlled Git operation subject origin evidence",
+		SQL:     controlledGitOperationSubjectKindSchemaSQL,
+	},
+	{
+		Version: "017_operator_task_runs",
+		Name:    "operator root task run idempotency ledger",
+		SQL:     operatorTaskRunsSchemaSQL,
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) (MigrationResult, error) {

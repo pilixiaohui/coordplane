@@ -268,6 +268,9 @@ func TestRunnerProcessesFallbackResumeQueueWithPinnedRouteAndDuplicateRecoveryIs
 	if resumed.State != "resumed" || resumed.RouteID != coordinator.Route.ID || resumed.MailboxID != mailbox.ID {
 		t.Fatalf("resume result = %+v, want coordinator mailbox resume", resumed)
 	}
+	if resumed.Env["COORDPLANE_TOKEN"] == "" || resumed.Env["COORDPLANE_TOKEN"] == coordinator.Env["COORDPLANE_TOKEN"] {
+		t.Fatalf("resume env token = %q, want fresh token different from initial session", resumed.Env["COORDPLANE_TOKEN"])
+	}
 	resumes := h.fake.Resumes()
 	if len(resumes) != 1 {
 		t.Fatalf("fake resumes = %d, want 1", len(resumes))

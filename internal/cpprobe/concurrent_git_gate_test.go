@@ -140,7 +140,7 @@ func TestCPProbeConcurrentGitGateCoversStaleConflictRetryAndNegativeMatrix(t *te
 		t.Fatalf("workspace head after missing path reject = %s, want %s", got, missingBefore)
 	}
 
-	abandon := exerciseChangeSetAbandon(t, ctx, link, &trace, tinyLedger.RepoPath, canonicalAfterB, dir)
+	abandon := exerciseChangeSetAbandon(t, ctx, link, &trace, developers.A.Repository.ID, tinyLedger.RepoPath, canonicalAfterB, dir)
 	if abandon.ChangeSet.State != "abandoned" {
 		t.Fatalf("abandoned changeset state = %s, want abandoned", abandon.ChangeSet.State)
 	}
@@ -148,7 +148,7 @@ func TestCPProbeConcurrentGitGateCoversStaleConflictRetryAndNegativeMatrix(t *te
 		t.Fatalf("canonical after changeset abandon = %s, want unchanged %s", got, canonicalAfterB)
 	}
 
-	rollback := exerciseRollback(t, ctx, link, &trace, tinyLedger.RepoPath, canonicalAfterB, dir)
+	rollback := exerciseRollback(t, ctx, link, &trace, developers.A.Repository.ID, tinyLedger.RepoPath, canonicalAfterB, dir)
 	if rollback.RollbackPoint.State != "used" || rollback.RestoredRef != canonicalAfterB {
 		t.Fatalf("rollback result = %+v, want used rollback point restored to %s", rollback, canonicalAfterB)
 	}
@@ -396,6 +396,14 @@ type preparedDevelopers struct {
 
 func prepareCPProbeDeveloperWorkspaces(t *testing.T, ctx context.Context, app *backend.Backend, link *coordlink.Adapter, trace *cpprobe.ManualTrace, tinyLedger cpprobe.TinyLedgerFixture, dir string) preparedDevelopers {
 	t.Helper()
+	repo, err := app.CodeManagement.RegisterRepository(ctx, codemanagement.RegisterRepositoryInput{
+		RepoPath:        tinyLedger.RepoPath,
+		Alias:           "cp-probe-concurrent-test",
+		CanonicalBranch: tinyLedger.CanonicalBranch,
+	})
+	if err != nil {
+		t.Fatalf("register tiny ledger repository: %v", err)
+	}
 	root, err := app.Coordination.AddContract(ctx, coordination.AddContractInput{
 		IssuerAgentID: "operator",
 		Title:         "CP-PROBE-001 concurrent git root",
@@ -449,13 +457,13 @@ func prepareCPProbeDeveloperWorkspaces(t *testing.T, ctx context.Context, app *b
 		t.Fatalf("developer assignments = %+v/%+v, want dispatched contracts", developerA, developerB)
 	}
 	preparedA := acceptedCapability[codemanagement.WorkspacePrepareResult](t, callCapability(t, ctx, link, trace, "developer-a", "workspace.prepare", "prepare category workspace", map[string]string{
-		"repo_path":        tinyLedger.RepoPath,
+		"repo_id":          repo.ID,
 		"canonical_branch": tinyLedger.CanonicalBranch,
 		"workspace_root":   filepath.Join(dir, "workspaces", "developer-a"),
 		"contract_id":      developerA.Contract.ID,
 	}))
 	preparedB := acceptedCapability[codemanagement.WorkspacePrepareResult](t, callCapability(t, ctx, link, trace, "developer-b", "workspace.prepare", "prepare transaction_count workspace", map[string]string{
-		"repo_path":        tinyLedger.RepoPath,
+		"repo_id":          repo.ID,
 		"canonical_branch": tinyLedger.CanonicalBranch,
 		"workspace_root":   filepath.Join(dir, "workspaces", "developer-b"),
 		"contract_id":      developerB.Contract.ID,
@@ -537,10 +545,10 @@ func requireMailboxForContract(t *testing.T, items []coordination.MailboxItem, c
 	return coordination.MailboxItem{}
 }
 
-func exerciseChangeSetAbandon(t *testing.T, ctx context.Context, link *coordlink.Adapter, trace *cpprobe.ManualTrace, repoPath, expectedCanonical, dir string) codemanagement.AbandonChangeSetResult {
+func exerciseChangeSetAbandon(t *testing.T, ctx context.Context, link *coordlink.Adapter, trace *cpprobe.ManualTrace, repoID, repoPath, expectedCanonical, dir string) codemanagement.AbandonChangeSetResult {
 	t.Helper()
 	prepared := acceptedCapability[codemanagement.WorkspacePrepareResult](t, callCapability(t, ctx, link, trace, "developer-a", "workspace.prepare", "prepare abandon workspace", map[string]string{
-		"repo_path":        repoPath,
+		"repo_id":          repoID,
 		"canonical_branch": "main",
 		"workspace_root":   filepath.Join(dir, "workspaces", "abandon"),
 		"contract_id":      "cp-probe-abandon",
@@ -561,10 +569,10 @@ func exerciseChangeSetAbandon(t *testing.T, ctx context.Context, link *coordlink
 	return result
 }
 
-func exerciseRollback(t *testing.T, ctx context.Context, link *coordlink.Adapter, trace *cpprobe.ManualTrace, repoPath, expectedCanonical, dir string) codemanagement.RollbackResult {
+func exerciseRollback(t *testing.T, ctx context.Context, link *coordlink.Adapter, trace *cpprobe.ManualTrace, repoID, repoPath, expectedCanonical, dir string) codemanagement.RollbackResult {
 	t.Helper()
 	prepared := acceptedCapability[codemanagement.WorkspacePrepareResult](t, callCapability(t, ctx, link, trace, "developer-a", "workspace.prepare", "prepare rollback workspace", map[string]string{
-		"repo_path":        repoPath,
+		"repo_id":          repoID,
 		"canonical_branch": "main",
 		"workspace_root":   filepath.Join(dir, "workspaces", "rollback"),
 		"contract_id":      "cp-probe-rollback",
@@ -705,7 +713,8 @@ ORDER BY created_at, id`)
 func gitOperationBriefs(t *testing.T, ctx context.Context, db *sql.DB) []cpprobe.GitOperationBrief {
 	t.Helper()
 	rows, err := db.QueryContext(ctx, `
-SELECT id, operation_type, actor_agent_id, COALESCE(workspace_id, ''), repo_id, before_ref, after_ref, state
+SELECT id, operation_type, actor_agent_id, COALESCE(workspace_id, ''), repo_id,
+  subject_kind, runtime_id, execution_location, before_ref, after_ref, state
 FROM git_operations
 ORDER BY created_at, id`)
 	if err != nil {
@@ -715,7 +724,7 @@ ORDER BY created_at, id`)
 	var out []cpprobe.GitOperationBrief
 	for rows.Next() {
 		var item cpprobe.GitOperationBrief
-		if err := rows.Scan(&item.ID, &item.OperationType, &item.ActorAgentID, &item.WorkspaceID, &item.RepoID, &item.BeforeRef, &item.AfterRef, &item.State); err != nil {
+		if err := rows.Scan(&item.ID, &item.OperationType, &item.ActorAgentID, &item.WorkspaceID, &item.RepoID, &item.SubjectKind, &item.RuntimeID, &item.ExecutionLocation, &item.BeforeRef, &item.AfterRef, &item.State); err != nil {
 			t.Fatalf("scan git operation summary: %v", err)
 		}
 		out = append(out, item)

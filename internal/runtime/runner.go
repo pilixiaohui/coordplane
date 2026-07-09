@@ -45,6 +45,10 @@ type RunnerConfig struct {
 	WorkspaceName   string
 }
 
+type startPreflightAdapter interface {
+	PreflightStart(context.Context, StartRequest) error
+}
+
 func NewRunner(cfg RunnerConfig) (*Runner, error) {
 	if cfg.Store == nil {
 		return nil, errors.New("runtime runner: store is nil")
@@ -126,6 +130,34 @@ func (r *Runner) StartNext(ctx context.Context, agentID string) (AssignmentSessi
 	if next.Idle {
 		return AssignmentSession{}, fmt.Errorf("runtime runner: no assignment for agent %q", agentID)
 	}
+	return r.startClaimed(ctx, agent, runtimeBackend, next)
+}
+
+func (r *Runner) StartAssignment(ctx context.Context, agentID, assignmentID string) (AssignmentSession, error) {
+	if agentID == "" || assignmentID == "" {
+		return AssignmentSession{}, errors.New("runtime runner: agent id and assignment id are required")
+	}
+	agent, ok := r.cfg.Agent(agentID)
+	if !ok {
+		return AssignmentSession{}, fmt.Errorf("runtime runner: agent %q is not declared in TeamConfig", agentID)
+	}
+	runtimeBackend, err := r.runtimeForAgent(agent)
+	if err != nil {
+		return AssignmentSession{}, err
+	}
+	next, err := r.coordination.AssignmentClaim(ctx, coordination.AssignmentClaimInput{
+		AgentID:      agentID,
+		AssignmentID: assignmentID,
+		LeaseFor:     time.Hour,
+	})
+	if err != nil {
+		return AssignmentSession{}, err
+	}
+	return r.startClaimed(ctx, agent, runtimeBackend, next)
+}
+
+func (r *Runner) startClaimed(ctx context.Context, agent teamconfig.AgentConfig, runtimeBackend RuntimeBackend, next coordination.AssignmentNextResult) (AssignmentSession, error) {
+	agentID := agent.ID
 	if existing, ok, err := r.activeSessionForLease(ctx, next.Lease.ID); err != nil {
 		return AssignmentSession{}, err
 	} else if ok {
@@ -203,20 +235,30 @@ func (r *Runner) StartNext(ctx context.Context, agentID string) (AssignmentSessi
 	if err := ValidateRuntimeEnv(env); err != nil {
 		return failPreparedAttempt(err)
 	}
-	start, err := r.adapter.Start(ctx, StartRequest{
+	sessionNativeID, err := newNativeSessionID()
+	if err != nil {
+		return failPreparedAttempt(err)
+	}
+	startReq := StartRequest{
 		AgentID:         agentID,
 		AttemptID:       attemptID,
 		AssignmentID:    next.Assignment.ID,
 		LeaseID:         next.Lease.ID,
 		ContractID:      next.Contract.ID,
+		SessionNativeID: sessionNativeID,
 		RuntimeID:       prepared.RuntimeID,
 		CLIBackend:      agent.CLIBackend,
 		Workspace:       prepared.Workspace,
 		HomeDir:         prepared.HomeDir,
 		Env:             env,
 		BootstrapPrompt: prompt,
-	})
-	if err != nil {
+	}
+	if preflight, ok := r.adapter.(startPreflightAdapter); ok {
+		if err := preflight.PreflightStart(ctx, startReq); err != nil {
+			return failPreparedAttempt(err)
+		}
+	}
+	if err := r.recordPreparedRuntime(ctx, runtimeBackend, agent, prepareRequest, prepared, env); err != nil {
 		return failPreparedAttempt(err)
 	}
 	route, err := r.PinSession(ctx, PinInput{
@@ -226,7 +268,7 @@ func (r *Runner) StartNext(ctx context.Context, agentID string) (AssignmentSessi
 		AgentID:         agentID,
 		RuntimeID:       prepared.RuntimeID,
 		CLIBackend:      agent.CLIBackend,
-		SessionNativeID: start.SessionNativeID,
+		SessionNativeID: sessionNativeID,
 		Workdir:         prepared.Workspace,
 		HomeDir:         prepared.HomeDir,
 	})
@@ -236,16 +278,20 @@ func (r *Runner) StartNext(ctx context.Context, agentID string) (AssignmentSessi
 	if err := r.attachActiveGuards(ctx, attemptID, route.ID); err != nil {
 		return failPreparedAttempt(err)
 	}
-	if err := r.recordPreparedRuntime(ctx, runtimeBackend, agent, prepareRequest, prepared, env); err != nil {
+	if err := r.setAttemptStatus(ctx, attemptID, "running"); err != nil {
 		return failPreparedAttempt(err)
+	}
+	start, err := r.adapter.Start(ctx, startReq)
+	if err != nil {
+		return failPreparedAttempt(err)
+	}
+	if start.SessionNativeID != "" && start.SessionNativeID != sessionNativeID {
+		return failPreparedAttempt(fmt.Errorf("runtime runner: CLI adapter returned session %q, want planned session %q", start.SessionNativeID, sessionNativeID))
 	}
 	if start.TranscriptRef != "" {
 		if err := r.setTranscriptRef(ctx, attemptID, start.TranscriptRef); err != nil {
 			return failPreparedAttempt(err)
 		}
-	}
-	if err := r.setAttemptStatus(ctx, attemptID, "running"); err != nil {
-		return failPreparedAttempt(err)
 	}
 	if err := r.ReleasePrepareLease(ctx, prepareLease.ID); err != nil {
 		return AssignmentSession{}, err
@@ -701,13 +747,25 @@ UPDATE leases SET state = 'released', updated_at = ? WHERE id = ? AND state = 'a
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `
-UPDATE assignments SET state = 'queued', updated_at = ?
+UPDATE assignments SET state = 'queued', session_route_id = NULL, updated_at = ?
 WHERE id = (SELECT assignment_id FROM leases WHERE id = ?) AND state = 'claimed'`,
 			now, current.LeaseID,
 		); err != nil {
 			return err
 		}
 		if err := markRouteTerminalForLease(ctx, tx, current.LeaseID, "failed", now); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+UPDATE leases SET runtime_id = NULL, session_route_id = NULL, updated_at = ? WHERE id = ?`,
+			now, current.LeaseID,
+		); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+UPDATE runtime_tokens SET state = 'revoked', updated_at = ? WHERE attempt_id = ? AND state = 'active'`,
+			now, attemptID,
+		); err != nil {
 			return err
 		}
 		if err := releaseActiveGuardsTx(ctx, tx, attemptID, now); err != nil {

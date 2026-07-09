@@ -39,9 +39,15 @@ type AgentConfig struct {
 }
 
 type RuntimeProfile struct {
-	Kind          string `json:"kind" yaml:"kind"`
-	Image         string `json:"image,omitempty" yaml:"image"`
-	WorkspaceMode string `json:"workspace_mode,omitempty" yaml:"workspace_mode"`
+	Kind          string               `json:"kind" yaml:"kind"`
+	Image         string               `json:"image,omitempty" yaml:"image"`
+	WorkspaceMode string               `json:"workspace_mode,omitempty" yaml:"workspace_mode"`
+	CommandPolicy RuntimeCommandPolicy `json:"command_policy,omitempty" yaml:"command_policy"`
+}
+
+type RuntimeCommandPolicy struct {
+	NonInteractiveApproval     bool     `json:"non_interactive_approval" yaml:"non_interactive_approval"`
+	AllowCoordlinkCapabilities []string `json:"allow_coordlink_capabilities,omitempty" yaml:"allow_coordlink_capabilities"`
 }
 
 type TerminationConfig struct {
@@ -145,6 +151,11 @@ func (c Config) Validate() error {
 			return err
 		}
 		if err := validateRolePromptRef(agent.ID, agent.RolePromptRef); err != nil {
+			return err
+		}
+	}
+	for name, profile := range c.RuntimeProfiles {
+		if err := validateRuntimeCommandPolicy(name, profile.CommandPolicy); err != nil {
 			return err
 		}
 	}
@@ -266,7 +277,7 @@ func cloneConfig(cfg Config) Config {
 	if cfg.RuntimeProfiles != nil {
 		cloned.RuntimeProfiles = make(map[string]RuntimeProfile, len(cfg.RuntimeProfiles))
 		for key, value := range cfg.RuntimeProfiles {
-			cloned.RuntimeProfiles[key] = value
+			cloned.RuntimeProfiles[key] = cloneRuntimeProfile(value)
 		}
 	}
 	return cloned
@@ -321,6 +332,12 @@ func cloneAgent(agent AgentConfig) AgentConfig {
 	return cloned
 }
 
+func cloneRuntimeProfile(profile RuntimeProfile) RuntimeProfile {
+	cloned := profile
+	cloned.CommandPolicy.AllowCoordlinkCapabilities = append([]string(nil), profile.CommandPolicy.AllowCoordlinkCapabilities...)
+	return cloned
+}
+
 func formatTime(t time.Time) string {
 	return t.UTC().Format(timeLayout)
 }
@@ -340,6 +357,21 @@ func validateRolePromptRef(agentID, ref string) error {
 		return fmt.Errorf("teamconfig: agent %q role_prompt_ref must be a relative safe reference", agentID)
 	}
 	return validateNoSensitiveMarkers("agent "+agentID+" role_prompt_ref", ref)
+}
+
+func validateRuntimeCommandPolicy(profileName string, policy RuntimeCommandPolicy) error {
+	seen := make(map[string]bool, len(policy.AllowCoordlinkCapabilities))
+	for _, capabilityName := range policy.AllowCoordlinkCapabilities {
+		capabilityName = strings.TrimSpace(capabilityName)
+		if capabilityName == "" {
+			return fmt.Errorf("teamconfig: runtime profile %q command_policy allow_coordlink_capabilities contains an empty capability", profileName)
+		}
+		if seen[capabilityName] {
+			return fmt.Errorf("teamconfig: runtime profile %q command_policy duplicates coordlink capability %q", profileName, capabilityName)
+		}
+		seen[capabilityName] = true
+	}
+	return nil
 }
 
 func validateNoSensitiveMarkers(field, value string) error {

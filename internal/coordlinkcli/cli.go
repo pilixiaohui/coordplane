@@ -17,6 +17,15 @@ import (
 
 type EnvFunc func(string) string
 
+const (
+	providerPolicyModeEnv       = "COORDPLANE_PROVIDER_POLICY_MODE"
+	providerPolicyModeStrict    = "strict_coordlink_call"
+	providerPolicyAllowlistEnv  = "COORDPLANE_PROVIDER_ALLOWED_CAPABILITIES"
+	providerPolicyAuditTraceEnv = "COORDPLANE_PROVIDER_AUDIT_TRACE_ID"
+	providerPolicyAuditAgentEnv = "COORDPLANE_PROVIDER_AUDIT_AGENT_ID"
+	providerPolicyAuditLeaseEnv = "COORDPLANE_PROVIDER_AUDIT_LEASE_ID"
+)
+
 type commonConfig struct {
 	BackendURL  string
 	AgentID     string
@@ -89,6 +98,13 @@ func runCall(ctx context.Context, args []string, getenv EnvFunc, stdin io.Reader
 		return 2
 	}
 	capabilityName := args[0]
+	strictProviderPolicy := providerPolicyStrict(getenv)
+	if strictProviderPolicy {
+		if err := validateProviderPolicyCallArgs(capabilityName, args[1:], getenv); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+	}
 	fs := flag.NewFlagSet("coordlink call", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfg := commonFromEnv(getenv)
@@ -105,6 +121,12 @@ func runCall(ctx context.Context, args []string, getenv EnvFunc, stdin io.Reader
 	if err := cfg.validate(); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
+	}
+	if strictProviderPolicy {
+		if err := validateProviderPolicyCallEnv(capabilityName, cfg, *traceID, *leaseID, getenv); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
 	}
 	input, err := rawInput(*inputValue, *inputFile, stdin)
 	if err != nil {
@@ -138,6 +160,154 @@ func runCall(ctx context.Context, args []string, getenv EnvFunc, stdin io.Reader
 	}
 	endpoint := strings.TrimRight(cfg.BackendURL, "/") + "/call"
 	return do(ctx, http.MethodPost, endpoint, body, cfg, stdout, stderr)
+}
+
+func providerPolicyStrict(getenv EnvFunc) bool {
+	return strings.TrimSpace(getenv(providerPolicyModeEnv)) == providerPolicyModeStrict
+}
+
+func validateProviderPolicyCallArgs(capabilityName string, tail []string, getenv EnvFunc) error {
+	if !providerPolicyCapabilityAllowed(capabilityName, getenv(providerPolicyAllowlistEnv)) {
+		return providerPolicyDenied()
+	}
+	for i := 0; i < len(tail); i++ {
+		arg := tail[i]
+		if arg == "" || providerPolicyUnsafeSuffix(arg) {
+			return providerPolicyDenied()
+		}
+		if !strings.HasPrefix(arg, "--") {
+			return providerPolicyDenied()
+		}
+		name, value, hasValue := strings.Cut(arg, "=")
+		switch name {
+		case "--input":
+			if !hasValue {
+				i++
+				if i >= len(tail) || strings.HasPrefix(tail[i], "--") {
+					return providerPolicyDenied()
+				}
+				value = tail[i]
+			}
+			if strings.TrimSpace(value) == "-" || providerPolicyUnsafeSuffix(value) {
+				return providerPolicyDenied()
+			}
+		case "--idempotency-key":
+			if !hasValue {
+				i++
+				if i >= len(tail) || strings.HasPrefix(tail[i], "--") {
+					return providerPolicyDenied()
+				}
+				value = tail[i]
+			}
+			if providerPolicyUnsafeSuffix(value) {
+				return providerPolicyDenied()
+			}
+		default:
+			return providerPolicyDenied()
+		}
+	}
+	return nil
+}
+
+func validateProviderPolicyCallEnv(capabilityName string, cfg commonConfig, traceID, leaseID string, getenv EnvFunc) error {
+	if !providerPolicyCapabilityAllowed(capabilityName, getenv(providerPolicyAllowlistEnv)) {
+		return providerPolicyDenied()
+	}
+	if cfg.BackendURL == "" || cfg.AgentID == "" || cfg.RuntimeID == "" || cfg.WorkspaceID == "" ||
+		cfg.Token == "" || traceID == "" || leaseID == "" {
+		return providerPolicyDenied()
+	}
+	for _, check := range []struct {
+		got  string
+		want string
+	}{
+		{got: cfg.BackendURL, want: getenv("COORDPLANE_BACKEND_URL")},
+		{got: cfg.AgentID, want: getenv("COORDPLANE_AGENT_ID")},
+		{got: cfg.RuntimeID, want: getenv("COORDPLANE_RUNTIME_ID")},
+		{got: cfg.WorkspaceID, want: getenv("COORDPLANE_WORKSPACE_ID")},
+		{got: cfg.Token, want: getenv("COORDPLANE_TOKEN")},
+		{got: traceID, want: getenv("COORDPLANE_TRACE_ID")},
+		{got: leaseID, want: getenv("COORDPLANE_LEASE_ID")},
+	} {
+		if strings.TrimSpace(check.want) == "" || check.got != check.want {
+			return providerPolicyDenied()
+		}
+	}
+	for _, check := range []struct {
+		got  string
+		want string
+	}{
+		{got: traceID, want: getenv(providerPolicyAuditTraceEnv)},
+		{got: cfg.AgentID, want: getenv(providerPolicyAuditAgentEnv)},
+		{got: leaseID, want: getenv(providerPolicyAuditLeaseEnv)},
+	} {
+		if strings.TrimSpace(check.want) != "" && check.got != check.want {
+			return providerPolicyDenied()
+		}
+	}
+	return nil
+}
+
+func providerPolicyCapabilityAllowed(capabilityName, rawAllowlist string) bool {
+	capabilityName = strings.TrimSpace(capabilityName)
+	if capabilityName == "" || strings.HasPrefix(capabilityName, "-") {
+		return false
+	}
+	for _, allowed := range strings.Split(rawAllowlist, ",") {
+		if capabilityName == strings.TrimSpace(allowed) {
+			return true
+		}
+	}
+	return false
+}
+
+func providerPolicyUnsafeSuffix(value string) bool {
+	lower := strings.ToLower(value)
+	if strings.HasPrefix(strings.TrimSpace(value), "/") {
+		return true
+	}
+	for _, marker := range []string{
+		"authorization:",
+		"bearer ",
+		"coordplane_token",
+		"operator_token",
+		"anthropic_auth",
+		"api_key",
+		"secret=",
+		"token=",
+		"password=",
+		"http://",
+		"https://",
+		"://",
+		"/home/",
+		"/tmp/",
+		"/var/",
+		"/etc/",
+		"/root/",
+		"/workspace",
+		"../",
+		"..\\",
+		";",
+		"&&",
+		"||",
+		"|",
+		"$(",
+		"${",
+		"`",
+		">",
+		"<",
+		"\n",
+		"\r",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func providerPolicyDenied() error {
+	return fmt.Errorf("coordlink provider policy denied suffix: only inline JSON --input and --idempotency-key are allowed; transport, identity, token, input-file, URL, host path, and shell metachar suffixes are denied")
 }
 
 func runSkill(ctx context.Context, args []string, getenv EnvFunc, stdout, stderr io.Writer) int {

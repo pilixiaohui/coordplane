@@ -23,12 +23,17 @@ import (
 )
 
 const (
-	timeLayout       = "2006-01-02T15:04:05.000000000Z07:00"
-	defaultLockTTL   = 5 * time.Minute
-	defaultLogMax    = 20
-	canonicalTenant  = "default"
-	defaultGitAuthor = "CoordPlane"
-	defaultGitEmail  = "coordplane@example.invalid"
+	timeLayout                   = "2006-01-02T15:04:05.000000000Z07:00"
+	defaultLockTTL               = 5 * time.Minute
+	defaultLogMax                = 20
+	canonicalTenant              = "default"
+	defaultGitAuthor             = "CoordPlane"
+	defaultGitEmail              = "coordplane@example.invalid"
+	executionBackendControlPlane = "backend_control_plane"
+	executionGitSandbox          = "git_sandbox"
+	executionRuntimeContainer    = "runtime_container"
+	subjectKindAgentRuntime      = "agent_runtime"
+	subjectKindOperatorDebug     = "operator_debug"
 )
 
 type Service struct {
@@ -37,6 +42,7 @@ type Service struct {
 
 type Repository struct {
 	ID              string    `json:"id"`
+	Alias           string    `json:"alias,omitempty"`
 	SourcePath      string    `json:"source_path"`
 	CanonicalBranch string    `json:"canonical_branch"`
 	Status          string    `json:"status"`
@@ -61,21 +67,24 @@ type Workspace struct {
 }
 
 type GitOperation struct {
-	ID             string    `json:"id"`
-	OperationType  string    `json:"operation_type"`
-	ActorAgentID   string    `json:"actor_agent_id"`
-	WorkspaceID    string    `json:"workspace_id,omitempty"`
-	RepoID         string    `json:"repo_id"`
-	IdempotencyKey string    `json:"idempotency_key,omitempty"`
-	BeforeRef      string    `json:"before_ref"`
-	AfterRef       string    `json:"after_ref"`
-	Stdout         string    `json:"stdout,omitempty"`
-	Stderr         string    `json:"stderr,omitempty"`
-	ExitCode       int       `json:"exit_code"`
-	State          string    `json:"state"`
-	Feedback       Feedback  `json:"feedback"`
-	CreatedAt      time.Time `json:"created_at"`
-	CompletedAt    time.Time `json:"completed_at,omitempty"`
+	ID                string    `json:"id"`
+	OperationType     string    `json:"operation_type"`
+	SubjectKind       string    `json:"subject_kind,omitempty"`
+	ActorAgentID      string    `json:"actor_agent_id"`
+	WorkspaceID       string    `json:"workspace_id,omitempty"`
+	RepoID            string    `json:"repo_id"`
+	RuntimeID         string    `json:"runtime_id,omitempty"`
+	ExecutionLocation string    `json:"execution_location"`
+	IdempotencyKey    string    `json:"idempotency_key,omitempty"`
+	BeforeRef         string    `json:"before_ref"`
+	AfterRef          string    `json:"after_ref"`
+	Stdout            string    `json:"stdout,omitempty"`
+	Stderr            string    `json:"stderr,omitempty"`
+	ExitCode          int       `json:"exit_code"`
+	State             string    `json:"state"`
+	Feedback          Feedback  `json:"feedback"`
+	CreatedAt         time.Time `json:"created_at"`
+	CompletedAt       time.Time `json:"completed_at,omitempty"`
 }
 
 type Feedback struct {
@@ -83,8 +92,15 @@ type Feedback struct {
 	NextActions []string `json:"next_actions,omitempty"`
 }
 
+type RegisterRepositoryInput struct {
+	RepoPath        string `json:"repo_path"`
+	Alias           string `json:"alias,omitempty"`
+	CanonicalBranch string `json:"canonical_branch,omitempty"`
+}
+
 type WorkspacePrepareInput struct {
 	RepoID          string `json:"repo_id,omitempty"`
+	RepoAlias       string `json:"repo_alias,omitempty"`
 	RepoPath        string `json:"repo_path,omitempty"`
 	CanonicalBranch string `json:"canonical_branch,omitempty"`
 	WorkspaceRoot   string `json:"workspace_root"`
@@ -92,6 +108,7 @@ type WorkspacePrepareInput struct {
 	RuntimeID       string `json:"runtime_id,omitempty"`
 	ContractID      string `json:"contract_id,omitempty"`
 	IdempotencyKey  string `json:"idempotency_key,omitempty"`
+	SubjectKind     string `json:"-"`
 }
 
 type WorkspacePrepareResult struct {
@@ -123,6 +140,7 @@ type WorkspaceSyncInput struct {
 	AgentID         string `json:"agent_id,omitempty"`
 	ExpectedHeadRef string `json:"expected_head_ref,omitempty"`
 	IdempotencyKey  string `json:"idempotency_key,omitempty"`
+	SubjectKind     string `json:"-"`
 }
 
 type WorkspaceSyncResult struct {
@@ -179,6 +197,7 @@ type GitCommitInput struct {
 	Paths           []string `json:"paths"`
 	ExpectedHeadRef string   `json:"expected_head_ref,omitempty"`
 	IdempotencyKey  string   `json:"idempotency_key,omitempty"`
+	SubjectKind     string   `json:"-"`
 }
 
 type GitCommitResult struct {
@@ -196,6 +215,7 @@ type SubmitChangeSetInput struct {
 	EvidenceRefs    []string `json:"evidence_refs,omitempty"`
 	ExpectedHeadRef string   `json:"expected_head_ref,omitempty"`
 	IdempotencyKey  string   `json:"idempotency_key,omitempty"`
+	SubjectKind     string   `json:"-"`
 }
 
 type ChangeSet struct {
@@ -225,6 +245,7 @@ type AbandonChangeSetInput struct {
 	ExpectedHeadRef string `json:"expected_head_ref,omitempty"`
 	Reason          string `json:"reason,omitempty"`
 	IdempotencyKey  string `json:"idempotency_key,omitempty"`
+	SubjectKind     string `json:"-"`
 }
 
 type AbandonChangeSetResult struct {
@@ -279,6 +300,7 @@ type MergePreviewInput struct {
 	TargetRef         string `json:"target_ref,omitempty"`
 	ExpectedTargetRef string `json:"expected_target_ref,omitempty"`
 	IdempotencyKey    string `json:"idempotency_key,omitempty"`
+	SubjectKind       string `json:"-"`
 }
 
 type MergePreviewResult struct {
@@ -292,6 +314,7 @@ type MergeApplyInput struct {
 	AgentID           string `json:"agent_id,omitempty"`
 	ExpectedTargetRef string `json:"expected_target_ref,omitempty"`
 	IdempotencyKey    string `json:"idempotency_key,omitempty"`
+	SubjectKind       string `json:"-"`
 }
 
 type MergeApplyResult struct {
@@ -319,6 +342,7 @@ type ResolveMergeInput struct {
 	ResolvedHeadRef   string `json:"resolved_head_ref,omitempty"`
 	ExpectedTargetRef string `json:"expected_target_ref,omitempty"`
 	IdempotencyKey    string `json:"idempotency_key,omitempty"`
+	SubjectKind       string `json:"-"`
 }
 
 type ResolveMergeResult struct {
@@ -333,6 +357,7 @@ type AbortMergeInput struct {
 	AgentID        string `json:"agent_id,omitempty"`
 	Reason         string `json:"reason,omitempty"`
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	SubjectKind    string `json:"-"`
 }
 
 type AbortMergeResult struct {
@@ -347,14 +372,17 @@ type RollbackInput struct {
 	OperationID       string `json:"operation_id,omitempty"`
 	AgentID           string `json:"agent_id,omitempty"`
 	ExpectedTargetRef string `json:"expected_target_ref,omitempty"`
+	Published         bool   `json:"published,omitempty"`
 	IdempotencyKey    string `json:"idempotency_key,omitempty"`
+	SubjectKind       string `json:"-"`
 }
 
 type RollbackResult struct {
-	RollbackPoint RollbackPoint `json:"rollback_point"`
-	Operation     GitOperation  `json:"operation"`
-	RestoredRef   string        `json:"restored_ref"`
-	Feedback      Feedback      `json:"feedback"`
+	RollbackPoint   RollbackPoint `json:"rollback_point"`
+	Operation       GitOperation  `json:"operation"`
+	RestoredRef     string        `json:"restored_ref,omitempty"`
+	RevertChangeSet *ChangeSet    `json:"revert_changeset,omitempty"`
+	Feedback        Feedback      `json:"feedback"`
 }
 
 type RecoverOperationsInput struct {
@@ -374,24 +402,30 @@ type gitRun struct {
 }
 
 type writeOperation struct {
-	ID            string
-	OperationType string
-	AgentID       string
-	WorkspaceID   string
-	RepoID        string
-	BeforeRef     string
-	CreatedAt     time.Time
+	ID                string
+	OperationType     string
+	SubjectKind       string
+	AgentID           string
+	WorkspaceID       string
+	RepoID            string
+	RuntimeID         string
+	ExecutionLocation string
+	BeforeRef         string
+	CreatedAt         time.Time
 }
 
 func writeOperationFromGitOperation(op GitOperation) writeOperation {
 	return writeOperation{
-		ID:            op.ID,
-		OperationType: op.OperationType,
-		AgentID:       op.ActorAgentID,
-		WorkspaceID:   op.WorkspaceID,
-		RepoID:        op.RepoID,
-		BeforeRef:     op.BeforeRef,
-		CreatedAt:     op.CreatedAt,
+		ID:                op.ID,
+		OperationType:     op.OperationType,
+		SubjectKind:       op.SubjectKind,
+		AgentID:           op.ActorAgentID,
+		WorkspaceID:       op.WorkspaceID,
+		RepoID:            op.RepoID,
+		RuntimeID:         op.RuntimeID,
+		ExecutionLocation: op.ExecutionLocation,
+		BeforeRef:         op.BeforeRef,
+		CreatedAt:         op.CreatedAt,
 	}
 }
 
@@ -399,9 +433,81 @@ func NewService(s *store.Store) *Service {
 	return &Service{db: s.DB()}
 }
 
+func (s *Service) RegisterRepository(ctx context.Context, in RegisterRepositoryInput) (Repository, error) {
+	if strings.TrimSpace(in.RepoPath) == "" {
+		return Repository{}, errors.New("repo_path is required")
+	}
+	if in.CanonicalBranch == "" {
+		in.CanonicalBranch = "main"
+	}
+	alias := strings.TrimSpace(in.Alias)
+	absPath, err := filepath.Abs(in.RepoPath)
+	if err != nil {
+		return Repository{}, err
+	}
+	if _, err := os.Stat(filepath.Join(absPath, ".git")); err != nil {
+		return Repository{}, fmt.Errorf("repo_path must point at a Git working tree: %w", err)
+	}
+	if alias != "" {
+		existing, err := s.repoByAlias(ctx, alias, in.CanonicalBranch)
+		if err == nil {
+			if existing.SourcePath != absPath {
+				return Repository{}, fmt.Errorf("repo alias %q is already registered for another repository", alias)
+			}
+			return existing, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return Repository{}, err
+		}
+	}
+	existing, err := s.repoBySourcePath(ctx, absPath, in.CanonicalBranch)
+	if err == nil {
+		if alias != "" && existing.Alias == "" {
+			if _, err := s.db.ExecContext(ctx, `
+UPDATE git_repositories
+SET alias = ?, updated_at = ?
+WHERE id = ?`, alias, formatTime(time.Now()), existing.ID); err != nil {
+				return Repository{}, err
+			}
+			return s.repoByID(ctx, existing.ID)
+		}
+		if alias != "" && existing.Alias != alias {
+			return Repository{}, fmt.Errorf("repository is already registered with alias %q", existing.Alias)
+		}
+		return existing, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Repository{}, err
+	}
+	id, err := ids.New("repo")
+	if err != nil {
+		return Repository{}, err
+	}
+	repo := Repository{
+		ID:              id,
+		Alias:           alias,
+		SourcePath:      absPath,
+		CanonicalBranch: in.CanonicalBranch,
+		Status:          "active",
+	}
+	if err := insertRepoDirect(ctx, s.db, repo); err != nil {
+		return Repository{}, err
+	}
+	return s.repoByID(ctx, id)
+}
+
 func (s *Service) WorkspacePrepare(ctx context.Context, in WorkspacePrepareInput) capability.Response[WorkspacePrepareResult] {
 	if in.AgentID == "" {
 		return rejected[WorkspacePrepareResult]("GIT_AGENT_REQUIRED", "agent identity is required", []string{"workspace.prepare"}, false)
+	}
+	if strings.TrimSpace(in.RepoPath) != "" {
+		return capability.Rejected[WorkspacePrepareResult](
+			"RAW_REPO_PATH_REJECTED",
+			"workspace.prepare accepts only registered repo_id or repo_alias; raw repo_path is operator registration input",
+			capability.WithRepairHint("ask an operator to register the repository, then retry with repo_id or repo_alias"),
+			capability.WithAllowedNextActions("workspace.prepare"),
+			capability.WithRetryable(false),
+		)
 	}
 	workspaceRoot, agentRoot, bridgeResp := s.resolveWorkspacePrepareRoot(ctx, in)
 	if bridgeResp != nil {
@@ -411,9 +517,12 @@ func (s *Service) WorkspacePrepare(ctx context.Context, in WorkspacePrepareInput
 	if in.CanonicalBranch == "" {
 		in.CanonicalBranch = "main"
 	}
-	repo, needsInsert, err := s.resolveRepoForPrepare(ctx, in)
+	repo, err := s.resolveRepoForPrepare(ctx, in)
 	if err != nil {
-		return errored[WorkspacePrepareResult]("GIT_REPO_PREPARE_FAILED", err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return rejected[WorkspacePrepareResult]("REPO_NOT_REGISTERED", "repository is not registered for workspace.prepare", []string{"workspace.prepare"}, false)
+		}
+		return rejected[WorkspacePrepareResult]("REPO_ID_REQUIRED", err.Error(), []string{"workspace.prepare"}, false)
 	}
 	canonicalRef, err := gitHead(ctx, repo.SourcePath, repo.CanonicalBranch)
 	if err != nil {
@@ -436,7 +545,7 @@ func (s *Service) WorkspacePrepare(ctx context.Context, in WorkspacePrepareInput
 		HeadRef:    canonicalRef,
 		State:      "preparing",
 	}
-	op, resp := s.startPrepareWrite(ctx, in.AgentID, repo, needsInsert, workspace, in.IdempotencyKey)
+	op, resp := s.startPrepareWrite(ctx, in.AgentID, operationSubjectKind(in.SubjectKind), repo, workspace, in.IdempotencyKey)
 	if resp != nil {
 		return copyRejected[WorkspacePrepareResult](*resp)
 	}
@@ -465,7 +574,7 @@ func (s *Service) WorkspacePrepare(ctx context.Context, in WorkspacePrepareInput
 	}
 	completed := s.completeWrite(ctx, op, "succeeded", head, run, Feedback{Message: "workspace prepared", NextActions: []string{"workspace.status", "git.status"}})
 	return capability.Accepted(WorkspacePrepareResult{
-		Repository:  repo,
+		Repository:  agentFacingRepository(repo),
 		Workspace:   workspace,
 		OperationID: completed.ID,
 		Feedback:    completed.Feedback,
@@ -587,7 +696,7 @@ func (s *Service) WorkspaceSync(ctx context.Context, in WorkspaceSyncInput) capa
 	if err != nil {
 		return errored[WorkspaceSyncResult]("WORKSPACE_SYNC_FAILED", err)
 	}
-	op, startResp := s.startWrite(ctx, "workspace.sync", in.AgentID, repo.ID, workspace.ID, in.IdempotencyKey, before)
+	op, startResp := s.startWrite(ctx, "workspace.sync", in.AgentID, operationSubjectKind(in.SubjectKind), repo.ID, workspace.ID, in.IdempotencyKey, before)
 	if startResp != nil {
 		return copyRejected[WorkspaceSyncResult](*startResp)
 	}
@@ -708,7 +817,7 @@ func (s *Service) GitCommit(ctx context.Context, in GitCommitInput) capability.R
 	if err != nil {
 		return errored[GitCommitResult]("GIT_COMMIT_FAILED", err)
 	}
-	op, startResp := s.startWrite(ctx, "git.commit", in.AgentID, repo.ID, workspace.ID, in.IdempotencyKey, before)
+	op, startResp := s.startWrite(ctx, "git.commit", in.AgentID, operationSubjectKind(in.SubjectKind), repo.ID, workspace.ID, in.IdempotencyKey, before)
 	if startResp != nil {
 		return copyRejected[GitCommitResult](*startResp)
 	}
@@ -799,7 +908,7 @@ func (s *Service) SubmitChangeSet(ctx context.Context, in SubmitChangeSetInput) 
 	if err != nil {
 		return errored[SubmitChangeSetResult]("CHANGESET_SUBMIT_FAILED", err)
 	}
-	op, startResp := s.startWrite(ctx, "changeset.submit", in.AgentID, repo.ID, workspace.ID, in.IdempotencyKey, before)
+	op, startResp := s.startWrite(ctx, "changeset.submit", in.AgentID, operationSubjectKind(in.SubjectKind), repo.ID, workspace.ID, in.IdempotencyKey, before)
 	if startResp != nil {
 		return copyRejected[SubmitChangeSetResult](*startResp)
 	}
@@ -868,7 +977,7 @@ func (s *Service) AbandonChangeSet(ctx context.Context, in AbandonChangeSetInput
 	if err != nil {
 		return errored[AbandonChangeSetResult]("CHANGESET_ABANDON_FAILED", err)
 	}
-	op, startResp := s.startWrite(ctx, "changeset.abandon", in.AgentID, repo.ID, workspace.ID, in.IdempotencyKey, before)
+	op, startResp := s.startWrite(ctx, "changeset.abandon", in.AgentID, operationSubjectKind(in.SubjectKind), repo.ID, workspace.ID, in.IdempotencyKey, before)
 	if startResp != nil {
 		return copyRejected[AbandonChangeSetResult](*startResp)
 	}
@@ -910,7 +1019,7 @@ func (s *Service) MergePreview(ctx context.Context, in MergePreviewInput) capabi
 	if err != nil {
 		return errored[MergePreviewResult]("GIT_MERGE_PREVIEW_FAILED", err)
 	}
-	op, startResp := s.startWrite(ctx, "git.merge_preview", in.AgentID, repo.ID, workspace.ID, in.IdempotencyKey, before)
+	op, startResp := s.startWrite(ctx, "git.merge_preview", in.AgentID, operationSubjectKind(in.SubjectKind), repo.ID, workspace.ID, in.IdempotencyKey, before)
 	if startResp != nil {
 		return copyRejected[MergePreviewResult](*startResp)
 	}
@@ -994,7 +1103,7 @@ func (s *Service) MergeApply(ctx context.Context, in MergeApplyInput) capability
 	if err != nil {
 		return errored[MergeApplyResult]("GIT_MERGE_APPLY_FAILED", err)
 	}
-	op, startResp := s.startWrite(ctx, "git.merge_apply", in.AgentID, repo.ID, workspace.ID, in.IdempotencyKey, before)
+	op, startResp := s.startWrite(ctx, "git.merge_apply", in.AgentID, operationSubjectKind(in.SubjectKind), repo.ID, workspace.ID, in.IdempotencyKey, before)
 	if startResp != nil {
 		return copyRejected[MergeApplyResult](*startResp)
 	}
@@ -1040,7 +1149,12 @@ func (s *Service) MergeApply(ctx context.Context, in MergeApplyInput) capability
 		completed := s.completeWrite(ctx, op, "failed", after, gitRun{Stderr: err.Error(), ExitCode: 1}, Feedback{Message: "rollback point could not be persisted"})
 		return failed[MergeApplyResult]("GIT_MERGE_APPLY_FAILED", err.Error(), completed)
 	}
-	attempt, err = s.updateMergeAttemptState(ctx, attempt.ID, "applied", after, attempt.IntegrationPath)
+	integrationPath := attempt.IntegrationPath
+	if err := cleanupIntegrationPath(repo, integrationPath); err != nil {
+		completed := s.completeWrite(ctx, op, "failed", after, gitRun{Stderr: err.Error(), ExitCode: 1}, Feedback{Message: "merge integration directory could not be cleaned"})
+		return failed[MergeApplyResult]("GIT_MERGE_APPLY_FAILED", err.Error(), completed)
+	}
+	attempt, err = s.updateMergeAttemptState(ctx, attempt.ID, "applied", after, "")
 	if err != nil {
 		completed := s.completeWrite(ctx, op, "failed", after, gitRun{Stderr: err.Error(), ExitCode: 1}, Feedback{Message: "merge attempt state could not be persisted"})
 		return failed[MergeApplyResult]("GIT_MERGE_APPLY_FAILED", err.Error(), completed)
@@ -1081,7 +1195,7 @@ func (s *Service) ResolveMerge(ctx context.Context, in ResolveMergeInput) capabi
 	if err != nil {
 		return errored[ResolveMergeResult]("GIT_RESOLVE_FAILED", err)
 	}
-	op, startResp := s.startWrite(ctx, "git.resolve", in.AgentID, repo.ID, workspace.ID, in.IdempotencyKey, before)
+	op, startResp := s.startWrite(ctx, "git.resolve", in.AgentID, operationSubjectKind(in.SubjectKind), repo.ID, workspace.ID, in.IdempotencyKey, before)
 	if startResp != nil {
 		return copyRejected[ResolveMergeResult](*startResp)
 	}
@@ -1127,11 +1241,15 @@ func (s *Service) AbortMerge(ctx context.Context, in AbortMergeInput) capability
 	if err != nil {
 		return errored[AbortMergeResult]("GIT_ABORT_FAILED", err)
 	}
-	op, startResp := s.startWrite(ctx, "git.abort", in.AgentID, repo.ID, workspace.ID, in.IdempotencyKey, before)
+	op, startResp := s.startWrite(ctx, "git.abort", in.AgentID, operationSubjectKind(in.SubjectKind), repo.ID, workspace.ID, in.IdempotencyKey, before)
 	if startResp != nil {
 		return copyRejected[AbortMergeResult](*startResp)
 	}
-	attempt, err = s.updateMergeAttemptState(ctx, attempt.ID, "aborted", attempt.ResultRef, attempt.IntegrationPath)
+	if err := cleanupIntegrationPath(repo, attempt.IntegrationPath); err != nil {
+		completed := s.completeWrite(ctx, op, "failed", before, gitRun{Stderr: err.Error(), ExitCode: 1}, Feedback{Message: "merge integration directory could not be cleaned"})
+		return failed[AbortMergeResult]("GIT_ABORT_FAILED", err.Error(), completed)
+	}
+	attempt, err = s.updateMergeAttemptState(ctx, attempt.ID, "aborted", attempt.ResultRef, "")
 	if err != nil {
 		completed := s.completeWrite(ctx, op, "failed", before, gitRun{Stderr: err.Error(), ExitCode: 1}, Feedback{Message: "merge attempt abort could not be persisted"})
 		return failed[AbortMergeResult]("GIT_ABORT_FAILED", err.Error(), completed)
@@ -1161,11 +1279,15 @@ func (s *Service) Rollback(ctx context.Context, in RollbackInput) capability.Res
 	if err != nil {
 		return errored[RollbackResult]("GIT_ROLLBACK_FAILED", err)
 	}
+	workspace, _, accessResp := s.workspaceForAgent(ctx, rollback.WorkspaceID, in.AgentID)
+	if accessResp != nil {
+		return copyRejected[RollbackResult](*accessResp)
+	}
 	before, err := gitHead(ctx, repo.SourcePath, rollback.TargetRef)
 	if err != nil {
 		return errored[RollbackResult]("GIT_ROLLBACK_FAILED", err)
 	}
-	op, startResp := s.startWrite(ctx, "git.rollback", in.AgentID, repo.ID, rollback.WorkspaceID, in.IdempotencyKey, before)
+	op, startResp := s.startWrite(ctx, "git.rollback", in.AgentID, operationSubjectKind(in.SubjectKind), repo.ID, rollback.WorkspaceID, in.IdempotencyKey, before)
 	if startResp != nil {
 		return copyRejected[RollbackResult](*startResp)
 	}
@@ -1183,6 +1305,20 @@ func (s *Service) Rollback(ctx context.Context, in RollbackInput) capability.Res
 			capability.WithAllowedNextActions("git.log"),
 			capability.WithRetryable(false),
 		)
+	}
+	if in.Published {
+		changeSet, run, err := s.createRevertChangeSet(ctx, repo, workspace, rollback, before)
+		if err != nil {
+			completed := s.completeWrite(ctx, op, "failed", before, run, Feedback{Message: "published rollback revert changeset could not be created"})
+			return failed[RollbackResult]("GIT_ROLLBACK_FAILED", err.Error(), completed)
+		}
+		if err := s.markRollbackPointState(ctx, rollback.ID, "used"); err != nil {
+			completed := s.completeWrite(ctx, op, "failed", changeSet.HeadRef, gitRun{Stderr: err.Error(), ExitCode: 1}, Feedback{Message: "rollback point state could not be persisted"})
+			return failed[RollbackResult]("GIT_ROLLBACK_FAILED", err.Error(), completed)
+		}
+		rollback, _ = s.rollbackPointByID(ctx, rollback.ID)
+		completed := s.completeWrite(ctx, op, "succeeded", changeSet.HeadRef, run, Feedback{Message: "published rollback generated a revert changeset", NextActions: []string{"git.diff", "git.merge_preview"}})
+		return capability.Accepted(RollbackResult{RollbackPoint: rollback, Operation: completed, RevertChangeSet: &changeSet, Feedback: completed.Feedback})
 	}
 	run := updateRef(ctx, repo.SourcePath, rollback.TargetRef, rollback.BeforeRef, before)
 	if run.ExitCode != 0 {
@@ -1214,68 +1350,83 @@ func (s *Service) RecoverOperations(ctx context.Context, in RecoverOperationsInp
 	})
 }
 
-func (s *Service) resolveRepoForPrepare(ctx context.Context, in WorkspacePrepareInput) (Repository, bool, error) {
+func (s *Service) resolveRepoForPrepare(ctx context.Context, in WorkspacePrepareInput) (Repository, error) {
 	if in.RepoID != "" {
-		repo, err := s.repoByID(ctx, in.RepoID)
-		return repo, false, err
+		return s.repoByID(ctx, in.RepoID)
 	}
-	if in.RepoPath == "" {
-		return Repository{}, false, errors.New("repo_path is required when repo_id is not provided")
+	if in.RepoAlias != "" {
+		return s.repoByAlias(ctx, in.RepoAlias, in.CanonicalBranch)
 	}
-	absPath, err := filepath.Abs(in.RepoPath)
-	if err != nil {
-		return Repository{}, false, err
-	}
-	if _, err := os.Stat(filepath.Join(absPath, ".git")); err != nil {
-		return Repository{}, false, fmt.Errorf("repo_path must point at a Git working tree: %w", err)
-	}
+	return Repository{}, errors.New("repo_id or repo_alias is required")
+}
+
+func (s *Service) repoBySourcePath(ctx context.Context, sourcePath, canonicalBranch string) (Repository, error) {
 	var repo Repository
-	err = s.db.QueryRowContext(ctx, `
-SELECT id, source_path, canonical_branch, status, created_at, updated_at
+	err := s.db.QueryRowContext(ctx, `
+SELECT id, COALESCE(alias, ''), source_path, canonical_branch, status, created_at, updated_at
 FROM git_repositories
-WHERE source_path = ? AND canonical_branch = ?`, absPath, in.CanonicalBranch).Scan(
-		&repo.ID, &repo.SourcePath, &repo.CanonicalBranch, &repo.Status, scanTime(&repo.CreatedAt), scanTime(&repo.UpdatedAt),
+WHERE source_path = ? AND canonical_branch = ?`, sourcePath, canonicalBranch).Scan(
+		&repo.ID, &repo.Alias, &repo.SourcePath, &repo.CanonicalBranch, &repo.Status, scanTime(&repo.CreatedAt), scanTime(&repo.UpdatedAt),
 	)
-	if err == nil {
-		return repo, false, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return Repository{}, false, err
-	}
-	id, err := ids.New("repo")
-	if err != nil {
-		return Repository{}, false, err
-	}
-	return Repository{
-		ID:              id,
-		SourcePath:      absPath,
-		CanonicalBranch: in.CanonicalBranch,
-		Status:          "active",
-	}, true, nil
+	return repo, err
+}
+
+func (s *Service) repoByAlias(ctx context.Context, alias, canonicalBranch string) (Repository, error) {
+	var repo Repository
+	err := s.db.QueryRowContext(ctx, `
+SELECT id, COALESCE(alias, ''), source_path, canonical_branch, status, created_at, updated_at
+FROM git_repositories
+WHERE alias = ? AND canonical_branch = ?`, strings.TrimSpace(alias), canonicalBranch).Scan(
+		&repo.ID, &repo.Alias, &repo.SourcePath, &repo.CanonicalBranch, &repo.Status, scanTime(&repo.CreatedAt), scanTime(&repo.UpdatedAt),
+	)
+	return repo, err
 }
 
 func (s *Service) repoByID(ctx context.Context, repoID string) (Repository, error) {
 	var repo Repository
 	if err := s.db.QueryRowContext(ctx, `
-SELECT id, source_path, canonical_branch, status, created_at, updated_at
+SELECT id, COALESCE(alias, ''), source_path, canonical_branch, status, created_at, updated_at
 FROM git_repositories
 WHERE id = ?`, repoID).Scan(
-		&repo.ID, &repo.SourcePath, &repo.CanonicalBranch, &repo.Status, scanTime(&repo.CreatedAt), scanTime(&repo.UpdatedAt),
+		&repo.ID, &repo.Alias, &repo.SourcePath, &repo.CanonicalBranch, &repo.Status, scanTime(&repo.CreatedAt), scanTime(&repo.UpdatedAt),
 	); err != nil {
 		return Repository{}, err
 	}
 	return repo, nil
 }
 
+func operationSubjectKind(subjectKind string) string {
+	if subjectKind == subjectKindOperatorDebug {
+		return subjectKindOperatorDebug
+	}
+	return subjectKindAgentRuntime
+}
+
+func insertRepoDirect(ctx context.Context, db *sql.DB, repo Repository) error {
+	now := formatTime(time.Now())
+	_, err := db.ExecContext(ctx, `
+INSERT INTO git_repositories (
+  id, tenant_id, alias, source_path, canonical_branch, status, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		repo.ID, canonicalTenant, repo.Alias, repo.SourcePath, repo.CanonicalBranch, repo.Status, now, now,
+	)
+	return err
+}
+
 func insertRepoTx(ctx context.Context, tx *sql.Tx, repo Repository) error {
 	now := formatTime(time.Now())
 	_, err := tx.ExecContext(ctx, `
 INSERT INTO git_repositories (
-  id, tenant_id, source_path, canonical_branch, status, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		repo.ID, canonicalTenant, repo.SourcePath, repo.CanonicalBranch, repo.Status, now, now,
+  id, tenant_id, alias, source_path, canonical_branch, status, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		repo.ID, canonicalTenant, repo.Alias, repo.SourcePath, repo.CanonicalBranch, repo.Status, now, now,
 	)
 	return err
+}
+
+func agentFacingRepository(repo Repository) Repository {
+	repo.SourcePath = ""
+	return repo
 }
 
 func insertWorkspaceTx(ctx context.Context, tx *sql.Tx, workspace Workspace) error {
@@ -1367,21 +1518,29 @@ func (s *Service) mergeAttemptForAgent(ctx context.Context, mergeAttemptID, agen
 	return attempt, changeset, workspace, repo, nil
 }
 
-func (s *Service) startPrepareWrite(ctx context.Context, agentID string, repo Repository, insertRepo bool, workspace Workspace, idempotencyKey string) (writeOperation, *capability.Response[json.RawMessage]) {
+func (s *Service) startPrepareWrite(ctx context.Context, agentID, subjectKind string, repo Repository, workspace Workspace, idempotencyKey string) (writeOperation, *capability.Response[json.RawMessage]) {
 	opID, err := ids.New("gitop")
 	if err != nil {
 		resp := capability.Error[json.RawMessage]("GIT_OPERATION_ID_FAILED", err.Error(), false)
 		return writeOperation{}, &resp
 	}
+	executionLocation, err := s.executionLocationForRuntime(ctx, workspace.RuntimeID)
+	if err != nil {
+		resp := capability.Error[json.RawMessage]("GIT_OPERATION_EVIDENCE_FAILED", err.Error(), true)
+		return writeOperation{}, &resp
+	}
 	now := time.Now()
 	op := writeOperation{
-		ID:            opID,
-		OperationType: "workspace.prepare",
-		AgentID:       agentID,
-		WorkspaceID:   workspace.ID,
-		RepoID:        repo.ID,
-		BeforeRef:     "",
-		CreatedAt:     now,
+		ID:                opID,
+		OperationType:     "workspace.prepare",
+		SubjectKind:       operationSubjectKind(subjectKind),
+		AgentID:           agentID,
+		WorkspaceID:       workspace.ID,
+		RepoID:            repo.ID,
+		RuntimeID:         workspace.RuntimeID,
+		ExecutionLocation: executionLocation,
+		BeforeRef:         "",
+		CreatedAt:         now,
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1391,12 +1550,6 @@ func (s *Service) startPrepareWrite(ctx context.Context, agentID string, repo Re
 	defer func() {
 		_ = tx.Rollback()
 	}()
-	if insertRepo {
-		if err := insertRepoTx(ctx, tx, repo); err != nil {
-			resp := capability.Error[json.RawMessage]("GIT_REPO_PREPARE_FAILED", err.Error(), true)
-			return writeOperation{}, &resp
-		}
-	}
 	if err := insertOperationTx(ctx, tx, op, idempotencyKey, "running", "", "", gitRun{}, Feedback{Message: "workspace.prepare started"}); err != nil {
 		resp := capability.Error[json.RawMessage]("GIT_OPERATION_START_FAILED", err.Error(), true)
 		return writeOperation{}, &resp
@@ -1452,21 +1605,29 @@ func (s *Service) startPrepareWrite(ctx context.Context, agentID string, repo Re
 	return op, nil
 }
 
-func (s *Service) startWrite(ctx context.Context, operationType, agentID, repoID, workspaceID, idempotencyKey, beforeRef string) (writeOperation, *capability.Response[json.RawMessage]) {
+func (s *Service) startWrite(ctx context.Context, operationType, agentID, subjectKind, repoID, workspaceID, idempotencyKey, beforeRef string) (writeOperation, *capability.Response[json.RawMessage]) {
 	opID, err := ids.New("gitop")
 	if err != nil {
 		resp := capability.Error[json.RawMessage]("GIT_OPERATION_ID_FAILED", err.Error(), false)
 		return writeOperation{}, &resp
 	}
+	runtimeID, executionLocation, err := s.operationExecutionEvidence(ctx, workspaceID)
+	if err != nil {
+		resp := capability.Error[json.RawMessage]("GIT_OPERATION_EVIDENCE_FAILED", err.Error(), true)
+		return writeOperation{}, &resp
+	}
 	now := time.Now()
 	op := writeOperation{
-		ID:            opID,
-		OperationType: operationType,
-		AgentID:       agentID,
-		WorkspaceID:   workspaceID,
-		RepoID:        repoID,
-		BeforeRef:     beforeRef,
-		CreatedAt:     now,
+		ID:                opID,
+		OperationType:     operationType,
+		SubjectKind:       operationSubjectKind(subjectKind),
+		AgentID:           agentID,
+		WorkspaceID:       workspaceID,
+		RepoID:            repoID,
+		RuntimeID:         runtimeID,
+		ExecutionLocation: executionLocation,
+		BeforeRef:         beforeRef,
+		CreatedAt:         now,
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1517,28 +1678,87 @@ func (s *Service) startWrite(ctx context.Context, operationType, agentID, repoID
 	return op, nil
 }
 
+func (s *Service) operationExecutionEvidence(ctx context.Context, workspaceID string) (string, string, error) {
+	if workspaceID == "" {
+		return "", executionBackendControlPlane, nil
+	}
+	var runtimeID string
+	if err := s.db.QueryRowContext(ctx, `
+SELECT COALESCE(runtime_id, '')
+FROM git_workspaces
+WHERE id = ?`, workspaceID).Scan(&runtimeID); err != nil {
+		return "", "", err
+	}
+	location, err := s.executionLocationForRuntime(ctx, runtimeID)
+	if err != nil {
+		return "", "", err
+	}
+	return runtimeID, location, nil
+}
+
+func (s *Service) executionLocationForRuntime(ctx context.Context, runtimeID string) (string, error) {
+	if strings.TrimSpace(runtimeID) == "" {
+		return executionBackendControlPlane, nil
+	}
+	var runtimeKind string
+	err := s.db.QueryRowContext(ctx, `
+SELECT runtime_kind
+FROM runtime_instances
+WHERE runtime_id = ?
+ORDER BY created_at DESC, id DESC
+LIMIT 1`, runtimeID).Scan(&runtimeKind)
+	if errors.Is(err, sql.ErrNoRows) {
+		return executionGitSandbox, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if runtimeKind == "docker" {
+		return executionRuntimeContainer, nil
+	}
+	return executionGitSandbox, nil
+}
+
 func (s *Service) completeWrite(ctx context.Context, op writeOperation, state, afterRef string, run gitRun, feedback Feedback) GitOperation {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return GitOperation{ID: op.ID, OperationType: op.OperationType, ActorAgentID: op.AgentID, WorkspaceID: op.WorkspaceID, RepoID: op.RepoID, BeforeRef: op.BeforeRef, AfterRef: afterRef, State: "failed", Stderr: err.Error(), Feedback: Feedback{Message: "operation completion could not start"}}
+		return fallbackOperation(op, afterRef, "failed", err.Error(), Feedback{Message: "operation completion could not start"})
 	}
 	defer func() {
 		_ = tx.Rollback()
 	}()
 	if err := completeOperationTx(ctx, tx, op, state, afterRef, run, feedback); err != nil {
-		return GitOperation{ID: op.ID, OperationType: op.OperationType, ActorAgentID: op.AgentID, WorkspaceID: op.WorkspaceID, RepoID: op.RepoID, BeforeRef: op.BeforeRef, AfterRef: afterRef, State: "failed", Stderr: err.Error(), Feedback: Feedback{Message: "operation completion failed"}}
+		return fallbackOperation(op, afterRef, "failed", err.Error(), Feedback{Message: "operation completion failed"})
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE git_locks SET state = 'released', updated_at = ? WHERE operation_id = ? AND state = 'active'`, formatTime(time.Now()), op.ID); err != nil {
-		return GitOperation{ID: op.ID, OperationType: op.OperationType, ActorAgentID: op.AgentID, WorkspaceID: op.WorkspaceID, RepoID: op.RepoID, BeforeRef: op.BeforeRef, AfterRef: afterRef, State: "failed", Stderr: err.Error(), Feedback: Feedback{Message: "operation locks could not be released"}}
+		return fallbackOperation(op, afterRef, "failed", err.Error(), Feedback{Message: "operation locks could not be released"})
 	}
 	if err := tx.Commit(); err != nil {
-		return GitOperation{ID: op.ID, OperationType: op.OperationType, ActorAgentID: op.AgentID, WorkspaceID: op.WorkspaceID, RepoID: op.RepoID, BeforeRef: op.BeforeRef, AfterRef: afterRef, State: "failed", Stderr: err.Error(), Feedback: Feedback{Message: "operation completion could not commit"}}
+		return fallbackOperation(op, afterRef, "failed", err.Error(), Feedback{Message: "operation completion could not commit"})
 	}
 	operation, err := s.operationByID(ctx, op.ID)
 	if err != nil {
-		return GitOperation{ID: op.ID, OperationType: op.OperationType, ActorAgentID: op.AgentID, WorkspaceID: op.WorkspaceID, RepoID: op.RepoID, BeforeRef: op.BeforeRef, AfterRef: afterRef, State: state, Feedback: feedback}
+		return fallbackOperation(op, afterRef, state, "", feedback)
 	}
 	return operation
+}
+
+func fallbackOperation(op writeOperation, afterRef, state, stderr string, feedback Feedback) GitOperation {
+	return GitOperation{
+		ID:                op.ID,
+		OperationType:     op.OperationType,
+		SubjectKind:       operationSubjectKind(op.SubjectKind),
+		ActorAgentID:      op.AgentID,
+		WorkspaceID:       op.WorkspaceID,
+		RepoID:            op.RepoID,
+		RuntimeID:         op.RuntimeID,
+		ExecutionLocation: op.ExecutionLocation,
+		BeforeRef:         op.BeforeRef,
+		AfterRef:          afterRef,
+		State:             state,
+		Stderr:            stderr,
+		Feedback:          feedback,
+	}
 }
 
 func (s *Service) rejectExpectedHead(ctx context.Context, op writeOperation, currentHead, expectedHead string) *capability.Response[json.RawMessage] {
@@ -1586,12 +1806,13 @@ func insertOperationTx(ctx context.Context, tx *sql.Tx, op writeOperation, idemp
 	now := formatTime(op.CreatedAt)
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO git_operations (
-  id, tenant_id, operation_type, actor_agent_id, workspace_id, repo_id,
-  idempotency_key, before_ref, after_ref, stdout, stderr, exit_code,
-  state, feedback_json, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		op.ID, canonicalTenant, op.OperationType, op.AgentID, nullable(op.WorkspaceID), op.RepoID,
-		idempotencyKey, beforeRef, afterRef, run.Stdout, run.Stderr, run.ExitCode, state, string(feedbackJSON), now,
+  id, tenant_id, operation_type, subject_kind, actor_agent_id, workspace_id, repo_id,
+  runtime_id, execution_location, idempotency_key, before_ref, after_ref,
+  stdout, stderr, exit_code, state, feedback_json, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		op.ID, canonicalTenant, op.OperationType, operationSubjectKind(op.SubjectKind), op.AgentID, nullable(op.WorkspaceID), op.RepoID,
+		op.RuntimeID, op.ExecutionLocation, idempotencyKey, beforeRef, afterRef,
+		run.Stdout, run.Stderr, run.ExitCode, state, string(feedbackJSON), now,
 	)
 	return err
 }
@@ -1629,20 +1850,24 @@ WHERE id = ?`,
 		return err
 	}
 	payload, _ := json.Marshal(map[string]any{
-		"operation_id":   op.ID,
-		"operation_type": op.OperationType,
-		"workspace_id":   op.WorkspaceID,
-		"repo_id":        op.RepoID,
-		"state":          state,
-		"before_ref":     op.BeforeRef,
-		"after_ref":      afterRef,
-		"feedback":       feedback,
+		"operation_id":       op.ID,
+		"operation_type":     op.OperationType,
+		"subject_kind":       operationSubjectKind(op.SubjectKind),
+		"workspace_id":       op.WorkspaceID,
+		"repo_id":            op.RepoID,
+		"runtime_id":         op.RuntimeID,
+		"execution_location": op.ExecutionLocation,
+		"state":              state,
+		"before_ref":         op.BeforeRef,
+		"after_ref":          afterRef,
+		"feedback":           feedback,
 	})
 	_, err = store.AppendEventTx(ctx, tx, events.Event{
 		TenantID:       canonicalTenant,
 		SubjectKind:    "agent",
 		SubjectID:      op.AgentID,
 		AgentID:        op.AgentID,
+		RuntimeID:      op.RuntimeID,
 		CapabilityName: op.OperationType,
 		Type:           "git.operation." + state,
 		AggregateType:  "git_operation",
@@ -1658,13 +1883,15 @@ func (s *Service) operationByID(ctx context.Context, id string) (GitOperation, e
 	var feedbackJSON, completedAt string
 	if err := s.db.QueryRowContext(ctx, `
 SELECT id, operation_type, actor_agent_id, COALESCE(workspace_id, ''), repo_id,
-  COALESCE(idempotency_key, ''), before_ref, after_ref, stdout, stderr, exit_code,
-  state, feedback_json, created_at, COALESCE(completed_at, '')
+  subject_kind, runtime_id, execution_location, COALESCE(idempotency_key, ''), before_ref,
+  after_ref, stdout, stderr, exit_code, state, feedback_json, created_at,
+  COALESCE(completed_at, '')
 FROM git_operations
 WHERE id = ?`, id).Scan(
 		&op.ID, &op.OperationType, &op.ActorAgentID, &op.WorkspaceID, &op.RepoID,
-		&op.IdempotencyKey, &op.BeforeRef, &op.AfterRef, &op.Stdout, &op.Stderr,
-		&op.ExitCode, &op.State, &feedbackJSON, scanTime(&op.CreatedAt), &completedAt,
+		&op.SubjectKind, &op.RuntimeID, &op.ExecutionLocation, &op.IdempotencyKey, &op.BeforeRef,
+		&op.AfterRef, &op.Stdout, &op.Stderr, &op.ExitCode, &op.State,
+		&feedbackJSON, scanTime(&op.CreatedAt), &completedAt,
 	); err != nil {
 		return GitOperation{}, err
 	}
@@ -1706,6 +1933,20 @@ INSERT INTO changesets (
 		return ChangeSet{}, err
 	}
 	return s.changeSetByID(ctx, id)
+}
+
+func insertWorkspaceDirect(ctx context.Context, db *sql.DB, workspace Workspace) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+	if err := insertWorkspaceTx(ctx, tx, workspace); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Service) changeSetByID(ctx context.Context, id string) (ChangeSet, error) {
@@ -2056,6 +2297,113 @@ func createResolvedIntegration(ctx context.Context, repo Repository, workspace W
 		return integrationPath, "", gitRun{Stderr: err.Error(), ExitCode: 1}, err
 	}
 	return integrationPath, resultRef, commit, nil
+}
+
+func (s *Service) createRevertChangeSet(ctx context.Context, repo Repository, sourceWorkspace Workspace, rollback RollbackPoint, currentRef string) (ChangeSet, gitRun, error) {
+	revertPath, err := os.MkdirTemp(filepath.Dir(repo.SourcePath), ".coordplane-revert-*")
+	if err != nil {
+		return ChangeSet{}, gitRun{Stderr: err.Error(), ExitCode: 1}, err
+	}
+	clone := runGit(ctx, "", "clone", "--quiet", repo.SourcePath, revertPath)
+	if clone.ExitCode != 0 {
+		return ChangeSet{}, clone, errors.New(firstNonEmpty(clone.Stderr, clone.Stdout, "git clone failed"))
+	}
+	checkout := runGit(ctx, revertPath, "checkout", "--detach", rollback.TargetRef)
+	if checkout.ExitCode != 0 {
+		return ChangeSet{}, checkout, errors.New(firstNonEmpty(checkout.Stderr, checkout.Stdout, "git checkout target failed"))
+	}
+	revertArgs := []string{"-c", "user.name=" + defaultGitAuthor, "-c", "user.email=" + defaultGitEmail, "revert", "--no-edit"}
+	if parentCount(ctx, revertPath, rollback.AfterRef) > 1 {
+		revertArgs = append(revertArgs, "-m", "1")
+	}
+	revertArgs = append(revertArgs, rollback.AfterRef)
+	revert := runGit(ctx, revertPath, revertArgs...)
+	combined := gitRun{
+		Stdout:   clone.Stdout + checkout.Stdout + revert.Stdout,
+		Stderr:   clone.Stderr + checkout.Stderr + revert.Stderr,
+		ExitCode: revert.ExitCode,
+	}
+	if revert.ExitCode != 0 {
+		return ChangeSet{}, combined, errors.New(firstNonEmpty(revert.Stderr, revert.Stdout, "git revert failed"))
+	}
+	head, err := gitHead(ctx, revertPath, "HEAD")
+	if err != nil {
+		combined.Stderr += err.Error()
+		combined.ExitCode = 1
+		return ChangeSet{}, combined, err
+	}
+	workspaceID, err := ids.New("ws")
+	if err != nil {
+		combined.Stderr += err.Error()
+		combined.ExitCode = 1
+		return ChangeSet{}, combined, err
+	}
+	revertWorkspace := Workspace{
+		ID:         workspaceID,
+		RepoID:     repo.ID,
+		AgentID:    sourceWorkspace.AgentID,
+		RuntimeID:  sourceWorkspace.RuntimeID,
+		ContractID: sourceWorkspace.ContractID,
+		Path:       revertPath,
+		AgentPath:  "",
+		BaseRef:    currentRef,
+		HeadRef:    head,
+		State:      "ready",
+	}
+	if err := insertWorkspaceDirect(ctx, s.db, revertWorkspace); err != nil {
+		combined.Stderr += err.Error()
+		combined.ExitCode = 1
+		return ChangeSet{}, combined, err
+	}
+	changeSet, err := s.insertChangeSet(ctx, revertWorkspace, SubmitChangeSetInput{
+		AgentID:      sourceWorkspace.AgentID,
+		ContractID:   sourceWorkspace.ContractID,
+		Summary:      "Revert published rollback point " + rollback.ID,
+		EvidenceRefs: []string{rollback.OperationID},
+	}, []string{head}, head)
+	if err != nil {
+		combined.Stderr += err.Error()
+		combined.ExitCode = 1
+		return ChangeSet{}, combined, err
+	}
+	return changeSet, combined, nil
+}
+
+func parentCount(ctx context.Context, repoPath, ref string) int {
+	run := runGit(ctx, repoPath, "rev-list", "--parents", "-n", "1", ref)
+	if run.ExitCode != 0 {
+		return 0
+	}
+	fields := strings.Fields(run.Stdout)
+	if len(fields) == 0 {
+		return 0
+	}
+	return len(fields) - 1
+}
+
+func cleanupIntegrationPath(repo Repository, integrationPath string) error {
+	if strings.TrimSpace(integrationPath) == "" {
+		return nil
+	}
+	base := filepath.Base(integrationPath)
+	if !strings.HasPrefix(base, ".coordplane-merge-") && !strings.HasPrefix(base, ".coordplane-resolve-") {
+		return fmt.Errorf("refusing to clean non-CoordPlane integration path %q", integrationPath)
+	}
+	absPath, err := filepath.Abs(integrationPath)
+	if err != nil {
+		return err
+	}
+	repoParent, err := filepath.Abs(filepath.Dir(repo.SourcePath))
+	if err != nil {
+		return err
+	}
+	if absPath != repoParent && !strings.HasPrefix(absPath, repoParent+string(os.PathSeparator)) {
+		return fmt.Errorf("refusing to clean integration path outside repository parent")
+	}
+	if err := os.RemoveAll(absPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func changedFilesInRange(ctx context.Context, dir, baseRef, headRef string) ([]string, error) {

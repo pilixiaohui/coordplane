@@ -19,6 +19,12 @@ import (
 
 const timeLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
+var (
+	ErrAssignmentBusy         = errors.New("assignment claim: target agent already has active assignment")
+	ErrAssignmentNotFound     = errors.New("assignment claim: assignment not found")
+	ErrAssignmentNotClaimable = errors.New("assignment claim: assignment is not queued for target agent")
+)
+
 type Service struct {
 	db          *sql.DB
 	objects     *objects.Store
@@ -141,6 +147,13 @@ type AssignmentNextInput struct {
 	AgentID  string        `json:"agent_id,omitempty"`
 	LeaseFor time.Duration `json:"-"`
 	Now      time.Time     `json:"-"`
+}
+
+type AssignmentClaimInput struct {
+	AgentID      string        `json:"agent_id,omitempty"`
+	AssignmentID string        `json:"assignment_id"`
+	LeaseFor     time.Duration `json:"-"`
+	Now          time.Time     `json:"-"`
 }
 
 type AssignmentNextResult struct {
@@ -379,40 +392,45 @@ func (s *Service) AssignmentNext(ctx context.Context, in AssignmentNextInput) (A
 			out.Idle = true
 			return err
 		}
-		leaseID, err := ids.New("lease")
+		var claimErr error
+		out, claimErr = claimAssignmentTx(ctx, tx, in.AgentID, assignment, contract, in.LeaseFor, now)
+		return claimErr
+	})
+	return out, err
+}
+
+func (s *Service) AssignmentClaim(ctx context.Context, in AssignmentClaimInput) (AssignmentNextResult, error) {
+	if in.AgentID == "" {
+		return AssignmentNextResult{}, errors.New("assignment.claim: agent id is required")
+	}
+	if in.AssignmentID == "" {
+		return AssignmentNextResult{}, errors.New("assignment.claim: assignment id is required")
+	}
+	if in.LeaseFor <= 0 {
+		in.LeaseFor = time.Hour
+	}
+	now := in.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	var out AssignmentNextResult
+	err := withTx(ctx, s.db, func(tx *sql.Tx) error {
+		if existing, ok, err := activeLeaseForAgent(ctx, tx, in.AgentID, now); err != nil {
+			return err
+		} else if ok {
+			if existing.Assignment.ID != in.AssignmentID {
+				return ErrAssignmentBusy
+			}
+			out = existing
+			return nil
+		}
+		assignment, contract, err := assignmentByID(ctx, tx, in.AssignmentID)
 		if err != nil {
 			return err
 		}
-		expires := now.Add(in.LeaseFor)
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO leases (
-  id, tenant_id, assignment_id, agent_id, session_route_id, state,
-  expires_at, created_at, updated_at
-) VALUES (?, 'default', ?, ?, ?, 'active', ?, ?, ?)`,
-			leaseID, assignment.ID, in.AgentID, assignment.SessionRouteID,
-			formatTime(expires), formatTime(now), formatTime(now),
-		); err != nil {
-			return fmt.Errorf("insert lease: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE assignments SET state = 'claimed', updated_at = ? WHERE id = ?`, formatTime(now), assignment.ID); err != nil {
-			return fmt.Errorf("claim assignment: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `
-UPDATE mailbox_items
-SET state = 'resolved', followup_ref = ?, updated_at = ?
-WHERE contract_id = ?
-  AND reason = 'task_assigned'
-  AND state = 'pending'
-  AND (recipient_agent_id = ? OR recipient_role = ?)`,
-			"lease:"+leaseID, formatTime(now), assignment.ContractID, in.AgentID, in.AgentID,
-		); err != nil {
-			return fmt.Errorf("resolve claimed task mailbox: %w", err)
-		}
-		lease := Lease{ID: leaseID, AssignmentID: assignment.ID, AgentID: in.AgentID, SessionRouteID: assignment.SessionRouteID, State: "active", ExpiresAt: expires}
-		assignment.State = "claimed"
-		out = AssignmentNextResult{Assignment: assignment, Contract: contract, Lease: lease}
-		_, err = appendFact(ctx, tx, "assignment.claimed", "assignment", assignment.ID, map[string]string{"lease_id": leaseID})
-		return err
+		var claimErr error
+		out, claimErr = claimAssignmentTx(ctx, tx, in.AgentID, assignment, contract, in.LeaseFor, now)
+		return claimErr
 	})
 	return out, err
 }
@@ -923,6 +941,85 @@ LIMIT 1`, agentID, agentID)
 		return Assignment{}, Contract{}, false, err
 	}
 	return assignment, contract, true, rows.Err()
+}
+
+func assignmentByID(ctx context.Context, tx *sql.Tx, assignmentID string) (Assignment, Contract, error) {
+	row := tx.QueryRowContext(ctx, `
+SELECT a.id, a.contract_id, COALESCE(a.assignee_agent_id, ''), COALESCE(a.assignee_role, ''), a.state, COALESCE(a.session_route_id, ''),
+  c.id, c.title, c.objective, COALESCE(c.issuer_agent_id, ''), COALESCE(c.issuer_contract_id, ''),
+  c.target_kind, c.target_id, c.status, COALESCE(ts.team_id, ''), COALESCE(ts.team_version, 0)
+FROM assignments a
+JOIN work_contracts c ON c.id = a.contract_id
+LEFT JOIN contract_team_scopes ts ON ts.contract_id = c.id
+WHERE a.id = ?`, assignmentID)
+	var assignment Assignment
+	var contract Contract
+	if err := row.Scan(
+		&assignment.ID, &assignment.ContractID, &assignment.AssigneeAgent, &assignment.AssigneeRole, &assignment.State, &assignment.SessionRouteID,
+		&contract.ID, &contract.Title, &contract.Objective, &contract.IssuerAgentID, &contract.IssuerContract,
+		&contract.TargetKind, &contract.TargetID, &contract.Status, &contract.TeamID, &contract.TeamVersion,
+	); errors.Is(err, sql.ErrNoRows) {
+		return Assignment{}, Contract{}, ErrAssignmentNotFound
+	} else if err != nil {
+		return Assignment{}, Contract{}, err
+	}
+	return assignment, contract, nil
+}
+
+func claimAssignmentTx(ctx context.Context, tx *sql.Tx, agentID string, assignment Assignment, contract Contract, leaseFor time.Duration, now time.Time) (AssignmentNextResult, error) {
+	if assignment.State != "queued" || (assignment.AssigneeAgent != agentID && assignment.AssigneeRole != agentID) {
+		return AssignmentNextResult{}, ErrAssignmentNotClaimable
+	}
+	nowRaw := formatTime(now)
+	result, err := tx.ExecContext(ctx, `
+UPDATE assignments
+SET state = 'claimed', updated_at = ?
+WHERE id = ?
+  AND state = 'queued'
+  AND (assignee_agent_id = ? OR assignee_role = ?)`,
+		nowRaw, assignment.ID, agentID, agentID,
+	)
+	if err != nil {
+		return AssignmentNextResult{}, fmt.Errorf("claim assignment: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return AssignmentNextResult{}, fmt.Errorf("claim assignment rows affected: %w", err)
+	}
+	if affected != 1 {
+		return AssignmentNextResult{}, ErrAssignmentNotClaimable
+	}
+	leaseID, err := ids.New("lease")
+	if err != nil {
+		return AssignmentNextResult{}, err
+	}
+	expires := now.Add(leaseFor)
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO leases (
+  id, tenant_id, assignment_id, agent_id, session_route_id, state,
+  expires_at, created_at, updated_at
+) VALUES (?, 'default', ?, ?, ?, 'active', ?, ?, ?)`,
+		leaseID, assignment.ID, agentID, assignment.SessionRouteID,
+		formatTime(expires), nowRaw, nowRaw,
+	); err != nil {
+		return AssignmentNextResult{}, fmt.Errorf("insert lease: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE mailbox_items
+SET state = 'resolved', followup_ref = ?, updated_at = ?
+WHERE contract_id = ?
+  AND reason = 'task_assigned'
+  AND state = 'pending'
+  AND (recipient_agent_id = ? OR recipient_role = ?)`,
+		"lease:"+leaseID, nowRaw, assignment.ContractID, agentID, agentID,
+	); err != nil {
+		return AssignmentNextResult{}, fmt.Errorf("resolve claimed task mailbox: %w", err)
+	}
+	lease := Lease{ID: leaseID, AssignmentID: assignment.ID, AgentID: agentID, SessionRouteID: assignment.SessionRouteID, State: "active", ExpiresAt: expires}
+	assignment.State = "claimed"
+	out := AssignmentNextResult{Assignment: assignment, Contract: contract, Lease: lease}
+	_, err = appendFact(ctx, tx, "assignment.claimed", "assignment", assignment.ID, map[string]string{"lease_id": leaseID})
+	return out, err
 }
 
 func missingEvidence(ctx context.Context, tx *sql.Tx, contractID string, evidenceIDs []string) ([]string, error) {

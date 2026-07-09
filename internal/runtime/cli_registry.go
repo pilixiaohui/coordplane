@@ -41,6 +41,18 @@ func (r *CLIAdapterRegistry) Start(ctx context.Context, req StartRequest) (Start
 	return adapter.Start(ctx, req)
 }
 
+func (r *CLIAdapterRegistry) PreflightStart(ctx context.Context, req StartRequest) error {
+	adapter, err := r.adapter(req.CLIBackend)
+	if err != nil {
+		return err
+	}
+	preflight, ok := adapter.(startPreflightAdapter)
+	if !ok {
+		return nil
+	}
+	return preflight.PreflightStart(ctx, req)
+}
+
 func (r *CLIAdapterRegistry) Steer(ctx context.Context, req SteerRequest) error {
 	adapter, err := r.adapter(req.Route.CLIBackend)
 	if err != nil {

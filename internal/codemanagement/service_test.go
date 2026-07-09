@@ -85,6 +85,43 @@ func TestWorkspaceReadOnlyCapabilitiesAndSyncUseRealGitRepo(t *testing.T) {
 	assertOperationAudit(t, ctx, db, synced.Operation.ID, "workspace.sync", "succeeded", prepared.Workspace.HeadRef, synced.Workspace.HeadRef)
 }
 
+func TestWorkspacePrepareRejectsRawRepoPathAndUsesRegisteredRepo(t *testing.T) {
+	ctx := context.Background()
+	svc, db := newService(t)
+	repoPath := newGitRepo(t)
+
+	rejected := svc.WorkspacePrepare(ctx, codemanagement.WorkspacePrepareInput{
+		RepoPath:        repoPath,
+		CanonicalBranch: "main",
+		WorkspaceRoot:   t.TempDir(),
+		AgentID:         "builder",
+		ContractID:      "contract_builder",
+	})
+	if rejected.Status != capability.StatusRejected || rejected.ErrorCode != "RAW_REPO_PATH_REJECTED" {
+		t.Fatalf("workspace.prepare raw repo_path = %+v, want RAW_REPO_PATH_REJECTED", rejected)
+	}
+	for _, table := range []string{"git_repositories", "git_workspaces", "git_operations"} {
+		if got := countRows(t, ctx, db, table); got != 0 {
+			t.Fatalf("%s rows after raw repo_path reject = %d, want 0", table, got)
+		}
+	}
+
+	repo := registerRepository(t, ctx, svc, repoPath, "tiny-ledger")
+	prepared := acceptedData(t, svc.WorkspacePrepare(ctx, codemanagement.WorkspacePrepareInput{
+		RepoID:          repo.ID,
+		CanonicalBranch: "main",
+		WorkspaceRoot:   t.TempDir(),
+		AgentID:         "builder",
+		ContractID:      "contract_builder",
+	}))
+	if prepared.Repository.ID != repo.ID || prepared.Repository.SourcePath != "" {
+		t.Fatalf("registered prepare repository = %+v, want registered id and redacted source_path", prepared.Repository)
+	}
+	if prepared.Workspace.RepoID != repo.ID {
+		t.Fatalf("workspace repo_id = %s, want %s", prepared.Workspace.RepoID, repo.ID)
+	}
+}
+
 func TestGitCommitRecordsDurableOperationLocksRefsAndEvent(t *testing.T) {
 	ctx := context.Background()
 	svc, db := newService(t)
@@ -112,6 +149,30 @@ func TestGitCommitRecordsDurableOperationLocksRefsAndEvent(t *testing.T) {
 	if got := git(t, prepared.Workspace.Path, "log", "-1", "--format=%s"); strings.TrimSpace(got) != "add feature" {
 		t.Fatalf("latest commit = %q, want add feature", got)
 	}
+}
+
+func TestGitOperationsRecordRuntimeAndExecutionLocationEvidence(t *testing.T) {
+	ctx := context.Background()
+	svc, db := newService(t)
+	repo := registerRepository(t, ctx, svc, newGitRepo(t), "runtime-repo")
+	hostRoot := t.TempDir()
+	insertDockerRuntimeBridge(t, ctx, db, "rt_developer_a", "developer-a", hostRoot)
+
+	prepared := acceptedData(t, svc.WorkspacePrepare(ctx, codemanagement.WorkspacePrepareInput{
+		RepoID:          repo.ID,
+		CanonicalBranch: "main",
+		WorkspaceRoot:   cpruntime.ContainerWorkspacePath,
+		AgentID:         "developer-a",
+		RuntimeID:       "rt_developer_a",
+		ContractID:      "contract_developer_a",
+	}))
+	assertOperationRuntimeEvidence(t, ctx, db, prepared.OperationID, "rt_developer_a", "runtime_container")
+
+	commit := commitWorkspaceFile(t, ctx, svc, prepared, "runtime.txt", "runtime\n", "runtime evidence")
+	if commit.Operation.RuntimeID != "rt_developer_a" || commit.Operation.ExecutionLocation != "runtime_container" {
+		t.Fatalf("commit operation evidence = %+v, want runtime id/location", commit.Operation)
+	}
+	assertOperationRuntimeEvidence(t, ctx, db, commit.Operation.ID, "rt_developer_a", "runtime_container")
 }
 
 func TestGitCommitOnlyCommitsExplicitPathsWhenUnrelatedFileAlreadyStaged(t *testing.T) {
@@ -265,7 +326,7 @@ func TestWorkspacePrepareRepoLockConflictDoesNotLeavePreparingWorkspace(t *testi
 	beforeWorkspaces := countRows(t, ctx, db, "git_workspaces")
 
 	resp := svc.WorkspacePrepare(ctx, codemanagement.WorkspacePrepareInput{
-		RepoPath:        repoPath,
+		RepoID:          prepared.Repository.ID,
 		CanonicalBranch: "main",
 		WorkspaceRoot:   t.TempDir(),
 		AgentID:         "builder",
@@ -290,12 +351,12 @@ func TestWorkspacePrepareRepoLockConflictDoesNotLeavePreparingWorkspace(t *testi
 func TestWorkspacePrepareMapsDockerRuntimeWorkspaceToHostAndReturnsAgentPath(t *testing.T) {
 	ctx := context.Background()
 	svc, db := newService(t)
-	repoPath := newGitRepo(t)
+	repo := registerRepository(t, ctx, svc, newGitRepo(t), "docker-repo")
 	hostRoot := t.TempDir()
 	insertDockerRuntimeBridge(t, ctx, db, "rt_developer_a", "developer-a", hostRoot)
 
 	prepared := acceptedData(t, svc.WorkspacePrepare(ctx, codemanagement.WorkspacePrepareInput{
-		RepoPath:        repoPath,
+		RepoID:          repo.ID,
 		CanonicalBranch: "main",
 		WorkspaceRoot:   cpruntime.ContainerWorkspacePath,
 		AgentID:         "developer-a",
@@ -314,6 +375,9 @@ func TestWorkspacePrepareMapsDockerRuntimeWorkspaceToHostAndReturnsAgentPath(t *
 	}
 	if _, err := os.Stat(filepath.Join(prepared.Workspace.Path, ".git")); err != nil {
 		t.Fatalf("backend host workspace was not cloned: %v", err)
+	}
+	if prepared.Repository.SourcePath != "" {
+		t.Fatalf("workspace.prepare leaked repository source path: %+v", prepared.Repository)
 	}
 }
 
@@ -362,6 +426,13 @@ func TestMergePreviewApplyAndRollbackUseReviewedRefs(t *testing.T) {
 	if got := strings.TrimSpace(git(t, repoPath, "rev-parse", "main")); got != targetBefore {
 		t.Fatalf("canonical ref after preview = %s, want unchanged %s", got, targetBefore)
 	}
+	integrationPath := preview.MergeAttempt.IntegrationPath
+	if integrationPath == "" {
+		t.Fatalf("merge preview did not record integration path")
+	}
+	if _, err := os.Stat(integrationPath); err != nil {
+		t.Fatalf("merge preview integration path missing before terminal cleanup: %v", err)
+	}
 	assertOperationAudit(t, ctx, db, preview.Operation.ID, "git.merge_preview", "succeeded", targetBefore, preview.MergeAttempt.ResultRef)
 	assertReleasedLocks(t, ctx, db, preview.Operation.ID, prepared.Workspace.ID, prepared.Workspace.RepoID)
 
@@ -379,6 +450,12 @@ func TestMergePreviewApplyAndRollbackUseReviewedRefs(t *testing.T) {
 	if applied.RollbackPoint.BeforeRef != targetBefore || applied.RollbackPoint.AfterRef != applied.AppliedRef || applied.RollbackPoint.State != "available" {
 		t.Fatalf("rollback point = %+v, want available %s -> %s", applied.RollbackPoint, targetBefore, applied.AppliedRef)
 	}
+	if applied.MergeAttempt.IntegrationPath != "" {
+		t.Fatalf("terminal merge apply response leaked integration path: %+v", applied.MergeAttempt)
+	}
+	if _, err := os.Stat(integrationPath); !os.IsNotExist(err) {
+		t.Fatalf("terminal merge integration path stat = %v, want cleaned", err)
+	}
 	assertOperationAudit(t, ctx, db, applied.Operation.ID, "git.merge_apply", "succeeded", targetBefore, applied.AppliedRef)
 	assertReleasedLocks(t, ctx, db, applied.Operation.ID, prepared.Workspace.ID, prepared.Workspace.RepoID)
 
@@ -394,6 +471,52 @@ func TestMergePreviewApplyAndRollbackUseReviewedRefs(t *testing.T) {
 		t.Fatalf("canonical ref after rollback = %s, want %s", got, targetBefore)
 	}
 	assertOperationAudit(t, ctx, db, rolledBack.Operation.ID, "git.rollback", "succeeded", applied.AppliedRef, targetBefore)
+}
+
+func TestPublishedRollbackCreatesRevertChangeSetWithoutRewritingCanonicalRef(t *testing.T) {
+	ctx := context.Background()
+	svc, db := newService(t)
+	repoPath := newGitRepo(t)
+	prepared := prepareWorkspace(t, ctx, svc, repoPath, "builder")
+	commit := commitWorkspaceFile(t, ctx, svc, prepared, "published.txt", "published\n", "published feature")
+	submitted := submitChangeSet(t, ctx, svc, prepared, commit.CommitSHA, "published feature")
+	targetBefore := strings.TrimSpace(git(t, repoPath, "rev-parse", "main"))
+	preview := acceptedData(t, svc.MergePreview(ctx, codemanagement.MergePreviewInput{
+		ChangeSetID:       submitted.ChangeSet.ID,
+		AgentID:           "builder",
+		ExpectedTargetRef: targetBefore,
+	}))
+	applied := acceptedData(t, svc.MergeApply(ctx, codemanagement.MergeApplyInput{
+		MergeAttemptID:    preview.MergeAttempt.ID,
+		AgentID:           "builder",
+		ExpectedTargetRef: targetBefore,
+	}))
+
+	rollback := acceptedData(t, svc.Rollback(ctx, codemanagement.RollbackInput{
+		OperationID:       applied.Operation.ID,
+		AgentID:           "builder",
+		ExpectedTargetRef: applied.AppliedRef,
+		Published:         true,
+	}))
+	if got := strings.TrimSpace(git(t, repoPath, "rev-parse", "main")); got != applied.AppliedRef {
+		t.Fatalf("published rollback rewrote canonical ref = %s, want unchanged %s", got, applied.AppliedRef)
+	}
+	if rollback.RestoredRef != "" {
+		t.Fatalf("published rollback restored_ref = %s, want empty because canonical ref was not rewritten", rollback.RestoredRef)
+	}
+	if rollback.RevertChangeSet == nil || rollback.RevertChangeSet.State != "submitted" || rollback.RevertChangeSet.BaseRef != applied.AppliedRef {
+		t.Fatalf("published rollback revert changeset = %+v, want submitted changeset based on applied ref", rollback.RevertChangeSet)
+	}
+	if rollback.RevertChangeSet.HeadRef == "" || rollback.RevertChangeSet.HeadRef == applied.AppliedRef || len(rollback.RevertChangeSet.CommitIDs) != 1 {
+		t.Fatalf("published rollback changeset refs = %+v, want one new revert commit", rollback.RevertChangeSet)
+	}
+	if rollback.RollbackPoint.State != "used" {
+		t.Fatalf("rollback point state = %s, want used", rollback.RollbackPoint.State)
+	}
+	if got := countRows(t, ctx, db, "changesets"); got != 2 {
+		t.Fatalf("changesets after published rollback = %d, want original plus revert", got)
+	}
+	assertOperationAudit(t, ctx, db, rollback.Operation.ID, "git.rollback", "succeeded", applied.AppliedRef, rollback.RevertChangeSet.HeadRef)
 }
 
 func TestMergePreviewConflictFailClosedAndAbort(t *testing.T) {
@@ -609,13 +732,27 @@ func newGitRepo(t *testing.T) string {
 
 func prepareWorkspace(t *testing.T, ctx context.Context, svc *codemanagement.Service, repoPath, agentID string) codemanagement.WorkspacePrepareResult {
 	t.Helper()
+	repo := registerRepository(t, ctx, svc, repoPath, "repo-"+agentID)
 	return acceptedData(t, svc.WorkspacePrepare(ctx, codemanagement.WorkspacePrepareInput{
-		RepoPath:        repoPath,
+		RepoID:          repo.ID,
 		CanonicalBranch: "main",
 		WorkspaceRoot:   t.TempDir(),
 		AgentID:         agentID,
 		ContractID:      "contract_" + agentID,
 	}))
+}
+
+func registerRepository(t *testing.T, ctx context.Context, svc *codemanagement.Service, repoPath, alias string) codemanagement.Repository {
+	t.Helper()
+	repo, err := svc.RegisterRepository(ctx, codemanagement.RegisterRepositoryInput{
+		RepoPath:        repoPath,
+		Alias:           alias,
+		CanonicalBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("register repository: %v", err)
+	}
+	return repo
 }
 
 func insertDockerRuntimeBridge(t *testing.T, ctx context.Context, db *sql.DB, runtimeID, agentID, hostWorkspace string) {
@@ -716,6 +853,20 @@ WHERE aggregate_type = 'git_operation' AND aggregate_id = ? AND event_type = ?`,
 	}
 	if events != 1 {
 		t.Fatalf("operation %s events = %d, want 1", operationID, events)
+	}
+}
+
+func assertOperationRuntimeEvidence(t *testing.T, ctx context.Context, db *sql.DB, operationID, runtimeID, executionLocation string) {
+	t.Helper()
+	var gotRuntimeID, gotExecutionLocation string
+	if err := db.QueryRowContext(ctx, `
+SELECT runtime_id, execution_location
+FROM git_operations
+WHERE id = ?`, operationID).Scan(&gotRuntimeID, &gotExecutionLocation); err != nil {
+		t.Fatalf("query operation evidence %s: %v", operationID, err)
+	}
+	if gotRuntimeID != runtimeID || gotExecutionLocation != executionLocation {
+		t.Fatalf("operation %s runtime evidence = %s/%s, want %s/%s", operationID, gotRuntimeID, gotExecutionLocation, runtimeID, executionLocation)
 	}
 }
 

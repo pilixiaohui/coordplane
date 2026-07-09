@@ -1,268 +1,396 @@
 package main
 
 import (
-	"context"
-	"database/sql"
-	"io"
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"coordplane/internal/backend"
-
-	_ "modernc.org/sqlite"
 )
 
-func TestReleaseHealthCommandWritesFailedLedgerAndReturnsNonzero(t *testing.T) {
-	ctx := context.Background()
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "coordplane.db")
-	app, err := backend.Open(ctx, backend.Config{
-		DBPath:         dbPath,
-		TeamConfigPath: filepath.Join("..", "..", "team_config", "fixtures", "cp_accept_001_three_agent_docker_claude.yaml"),
-	})
-	if err != nil {
-		t.Fatalf("seed backend db: %v", err)
-	}
-	if err := app.Close(); err != nil {
-		t.Fatalf("close seed backend: %v", err)
-	}
-
-	stdout := captureStdout(t, func() {
-		err = run([]string{
-			"release-health",
-			"cp-accept-001",
-			"--db", dbPath,
-			"--root-contract", "ctr_missing",
-			"--team-id", "cp-accept-001-three-agent-docker-claude",
-			"--team-version", "1",
-			"--run-label", "command-fail-closed",
-		})
-	})
-	if err == nil || !strings.Contains(err.Error(), "status is failed") {
-		t.Fatalf("release-health error = %v, want failed status", err)
-	}
-	if !strings.Contains(stdout, `"status": "failed"`) ||
-		!strings.Contains(stdout, `"team_id": "cp-accept-001-three-agent-docker-claude"`) {
-		t.Fatalf("release-health stdout = %s, want structured failed acceptance", stdout)
-	}
-
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	defer db.Close()
-	var count int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_acceptances WHERE run_label = 'command-fail-closed'`).Scan(&count); err != nil {
-		t.Fatalf("count release_acceptances: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("release_acceptances = %d, want failed ledger row", count)
-	}
-}
-
-func TestReleaseHealthCommandUsesRootContractEnvAsReviewOverride(t *testing.T) {
-	t.Setenv("COORDPLANE_ROOT_CONTRACT_ID", "ctr_missing_env")
-	ctx := context.Background()
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "coordplane.db")
-	app, err := backend.Open(ctx, backend.Config{
-		DBPath:         dbPath,
-		TeamConfigPath: filepath.Join("..", "..", "team_config", "fixtures", "cp_accept_001_three_agent_docker_claude.yaml"),
-	})
-	if err != nil {
-		t.Fatalf("seed backend db: %v", err)
-	}
-	if err := app.Close(); err != nil {
-		t.Fatalf("close seed backend: %v", err)
-	}
-
-	stdout := captureStdout(t, func() {
-		err = run([]string{
-			"release-health",
-			"cp-accept-001",
-			"--db", dbPath,
-			"--team-id", "cp-accept-001-three-agent-docker-claude",
-			"--team-version", "1",
-			"--run-label", "env-review-override",
-		})
-	})
-	if err == nil || !strings.Contains(err.Error(), "status is failed") {
-		t.Fatalf("release-health env override error = %v, want failed review", err)
-	}
-	if !strings.Contains(stdout, `"root_contract_id": "ctr_missing_env"`) {
-		t.Fatalf("release-health stdout = %s, want env root review", stdout)
-	}
-
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	defer db.Close()
-	var roots int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM work_contracts WHERE target_id = 'coordinator'`).Scan(&roots); err != nil {
-		t.Fatalf("count root contracts: %v", err)
-	}
-	if roots != 0 {
-		t.Fatalf("root contracts = %d, want env override to avoid driving workflow", roots)
-	}
-}
-
-func TestReleaseHealthCommandWithoutRootDrivesWorkflowAndFailsClosed(t *testing.T) {
-	t.Setenv("COORDPLANE_ROOT_CONTRACT_ID", "")
-	ctx := context.Background()
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "coordplane.db")
-
-	var err error
-	stdout := captureStdout(t, func() {
-		err = run([]string{
-			"release-health",
-			"cp-accept-001",
-			"--db", dbPath,
-			"--teamconfig", filepath.Join("..", "..", "team_config", "fixtures", "cp_accept_001_three_agent_docker_claude.yaml"),
-			"--listen", "127.0.0.1:0",
-			"--backend-url", "http://127.0.0.1:1",
-			"--docker-network", "",
-			"--workdir", dir,
-			"--run-label", "command-drive-fail-closed",
-		})
-	})
-	if err == nil {
-		t.Fatalf("release-health without root unexpectedly passed")
-	}
-	if strings.Contains(err.Error(), "--root-contract") || strings.Contains(err.Error(), "COORDPLANE_ROOT_CONTRACT_ID") {
-		t.Fatalf("release-health error = %v, still requires preexisting root", err)
-	}
-	if !strings.Contains(err.Error(), "coordinator Docker/Claude session could not start") {
-		t.Fatalf("release-health error = %v, want workflow-mode environment failure", err)
-	}
-	if !strings.Contains(stdout, `"status": "failed"`) ||
-		!strings.Contains(stdout, `"root_contract_id": "ctr_`) {
-		t.Fatalf("release-health stdout = %s, want failed acceptance for created root", stdout)
-	}
-
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	defer db.Close()
-	var roots int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM work_contracts WHERE target_id = 'coordinator'`).Scan(&roots); err != nil {
-		t.Fatalf("count created root contracts: %v", err)
-	}
-	if roots != 1 {
-		t.Fatalf("root contracts = %d, want workflow-created root", roots)
-	}
-	var acceptances int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_acceptances WHERE run_label = 'command-drive-fail-closed'`).Scan(&acceptances); err != nil {
-		t.Fatalf("count release_acceptances: %v", err)
-	}
-	if acceptances != 1 {
-		t.Fatalf("release_acceptances = %d, want failed ledger row", acceptances)
-	}
-}
-
-func TestReleaseHealthCPProbeCommandWritesFormalArtifactsAndReturnsEnvironmentBlocked(t *testing.T) {
-	ctx := context.Background()
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "coordplane.db")
-
-	var err error
-	stdout := captureStdout(t, func() {
-		err = run([]string{
-			"release-health",
-			"cp-probe-001",
-			"--db", dbPath,
-			"--teamconfig", filepath.Join("..", "..", "team_config", "fixtures", "cp_probe_001_manual_service.yaml"),
-			"--listen", "127.0.0.1:0",
-			"--backend-url", "http://127.0.0.1:1",
-			"--workdir", dir,
-			"--artifact-dir", dir,
-			"--environment-blocker", "Docker/Claude replay not available in command test",
-		})
-	})
-	if err == nil || !strings.Contains(err.Error(), "status is environment_blocked") {
-		t.Fatalf("cp-probe release-health error = %v, want environment_blocked", err)
-	}
-	if !strings.Contains(stdout, `"scenario": "CP-PROBE-001"`) ||
-		!strings.Contains(stdout, `"status": "environment_blocked"`) ||
-		!strings.Contains(stdout, `"docker_replay_status": "environment_blocked"`) ||
-		!strings.Contains(stdout, `"root_contract_id": "ctr_`) {
-		t.Fatalf("cp-probe stdout = %s, want structured environment-blocked result", stdout)
-	}
-	for _, name := range []string{
-		"cp_probe_001_manual_trace.md",
-		"cp_probe_001_inspect_redacted.json",
-		"cp_probe_001_git_operation_summary.json",
-		"cp_probe_001_failure_matrix.md",
-		"cp_probe_001_conclusion.md",
-	} {
-		raw, readErr := os.ReadFile(filepath.Join(dir, name))
-		if readErr != nil {
-			t.Fatalf("read %s: %v", name, readErr)
+func TestTaskCreateCommandPostsToOperatorTasksEndpoint(t *testing.T) {
+	payloadPath := writeTaskPayload(t)
+	var gotPath, gotAuth string
+	var gotPayload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
 		}
-		if len(raw) == 0 {
-			t.Fatalf("%s is empty", name)
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode request payload: %v", err)
 		}
-		for _, forbidden := range []string{"coordplane.db", "Bearer ", "sk-", "ANTHROPIC_AUTH_TOKEN", filepath.Join(dir, "runtime")} {
-			if strings.Contains(string(raw), forbidden) {
-				t.Fatalf("%s leaked forbidden marker %q:\n%s", name, forbidden, raw)
+		writeAccepted(t, w, map[string]any{
+			"task_run_id":        "taskrun_create",
+			"root_contract_id":   "ctr_create",
+			"root_assignment_id": "asg_create",
+			"status":             "created",
+		})
+	}))
+	defer server.Close()
+
+	t.Setenv("TEST_OPERATOR_TOKEN", "operator-secret")
+	var stdout, stderr bytes.Buffer
+	err := run([]string{
+		"task", "create",
+		"--backend-url", server.URL,
+		"--operator-token-env", "TEST_OPERATOR_TOKEN",
+		"--payload", payloadPath,
+	}, &stdout, &stderr, server.Client())
+	if err != nil {
+		t.Fatalf("task create error = %v; stderr=%s", err, stderr.String())
+	}
+	if gotPath != "/operator/tasks" || gotAuth != "Bearer operator-secret" {
+		t.Fatalf("request path/auth = %s/%s", gotPath, gotAuth)
+	}
+	if gotPayload["idempotency_key"] != "operator-cli-test" || gotPayload["target_agent_id"] != "coordinator" {
+		t.Fatalf("payload = %#v, want operator task JSON", gotPayload)
+	}
+	if !strings.Contains(stdout.String(), `"task_run_id":"taskrun_create"`) {
+		t.Fatalf("stdout = %s, want create response", stdout.String())
+	}
+}
+
+func TestTaskRunCommandCreatesThenStartsOperatorTask(t *testing.T) {
+	payloadPath := writeTaskPayload(t)
+	var paths []string
+	var startAuth string
+	var startPayload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/operator/tasks":
+			if r.Header.Get("Authorization") != "Bearer operator-secret" {
+				t.Fatalf("create auth = %q", r.Header.Get("Authorization"))
 			}
+			writeAccepted(t, w, map[string]any{
+				"task_run_id":        "taskrun_run",
+				"root_contract_id":   "ctr_run",
+				"root_assignment_id": "asg_run",
+				"status":             "created",
+			})
+		case "/operator/tasks/taskrun_run/start":
+			startAuth = r.Header.Get("Authorization")
+			if err := json.NewDecoder(r.Body).Decode(&startPayload); err != nil {
+				t.Fatalf("decode start payload: %v", err)
+			}
+			writeAccepted(t, w, map[string]any{
+				"task_run_id":        "taskrun_run",
+				"root_contract_id":   "ctr_run",
+				"root_assignment_id": "asg_run",
+				"target_agent_id":    "coordinator",
+				"lease_id":           "lease_run",
+				"attempt_id":         "att_run",
+				"session_route_id":   "route_run",
+				"runtime_id":         "rt_run",
+				"status":             "started",
+			})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
-	}
+	}))
+	defer server.Close()
 
-	db, err := sql.Open("sqlite", dbPath)
+	t.Setenv("TEST_OPERATOR_TOKEN", "operator-secret")
+	var stdout, stderr bytes.Buffer
+	err := run([]string{
+		"task", "run",
+		"--backend-url", server.URL,
+		"--operator-token-env", "TEST_OPERATOR_TOKEN",
+		"--payload", payloadPath,
+		"--start-idempotency-key", "start-cli-test",
+	}, &stdout, &stderr, server.Client())
 	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
+		t.Fatalf("task run error = %v; stderr=%s", err, stderr.String())
 	}
-	defer db.Close()
-	var assessments int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM validation_assessments WHERE verdict = 'pass'`).Scan(&assessments); err != nil {
-		t.Fatalf("count validation_assessments: %v", err)
+	if strings.Join(paths, ",") != "/operator/tasks,/operator/tasks/taskrun_run/start" {
+		t.Fatalf("paths = %v, want create then start", paths)
 	}
-	if assessments != 1 {
-		t.Fatalf("validation_assessments = %d, want one non-Docker manual assessment", assessments)
+	if startAuth != "Bearer operator-secret" || startPayload["idempotency_key"] != "start-cli-test" {
+		t.Fatalf("start auth/payload = %s/%#v", startAuth, startPayload)
 	}
-	var roots int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM work_contracts WHERE target_id = 'coordinator' AND status = 'satisfied'`).Scan(&roots); err != nil {
-		t.Fatalf("count satisfied root contracts: %v", err)
-	}
-	if roots != 1 {
-		t.Fatalf("satisfied root contracts = %d, want 1", roots)
-	}
-	failureMatrix, err := os.ReadFile(filepath.Join(dir, "cp_probe_001_failure_matrix.md"))
-	if err != nil {
-		t.Fatalf("read failure matrix: %v", err)
-	}
-	if !strings.Contains(string(failureMatrix), "docker-controlled-workspace-bridge") ||
-		!strings.Contains(string(failureMatrix), "environment_blocked") {
-		t.Fatalf("failure matrix = %s, want Docker replay bridge status and environment_blocked", failureMatrix)
+	if !strings.Contains(stdout.String(), `"session_route_id":"route_run"`) {
+		t.Fatalf("stdout = %s, want start response", stdout.String())
 	}
 }
 
-func TestReleaseHealthCommandRejectsUnknownScenario(t *testing.T) {
-	err := run([]string{"release-health", "unknown"})
-	if err == nil || !strings.Contains(err.Error(), "unknown release-health scenario") {
-		t.Fatalf("unknown scenario error = %v", err)
+func TestTaskRunCommandWaitsAndWritesEvidenceThroughOperatorAPI(t *testing.T) {
+	payloadPath := writeTaskPayload(t)
+	evidencePath := filepath.Join(t.TempDir(), "evidence.json")
+	var paths []string
+	var waitPayload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.Header.Get("Authorization") != "Bearer operator-secret" {
+			t.Fatalf("%s auth = %q", r.URL.Path, r.Header.Get("Authorization"))
+		}
+		switch r.URL.Path {
+		case "/operator/tasks":
+			writeAccepted(t, w, map[string]any{
+				"task_run_id":        "taskrun_wait",
+				"root_contract_id":   "ctr_wait",
+				"root_assignment_id": "asg_wait",
+				"status":             "created",
+			})
+		case "/operator/tasks/taskrun_wait/start":
+			writeAccepted(t, w, map[string]any{
+				"task_run_id":        "taskrun_wait",
+				"root_contract_id":   "ctr_wait",
+				"root_assignment_id": "asg_wait",
+				"target_agent_id":    "coordinator",
+				"lease_id":           "lease_wait",
+				"attempt_id":         "att_wait",
+				"session_route_id":   "route_wait",
+				"runtime_id":         "rt_wait",
+				"status":             "started",
+			})
+		case "/operator/tasks/taskrun_wait/wait":
+			if err := json.NewDecoder(r.Body).Decode(&waitPayload); err != nil {
+				t.Fatalf("decode wait payload: %v", err)
+			}
+			writeAccepted(t, w, map[string]any{
+				"task_run_id": "taskrun_wait",
+				"status":      "passed",
+				"evidence": map[string]any{
+					"schema_version": "operator.task.evidence.v1",
+					"task_run_id":    "taskrun_wait",
+					"status":         "passed",
+					"terminal": map[string]any{
+						"status": "passed",
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("TEST_OPERATOR_TOKEN", "operator-secret")
+	var stdout, stderr bytes.Buffer
+	err := run([]string{
+		"task", "run",
+		"--backend-url", server.URL,
+		"--operator-token-env", "TEST_OPERATOR_TOKEN",
+		"--payload", payloadPath,
+		"--wait",
+		"--wait-timeout-ms", "25",
+		"--poll-interval-ms", "1",
+		"--evidence-out", evidencePath,
+	}, &stdout, &stderr, server.Client())
+	if err != nil {
+		t.Fatalf("task run --wait error = %v; stderr=%s", err, stderr.String())
+	}
+	if strings.Join(paths, ",") != "/operator/tasks,/operator/tasks/taskrun_wait/start,/operator/tasks/taskrun_wait/wait" {
+		t.Fatalf("paths = %v, want create start wait", paths)
+	}
+	if waitPayload["timeout_millis"] != float64(25) || waitPayload["poll_interval_millis"] != float64(1) {
+		t.Fatalf("wait payload = %#v, want CLI timeout/poll", waitPayload)
+	}
+	if !strings.Contains(stdout.String(), `"status":"passed"`) {
+		t.Fatalf("stdout = %s, want wait response", stdout.String())
+	}
+	rawEvidence, err := os.ReadFile(evidencePath)
+	if err != nil {
+		t.Fatalf("read evidence out: %v", err)
+	}
+	if !strings.Contains(string(rawEvidence), `"task_run_id":"taskrun_wait"`) || !strings.Contains(string(rawEvidence), `"schema_version":"operator.task.evidence.v1"`) {
+		t.Fatalf("evidence file = %s, want public wait evidence", string(rawEvidence))
 	}
 }
 
-func captureStdout(t *testing.T, fn func()) string {
+func TestTaskRunCommandWritesNotPassedEvidenceWithUnfinishedCounts(t *testing.T) {
+	payloadPath := writeTaskPayload(t)
+	evidencePath := filepath.Join(t.TempDir(), "unfinished-evidence.json")
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.Header.Get("Authorization") != "Bearer operator-secret" {
+			t.Fatalf("%s auth = %q", r.URL.Path, r.Header.Get("Authorization"))
+		}
+		switch r.URL.Path {
+		case "/operator/tasks":
+			writeAccepted(t, w, map[string]any{
+				"task_run_id":        "taskrun_unfinished",
+				"root_contract_id":   "ctr_unfinished",
+				"root_assignment_id": "asg_unfinished",
+				"status":             "created",
+			})
+		case "/operator/tasks/taskrun_unfinished/start":
+			writeAccepted(t, w, map[string]any{
+				"task_run_id":        "taskrun_unfinished",
+				"root_contract_id":   "ctr_unfinished",
+				"root_assignment_id": "asg_unfinished",
+				"target_agent_id":    "coordinator",
+				"lease_id":           "lease_unfinished",
+				"attempt_id":         "att_unfinished",
+				"session_route_id":   "route_unfinished",
+				"runtime_id":         "rt_unfinished",
+				"status":             "started",
+			})
+		case "/operator/tasks/taskrun_unfinished/wait":
+			writeAccepted(t, w, map[string]any{
+				"task_run_id":     "taskrun_unfinished",
+				"status":          "timeout",
+				"failure_summary": "wait timed out before unfinished lineage quiesced",
+				"evidence": map[string]any{
+					"schema_version": "operator.task.evidence.v1",
+					"task_run_id":    "taskrun_unfinished",
+					"status":         "timeout",
+					"terminal": map[string]any{
+						"status":                  "timeout",
+						"root_contract_status":    "satisfied",
+						"report_count":            1,
+						"validation_pass_count":   1,
+						"queued_assignment_count": 0,
+						"active_assignment_count": 1,
+						"active_lease_count":      1,
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("TEST_OPERATOR_TOKEN", "operator-secret")
+	var stdout, stderr bytes.Buffer
+	err := run([]string{
+		"task", "run",
+		"--backend-url", server.URL,
+		"--operator-token-env", "TEST_OPERATOR_TOKEN",
+		"--payload", payloadPath,
+		"--wait",
+		"--wait-timeout-ms", "25",
+		"--poll-interval-ms", "1",
+		"--evidence-out", evidencePath,
+	}, &stdout, &stderr, server.Client())
+	if err != nil {
+		t.Fatalf("task run unfinished wait error = %v; stderr=%s", err, stderr.String())
+	}
+	if strings.Join(paths, ",") != "/operator/tasks,/operator/tasks/taskrun_unfinished/start,/operator/tasks/taskrun_unfinished/wait" {
+		t.Fatalf("paths = %v, want create start wait", paths)
+	}
+	if strings.Contains(stdout.String(), `"status":"passed"`) {
+		t.Fatalf("stdout = %s, must not contain passed status", stdout.String())
+	}
+	rawEvidence, err := os.ReadFile(evidencePath)
+	if err != nil {
+		t.Fatalf("read unfinished evidence out: %v", err)
+	}
+	evidenceText := string(rawEvidence)
+	if strings.Contains(evidenceText, `"status":"passed"`) ||
+		!strings.Contains(evidenceText, `"root_contract_status":"satisfied"`) ||
+		!strings.Contains(evidenceText, `"active_assignment_count":1`) ||
+		!strings.Contains(evidenceText, `"active_lease_count":1`) {
+		t.Fatalf("unfinished evidence file = %s, want not-passed evidence with unfinished counts", evidenceText)
+	}
+}
+
+func TestTaskRunCommandWritesEvidenceWhenStartFails(t *testing.T) {
+	payloadPath := writeTaskPayload(t)
+	evidencePath := filepath.Join(t.TempDir(), "start-failure-evidence.json")
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.Header.Get("Authorization") != "Bearer operator-secret" {
+			t.Fatalf("%s auth = %q", r.URL.Path, r.Header.Get("Authorization"))
+		}
+		switch r.URL.Path {
+		case "/operator/tasks":
+			writeAccepted(t, w, map[string]any{
+				"task_run_id":        "taskrun_start_failed",
+				"root_contract_id":   "ctr_start_failed",
+				"root_assignment_id": "asg_start_failed",
+				"status":             "created",
+			})
+		case "/operator/tasks/taskrun_start_failed/start":
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok":          false,
+				"status":      "error",
+				"error_code":  "OPERATOR_TASK_START_FAILED",
+				"message":     "RUNTIME_APPROVAL_POLICY_UNAVAILABLE: command runtime provider is not configured for non-interactive approval",
+				"retryable":   false,
+				"repair_hint": "fix runtime command_policy",
+			})
+		case "/operator/tasks/taskrun_start_failed/evidence":
+			writeAccepted(t, w, map[string]any{
+				"schema_version":  "operator.task.evidence.v1",
+				"task_run_id":     "taskrun_start_failed",
+				"status":          "blocked",
+				"failure_class":   "runtime_approval_blocked",
+				"terminal_reason": "RUNTIME_APPROVAL_POLICY_UNAVAILABLE",
+				"terminal": map[string]any{
+					"status":          "blocked",
+					"failure_class":   "runtime_approval_blocked",
+					"terminal_reason": "RUNTIME_APPROVAL_POLICY_UNAVAILABLE",
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("TEST_OPERATOR_TOKEN", "operator-secret")
+	var stdout, stderr bytes.Buffer
+	err := run([]string{
+		"task", "run",
+		"--backend-url", server.URL,
+		"--operator-token-env", "TEST_OPERATOR_TOKEN",
+		"--payload", payloadPath,
+		"--wait",
+		"--evidence-out", evidencePath,
+	}, &stdout, &stderr, server.Client())
+	if err == nil || !strings.Contains(err.Error(), "OPERATOR_TASK_START_FAILED") {
+		t.Fatalf("task run start failure error = %v; stderr=%s", err, stderr.String())
+	}
+	if strings.Join(paths, ",") != "/operator/tasks,/operator/tasks/taskrun_start_failed/start,/operator/tasks/taskrun_start_failed/evidence" {
+		t.Fatalf("paths = %v, want create start evidence", paths)
+	}
+	rawEvidence, readErr := os.ReadFile(evidencePath)
+	if readErr != nil {
+		t.Fatalf("read evidence out after start failure: %v", readErr)
+	}
+	if !strings.Contains(string(rawEvidence), `"failure_class":"runtime_approval_blocked"`) ||
+		!strings.Contains(string(rawEvidence), `"terminal_reason":"RUNTIME_APPROVAL_POLICY_UNAVAILABLE"`) {
+		t.Fatalf("start failure evidence file = %s, want runtime approval blocker", string(rawEvidence))
+	}
+}
+
+func writeTaskPayload(t *testing.T) string {
 	t.Helper()
-	original := os.Stdout
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("pipe stdout: %v", err)
+	path := filepath.Join(t.TempDir(), "task.json")
+	payload := []byte(`{
+  "run_label": "cli operator task",
+  "idempotency_key": "operator-cli-test",
+  "team_id": "cp-accept-001-three-agent",
+  "team_version": 1,
+  "title": "CLI operator seeded task",
+  "objective": "Create and start through the operator HTTP API.",
+  "target_agent_id": "coordinator",
+  "completion_requirements": ["report"]
+}`)
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		t.Fatalf("write payload: %v", err)
 	}
-	os.Stdout = writer
-	fn()
-	_ = writer.Close()
-	os.Stdout = original
-	raw, err := io.ReadAll(reader)
-	if err != nil {
-		t.Fatalf("read stdout: %v", err)
+	return path
+}
+
+func writeAccepted(t *testing.T, w http.ResponseWriter, data map[string]any) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(map[string]any{
+		"ok":     true,
+		"status": "accepted",
+		"data":   data,
+	}); err != nil {
+		t.Fatalf("write response: %v", err)
 	}
-	return string(raw)
 }

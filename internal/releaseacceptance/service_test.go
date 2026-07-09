@@ -19,6 +19,7 @@ import (
 
 	"coordplane/internal/backend"
 	"coordplane/internal/releaseacceptance"
+	cpruntime "coordplane/internal/runtime"
 	"coordplane/internal/store"
 	"coordplane/internal/teamconfig"
 
@@ -440,7 +441,7 @@ func TestReleaseAcceptanceIsInternalOnlyAndInspectShowsRedactedSummary(t *testin
 	ctx := context.Background()
 	dir := t.TempDir()
 	teamConfigPath := filepath.Join(dir, "team.yaml")
-	if err := os.WriteFile(teamConfigPath, []byte(testTeamConfigYAML), 0o644); err != nil {
+	if err := os.WriteFile(teamConfigPath, []byte(testHTTPDiscoveryTeamConfigYAML), 0o644); err != nil {
 		t.Fatalf("write TeamConfig: %v", err)
 	}
 	app, err := backend.Open(ctx, backend.Config{
@@ -453,7 +454,8 @@ func TestReleaseAcceptanceIsInternalOnlyAndInspectShowsRedactedSummary(t *testin
 	}
 	defer app.Close()
 
-	capabilityEnvelope := getJSON(t, app.Handler, "/capabilities?agent_id=verifier", http.StatusOK)
+	token := insertRuntimeAuthSession(t, ctx, app.DB, "verifier")
+	capabilityEnvelope := getJSONWithBearer(t, app.Handler, "/capabilities", token, http.StatusOK)
 	if containsString(capabilityNames(t, capabilityEnvelope), "release_acceptance.evaluate") {
 		t.Fatalf("public capability discovery exposed release_acceptance.evaluate: %#v", capabilityEnvelope)
 	}
@@ -956,6 +958,80 @@ func getJSON(t *testing.T, handler http.Handler, path string, wantStatus int) ma
 	return decodeObject(t, rec.Body.Bytes())
 }
 
+func getJSONWithBearer(t *testing.T, handler http.Handler, path, token string, wantStatus int) map[string]any {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != wantStatus {
+		t.Fatalf("GET %s status = %d, want %d; body=%s", path, rec.Code, wantStatus, rec.Body.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode GET %s: %v; body=%s", path, err, rec.Body.String())
+	}
+	return out
+}
+
+func insertRuntimeAuthSession(t *testing.T, ctx context.Context, db *sql.DB, agentID string) string {
+	t.Helper()
+	now := nowString()
+	token := "tok_" + agentID + "_discovery"
+	runtimeID := "rt_" + agentID + "_discovery"
+	attemptID := "att_" + agentID + "_discovery"
+	leaseID := "lease_" + agentID + "_discovery"
+	assignmentID := "asg_" + agentID + "_discovery"
+	routeID := "route_" + agentID + "_discovery"
+	contractID := "ctr_" + agentID + "_discovery"
+	execSQL(t, ctx, db, `
+INSERT INTO work_contracts (
+  id, title, objective, issuer_agent_id, issuer_contract_id, target_kind,
+  target_id, status, completion_requirements_json, acceptance_policy_json,
+  created_at, updated_at
+) VALUES (?, 'auth', 'auth discovery', 'operator', '', 'agent', ?, 'active', '{}', '{}', ?, ?)`,
+		contractID, agentID, now, now)
+	execSQL(t, ctx, db, `
+INSERT INTO assignments (
+  id, contract_id, assignee_agent_id, assignee_role, state, priority, reason,
+  session_route_id, created_at, updated_at
+) VALUES (?, ?, ?, '', 'claimed', 0, 'auth discovery', ?, ?, ?)`,
+		assignmentID, contractID, agentID, routeID, now, now)
+	execSQL(t, ctx, db, `
+INSERT INTO session_routes (
+  id, agent_id, runtime_id, cli_backend, session_native_id, route_json, state,
+  created_at, updated_at
+) VALUES (?, ?, ?, 'fake', ?, '{}', 'active', ?, ?)`,
+		routeID, agentID, runtimeID, "native_"+agentID, now, now)
+	execSQL(t, ctx, db, `
+INSERT INTO leases (
+  id, assignment_id, agent_id, runtime_id, session_route_id, state, expires_at,
+  created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+		leaseID, assignmentID, agentID, runtimeID, routeID, time.Now().Add(time.Hour).UTC().Format(testTimeLayout), now, now)
+	execSQL(t, ctx, db, `
+INSERT INTO attempts (
+  id, lease_id, cli_backend, runtime_kind, session_native_id, start_reason,
+  status, transcript_ref, started_at
+) VALUES (?, ?, 'fake', 'external', ?, 'initial', 'running', '', ?)`,
+		attemptID, leaseID, "native_"+agentID, now)
+	execSQL(t, ctx, db, `
+INSERT INTO runtime_instances (
+  id, runtime_id, runtime_profile, runtime_kind, agent_id, attempt_id,
+  lease_id, state, workspace_path, home_path, checks_json, env_keys_json,
+  created_at, updated_at
+) VALUES (?, ?, 'external-local', 'external', ?, ?, ?, 'ready', '/workspace', '/home/agent', '{}', '[]', ?, ?)`,
+		"rti_"+agentID+"_discovery", runtimeID, agentID, attemptID, leaseID, now, now)
+	execSQL(t, ctx, db, `
+INSERT INTO runtime_tokens (
+  token_hash, agent_id, runtime_id, attempt_id, lease_id, state, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)`,
+		cpruntime.RuntimeTokenHash(token), agentID, runtimeID, attemptID, leaseID, now, now)
+	return token
+}
+
 func postJSON(t *testing.T, handler http.Handler, path, body string, wantStatus int) map[string]any {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
@@ -1096,6 +1172,25 @@ agents:
     role_prompt: "verify release evidence"
     runtime_profile: docker-default
     cli_backend: claude
+    skills:
+      - coordplane-service
+    capabilities:
+      - assignment.next
+      - validation.assessment
+      - report.submit
+`
+
+const testHTTPDiscoveryTeamConfigYAML = `
+team_id: release-test
+version: 1
+runtime_profiles:
+  external-local:
+    kind: external
+agents:
+  - id: verifier
+    role_prompt: "verify release evidence"
+    runtime_profile: external-local
+    cli_backend: fake
     skills:
       - coordplane-service
     capabilities:

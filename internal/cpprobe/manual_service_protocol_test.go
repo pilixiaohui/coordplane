@@ -40,6 +40,14 @@ func TestCPProbeManualServiceProtocolSkeletonPreparesIsolatedDeveloperWorkspaces
 
 	link := coordlink.New(app.Dispatcher)
 	trace := cpprobe.ManualTrace{Scenario: cpprobe.ScenarioID}
+	repo, err := app.CodeManagement.RegisterRepository(ctx, codemanagement.RegisterRepositoryInput{
+		RepoPath:        tinyLedger.RepoPath,
+		Alias:           "cp-probe-manual-test",
+		CanonicalBranch: tinyLedger.CanonicalBranch,
+	})
+	if err != nil {
+		t.Fatalf("register tiny ledger repository: %v", err)
+	}
 	root, err := app.Coordination.AddContract(ctx, coordination.AddContractInput{
 		IssuerAgentID: "operator",
 		Title:         "CP-PROBE-001 tiny-ledger root",
@@ -123,7 +131,7 @@ func TestCPProbeManualServiceProtocolSkeletonPreparesIsolatedDeveloperWorkspaces
 	}
 
 	preparedA := acceptedCapability[codemanagement.WorkspacePrepareResult](t, callCapability(t, ctx, link, &trace, "developer-a", "workspace.prepare", "prepare developer-a workspace", map[string]string{
-		"repo_path":        tinyLedger.RepoPath,
+		"repo_id":          repo.ID,
 		"canonical_branch": tinyLedger.CanonicalBranch,
 		"workspace_root":   filepath.Join(dir, "workspaces", "developer-a"),
 		"contract_id":      developerA.Contract.ID,
@@ -136,7 +144,7 @@ func TestCPProbeManualServiceProtocolSkeletonPreparesIsolatedDeveloperWorkspaces
 		"workspace_ref": preparedA.Workspace.BaseRef,
 	})
 	preparedB := acceptedCapability[codemanagement.WorkspacePrepareResult](t, callCapability(t, ctx, link, &trace, "developer-b", "workspace.prepare", "prepare developer-b workspace", map[string]string{
-		"repo_path":        tinyLedger.RepoPath,
+		"repo_id":          repo.ID,
 		"canonical_branch": tinyLedger.CanonicalBranch,
 		"workspace_root":   filepath.Join(dir, "workspaces", "developer-b"),
 		"contract_id":      developerB.Contract.ID,
@@ -258,8 +266,8 @@ func TestCPProbeManualServiceProtocolSkeletonPreparesIsolatedDeveloperWorkspaces
 			workspaceSummary(preparedB.Workspace),
 		},
 		Operations: []cpprobe.GitOperationBrief{
-			{ID: preparedA.OperationID, OperationType: "workspace.prepare", ActorAgentID: "developer-a", WorkspaceID: preparedA.Workspace.ID, RepoID: preparedA.Repository.ID, BeforeRef: "", AfterRef: preparedA.Workspace.HeadRef, State: "succeeded"},
-			{ID: preparedB.OperationID, OperationType: "workspace.prepare", ActorAgentID: "developer-b", WorkspaceID: preparedB.Workspace.ID, RepoID: preparedB.Repository.ID, BeforeRef: "", AfterRef: preparedB.Workspace.HeadRef, State: "succeeded"},
+			{ID: preparedA.OperationID, OperationType: "workspace.prepare", SubjectKind: "operator_debug", ActorAgentID: "developer-a", WorkspaceID: preparedA.Workspace.ID, RepoID: preparedA.Repository.ID, ExecutionLocation: "backend_control_plane", BeforeRef: "", AfterRef: preparedA.Workspace.HeadRef, State: "succeeded"},
+			{ID: preparedB.OperationID, OperationType: "workspace.prepare", SubjectKind: "operator_debug", ActorAgentID: "developer-b", WorkspaceID: preparedB.Workspace.ID, RepoID: preparedB.Repository.ID, ExecutionLocation: "backend_control_plane", BeforeRef: "", AfterRef: preparedB.Workspace.HeadRef, State: "succeeded"},
 		},
 		NoActiveLocks: countRowsWhere(t, ctx, app.DB, "git_locks", "state = 'active'") == 0,
 	}
@@ -321,10 +329,15 @@ func TestCPProbeManualServiceProtocolSkeletonPreparesIsolatedDeveloperWorkspaces
 
 func callCapability(t *testing.T, ctx context.Context, link *coordlink.Adapter, trace *cpprobe.ManualTrace, actor, capabilityName, inputSummary string, input any) cpcapability.Response[json.RawMessage] {
 	t.Helper()
-	return callCapabilityWithRuntime(t, ctx, link, trace, actor, "", capabilityName, inputSummary, input, nil)
+	return callCapabilityWithSubjectKind(t, ctx, link, trace, actor, "operator_debug", "", capabilityName, inputSummary, input, nil)
 }
 
 func callCapabilityWithRuntime(t *testing.T, ctx context.Context, link *coordlink.Adapter, trace *cpprobe.ManualTrace, actor, runtimeID, capabilityName, inputSummary string, input, scope any) cpcapability.Response[json.RawMessage] {
+	t.Helper()
+	return callCapabilityWithSubjectKind(t, ctx, link, trace, actor, "agent", runtimeID, capabilityName, inputSummary, input, scope)
+}
+
+func callCapabilityWithSubjectKind(t *testing.T, ctx context.Context, link *coordlink.Adapter, trace *cpprobe.ManualTrace, actor, subjectKind, runtimeID, capabilityName, inputSummary string, input, scope any) cpcapability.Response[json.RawMessage] {
 	t.Helper()
 	raw := json.RawMessage(`{}`)
 	if input != nil {
@@ -346,7 +359,7 @@ func callCapabilityWithRuntime(t *testing.T, ctx context.Context, link *coordlin
 		CapabilityName: capabilityName,
 		TraceID:        "cp-probe-001-manual",
 		Subject: cpcapability.Subject{
-			Kind:      "agent",
+			Kind:      subjectKind,
 			ID:        actor,
 			AgentID:   actor,
 			RuntimeID: runtimeID,

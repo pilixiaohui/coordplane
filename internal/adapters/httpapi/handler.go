@@ -17,6 +17,10 @@ type CallAuthenticator interface {
 	AuthenticateCall(context.Context, *http.Request, capability.Call) (capability.Call, capability.Response[json.RawMessage])
 }
 
+type SubjectAuthenticator interface {
+	AuthenticateSubject(context.Context, *http.Request, capability.Subject) (capability.Subject, capability.Response[json.RawMessage])
+}
+
 type Handler struct {
 	dispatcher    Dispatcher
 	authenticator CallAuthenticator
@@ -63,7 +67,16 @@ func (h *Handler) handleCall(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleList(w http.ResponseWriter, r *http.Request) {
-	writeResponse(w, h.dispatcher.ListForSubject(r.Context(), subjectFromRequest(r)))
+	subject := subjectFromRequest(r)
+	if authenticator, ok := h.authenticator.(SubjectAuthenticator); ok {
+		authenticated, response := authenticator.AuthenticateSubject(r.Context(), r, subject)
+		if response.Status != "" {
+			writeResponse(w, response)
+			return
+		}
+		subject = authenticated
+	}
+	writeResponse(w, h.dispatcher.ListForSubject(r.Context(), subject))
 }
 
 func writeResponse(w http.ResponseWriter, response capability.Response[json.RawMessage]) {

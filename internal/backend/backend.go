@@ -2,10 +2,12 @@ package backend
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -23,6 +25,7 @@ import (
 	"coordplane/internal/delivery"
 	"coordplane/internal/ids"
 	"coordplane/internal/objects"
+	operator "coordplane/internal/operator"
 	"coordplane/internal/policy"
 	"coordplane/internal/queue"
 	"coordplane/internal/releaseacceptance"
@@ -54,6 +57,9 @@ type Config struct {
 	ClaudeStartArgs      []string
 	ClaudeResumeArgs     []string
 	ClaudeTimeout        time.Duration
+	OperatorToken        string
+	OperatorTokenEnv     string
+	OperatorSubjectID    string
 }
 
 type Backend struct {
@@ -71,6 +77,7 @@ type Backend struct {
 	ReleaseAcceptance        *releaseacceptance.Service
 	CodeManagement           *codemanagement.Service
 	Delivery                 *delivery.Service
+	OperatorTasks            *operator.Service
 	Runner                   *cpruntime.Runner
 	Runtime                  cpruntime.RuntimeBackend
 	RuntimeRegistry          []RuntimeEntry
@@ -85,6 +92,9 @@ type Backend struct {
 	StartedAt                time.Time
 	dbPath                   string
 	listenAddr               string
+	authenticator            *sessionauth.Authenticator
+	operatorToken            string
+	operatorSubjectID        string
 }
 
 type RuntimeEntry struct {
@@ -273,7 +283,7 @@ func Open(ctx context.Context, cfg Config) (*Backend, error) {
 	}
 	dispatcher := policy.NewDispatcher(teamCfg, registry)
 	auditedDispatcher := newAuditedDispatcher(db, dispatcher)
-	runtimeAdapter, cliAdapterRegistry := buildCLIAdapters(st, db, cfg)
+	runtimeAdapter, cliAdapterRegistry := buildCLIAdapters(st, db, cfg, teamCfg)
 	externalRuntime := cpruntime.ExternalRuntime{
 		ID:            "external-local",
 		WorkspaceRoot: cfg.RuntimeWorkspaceRoot,
@@ -299,7 +309,17 @@ func Open(ctx context.Context, cfg Config) (*Backend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("initialize delivery service: %w", err)
 	}
+	operatorSvc, err := operator.NewService(operator.Config{
+		Store:            st,
+		TeamConfig:       teamCfg,
+		TeamConfigLoaded: teamLoaded,
+		Runner:           runner,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("initialize operator task service: %w", err)
+	}
 
+	authenticator := sessionauth.NewAll(db)
 	backend := &Backend{
 		DB:                 db,
 		Store:              st,
@@ -315,6 +335,7 @@ func Open(ctx context.Context, cfg Config) (*Backend, error) {
 		ReleaseAcceptance:  releaseSvc,
 		CodeManagement:     codeSvc,
 		Delivery:           deliverySvc,
+		OperatorTasks:      operatorSvc,
 		Runner:             runner,
 		Runtime:            externalRuntime,
 		RuntimeRegistry:    runtimeRegistry,
@@ -323,8 +344,11 @@ func Open(ctx context.Context, cfg Config) (*Backend, error) {
 		StartedAt:          time.Now().UTC(),
 		dbPath:             cfg.DBPath,
 		listenAddr:         cfg.ListenAddr,
+		authenticator:      authenticator,
+		operatorToken:      cfg.OperatorToken,
+		operatorSubjectID:  cfg.OperatorSubjectID,
 	}
-	backend.Handler = backend.routes(httpapi.NewWithAuthenticator(auditedDispatcher, sessionauth.New(db, "command.run", "validation.assessment", "communication.read")))
+	backend.Handler = backend.routes(httpapi.NewWithAuthenticator(auditedDispatcher, authenticator))
 	closeOnError = false
 	return backend, nil
 }
@@ -397,6 +421,7 @@ func (b *Backend) Inspect(ctx context.Context) (Inspect, error) {
 		"contract_team_scopes",
 		"delivery_attempts",
 		"git_operations",
+		"operator_task_runs",
 	})
 	if err != nil {
 		return Inspect{}, err
@@ -538,6 +563,8 @@ func (b *Backend) routes(capabilityHandler http.Handler) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, inspect)
 	})
+	mux.HandleFunc("/operator/tasks", b.handleOperatorTasks)
+	mux.HandleFunc("/operator/tasks/", b.handleOperatorTaskSubresource)
 	mux.HandleFunc("/skills", b.handleSkillList)
 	mux.HandleFunc("/skills/", b.handleSkillRead)
 	mux.Handle("/call", capabilityHandler)
@@ -545,12 +572,243 @@ func (b *Backend) routes(capabilityHandler http.Handler) http.Handler {
 	return mux
 }
 
+func (b *Backend) handleOperatorTasks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	subject, ok := b.authenticateOperator(w, r)
+	if !ok {
+		return
+	}
+	if b == nil || b.OperatorTasks == nil {
+		writeTypedResponse(w, capability.Error[json.RawMessage]("OPERATOR_TASK_SERVICE_UNAVAILABLE", "operator task service is not initialized", true))
+		return
+	}
+	var input operator.CreateTaskInput
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err := decoder.Decode(&input); err != nil {
+		writeTypedResponse(w, capability.Error[json.RawMessage]("INVALID_OPERATOR_TASK_REQUEST", "request body must be a JSON operator task create payload", false))
+		return
+	}
+	result, err := b.OperatorTasks.CreateTask(r.Context(), subject, input)
+	if err != nil {
+		var rejected operator.RejectedError
+		if errors.As(err, &rejected) {
+			writeTypedResponse(w, capability.Rejected[json.RawMessage](
+				rejected.Code,
+				rejected.Message,
+				capability.WithRepairHint("retry with a valid operator task create payload and loaded TeamConfig"),
+				capability.WithAllowedNextActions("operator.task.create"),
+				capability.WithRetryable(false),
+			))
+			return
+		}
+		writeTypedResponse(w, capability.Error[json.RawMessage]("OPERATOR_TASK_CREATE_FAILED", err.Error(), false))
+		return
+	}
+	response, err := capability.AcceptedJSON(result)
+	if err != nil {
+		writeTypedResponse(w, capability.Error[json.RawMessage]("OPERATOR_TASK_RESPONSE_FAILED", err.Error(), false))
+		return
+	}
+	writeTypedResponse(w, response)
+}
+
+func (b *Backend) handleOperatorTaskSubresource(w http.ResponseWriter, r *http.Request) {
+	taskRunID, action, ok := parseOperatorTaskSubresource(r.URL.Path)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	subject, ok := b.authenticateOperator(w, r)
+	if !ok {
+		return
+	}
+	if b == nil || b.OperatorTasks == nil {
+		writeTypedResponse(w, capability.Error[json.RawMessage]("OPERATOR_TASK_SERVICE_UNAVAILABLE", "operator task service is not initialized", true))
+		return
+	}
+	switch action {
+	case "start":
+		b.handleOperatorTaskStart(w, r, subject, taskRunID)
+	case "wait":
+		b.handleOperatorTaskWait(w, r, subject, taskRunID)
+	case "evidence":
+		b.handleOperatorTaskEvidence(w, r, subject, taskRunID)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (b *Backend) handleOperatorTaskStart(w http.ResponseWriter, r *http.Request, subject operator.Subject, taskRunID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var input operator.StartTaskInput
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err := decoder.Decode(&input); err != nil && !errors.Is(err, io.EOF) {
+		writeTypedResponse(w, capability.Error[json.RawMessage]("INVALID_OPERATOR_TASK_START_REQUEST", "request body must be a JSON operator task start payload", false))
+		return
+	}
+	result, err := b.OperatorTasks.StartTask(r.Context(), subject, taskRunID, input)
+	if err != nil {
+		var rejected operator.RejectedError
+		if errors.As(err, &rejected) {
+			writeTypedResponse(w, capability.Rejected[json.RawMessage](
+				rejected.Code,
+				rejected.Message,
+				capability.WithRepairHint("retry with a valid operator task run and operator token"),
+				capability.WithAllowedNextActions("operator.task.start"),
+				capability.WithRetryable(false),
+			))
+			return
+		}
+		writeTypedResponse(w, capability.Error[json.RawMessage]("OPERATOR_TASK_START_FAILED", err.Error(), false))
+		return
+	}
+	response, err := capability.AcceptedJSON(result)
+	if err != nil {
+		writeTypedResponse(w, capability.Error[json.RawMessage]("OPERATOR_TASK_RESPONSE_FAILED", err.Error(), false))
+		return
+	}
+	writeTypedResponse(w, response)
+}
+
+func (b *Backend) handleOperatorTaskWait(w http.ResponseWriter, r *http.Request, subject operator.Subject, taskRunID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var input operator.WaitTaskInput
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err := decoder.Decode(&input); err != nil && !errors.Is(err, io.EOF) {
+		writeTypedResponse(w, capability.Error[json.RawMessage]("INVALID_OPERATOR_TASK_WAIT_REQUEST", "request body must be a JSON operator task wait payload", false))
+		return
+	}
+	result, err := b.OperatorTasks.WaitTask(r.Context(), subject, taskRunID, input)
+	if err != nil {
+		var rejected operator.RejectedError
+		if errors.As(err, &rejected) {
+			writeTypedResponse(w, capability.Rejected[json.RawMessage](
+				rejected.Code,
+				rejected.Message,
+				capability.WithRepairHint("retry with a valid operator task run and operator token"),
+				capability.WithAllowedNextActions("operator.task.wait", "operator.task.evidence"),
+				capability.WithRetryable(false),
+			))
+			return
+		}
+		writeTypedResponse(w, capability.Error[json.RawMessage]("OPERATOR_TASK_WAIT_FAILED", err.Error(), false))
+		return
+	}
+	response, err := capability.AcceptedJSON(result)
+	if err != nil {
+		writeTypedResponse(w, capability.Error[json.RawMessage]("OPERATOR_TASK_RESPONSE_FAILED", err.Error(), false))
+		return
+	}
+	writeTypedResponse(w, response)
+}
+
+func (b *Backend) handleOperatorTaskEvidence(w http.ResponseWriter, r *http.Request, subject operator.Subject, taskRunID string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	result, err := b.OperatorTasks.Evidence(r.Context(), subject, taskRunID)
+	if err != nil {
+		var rejected operator.RejectedError
+		if errors.As(err, &rejected) {
+			writeTypedResponse(w, capability.Rejected[json.RawMessage](
+				rejected.Code,
+				rejected.Message,
+				capability.WithRepairHint("retry with a valid operator task run and operator token"),
+				capability.WithAllowedNextActions("operator.task.evidence"),
+				capability.WithRetryable(false),
+			))
+			return
+		}
+		writeTypedResponse(w, capability.Error[json.RawMessage]("OPERATOR_TASK_EVIDENCE_FAILED", err.Error(), false))
+		return
+	}
+	response, err := capability.AcceptedJSON(result)
+	if err != nil {
+		writeTypedResponse(w, capability.Error[json.RawMessage]("OPERATOR_TASK_RESPONSE_FAILED", err.Error(), false))
+		return
+	}
+	writeTypedResponse(w, response)
+}
+
+func parseOperatorTaskSubresource(path string) (taskRunID string, action string, ok bool) {
+	rest := strings.TrimPrefix(path, "/operator/tasks/")
+	if rest == path || rest == "" {
+		return "", "", false
+	}
+	taskRunID, action, ok = strings.Cut(rest, "/")
+	if !ok || taskRunID == "" || action == "" || strings.Contains(action, "/") {
+		return "", "", false
+	}
+	return taskRunID, action, true
+}
+
+func (b *Backend) authenticateOperator(w http.ResponseWriter, r *http.Request) (operator.Subject, bool) {
+	if b == nil || strings.TrimSpace(b.operatorToken) == "" {
+		writeOperatorAuthRejected(w, http.StatusUnauthorized, "OPERATOR_AUTH_REQUIRED", "operator bearer token is required")
+		return operator.Subject{}, false
+	}
+	token, ok := operatorBearerToken(r)
+	if !ok {
+		writeOperatorAuthRejected(w, http.StatusUnauthorized, "OPERATOR_AUTH_REQUIRED", "operator bearer token is required")
+		return operator.Subject{}, false
+	}
+	if subtle.ConstantTimeCompare([]byte(token), []byte(b.operatorToken)) != 1 {
+		writeOperatorAuthRejected(w, http.StatusForbidden, "OPERATOR_AUTH_REJECTED", "authorization token is not an operator token")
+		return operator.Subject{}, false
+	}
+	subjectID := strings.TrimSpace(b.operatorSubjectID)
+	if subjectID == "" {
+		subjectID = "operator"
+	}
+	return operator.Subject{Kind: "operator", ID: subjectID}, true
+}
+
+func operatorBearerToken(r *http.Request) (string, bool) {
+	header := ""
+	if r != nil {
+		header = strings.TrimSpace(r.Header.Get("Authorization"))
+	}
+	if header == "" {
+		return "", false
+	}
+	const prefix = "Bearer "
+	if !strings.HasPrefix(header, prefix) {
+		return "", false
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(header, prefix))
+	return token, token != ""
+}
+
+func writeOperatorAuthRejected(w http.ResponseWriter, status int, code, message string) {
+	writeJSON(w, status, capability.Rejected[json.RawMessage](
+		code,
+		message,
+		capability.WithRepairHint("retry with the configured operator token"),
+		capability.WithAllowedNextActions("operator.task.create"),
+		capability.WithRetryable(false),
+	))
+}
+
 func (b *Backend) handleSkillList(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	agentID := agentIDFromRequest(r)
+	subject, ok := b.authenticateDiscoverySubject(w, r)
+	if !ok {
+		return
+	}
+	agentID := subject.AgentID
 	summaries, err := b.Skills.ListForAgent(r.Context(), b.TeamConfig, agentID)
 	if err != nil {
 		writeTypedResponse(w, capability.Rejected[json.RawMessage](
@@ -586,7 +844,11 @@ func (b *Backend) handleSkillRead(w http.ResponseWriter, r *http.Request) {
 		))
 		return
 	}
-	agentID := agentIDFromRequest(r)
+	subject, ok := b.authenticateDiscoverySubject(w, r)
+	if !ok {
+		return
+	}
+	agentID := subject.AgentID
 	skill, err := b.Skills.ReadForAgent(r.Context(), b.TeamConfig, agentID, name)
 	if err != nil {
 		writeTypedResponse(w, capability.Rejected[json.RawMessage](
@@ -606,7 +868,20 @@ func (b *Backend) handleSkillRead(w http.ResponseWriter, r *http.Request) {
 	writeTypedResponse(w, response)
 }
 
-func buildCLIAdapters(st *store.Store, db *sql.DB, cfg Config) (cpruntime.CLIAdapter, []CLIAdapterEntry) {
+func (b *Backend) authenticateDiscoverySubject(w http.ResponseWriter, r *http.Request) (capability.Subject, bool) {
+	if b == nil || b.authenticator == nil {
+		writeTypedResponse(w, capability.Error[json.RawMessage]("AUTH_STORE_UNAVAILABLE", "runtime token store is unavailable", true))
+		return capability.Subject{}, false
+	}
+	subject, response := b.authenticator.AuthenticateSubject(r.Context(), r, subjectFromRequest(r))
+	if response.Status != "" {
+		writeTypedResponse(w, response)
+		return capability.Subject{}, false
+	}
+	return subject, true
+}
+
+func buildCLIAdapters(st *store.Store, db *sql.DB, cfg Config, teamCfg teamconfig.Config) (cpruntime.CLIAdapter, []CLIAdapterEntry) {
 	fake := cpruntime.NewFakeCLIAdapter()
 	registrations := []cpruntime.CLIAdapterRegistration{{
 		Name:    "fake",
@@ -624,12 +899,13 @@ func buildCLIAdapters(st *store.Store, db *sql.DB, cfg Config) (cpruntime.CLIAda
 		claude, err := cpruntime.NewClaudeCommandCLIAdapter(cpruntime.CommandCLIAdapterConfig{
 			Store: st,
 			Profile: cpruntime.CommandCLIProfile{
-				Name:       "claude",
-				Backend:    "claude",
-				Binary:     cfg.ClaudeBinary,
-				StartArgs:  cfg.ClaudeStartArgs,
-				ResumeArgs: cfg.ClaudeResumeArgs,
-				Timeout:    cfg.ClaudeTimeout,
+				Name:                   "claude",
+				Backend:                "claude",
+				Binary:                 cfg.ClaudeBinary,
+				StartArgs:              cfg.ClaudeStartArgs,
+				ResumeArgs:             cfg.ClaudeResumeArgs,
+				Timeout:                cfg.ClaudeTimeout,
+				RuntimeCommandPolicies: runtimeCommandPolicies(teamCfg),
 			},
 		})
 		if err == nil {
@@ -651,9 +927,39 @@ func buildCLIAdapters(st *store.Store, db *sql.DB, cfg Config) (cpruntime.CLIAda
 	return cpruntime.NewCLIAdapterRegistry(db, registrations), entries
 }
 
+func runtimeCommandPolicies(teamCfg teamconfig.Config) map[string]cpruntime.RuntimeCommandPolicy {
+	if len(teamCfg.RuntimeProfiles) == 0 {
+		return nil
+	}
+	out := make(map[string]cpruntime.RuntimeCommandPolicy, len(teamCfg.RuntimeProfiles))
+	for name, profile := range teamCfg.RuntimeProfiles {
+		policy := profile.CommandPolicy
+		if profile.Kind != "docker" && !policy.NonInteractiveApproval && len(policy.AllowCoordlinkCapabilities) == 0 {
+			continue
+		}
+		out[name] = cpruntime.RuntimeCommandPolicy{
+			NonInteractiveApproval:     policy.NonInteractiveApproval,
+			AllowCoordlinkCapabilities: append([]string(nil), policy.AllowCoordlinkCapabilities...),
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func (cfg Config) withDefaults() Config {
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = ":8080"
+	}
+	if cfg.OperatorTokenEnv == "" {
+		cfg.OperatorTokenEnv = "COORDPLANE_OPERATOR_TOKEN"
+	}
+	if cfg.OperatorToken == "" && cfg.OperatorTokenEnv != "" {
+		cfg.OperatorToken = strings.TrimSpace(os.Getenv(cfg.OperatorTokenEnv))
+	}
+	if cfg.OperatorSubjectID == "" {
+		cfg.OperatorSubjectID = "operator"
 	}
 	if cfg.TeamID == "" {
 		cfg.TeamID = defaultTeamID
@@ -832,12 +1138,28 @@ func listenAddrForURL(listenAddr string) string {
 	return listenAddr
 }
 
-func agentIDFromRequest(r *http.Request) string {
-	agentID := r.URL.Query().Get("agent_id")
-	if agentID == "" {
-		agentID = r.Header.Get("X-CoordPlane-Agent-ID")
+func subjectFromRequest(r *http.Request) capability.Subject {
+	agentID := requestValue(r, "agent_id", "X-CoordPlane-Agent-ID")
+	runtimeID := requestValue(r, "runtime_id", "X-CoordPlane-Runtime-ID")
+	workspaceID := requestValue(r, "workspace_id", "X-CoordPlane-Workspace-ID")
+	return capability.Subject{
+		Kind:        "agent",
+		ID:          agentID,
+		AgentID:     agentID,
+		RuntimeID:   runtimeID,
+		WorkspaceID: workspaceID,
 	}
-	return agentID
+}
+
+func requestValue(r *http.Request, queryKey, headerKey string) string {
+	if r == nil {
+		return ""
+	}
+	value := r.URL.Query().Get(queryKey)
+	if value == "" {
+		value = r.Header.Get(headerKey)
+	}
+	return value
 }
 
 func writeTypedResponse(w http.ResponseWriter, response capability.Response[json.RawMessage]) {

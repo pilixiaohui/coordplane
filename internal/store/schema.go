@@ -496,6 +496,21 @@ CREATE INDEX IF NOT EXISTS git_rollback_points_operation_idx
   ON git_rollback_points(operation_id, state);
 `
 
+const controlledGitOperationEvidenceSchemaSQL = `
+ALTER TABLE git_repositories ADD COLUMN alias TEXT NOT NULL DEFAULT '';
+
+CREATE UNIQUE INDEX IF NOT EXISTS git_repositories_alias_idx
+  ON git_repositories(alias, canonical_branch)
+  WHERE alias <> '';
+
+ALTER TABLE git_operations ADD COLUMN runtime_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE git_operations ADD COLUMN execution_location TEXT NOT NULL DEFAULT 'backend_control_plane';
+`
+
+const controlledGitOperationSubjectKindSchemaSQL = `
+ALTER TABLE git_operations ADD COLUMN subject_kind TEXT NOT NULL DEFAULT 'agent_runtime';
+`
+
 const runtimeEvidenceSchemaSQL = `
 CREATE TABLE IF NOT EXISTS runtime_instances (
   id TEXT PRIMARY KEY,
@@ -753,4 +768,30 @@ ALTER TABLE mailbox_items ADD COLUMN trigger_turn INTEGER NOT NULL DEFAULT 1;
 
 CREATE INDEX IF NOT EXISTS mailbox_items_envelope_idx
   ON mailbox_items(envelope_id);
+`
+
+const operatorTaskRunsSchemaSQL = `
+CREATE TABLE IF NOT EXISTS operator_task_runs (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  idempotency_key TEXT NOT NULL UNIQUE,
+  run_label TEXT NOT NULL DEFAULT '',
+  operator_subject_kind TEXT NOT NULL,
+  operator_subject_id TEXT NOT NULL,
+  team_id TEXT NOT NULL,
+  team_version INTEGER NOT NULL,
+  root_contract_id TEXT NOT NULL,
+  root_assignment_id TEXT NOT NULL,
+  root_envelope_id TEXT NOT NULL,
+  root_mailbox_id TEXT NOT NULL,
+  request_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(root_contract_id) REFERENCES work_contracts(id),
+  FOREIGN KEY(root_assignment_id) REFERENCES assignments(id),
+  FOREIGN KEY(root_envelope_id) REFERENCES agent_communication_envelopes(id),
+  FOREIGN KEY(root_mailbox_id) REFERENCES mailbox_items(id)
+);
+
+CREATE INDEX IF NOT EXISTS operator_task_runs_root_idx
+  ON operator_task_runs(root_contract_id);
 `

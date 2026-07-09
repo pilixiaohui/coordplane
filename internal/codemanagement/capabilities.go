@@ -63,6 +63,7 @@ func (s *Service) handleWorkspacePrepare(ctx context.Context, call capability.Ca
 		return invalidInput("workspace.prepare", err)
 	}
 	input.AgentID = agentIDFromCall(call)
+	input.SubjectKind = subjectKindFromCall(call)
 	if input.RuntimeID == "" {
 		input.RuntimeID = call.Subject.RuntimeID
 	}
@@ -87,6 +88,7 @@ func (s *Service) handleWorkspaceSync(ctx context.Context, call capability.Call)
 		return invalidInput("workspace.sync", err)
 	}
 	input.AgentID = agentIDFromCall(call)
+	input.SubjectKind = subjectKindFromCall(call)
 	if call.IdempotencyKey != "" {
 		input.IdempotencyKey = call.IdempotencyKey
 	}
@@ -126,6 +128,7 @@ func (s *Service) handleGitCommit(ctx context.Context, call capability.Call) cap
 		return invalidInput("git.commit", err)
 	}
 	input.AgentID = agentIDFromCall(call)
+	input.SubjectKind = subjectKindFromCall(call)
 	if call.IdempotencyKey != "" {
 		input.IdempotencyKey = call.IdempotencyKey
 	}
@@ -138,6 +141,7 @@ func (s *Service) handleChangeSetSubmit(ctx context.Context, call capability.Cal
 		return invalidInput("changeset.submit", err)
 	}
 	input.AgentID = agentIDFromCall(call)
+	input.SubjectKind = subjectKindFromCall(call)
 	if call.IdempotencyKey != "" {
 		input.IdempotencyKey = call.IdempotencyKey
 	}
@@ -150,6 +154,7 @@ func (s *Service) handleChangeSetAbandon(ctx context.Context, call capability.Ca
 		return invalidInput("changeset.abandon", err)
 	}
 	input.AgentID = agentIDFromCall(call)
+	input.SubjectKind = subjectKindFromCall(call)
 	if call.IdempotencyKey != "" {
 		input.IdempotencyKey = call.IdempotencyKey
 	}
@@ -162,6 +167,7 @@ func (s *Service) handleMergePreview(ctx context.Context, call capability.Call) 
 		return invalidInput("git.merge_preview", err)
 	}
 	input.AgentID = agentIDFromCall(call)
+	input.SubjectKind = subjectKindFromCall(call)
 	if call.IdempotencyKey != "" {
 		input.IdempotencyKey = call.IdempotencyKey
 	}
@@ -174,6 +180,7 @@ func (s *Service) handleMergeApply(ctx context.Context, call capability.Call) ca
 		return invalidInput("git.merge_apply", err)
 	}
 	input.AgentID = agentIDFromCall(call)
+	input.SubjectKind = subjectKindFromCall(call)
 	if call.IdempotencyKey != "" {
 		input.IdempotencyKey = call.IdempotencyKey
 	}
@@ -195,6 +202,7 @@ func (s *Service) handleResolveMerge(ctx context.Context, call capability.Call) 
 		return invalidInput("git.resolve", err)
 	}
 	input.AgentID = agentIDFromCall(call)
+	input.SubjectKind = subjectKindFromCall(call)
 	if call.IdempotencyKey != "" {
 		input.IdempotencyKey = call.IdempotencyKey
 	}
@@ -207,6 +215,7 @@ func (s *Service) handleAbortMerge(ctx context.Context, call capability.Call) ca
 		return invalidInput("git.abort", err)
 	}
 	input.AgentID = agentIDFromCall(call)
+	input.SubjectKind = subjectKindFromCall(call)
 	if call.IdempotencyKey != "" {
 		input.IdempotencyKey = call.IdempotencyKey
 	}
@@ -219,6 +228,7 @@ func (s *Service) handleRollback(ctx context.Context, call capability.Call) capa
 		return invalidInput("git.rollback", err)
 	}
 	input.AgentID = agentIDFromCall(call)
+	input.SubjectKind = subjectKindFromCall(call)
 	if call.IdempotencyKey != "" {
 		input.IdempotencyKey = call.IdempotencyKey
 	}
@@ -272,6 +282,13 @@ func agentIDFromCall(call capability.Call) string {
 		return call.Subject.ID
 	}
 	return call.Subject.ID
+}
+
+func subjectKindFromCall(call capability.Call) string {
+	if call.Subject.Kind == subjectKindOperatorDebug {
+		return subjectKindOperatorDebug
+	}
+	return subjectKindAgentRuntime
 }
 
 func invalidInput(capabilityName string, err error) capability.Response[json.RawMessage] {

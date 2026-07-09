@@ -35,6 +35,9 @@ func TestMigrateCreatesCanonicalTablesAndIsIdempotent(t *testing.T) {
 		"012_release_acceptances",
 		"013_contract_team_scopes",
 		"014_agent_communication_envelopes",
+		"015_controlled_git_operation_evidence",
+		"016_controlled_git_operation_subject_kind",
+		"017_operator_task_runs",
 	}; !equalStrings(got, want) {
 		t.Fatalf("applied migrations = %v, want %v", got, want)
 	}
@@ -86,6 +89,7 @@ func TestMigrateCreatesCanonicalTablesAndIsIdempotent(t *testing.T) {
 		"validation_assessments",
 		"release_acceptances",
 		"contract_team_scopes",
+		"operator_task_runs",
 	} {
 		var name string
 		err := s.DB().QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
@@ -97,6 +101,14 @@ func TestMigrateCreatesCanonicalTablesAndIsIdempotent(t *testing.T) {
 		if !columnExists(t, ctx, s.DB(), "mailbox_items", column) {
 			t.Fatalf("mailbox_items.%s missing after migration", column)
 		}
+	}
+	for _, column := range []string{"runtime_id", "execution_location", "subject_kind"} {
+		if !columnExists(t, ctx, s.DB(), "git_operations", column) {
+			t.Fatalf("git_operations.%s missing after migration", column)
+		}
+	}
+	if !columnExists(t, ctx, s.DB(), "git_repositories", "alias") {
+		t.Fatal("git_repositories.alias missing after migration")
 	}
 }
 

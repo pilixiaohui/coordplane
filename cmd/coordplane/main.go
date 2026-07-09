@@ -1,234 +1,460 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
-	"os/signal"
-	"path/filepath"
+	"strconv"
 	"strings"
-	"syscall"
-	"time"
 
 	"coordplane/internal/backend"
 	"coordplane/internal/releasehealth"
 )
 
+type typedResponse struct {
+	OK        bool            `json:"ok"`
+	Status    string          `json:"status"`
+	Data      json.RawMessage `json:"data,omitempty"`
+	ErrorCode string          `json:"error_code,omitempty"`
+	Message   string          `json:"message,omitempty"`
+}
+
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	if err := run(os.Args[1:], os.Stdout, os.Stderr, http.DefaultClient); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func run(args []string) error {
+func run(args []string, stdout, stderr io.Writer, client *http.Client) error {
+	if client == nil {
+		client = http.DefaultClient
+	}
 	if len(args) == 0 {
-		return usageError("missing subcommand")
+		printUsage(stdout)
+		return nil
 	}
 	switch args[0] {
-	case "serve":
-		return runServe(args[1:])
-	case "release-health":
-		return runReleaseHealth(args[1:])
 	case "-h", "--help", "help":
-		printUsage()
+		printUsage(stdout)
 		return nil
+	case "serve":
+		return runServe(args[1:], stderr)
+	case "task":
+		return runTask(args[1:], stdout, stderr, client)
+	case "release-health":
+		return runReleaseHealth(args[1:], stdout, stderr)
 	default:
-		return usageError("unknown subcommand " + args[0])
+		return fmt.Errorf("unknown command %q", args[0])
 	}
 }
 
-func runServe(args []string) error {
-	flags := flag.NewFlagSet("coordplane serve", flag.ContinueOnError)
-	flags.SetOutput(os.Stderr)
+func printUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  coordplane serve --db PATH [--listen ADDR] [--teamconfig PATH]")
+	fmt.Fprintln(w, "  coordplane task create --backend-url URL --payload FILE [--operator-token-env ENV]")
+	fmt.Fprintln(w, "  coordplane task run --backend-url URL --payload FILE [--wait] [--evidence-out PATH] [--operator-token-env ENV]")
+	fmt.Fprintln(w, "  coordplane release-health cp-accept-001 [flags]")
+	fmt.Fprintln(w, "  coordplane release-health cp-probe-001 [flags]")
+}
+
+func runServe(args []string, stderr io.Writer) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	var cfg backend.Config
-	flags.StringVar(&cfg.DBPath, "db", "", "SQLite database path")
-	flags.StringVar(&cfg.ListenAddr, "listen", ":8080", "HTTP listen address")
-	flags.StringVar(&cfg.TeamConfigPath, "teamconfig", "", "optional TeamConfig YAML to load at startup")
-	flags.StringVar(&cfg.TeamID, "team-id", "", "TeamConfig team_id to load when --teamconfig is omitted")
-	flags.StringVar(&cfg.RuntimeWorkspaceRoot, "runtime-workspace-root", "", "external runtime workspace root")
-	flags.StringVar(&cfg.RuntimeHomeRoot, "runtime-home-root", "", "external runtime home root")
-	flags.StringVar(&cfg.DockerNetwork, "docker-network", "", "Docker network for managed docker runtimes")
-	flags.StringVar(&cfg.BackendURL, "backend-url", "", "backend URL injected into runner sessions")
-	flags.StringVar(&cfg.CoordlinkPath, "coordlink", "", "coordlink binary path for docker runtime injection")
-	flags.StringVar(&cfg.ClaudeBinary, "claude-bin", "", "container path for the claude CLI profile")
 	var claudeEnv string
-	flags.StringVar(&claudeEnv, "claude-env", "", "comma-separated allowlisted host env keys to inject into Claude CLI runtime; defaults to the built-in Claude CLI env contract")
-	if err := flags.Parse(args); err != nil {
+	fs.StringVar(&cfg.DBPath, "db", "", "sqlite database path")
+	fs.StringVar(&cfg.ListenAddr, "listen", "", "listen address")
+	fs.StringVar(&cfg.TeamConfigPath, "teamconfig", "", "TeamConfig YAML path")
+	fs.StringVar(&cfg.TeamID, "team-id", "", "TeamConfig team id override")
+	fs.StringVar(&cfg.BackendURL, "backend-url", "", "public backend URL for runtime env")
+	fs.StringVar(&cfg.RuntimeWorkspaceRoot, "runtime-workspace-root", "", "external runtime workspace root")
+	fs.StringVar(&cfg.RuntimeHomeRoot, "runtime-home-root", "", "external runtime home root")
+	fs.StringVar(&cfg.DockerNetwork, "docker-network", "", "Docker runtime network")
+	fs.StringVar(&cfg.CoordlinkPath, "coordlink", "", "coordlink binary path for Docker runtime")
+	fs.StringVar(&cfg.ClaudeBinary, "claude-bin", "", "Claude binary path")
+	fs.StringVar(&claudeEnv, "claude-env", "", "comma-separated Claude env allowlist")
+	fs.StringVar(&cfg.OperatorToken, "operator-token", "", "operator bearer token")
+	fs.StringVar(&cfg.OperatorTokenEnv, "operator-token-env", "", "operator token env var")
+	fs.StringVar(&cfg.OperatorSubjectID, "operator-subject-id", "", "operator subject id")
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	cfg.ClaudeEnvKeys = splitCSV(claudeEnv)
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	fmt.Fprintf(os.Stderr, "coordplane serve listening on %s using db %s\n", firstNonEmpty(cfg.ListenAddr, ":8080"), cfg.DBPath)
-	return backend.RunServe(ctx, cfg)
+	return backend.RunServe(context.Background(), cfg)
 }
 
-func runReleaseHealth(args []string) error {
+func runTask(args []string, stdout, stderr io.Writer, client *http.Client) error {
 	if len(args) == 0 {
-		return usageError("release-health requires a scenario")
+		return errors.New("task subcommand is required")
+	}
+	switch args[0] {
+	case "create":
+		return runTaskCreate(args[1:], stdout, stderr, client)
+	case "run":
+		return runTaskRun(args[1:], stdout, stderr, client)
+	default:
+		return fmt.Errorf("unknown task subcommand %q", args[0])
+	}
+}
+
+type taskFlags struct {
+	backendURL          string
+	payloadPath         string
+	operatorToken       string
+	operatorTokenEnv    string
+	startIdempotencyKey string
+	wait                bool
+	evidenceOut         string
+	waitTimeoutSeconds  int
+	waitTimeoutMillis   int
+	pollIntervalMillis  int
+}
+
+func commonTaskFlags(name string, stderr io.Writer) (*flag.FlagSet, *taskFlags) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfg := &taskFlags{}
+	fs.StringVar(&cfg.backendURL, "backend-url", "", "CoordPlane backend URL")
+	fs.StringVar(&cfg.payloadPath, "payload", "", "operator task payload JSON file")
+	fs.StringVar(&cfg.operatorToken, "operator-token", "", "operator bearer token")
+	fs.StringVar(&cfg.operatorTokenEnv, "operator-token-env", "COORDPLANE_OPERATOR_TOKEN", "operator token env var")
+	return fs, cfg
+}
+
+func runTaskCreate(args []string, stdout, stderr io.Writer, client *http.Client) error {
+	fs, cfg := commonTaskFlags("task create", stderr)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	token, payload, err := cfg.operatorRequestParts()
+	if err != nil {
+		return err
+	}
+	raw, response, err := postOperatorJSON(client, cfg.backendURL, "/operator/tasks", token, payload)
+	if err != nil {
+		return err
+	}
+	if response.Status != "accepted" {
+		return fmt.Errorf("operator task create rejected: %s", string(raw))
+	}
+	_, err = stdout.Write(append(raw, '\n'))
+	return err
+}
+
+func runTaskRun(args []string, stdout, stderr io.Writer, client *http.Client) error {
+	fs, cfg := commonTaskFlags("task run", stderr)
+	fs.StringVar(&cfg.startIdempotencyKey, "start-idempotency-key", "", "operator task start idempotency key")
+	fs.BoolVar(&cfg.wait, "wait", false, "wait for operator task terminal evidence state")
+	fs.StringVar(&cfg.evidenceOut, "evidence-out", "", "write operator evidence bundle JSON to path")
+	fs.IntVar(&cfg.waitTimeoutSeconds, "wait-timeout-seconds", 30, "operator task wait timeout in seconds")
+	fs.IntVar(&cfg.waitTimeoutMillis, "wait-timeout-ms", 0, "operator task wait timeout in milliseconds")
+	fs.IntVar(&cfg.pollIntervalMillis, "poll-interval-ms", 250, "operator task wait poll interval in milliseconds")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	token, payload, err := cfg.operatorRequestParts()
+	if err != nil {
+		return err
+	}
+	createRaw, createResponse, err := postOperatorJSON(client, cfg.backendURL, "/operator/tasks", token, payload)
+	if err != nil {
+		return err
+	}
+	if createResponse.Status != "accepted" {
+		return fmt.Errorf("operator task create rejected: %s", string(createRaw))
+	}
+	var createData struct {
+		TaskRunID string `json:"task_run_id"`
+	}
+	if err := json.Unmarshal(createResponse.Data, &createData); err != nil {
+		return fmt.Errorf("decode operator task create response: %w", err)
+	}
+	if createData.TaskRunID == "" {
+		return errors.New("operator task create response missing task_run_id")
+	}
+	startKey := strings.TrimSpace(cfg.startIdempotencyKey)
+	if startKey == "" {
+		startKey = "start:" + createData.TaskRunID
+	}
+	startBody, err := json.Marshal(map[string]string{"idempotency_key": startKey})
+	if err != nil {
+		return err
+	}
+	startPath := "/operator/tasks/" + url.PathEscape(createData.TaskRunID) + "/start"
+	startRaw, startResponse, err := postOperatorJSON(client, cfg.backendURL, startPath, token, startBody)
+	if err != nil {
+		_ = cfg.writeEvidenceAfterStartFailure(client, token, createData.TaskRunID)
+		return err
+	}
+	if startResponse.Status != "accepted" {
+		_ = cfg.writeEvidenceAfterStartFailure(client, token, createData.TaskRunID)
+		return fmt.Errorf("operator task start rejected: %s", string(startRaw))
+	}
+	if cfg.wait {
+		waitBody, err := json.Marshal(map[string]int{
+			"timeout_seconds":      cfg.waitTimeoutSeconds,
+			"timeout_millis":       cfg.waitTimeoutMillis,
+			"poll_interval_millis": cfg.pollIntervalMillis,
+		})
+		if err != nil {
+			return err
+		}
+		waitPath := "/operator/tasks/" + url.PathEscape(createData.TaskRunID) + "/wait"
+		waitRaw, waitResponse, err := postOperatorJSON(client, cfg.backendURL, waitPath, token, waitBody)
+		if err != nil {
+			return err
+		}
+		if waitResponse.Status != "accepted" {
+			return fmt.Errorf("operator task wait rejected: %s", string(waitRaw))
+		}
+		if strings.TrimSpace(cfg.evidenceOut) != "" {
+			if err := writeEvidenceFromWaitResponse(cfg.evidenceOut, waitResponse); err != nil {
+				return err
+			}
+		}
+		_, err = stdout.Write(append(waitRaw, '\n'))
+		return err
+	}
+	if strings.TrimSpace(cfg.evidenceOut) != "" {
+		evidencePath := "/operator/tasks/" + url.PathEscape(createData.TaskRunID) + "/evidence"
+		evidenceRaw, evidenceResponse, err := getOperatorJSON(client, cfg.backendURL, evidencePath, token)
+		if err != nil {
+			return err
+		}
+		if evidenceResponse.Status != "accepted" {
+			return fmt.Errorf("operator task evidence rejected: %s", string(evidenceRaw))
+		}
+		if err := writeRawJSONFile(cfg.evidenceOut, evidenceResponse.Data); err != nil {
+			return err
+		}
+	}
+	_, err = stdout.Write(append(startRaw, '\n'))
+	return err
+}
+
+func (cfg taskFlags) writeEvidenceAfterStartFailure(client *http.Client, token, taskRunID string) error {
+	if !cfg.wait || strings.TrimSpace(cfg.evidenceOut) == "" || strings.TrimSpace(taskRunID) == "" {
+		return nil
+	}
+	evidencePath := "/operator/tasks/" + url.PathEscape(taskRunID) + "/evidence"
+	_, evidenceResponse, err := getOperatorJSON(client, cfg.backendURL, evidencePath, token)
+	if err != nil {
+		return err
+	}
+	if evidenceResponse.Status != "accepted" {
+		return fmt.Errorf("operator task evidence rejected after start failure")
+	}
+	return writeRawJSONFile(cfg.evidenceOut, evidenceResponse.Data)
+}
+
+func (cfg taskFlags) operatorRequestParts() (string, []byte, error) {
+	if strings.TrimSpace(cfg.backendURL) == "" {
+		return "", nil, errors.New("--backend-url is required")
+	}
+	if strings.TrimSpace(cfg.payloadPath) == "" {
+		return "", nil, errors.New("--payload is required")
+	}
+	token := strings.TrimSpace(cfg.operatorToken)
+	if token == "" && strings.TrimSpace(cfg.operatorTokenEnv) != "" {
+		token = strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.operatorTokenEnv)))
+	}
+	if token == "" {
+		return "", nil, errors.New("operator token is required")
+	}
+	payload, err := os.ReadFile(cfg.payloadPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("read payload: %w", err)
+	}
+	if !json.Valid(payload) {
+		return "", nil, errors.New("payload must be valid JSON")
+	}
+	return token, payload, nil
+}
+
+func postOperatorJSON(client *http.Client, backendURL, path, token string, body []byte) ([]byte, typedResponse, error) {
+	endpoint := strings.TrimRight(backendURL, "/") + path
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, typedResponse{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, typedResponse{}, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, typedResponse{}, err
+	}
+	var decoded typedResponse
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return raw, typedResponse{}, fmt.Errorf("decode operator response: %w; body=%s", err, string(raw))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return raw, decoded, fmt.Errorf("operator endpoint returned HTTP %d: %s", resp.StatusCode, string(raw))
+	}
+	return raw, decoded, nil
+}
+
+func getOperatorJSON(client *http.Client, backendURL, path, token string) ([]byte, typedResponse, error) {
+	endpoint := strings.TrimRight(backendURL, "/") + path
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, typedResponse{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, typedResponse{}, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, typedResponse{}, err
+	}
+	var decoded typedResponse
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return raw, typedResponse{}, fmt.Errorf("decode operator response: %w; body=%s", err, string(raw))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return raw, decoded, fmt.Errorf("operator endpoint returned HTTP %d: %s", resp.StatusCode, string(raw))
+	}
+	return raw, decoded, nil
+}
+
+func runReleaseHealth(args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("release-health scenario is required")
 	}
 	switch args[0] {
 	case releasehealth.ScenarioCPAccept001:
-		return runReleaseHealthCPAccept001(args[1:])
+		return runCPAccept001(args[1:], stdout, stderr)
 	case releasehealth.ScenarioCPProbe001:
-		return runReleaseHealthCPProbe001(args[1:])
+		return runCPProbe001(args[1:], stdout, stderr)
 	default:
-		return usageError("unknown release-health scenario " + args[0])
+		return fmt.Errorf("unknown release-health scenario %q", args[0])
 	}
 }
 
-func runReleaseHealthCPAccept001(args []string) error {
-	flags := flag.NewFlagSet("coordplane release-health cp-accept-001", flag.ContinueOnError)
-	flags.SetOutput(os.Stderr)
-	var dbPath, rootContractID, teamID, teamConfig, runLabel, createdBy string
-	var listenAddr, backendURL, coordlinkPath, dockerNetwork, claudeBinary, claudeEnv, workDir, inspectOut string
-	var teamVersion int
-	flags.StringVar(&dbPath, "db", filepath.Join(releasehealth.DefaultWorkDir, "coordplane.db"), "SQLite database path for durable release evidence")
-	flags.StringVar(&rootContractID, "root-contract", "", "optional existing root contract id to evaluate instead of driving a new workflow")
-	flags.StringVar(&teamID, "team-id", releasehealth.DefaultTeamID, "TeamConfig team_id expected to own the root contract and evidence")
-	flags.IntVar(&teamVersion, "team-version", releasehealth.DefaultTeamVersion, "TeamConfig version expected to own the root contract and evidence")
-	flags.StringVar(&teamConfig, "teamconfig", "", "TeamConfig YAML for the formal Docker/Claude release-health workflow")
-	flags.StringVar(&listenAddr, "listen", releasehealth.DefaultListen, "HTTP listen address used while driving the workflow")
-	flags.StringVar(&backendURL, "backend-url", releasehealth.DefaultPublicURL, "backend URL injected into Docker runtime coordlink sessions")
-	flags.StringVar(&coordlinkPath, "coordlink", filepath.Join(releasehealth.DefaultWorkDir, "bin", "coordlink"), "coordlink binary path mounted into Docker runtime sessions")
-	flags.StringVar(&dockerNetwork, "docker-network", releasehealth.DefaultNetwork, "Docker network for managed runtime containers")
-	flags.StringVar(&claudeBinary, "claude-bin", "/usr/local/bin/claude", "container path for the Claude CLI profile")
-	flags.StringVar(&claudeEnv, "claude-env", releasehealth.ClaudeEnvCSV(), "comma-separated allowlisted host env keys to inject into Claude CLI runtime")
-	flags.StringVar(&workDir, "workdir", releasehealth.DefaultWorkDir, "release-health work directory for repository, DB, binaries, and evidence")
-	flags.StringVar(&inspectOut, "inspect-out", "", "optional path to write inspect JSON after evaluation")
-	flags.StringVar(&runLabel, "run-label", "cp-accept-001-release-health", "idempotency label for this release-health evaluation")
-	flags.StringVar(&createdBy, "created-by", "release-health", "operator/internal actor recorded on release_acceptances")
-	if err := flags.Parse(args); err != nil {
+func runCPAccept001(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("release-health cp-accept-001", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var cfg releasehealth.CPAccept001Config
+	var teamVersion string
+	var claudeEnv string
+	var inspectOut string
+	fs.StringVar(&cfg.DBPath, "db", "", "sqlite database path")
+	fs.StringVar(&cfg.RootContract, "root-contract", "", "root contract id to verify")
+	fs.StringVar(&cfg.TeamID, "team-id", "", "team id")
+	fs.StringVar(&teamVersion, "team-version", "", "team version")
+	fs.StringVar(&cfg.TeamConfig, "teamconfig", "", "TeamConfig YAML path")
+	fs.StringVar(&cfg.ListenAddr, "listen", "", "listen address")
+	fs.StringVar(&cfg.BackendURL, "backend-url", "", "backend URL")
+	fs.StringVar(&cfg.CoordlinkPath, "coordlink", "", "coordlink binary path")
+	fs.StringVar(&cfg.DockerNetwork, "docker-network", "", "Docker network")
+	fs.StringVar(&cfg.ClaudeBinary, "claude-bin", "", "Claude binary path")
+	fs.StringVar(&claudeEnv, "claude-env", "", "comma-separated Claude env allowlist")
+	fs.StringVar(&cfg.WorkDir, "workdir", "", "workdir")
+	fs.StringVar(&cfg.RunLabel, "run-label", "", "run label")
+	fs.StringVar(&cfg.CreatedBy, "created-by", "", "created by")
+	fs.StringVar(&inspectOut, "inspect-out", "", "write inspect JSON to path")
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if rootContractID == "" {
-		rootContractID = strings.TrimSpace(os.Getenv("COORDPLANE_ROOT_CONTRACT_ID"))
+	version, err := parseOptionalInt(teamVersion, "team-version")
+	if err != nil {
+		return err
 	}
-	if dbPath == "" {
-		return fmt.Errorf("coordplane release-health: --db is required")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
-	defer cancel()
-	result, err := releasehealth.RunCPAccept001(ctx, releasehealth.CPAccept001Config{
-		DBPath:        dbPath,
-		RootContract:  rootContractID,
-		TeamID:        teamID,
-		TeamVersion:   teamVersion,
-		TeamConfig:    teamConfig,
-		ListenAddr:    listenAddr,
-		BackendURL:    backendURL,
-		CoordlinkPath: coordlinkPath,
-		DockerNetwork: dockerNetwork,
-		ClaudeBinary:  claudeBinary,
-		ClaudeEnvKeys: splitCSV(claudeEnv),
-		WorkDir:       workDir,
-		RunLabel:      runLabel,
-		CreatedBy:     createdBy,
-	})
-	acceptance := result.Acceptance
-	encoder := json.NewEncoder(os.Stdout)
-	encoder.SetIndent("", "  ")
-	if acceptance.ID != "" {
-		if encodeErr := encoder.Encode(acceptance); encodeErr != nil {
-			return encodeErr
-		}
-	}
+	cfg.TeamVersion = version
+	cfg.ClaudeEnvKeys = splitCSV(claudeEnv)
+	ctx := commandContext()
+	result, runErr := releasehealth.RunCPAccept001(ctx, cfg)
 	if inspectOut != "" && result.Inspect != nil {
-		if writeErr := writeJSONFile(inspectOut, result.Inspect); writeErr != nil {
-			return writeErr
+		if err := writeJSONFile(inspectOut, result.Inspect); err != nil && runErr == nil {
+			runErr = err
 		}
 	}
-	return err
+	if err := json.NewEncoder(stdout).Encode(result.Acceptance); err != nil && runErr == nil {
+		runErr = err
+	}
+	return runErr
 }
 
-func runReleaseHealthCPProbe001(args []string) error {
-	flags := flag.NewFlagSet("coordplane release-health cp-probe-001", flag.ContinueOnError)
-	flags.SetOutput(os.Stderr)
-	var dbPath, teamID, teamConfig, workDir, artifactDir, listenAddr, backendURL string
-	var dockerTeamID, dockerTeamConfig, coordlinkPath, dockerNetwork, claudeBinary, claudeEnv string
-	var runtimeWorkspaceRoot, runtimeHomeRoot, environmentBlocker string
-	var teamVersion, dockerTeamVersion int
-	flags.StringVar(&dbPath, "db", filepath.Join(releasehealth.DefaultWorkDir, "coordplane.db"), "SQLite database path for durable CP-PROBE release evidence")
-	flags.StringVar(&teamID, "team-id", releasehealth.CPProbeDefaultTeamID, "TeamConfig team_id expected for CP-PROBE evidence")
-	flags.IntVar(&teamVersion, "team-version", releasehealth.CPProbeDefaultTeamVersion, "TeamConfig version expected for CP-PROBE evidence")
-	flags.StringVar(&teamConfig, "teamconfig", releasehealth.CPProbeTeamConfigPath, "TeamConfig YAML for the CP-PROBE release-health workflow")
-	flags.StringVar(&dockerTeamID, "docker-team-id", releasehealth.CPProbeDockerTeamID, "Docker/Claude TeamConfig team_id expected for CP-PROBE replay evidence")
-	flags.IntVar(&dockerTeamVersion, "docker-team-version", releasehealth.CPProbeDockerTeamVersion, "Docker/Claude TeamConfig version expected for CP-PROBE replay evidence")
-	flags.StringVar(&dockerTeamConfig, "docker-teamconfig", releasehealth.CPProbeDockerTeamConfigPath, "TeamConfig YAML for the CP-PROBE Docker/Claude replay stage")
-	flags.StringVar(&coordlinkPath, "coordlink", filepath.Join(releasehealth.DefaultWorkDir, "bin", "coordlink"), "coordlink binary path mounted into Docker runtime sessions")
-	flags.StringVar(&dockerNetwork, "docker-network", releasehealth.DefaultNetwork, "Docker network for managed CP-PROBE runtime containers")
-	flags.StringVar(&claudeBinary, "claude-bin", "/usr/local/bin/claude", "container path for the Claude CLI profile")
-	flags.StringVar(&claudeEnv, "claude-env", releasehealth.ClaudeEnvCSV(), "comma-separated allowlisted host env keys to inject into Claude CLI runtime")
-	flags.StringVar(&workDir, "workdir", releasehealth.DefaultWorkDir, "release-health work directory for CP-PROBE DB, fixtures, and artifacts")
-	flags.StringVar(&artifactDir, "artifact-dir", "", "directory for CP-PROBE artifact files; defaults to --workdir")
-	flags.StringVar(&listenAddr, "listen", releasehealth.DefaultListen, "backend listen address recorded for CP-PROBE backend")
-	flags.StringVar(&backendURL, "backend-url", releasehealth.DefaultPublicURL, "backend URL injected into non-Docker runtime sessions")
-	flags.StringVar(&runtimeWorkspaceRoot, "runtime-workspace-root", "", "external runtime workspace root; defaults under --workdir")
-	flags.StringVar(&runtimeHomeRoot, "runtime-home-root", "", "external runtime home root; defaults under --workdir")
-	flags.StringVar(&environmentBlocker, "environment-blocker", "", "blocker recorded in the CP-PROBE conclusion when Docker/Claude replay is unavailable")
-	if err := flags.Parse(args); err != nil {
+func runCPProbe001(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("release-health cp-probe-001", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var cfg releasehealth.CPProbe001Config
+	var teamVersion string
+	var dockerTeamVersion string
+	var claudeEnv string
+	fs.StringVar(&cfg.DBPath, "db", "", "sqlite database path")
+	fs.StringVar(&cfg.TeamID, "team-id", "", "team id")
+	fs.StringVar(&teamVersion, "team-version", "", "team version")
+	fs.StringVar(&cfg.TeamConfig, "teamconfig", "", "TeamConfig YAML path")
+	fs.StringVar(&cfg.DockerTeamID, "docker-team-id", "", "Docker team id")
+	fs.StringVar(&dockerTeamVersion, "docker-team-version", "", "Docker team version")
+	fs.StringVar(&cfg.DockerTeamConfig, "docker-teamconfig", "", "Docker TeamConfig YAML path")
+	fs.StringVar(&cfg.ListenAddr, "listen", "", "listen address")
+	fs.StringVar(&cfg.BackendURL, "backend-url", "", "backend URL")
+	fs.StringVar(&cfg.CoordlinkPath, "coordlink", "", "coordlink binary path")
+	fs.StringVar(&cfg.DockerNetwork, "docker-network", "", "Docker network")
+	fs.StringVar(&cfg.ClaudeBinary, "claude-bin", "", "Claude binary path")
+	fs.StringVar(&claudeEnv, "claude-env", "", "comma-separated Claude env allowlist")
+	fs.StringVar(&cfg.WorkDir, "workdir", "", "workdir")
+	fs.StringVar(&cfg.ArtifactDir, "artifact-dir", "", "artifact dir")
+	fs.StringVar(&cfg.RuntimeWorkspaceRoot, "runtime-workspace-root", "", "runtime workspace root")
+	fs.StringVar(&cfg.RuntimeHomeRoot, "runtime-home-root", "", "runtime home root")
+	fs.StringVar(&cfg.EnvironmentBlocker, "environment-blocker", "", "environment blocker text")
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if dbPath == "" {
-		return fmt.Errorf("coordplane release-health: --db is required")
+	version, err := parseOptionalInt(teamVersion, "team-version")
+	if err != nil {
+		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
-	defer cancel()
-	result, err := releasehealth.RunCPProbe001(ctx, releasehealth.CPProbe001Config{
-		DBPath:               dbPath,
-		TeamID:               teamID,
-		TeamVersion:          teamVersion,
-		TeamConfig:           teamConfig,
-		DockerTeamID:         dockerTeamID,
-		DockerTeamVersion:    dockerTeamVersion,
-		DockerTeamConfig:     dockerTeamConfig,
-		ListenAddr:           listenAddr,
-		BackendURL:           backendURL,
-		CoordlinkPath:        coordlinkPath,
-		DockerNetwork:        dockerNetwork,
-		ClaudeBinary:         claudeBinary,
-		ClaudeEnvKeys:        splitCSV(claudeEnv),
-		WorkDir:              workDir,
-		ArtifactDir:          artifactDir,
-		RuntimeWorkspaceRoot: runtimeWorkspaceRoot,
-		RuntimeHomeRoot:      runtimeHomeRoot,
-		EnvironmentBlocker:   environmentBlocker,
-	})
-	encoder := json.NewEncoder(os.Stdout)
-	encoder.SetIndent("", "  ")
-	if encodeErr := encoder.Encode(result); encodeErr != nil {
-		return encodeErr
+	dockerVersion, err := parseOptionalInt(dockerTeamVersion, "docker-team-version")
+	if err != nil {
+		return err
 	}
-	return err
+	cfg.TeamVersion = version
+	cfg.DockerTeamVersion = dockerVersion
+	cfg.ClaudeEnvKeys = splitCSV(claudeEnv)
+	result, runErr := releasehealth.RunCPProbe001(commandContext(), cfg)
+	if err := json.NewEncoder(stdout).Encode(result); err != nil && runErr == nil {
+		runErr = err
+	}
+	return runErr
 }
 
-func usageError(message string) error {
-	printUsage()
-	return fmt.Errorf("coordplane: %s", message)
-}
-
-func printUsage() {
-	fmt.Fprintln(os.Stderr, "usage:")
-	fmt.Fprintln(os.Stderr, "  coordplane serve --db /path/to/coordplane.db --listen :8080 [--teamconfig team.yaml] [--coordlink /path/to/coordlink] [--docker-network coordplane-release-health] [--claude-bin /usr/local/bin/claude] [--claude-env ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL,ANTHROPIC_MODEL]")
-	fmt.Fprintln(os.Stderr, "  coordplane release-health cp-accept-001 [--db .coordplane-release-health/coordplane.db] [--coordlink .coordplane-release-health/bin/coordlink] [--root-contract ctr_root]")
-	fmt.Fprintln(os.Stderr, "  coordplane release-health cp-probe-001 [--db .coordplane-release-health/coordplane.db] [--workdir .coordplane-release-health] [--docker-teamconfig team_config/fixtures/cp_probe_001_docker_claude.yaml] [--coordlink .coordplane-release-health/bin/coordlink]")
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if value != "" {
-			return value
-		}
+func parseOptionalInt(value, name string) (int, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, nil
 	}
-	return ""
+	out, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("--%s must be an integer", name)
+	}
+	return out, nil
 }
 
 func splitCSV(value string) []string {
-	var out []string
-	for _, part := range strings.Split(value, ",") {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		if part != "" {
 			out = append(out, part)
@@ -238,17 +464,33 @@ func splitCSV(value string) []string {
 }
 
 func writeJSONFile(path string, value any) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(value); err != nil {
 		return err
 	}
-	file, err := os.Create(path)
-	if err != nil {
-		return err
+	return os.WriteFile(path, buf.Bytes(), 0o644)
+}
+
+func writeEvidenceFromWaitResponse(path string, response typedResponse) error {
+	var data struct {
+		Evidence json.RawMessage `json:"evidence"`
 	}
-	defer func() {
-		_ = file.Close()
-	}()
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(value)
+	if err := json.Unmarshal(response.Data, &data); err != nil {
+		return fmt.Errorf("decode operator wait evidence: %w", err)
+	}
+	if len(data.Evidence) == 0 {
+		return errors.New("operator task wait response missing evidence")
+	}
+	return writeRawJSONFile(path, data.Evidence)
+}
+
+func writeRawJSONFile(path string, raw json.RawMessage) error {
+	if !json.Valid(raw) {
+		return errors.New("operator evidence is not valid JSON")
+	}
+	return os.WriteFile(path, append(append([]byte(nil), raw...), '\n'), 0o644)
+}
+
+func commandContext() context.Context {
+	return context.Background()
 }

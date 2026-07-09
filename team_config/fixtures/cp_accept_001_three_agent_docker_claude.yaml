@@ -5,6 +5,25 @@ runtime_profiles:
     kind: docker
     image: coordplane/claude-runtime:release-health
     workspace_mode: isolated
+    command_policy:
+      non_interactive_approval: true
+      allow_coordlink_capabilities:
+        - assignment.next
+        - assignment.watch
+        - communication.read
+        - contract.add
+        - contract.complete
+        - contract.context
+        - contract.current
+        - contract.wait
+        - mailbox.get
+        - mailbox.list
+        - mailbox.resolve
+        - message.send
+        - object.inspect
+        - object.read
+        - report.submit
+        - validation.assessment
 termination:
   terminal_contract_type: root
   accepted_by_capability: validation.assessment

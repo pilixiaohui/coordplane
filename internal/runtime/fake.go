@@ -35,8 +35,12 @@ func (a *FakeCLIAdapter) Start(ctx context.Context, req StartRequest) (StartResu
 	defer a.mu.Unlock()
 	a.nextSession++
 	a.starts = append(a.starts, cloneStartRequest(req))
+	sessionID := req.SessionNativeID
+	if sessionID == "" {
+		sessionID = fmt.Sprintf("fake-session-%s-%d", req.AgentID, a.nextSession)
+	}
 	return StartResult{
-		SessionNativeID: fmt.Sprintf("fake-session-%s-%d", req.AgentID, a.nextSession),
+		SessionNativeID: sessionID,
 		TranscriptRef:   fmt.Sprintf("fake-transcript-%s-%d", req.AgentID, a.nextSession),
 	}, nil
 }

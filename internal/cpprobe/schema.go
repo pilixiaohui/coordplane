@@ -75,15 +75,18 @@ type WorkspaceSummary struct {
 }
 
 type GitOperationBrief struct {
-	ID            string `json:"id"`
-	OperationType string `json:"operation_type"`
-	ActorAgentID  string `json:"actor_agent_id"`
-	WorkspaceID   string `json:"workspace_id,omitempty"`
-	RepoID        string `json:"repo_id"`
-	BeforeRef     string `json:"before_ref"`
-	AfterRef      string `json:"after_ref"`
-	State         string `json:"state"`
-	ErrorCode     string `json:"error_code,omitempty"`
+	ID                string `json:"id"`
+	OperationType     string `json:"operation_type"`
+	SubjectKind       string `json:"subject_kind,omitempty"`
+	ActorAgentID      string `json:"actor_agent_id"`
+	WorkspaceID       string `json:"workspace_id,omitempty"`
+	RepoID            string `json:"repo_id"`
+	RuntimeID         string `json:"runtime_id,omitempty"`
+	ExecutionLocation string `json:"execution_location"`
+	BeforeRef         string `json:"before_ref"`
+	AfterRef          string `json:"after_ref"`
+	State             string `json:"state"`
+	ErrorCode         string `json:"error_code,omitempty"`
 }
 
 type RollbackPointBrief struct {
@@ -170,6 +173,12 @@ func (s GitOperationSummary) Validate() error {
 	for _, op := range s.Operations {
 		if op.ID == "" || op.OperationType == "" || op.ActorAgentID == "" || op.RepoID == "" || op.State == "" {
 			return fmt.Errorf("git operation %q requires id, operation_type, actor_agent_id, repo_id, and state", op.ID)
+		}
+		if op.ExecutionLocation == "" {
+			return fmt.Errorf("git operation %q requires execution_location", op.ID)
+		}
+		if op.RuntimeID == "" && op.SubjectKind != "operator_debug" {
+			return fmt.Errorf("git operation %q requires runtime_id for ordinary agent operation or subject_kind=operator_debug", op.ID)
 		}
 	}
 	for _, point := range s.RollbackPoints {

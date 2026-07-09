@@ -109,6 +109,62 @@ agents:
 	}
 }
 
+func TestParseYAMLLoadsRuntimeCommandPolicyAllowlist(t *testing.T) {
+	cfg, err := teamconfig.ParseYAML([]byte(`
+team_id: runtime-policy-team
+version: 1
+runtime_profiles:
+  docker-default:
+    kind: docker
+    image: coordplane/claude-runtime:test
+    workspace_mode: isolated
+    command_policy:
+      non_interactive_approval: true
+      allow_coordlink_capabilities:
+        - contract.current
+        - contract.add
+agents:
+  - id: coordinator
+    runtime_profile: docker-default
+    cli_backend: claude
+    capabilities:
+      - contract.current
+      - contract.add
+`))
+	if err != nil {
+		t.Fatalf("parse TeamConfig command policy: %v", err)
+	}
+	policy := cfg.RuntimeProfiles["docker-default"].CommandPolicy
+	if !policy.NonInteractiveApproval ||
+		len(policy.AllowCoordlinkCapabilities) != 2 ||
+		policy.AllowCoordlinkCapabilities[0] != "contract.current" ||
+		policy.AllowCoordlinkCapabilities[1] != "contract.add" {
+		t.Fatalf("command policy = %+v, want explicit non-interactive coordlink allowlist", policy)
+	}
+}
+
+func TestParseYAMLRejectsDuplicateRuntimeCommandPolicyCapabilities(t *testing.T) {
+	_, err := teamconfig.ParseYAML([]byte(`
+team_id: runtime-policy-team
+version: 1
+runtime_profiles:
+  docker-default:
+    kind: docker
+    command_policy:
+      non_interactive_approval: true
+      allow_coordlink_capabilities:
+        - contract.current
+        - contract.current
+agents:
+  - id: coordinator
+    runtime_profile: docker-default
+    cli_backend: claude
+`))
+	if err == nil || !strings.Contains(err.Error(), "duplicates coordlink capability") {
+		t.Fatalf("ParseYAML duplicate policy capability error = %v, want validation rejection", err)
+	}
+}
+
 func TestSaveYAMLRejectsUnsafeConfigWithoutWritingCanonicalState(t *testing.T) {
 	for name, raw := range map[string]string{
 		"unknown secrets field": `

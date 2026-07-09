@@ -335,6 +335,458 @@ func TestCommandCLIAdapterMissingBootstrapPromptFailsClosedWithSessionEvidence(t
 	}
 }
 
+func TestCommandCLIAdapterCommandPolicyAllowsConfiguredCoordlinkCapability(t *testing.T) {
+	ctx := context.Background()
+	exec := &recordingContainerExecutor{results: []cpruntime.ContainerExecResult{{
+		ProcessRef: "exec-coordlink",
+		ExitCode:   0,
+		Stdout:     []byte(`{"status":"accepted"}`),
+	}}}
+	db, st, _, _ := newCommandCLIBase(t)
+	insertAttemptOwnershipRows(t, ctx, db, "att_policy_allow", "lease_missing_prompt", "asg_missing_prompt", "ctr_missing_prompt", "developer", "rt_policy_allow")
+	insertReadyRuntimeInstance(t, ctx, db, "rt_policy_allow", "att_policy_allow", "developer")
+	adapter, err := cpruntime.NewClaudeCommandCLIAdapter(cpruntime.CommandCLIAdapterConfig{
+		Store: st,
+		Profile: cpruntime.CommandCLIProfile{
+			Name:       "coordlink-direct",
+			Backend:    "coordlink",
+			Binary:     cpruntime.ContainerCoordlinkPath,
+			StartArgs:  []string{"call", "contract.current"},
+			ResumeArgs: []string{"call", "contract.current"},
+			Timeout:    timeSecond(),
+			RuntimeCommandPolicies: map[string]cpruntime.RuntimeCommandPolicy{
+				"docker-default": {
+					NonInteractiveApproval:     true,
+					AllowCoordlinkCapabilities: []string{"contract.current", "contract.add"},
+				},
+			},
+		},
+		Executor: exec,
+	})
+	if err != nil {
+		t.Fatalf("new command adapter: %v", err)
+	}
+	_, err = adapter.Start(ctx, cpruntime.StartRequest{
+		AgentID:         "developer",
+		AttemptID:       "att_policy_allow",
+		AssignmentID:    "asg_missing_prompt",
+		LeaseID:         "lease_missing_prompt",
+		ContractID:      "ctr_missing_prompt",
+		RuntimeID:       "rt_policy_allow",
+		CLIBackend:      "coordlink",
+		Workspace:       cpruntime.ContainerWorkspacePath,
+		HomeDir:         cpruntime.ContainerHomePath,
+		Env:             runtimeEnv(t, "developer", "rt_policy_allow", "att_policy_allow"),
+		BootstrapPrompt: "policy allowlist direct coordlink call",
+	})
+	if err != nil {
+		t.Fatalf("Start allowed coordlink command: %v", err)
+	}
+	if len(exec.specs) != 1 {
+		t.Fatalf("exec specs = %+v, want one allowed coordlink command", exec.specs)
+	}
+	if got := exec.specs[0].Command; len(got) != 3 || got[0] != cpruntime.ContainerCoordlinkPath || got[1] != "call" || got[2] != "contract.current" {
+		t.Fatalf("exec command = %#v, want allowed coordlink call contract.current", got)
+	}
+}
+
+func TestCommandCLIAdapterCommandPolicyDeniesUnauthorizedCommandsWithoutExecutorSideEffects(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		binary    string
+		startArgs []string
+		forbidden []string
+	}{
+		{
+			name:      "shell escape",
+			binary:    "/bin/sh",
+			startArgs: []string{"-lc", "/usr/local/bin/coordlink call contract.current"},
+			forbidden: []string{"/usr/local/bin/coordlink call contract.current"},
+		},
+		{
+			name:      "raw db",
+			binary:    "/usr/bin/sqlite3",
+			startArgs: []string{"/workspace/project/coordplane.db"},
+			forbidden: []string{"coordplane.db"},
+		},
+		{
+			name:      "token env dump",
+			binary:    "/usr/bin/env",
+			startArgs: []string{"COORDPLANE_TOKEN"},
+			forbidden: []string{"COORDPLANE_TOKEN_DENY_SENTINEL"},
+		},
+		{
+			name:      "docker",
+			binary:    "/usr/bin/docker",
+			startArgs: []string{"ps"},
+			forbidden: []string{"docker"},
+		},
+		{
+			name:      "network",
+			binary:    "/usr/bin/curl",
+			startArgs: []string{"https://example.invalid"},
+			forbidden: []string{"https://example.invalid"},
+		},
+		{
+			name:      "unauthorized coordlink capability",
+			binary:    cpruntime.ContainerCoordlinkPath,
+			startArgs: []string{"call", "command.run"},
+			forbidden: []string{"command.run"},
+		},
+		{
+			name:      "authorization header in argv",
+			binary:    cpruntime.ContainerCoordlinkPath,
+			startArgs: []string{"call", "contract.current", "--input", `{"header":"Authorization: Bearer SECRET_HEADER_SENTINEL"}`},
+			forbidden: []string{"SECRET_HEADER_SENTINEL", "Authorization"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			exec := &recordingContainerExecutor{results: []cpruntime.ContainerExecResult{{ProcessRef: "should-not-run", ExitCode: 0}}}
+			db, st, _, _ := newCommandCLIBase(t)
+			insertAttemptOwnershipRows(t, ctx, db, "att_policy_deny", "lease_missing_prompt", "asg_missing_prompt", "ctr_missing_prompt", "developer", "rt_policy_deny")
+			insertReadyRuntimeInstance(t, ctx, db, "rt_policy_deny", "att_policy_deny", "developer")
+			adapter, err := cpruntime.NewClaudeCommandCLIAdapter(cpruntime.CommandCLIAdapterConfig{
+				Store: st,
+				Profile: cpruntime.CommandCLIProfile{
+					Name:       "policy-deny",
+					Backend:    "coordlink",
+					Binary:     tc.binary,
+					StartArgs:  tc.startArgs,
+					ResumeArgs: []string{"call", "contract.current"},
+					Timeout:    timeSecond(),
+					RuntimeCommandPolicies: map[string]cpruntime.RuntimeCommandPolicy{
+						"docker-default": {
+							NonInteractiveApproval:     true,
+							AllowCoordlinkCapabilities: []string{"contract.current", "contract.add"},
+						},
+					},
+				},
+				Executor: exec,
+			})
+			if err != nil {
+				t.Fatalf("new command adapter: %v", err)
+			}
+			env := runtimeEnv(t, "developer", "rt_policy_deny", "att_policy_deny")
+			env["COORDPLANE_TOKEN"] = "COORDPLANE_TOKEN_DENY_SENTINEL"
+			_, startErr := adapter.Start(ctx, cpruntime.StartRequest{
+				AgentID:         "developer",
+				AttemptID:       "att_policy_deny",
+				AssignmentID:    "asg_missing_prompt",
+				LeaseID:         "lease_missing_prompt",
+				ContractID:      "ctr_missing_prompt",
+				RuntimeID:       "rt_policy_deny",
+				CLIBackend:      "coordlink",
+				Workspace:       cpruntime.ContainerWorkspacePath,
+				HomeDir:         cpruntime.ContainerHomePath,
+				Env:             env,
+				BootstrapPrompt: "policy denied command should not execute",
+			})
+			if startErr == nil || !strings.Contains(startErr.Error(), cpruntime.TerminalReasonCommandPolicyDenied) {
+				t.Fatalf("Start error = %v, want command policy denial", startErr)
+			}
+			if len(exec.specs) != 0 {
+				t.Fatalf("executor specs = %+v, want no exec for denied command", exec.specs)
+			}
+			cliSessions, err := cpruntime.ListCLISessions(ctx, db)
+			if err != nil {
+				t.Fatalf("list cli sessions: %v", err)
+			}
+			if len(cliSessions) != 0 {
+				t.Fatalf("cli sessions = %+v, want no session side effect for denied command", cliSessions)
+			}
+			for _, marker := range tc.forbidden {
+				if marker != "" && strings.Contains(startErr.Error(), marker) {
+					t.Fatalf("denial leaked forbidden marker %q: %v", marker, startErr)
+				}
+			}
+			if strings.Contains(startErr.Error(), "COORDPLANE_TOKEN_DENY_SENTINEL") {
+				t.Fatalf("denial leaked runtime token: %v", startErr)
+			}
+		})
+	}
+}
+
+func TestCommandCLIAdapterAppliesClaudeProviderPolicyAndRequiresAcceptedCapabilityCall(t *testing.T) {
+	ctx := context.Background()
+	exec := &recordingContainerExecutor{results: []cpruntime.ContainerExecResult{{
+		ProcessRef: "fake-claude-coordlink",
+		ExitCode:   0,
+	}}}
+	db, st, _, _ := newCommandCLIBase(t)
+	exec.onExec = func(spec cpruntime.ContainerExecSpec) {
+		insertAcceptedCapabilityCall(t, ctx, db, spec.Env["COORDPLANE_TRACE_ID"], "developer", "contract.current")
+	}
+	insertAttemptOwnershipRows(t, ctx, db, "att_provider_policy", "lease_missing_prompt", "asg_missing_prompt", "ctr_missing_prompt", "developer", "rt_provider_policy")
+	insertReadyRuntimeInstance(t, ctx, db, "rt_provider_policy", "att_provider_policy", "developer")
+	adapter, err := cpruntime.NewClaudeCommandCLIAdapter(cpruntime.CommandCLIAdapterConfig{
+		Store: st,
+		Profile: cpruntime.CommandCLIProfile{
+			Name:    "claude",
+			Backend: "claude",
+			Binary:  "/usr/local/bin/claude",
+			Timeout: timeSecond(),
+			RuntimeCommandPolicies: map[string]cpruntime.RuntimeCommandPolicy{
+				"docker-default": {
+					NonInteractiveApproval:     true,
+					AllowCoordlinkCapabilities: []string{"contract.current", "contract.add"},
+				},
+			},
+		},
+		Executor: exec,
+	})
+	if err != nil {
+		t.Fatalf("new command adapter: %v", err)
+	}
+	_, err = adapter.Start(ctx, cpruntime.StartRequest{
+		AgentID:         "developer",
+		AttemptID:       "att_provider_policy",
+		AssignmentID:    "asg_missing_prompt",
+		LeaseID:         "lease_missing_prompt",
+		ContractID:      "ctr_missing_prompt",
+		RuntimeID:       "rt_provider_policy",
+		CLIBackend:      "claude",
+		Workspace:       cpruntime.ContainerWorkspacePath,
+		HomeDir:         cpruntime.ContainerHomePath,
+		Env:             runtimeEnv(t, "developer", "rt_provider_policy", "att_provider_policy"),
+		BootstrapPrompt: "provider uses allowlisted coordlink calls",
+	})
+	if err != nil {
+		t.Fatalf("Start with provider policy: %v", err)
+	}
+	if len(exec.specs) != 1 {
+		t.Fatalf("executor specs = %+v, want one Claude provider exec", exec.specs)
+	}
+	command := exec.specs[0].Command
+	joined := strings.Join(command, "\n")
+	for _, want := range []string{
+		"--safe-mode",
+		"--disable-slash-commands",
+		"--strict-mcp-config",
+		"--permission-mode\ndontAsk",
+		"--tools\nBash",
+		"Bash(" + cpruntime.ContainerCoordlinkPath + " call contract.current *)",
+		"Bash(" + cpruntime.ContainerCoordlinkPath + " call contract.add *)",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("provider command = %#v, missing %q", command, want)
+		}
+	}
+	for _, forbidden := range []string{"bypassPermissions", "dangerously-skip-permissions", "Bash(*)", "Authorization", "Bearer"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("provider command leaked or widened policy with %q: %#v", forbidden, command)
+		}
+	}
+	env := exec.specs[0].Env
+	if env["COORDPLANE_PROVIDER_POLICY_MODE"] != "strict_coordlink_call" {
+		t.Fatalf("provider policy mode env = %q, want strict_coordlink_call", env["COORDPLANE_PROVIDER_POLICY_MODE"])
+	}
+	if env["COORDPLANE_PROVIDER_ALLOWED_CAPABILITIES"] != "contract.add,contract.current" {
+		t.Fatalf("provider allowlist env = %q, want sorted contract.add,contract.current", env["COORDPLANE_PROVIDER_ALLOWED_CAPABILITIES"])
+	}
+	if env["COORDPLANE_PROVIDER_AUDIT_TRACE_ID"] == "" ||
+		env["COORDPLANE_PROVIDER_AUDIT_AGENT_ID"] != "developer" ||
+		env["COORDPLANE_PROVIDER_AUDIT_LEASE_ID"] != "lease_missing_prompt" {
+		t.Fatalf("provider audit env = trace:%q agent:%q lease:%q, want same trace/agent/lease audit anchors",
+			env["COORDPLANE_PROVIDER_AUDIT_TRACE_ID"],
+			env["COORDPLANE_PROVIDER_AUDIT_AGENT_ID"],
+			env["COORDPLANE_PROVIDER_AUDIT_LEASE_ID"])
+	}
+	for _, forbidden := range []string{"COORDPLANE_TOKEN_ARGV_SENTINEL", "Authorization", "Bearer", "/home/", "/tmp/"} {
+		if strings.Contains(env["COORDPLANE_PROVIDER_ALLOWED_CAPABILITIES"], forbidden) {
+			t.Fatalf("provider allowlist env leaked forbidden marker %q: %q", forbidden, env["COORDPLANE_PROVIDER_ALLOWED_CAPABILITIES"])
+		}
+	}
+	cliSessions, err := cpruntime.ListCLISessions(ctx, db)
+	if err != nil {
+		t.Fatalf("list cli sessions: %v", err)
+	}
+	if len(cliSessions) != 1 || cliSessions[0].State != "exited" {
+		t.Fatalf("cli sessions = %+v, want exited provider-policy session", cliSessions)
+	}
+}
+
+func TestCommandCLIAdapterRejectsProviderProgressWithoutMatchingLease(t *testing.T) {
+	ctx := context.Background()
+	exec := &recordingContainerExecutor{results: []cpruntime.ContainerExecResult{{
+		ProcessRef: "fake-claude-wrong-lease",
+		ExitCode:   0,
+	}}}
+	db, st, _, _ := newCommandCLIBase(t)
+	exec.onExec = func(spec cpruntime.ContainerExecSpec) {
+		insertAcceptedCapabilityCallWithLease(t, ctx, db, spec.Env["COORDPLANE_TRACE_ID"], "developer", "contract.current", "lease_attacker")
+	}
+	insertAttemptOwnershipRows(t, ctx, db, "att_policy_wrong_lease", "lease_missing_prompt", "asg_missing_prompt", "ctr_missing_prompt", "developer", "rt_policy_wrong_lease")
+	insertReadyRuntimeInstance(t, ctx, db, "rt_policy_wrong_lease", "att_policy_wrong_lease", "developer")
+	adapter, err := cpruntime.NewClaudeCommandCLIAdapter(cpruntime.CommandCLIAdapterConfig{
+		Store: st,
+		Profile: cpruntime.CommandCLIProfile{
+			Name:    "claude",
+			Backend: "claude",
+			Binary:  "/usr/local/bin/claude",
+			Timeout: timeSecond(),
+			RuntimeCommandPolicies: map[string]cpruntime.RuntimeCommandPolicy{
+				"docker-default": {
+					NonInteractiveApproval:     true,
+					AllowCoordlinkCapabilities: []string{"contract.current", "contract.add"},
+				},
+			},
+		},
+		Executor: exec,
+	})
+	if err != nil {
+		t.Fatalf("new command adapter: %v", err)
+	}
+	_, startErr := adapter.Start(ctx, cpruntime.StartRequest{
+		AgentID:         "developer",
+		AttemptID:       "att_policy_wrong_lease",
+		AssignmentID:    "asg_missing_prompt",
+		LeaseID:         "lease_missing_prompt",
+		ContractID:      "ctr_missing_prompt",
+		RuntimeID:       "rt_policy_wrong_lease",
+		CLIBackend:      "claude",
+		Workspace:       cpruntime.ContainerWorkspacePath,
+		HomeDir:         cpruntime.ContainerHomePath,
+		Env:             runtimeEnv(t, "developer", "rt_policy_wrong_lease", "att_policy_wrong_lease"),
+		BootstrapPrompt: "provider call with wrong lease must not count",
+	})
+	if startErr == nil || !strings.Contains(startErr.Error(), cpruntime.TerminalReasonApprovalPolicyUnavailable) {
+		t.Fatalf("Start error = %v, want runtime approval unavailable for wrong lease audit", startErr)
+	}
+	if class, ok := cpruntime.ErrorFailureClass(startErr); !ok || class != cpruntime.FailureClassRuntimeApprovalBlocked {
+		t.Fatalf("failure class = %s/%v, want runtime_approval_blocked", class, ok)
+	}
+	cliSessions, err := cpruntime.ListCLISessions(ctx, db)
+	if err != nil {
+		t.Fatalf("list cli sessions: %v", err)
+	}
+	if len(cliSessions) != 1 || cliSessions[0].State != "failed" {
+		t.Fatalf("cli sessions = %+v, want failed wrong-lease provider session", cliSessions)
+	}
+}
+
+func TestCommandCLIAdapterFailsFastWhenClaudeProviderPolicyIsUnavailable(t *testing.T) {
+	ctx := context.Background()
+	exec := &recordingContainerExecutor{results: []cpruntime.ContainerExecResult{{
+		ProcessRef: "should-not-run",
+		ExitCode:   0,
+	}}}
+	db, st, _, _ := newCommandCLIBase(t)
+	insertAttemptOwnershipRows(t, ctx, db, "att_policy_unavailable", "lease_missing_prompt", "asg_missing_prompt", "ctr_missing_prompt", "developer", "rt_policy_unavailable")
+	insertReadyRuntimeInstance(t, ctx, db, "rt_policy_unavailable", "att_policy_unavailable", "developer")
+	adapter, err := cpruntime.NewClaudeCommandCLIAdapter(cpruntime.CommandCLIAdapterConfig{
+		Store: st,
+		Profile: cpruntime.CommandCLIProfile{
+			Name:    "claude",
+			Backend: "claude",
+			Binary:  "/usr/local/bin/claude",
+			Timeout: timeSecond(),
+			RuntimeCommandPolicies: map[string]cpruntime.RuntimeCommandPolicy{
+				"docker-default": {NonInteractiveApproval: true},
+			},
+		},
+		Executor: exec,
+	})
+	if err != nil {
+		t.Fatalf("new command adapter: %v", err)
+	}
+	_, startErr := adapter.Start(ctx, cpruntime.StartRequest{
+		AgentID:         "developer",
+		AttemptID:       "att_policy_unavailable",
+		AssignmentID:    "asg_missing_prompt",
+		LeaseID:         "lease_missing_prompt",
+		ContractID:      "ctr_missing_prompt",
+		RuntimeID:       "rt_policy_unavailable",
+		CLIBackend:      "claude",
+		Workspace:       cpruntime.ContainerWorkspacePath,
+		HomeDir:         cpruntime.ContainerHomePath,
+		Env:             runtimeEnv(t, "developer", "rt_policy_unavailable", "att_policy_unavailable"),
+		BootstrapPrompt: "provider policy is unavailable",
+	})
+	if startErr == nil || !strings.Contains(startErr.Error(), cpruntime.TerminalReasonApprovalPolicyUnavailable) {
+		t.Fatalf("Start error = %v, want runtime approval unavailable", startErr)
+	}
+	if class, ok := cpruntime.ErrorFailureClass(startErr); !ok || class != cpruntime.FailureClassRuntimeApprovalBlocked {
+		t.Fatalf("failure class = %s/%v, want runtime_approval_blocked", class, ok)
+	}
+	if len(exec.specs) != 0 {
+		t.Fatalf("executor specs = %+v, want no Claude exec without auditable provider approval config", exec.specs)
+	}
+	cliSessions, err := cpruntime.ListCLISessions(ctx, db)
+	if err != nil {
+		t.Fatalf("list cli sessions: %v", err)
+	}
+	if len(cliSessions) != 0 {
+		t.Fatalf("cli sessions = %+v, want no ordinary Claude session before provider policy is configured", cliSessions)
+	}
+}
+
+func TestCommandCLIAdapterRejectsClaudeProviderExitWithoutAcceptedCapabilityCall(t *testing.T) {
+	ctx := context.Background()
+	exec := &recordingContainerExecutor{results: []cpruntime.ContainerExecResult{{
+		ProcessRef: "fake-claude-zero-without-side-effects",
+		ExitCode:   0,
+		Stdout:     []byte("no coordlink calls; Authorization: Bearer SECRET_HEADER_SENTINEL /home/zxh/private"),
+	}}}
+	db, st, _, _ := newCommandCLIBase(t)
+	insertAttemptOwnershipRows(t, ctx, db, "att_policy_no_progress", "lease_missing_prompt", "asg_missing_prompt", "ctr_missing_prompt", "developer", "rt_policy_no_progress")
+	insertReadyRuntimeInstance(t, ctx, db, "rt_policy_no_progress", "att_policy_no_progress", "developer")
+	adapter, err := cpruntime.NewClaudeCommandCLIAdapter(cpruntime.CommandCLIAdapterConfig{
+		Store: st,
+		Profile: cpruntime.CommandCLIProfile{
+			Name:    "claude",
+			Backend: "claude",
+			Binary:  "/usr/local/bin/claude",
+			Timeout: timeSecond(),
+			RuntimeCommandPolicies: map[string]cpruntime.RuntimeCommandPolicy{
+				"docker-default": {
+					NonInteractiveApproval:     true,
+					AllowCoordlinkCapabilities: []string{"contract.current", "contract.add"},
+				},
+			},
+		},
+		Executor: exec,
+	})
+	if err != nil {
+		t.Fatalf("new command adapter: %v", err)
+	}
+	_, startErr := adapter.Start(ctx, cpruntime.StartRequest{
+		AgentID:         "developer",
+		AttemptID:       "att_policy_no_progress",
+		AssignmentID:    "asg_missing_prompt",
+		LeaseID:         "lease_missing_prompt",
+		ContractID:      "ctr_missing_prompt",
+		RuntimeID:       "rt_policy_no_progress",
+		CLIBackend:      "claude",
+		Workspace:       cpruntime.ContainerWorkspacePath,
+		HomeDir:         cpruntime.ContainerHomePath,
+		Env:             runtimeEnv(t, "developer", "rt_policy_no_progress", "att_policy_no_progress"),
+		BootstrapPrompt: "provider exits without allowlisted coordlink progress",
+	})
+	if startErr == nil || !strings.Contains(startErr.Error(), cpruntime.TerminalReasonApprovalPolicyUnavailable) {
+		t.Fatalf("Start error = %v, want runtime approval unavailable", startErr)
+	}
+	if len(exec.specs) != 1 {
+		t.Fatalf("executor specs = %+v, want provider attempted once under scoped policy", exec.specs)
+	}
+	if class, ok := cpruntime.ErrorFailureClass(startErr); !ok || class != cpruntime.FailureClassRuntimeApprovalBlocked {
+		t.Fatalf("failure class = %s/%v, want runtime_approval_blocked", class, ok)
+	}
+	cliSessions, err := cpruntime.ListCLISessions(ctx, db)
+	if err != nil {
+		t.Fatalf("list cli sessions: %v", err)
+	}
+	if len(cliSessions) != 1 || cliSessions[0].State != "failed" ||
+		!strings.Contains(cliSessions[0].LastError, cpruntime.TerminalReasonApprovalPolicyUnavailable) {
+		t.Fatalf("cli sessions = %+v, want failed no-progress provider session", cliSessions)
+	}
+	for _, forbidden := range []string{"SECRET_HEADER_SENTINEL", "/home/zxh/private", "Do you want to proceed"} {
+		if strings.Contains(startErr.Error(), forbidden) {
+			t.Fatalf("approval policy error leaked %q: %v", forbidden, startErr)
+		}
+	}
+}
+
 func TestDockerExecClientAttachesStdinWhenProvided(t *testing.T) {
 	dir := t.TempDir()
 	argsPath := filepath.Join(dir, "args.txt")
@@ -855,6 +1307,7 @@ type recordingContainerExecutor struct {
 	err     error
 	results []cpruntime.ContainerExecResult
 	specs   []cpruntime.ContainerExecSpec
+	onExec  func(cpruntime.ContainerExecSpec)
 }
 
 func (e *recordingContainerExecutor) Exec(ctx context.Context, spec cpruntime.ContainerExecSpec) (cpruntime.ContainerExecResult, error) {
@@ -864,6 +1317,9 @@ func (e *recordingContainerExecutor) Exec(ctx context.Context, spec cpruntime.Co
 	default:
 	}
 	e.specs = append(e.specs, cloneExecSpec(spec))
+	if e.onExec != nil {
+		e.onExec(cloneExecSpec(spec))
+	}
 	if e.err != nil {
 		return cpruntime.ContainerExecResult{}, e.err
 	}
@@ -999,6 +1455,29 @@ func runtimeEnv(t *testing.T, agentID, runtimeID, attemptID string) map[string]s
 		t.Fatalf("build runtime env: %v", err)
 	}
 	return env
+}
+
+func insertAcceptedCapabilityCall(t *testing.T, ctx context.Context, db *sql.DB, traceID, agentID, capabilityName string) {
+	t.Helper()
+	insertAcceptedCapabilityCallWithLease(t, ctx, db, traceID, agentID, capabilityName, "lease_missing_prompt")
+}
+
+func insertAcceptedCapabilityCallWithLease(t *testing.T, ctx context.Context, db *sql.DB, traceID, agentID, capabilityName, leaseID string) {
+	t.Helper()
+	if traceID == "" {
+		t.Fatal("trace id is required for accepted capability call audit")
+	}
+	scope := `{"lease_id":"` + leaseID + `"}`
+	now := time.Now().UTC().Format("2006-01-02T15:04:05.000000000Z07:00")
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO capability_calls (
+  id, tenant_id, trace_id, capability_name, subject_kind, subject_id,
+  scope_json, status, idempotency_key, created_at
+) VALUES (?, 'default', ?, ?, 'agent', ?, ?, 'accepted', '', ?)`,
+		"capcall_"+capabilityName+"_"+traceID+"_"+leaseID, traceID, capabilityName, agentID, scope, now,
+	); err != nil {
+		t.Fatalf("insert accepted capability call: %v", err)
+	}
 }
 
 func transcriptContentForAttempt(t *testing.T, ctx context.Context, db *sql.DB, attemptID string) string {
