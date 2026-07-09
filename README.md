@@ -71,7 +71,71 @@
 
 如果后续增加远端 PR 平台集成、复杂发布流水线或跨仓库事务，也必须作为独立能力接入同一 backend truth，不能改变本阶段的任务、消息和受控 Git 操作协议。
 
-## 4. 文档目录
+## 4. Codemap 开发使用方式
+
+`coordplane codemap` 用于在开发时生成可查询的工程知识索引快照。当前验收口径只承认 `status: "ready"` 的原子 ready snapshot；`status: "partial"` 或包含 error diagnostic 的 artifact 只能用于排障，不能作为 CI、评审或需求验收结果。
+
+开发时推荐把快照写到固定路径：
+
+```bash
+export PROJECT_ID=coordplane-dev
+export RESOURCE_ID=coordplane-repo
+go run ./cmd/coordplane codemap index \
+  --root . \
+  --project-id "$PROJECT_ID" \
+  --resource-id "$RESOURCE_ID" \
+  --strict \
+  --out .coordplane/codemap/latest.json
+```
+
+参数说明：
+
+- `--root` 指向要索引的仓库根目录，通常是当前仓库 `.`。
+- `--project-id` 和 `--resource-id` 是 project/resource stamp，会写入 snapshot，并参与稳定 `snapshot_id` 计算；同一个验收对象应使用同一组 stamp，避免把不同项目或资源的索引混用。上面的 `coordplane-dev` / `coordplane-repo` 只是本地示例值，验收时应替换为真实 project/resource 身份。
+- `--strict` 会在生成结果不是可提升的 ready snapshot 时失败；失败时不会把 partial snapshot 写成 `latest.json`。
+- 不带 `--strict` 的 `index` 可能写出 diagnostic-only 的 partial artifact，便于查看缺失 Go module、语法错误或收集器错误，但该文件不能替代 ready snapshot。
+
+生成后先验证快照结构和可提升状态：
+
+```bash
+go run ./cmd/coordplane codemap validate \
+  --snapshot .coordplane/codemap/latest.json
+```
+
+`validate` 成功时输出包含 `"ok": true`、`schema_version`、`snapshot_id`、`status` 和 `diagnostic_count`；如果快照是 partial、building、schema 不匹配、stable id 漂移、包含 error diagnostic 或泄露不允许的路径/敏感标记，命令会返回非零退出码。
+
+提交或验收前用 `check` 对比当前仓库与已保存的 ready snapshot：
+
+```bash
+go run ./cmd/coordplane codemap check \
+  --root . \
+  --snapshot .coordplane/codemap/latest.json
+```
+
+`check` 会先验证已有 snapshot，再重新索引当前 `--root` 并比较规范化 JSON；发现源码、文档、配置、测试或 stamp 导致的 drift 时返回非零退出码，并提示重新运行 `codemap index`。如果未显式传入 `--project-id` / `--resource-id`，`check` 会复用已有 snapshot 中的 stamp；需要确认特定项目/资源身份时也可以显式传入：
+
+```bash
+go run ./cmd/coordplane codemap check \
+  --root . \
+  --project-id "$PROJECT_ID" \
+  --resource-id "$RESOURCE_ID" \
+  --snapshot .coordplane/codemap/latest.json
+```
+
+推荐验证命令：
+
+```bash
+go test ./cmd/coordplane ./internal/codemap
+export PROJECT_ID=coordplane-dev
+export RESOURCE_ID=coordplane-repo
+go run ./cmd/coordplane codemap index --root . --project-id "$PROJECT_ID" --resource-id "$RESOURCE_ID" --strict --out .coordplane/codemap/latest.json
+go run ./cmd/coordplane codemap validate --snapshot .coordplane/codemap/latest.json
+go run ./cmd/coordplane codemap check --root . --snapshot .coordplane/codemap/latest.json
+```
+
+验收时以 `validate` / `check` 均成功的 ready snapshot 为准；partial artifact、临时 stdout、历史评论或未带正确 project/resource stamp 的快照都不能作为最终验收证据。
+
+## 5. 文档目录
 
 - `backend/`
   - 单用户 CoordPlane 后台 MVP、canonical store、queue、policy、capability registry、skill registry、TeamConfig、object store、inspect 和后续扩展接口。
@@ -92,7 +156,7 @@
 - `testing_acceptance/`
   - 全局测试验收口径、测试分层、场景矩阵、CI gate 和 release health check。
 
-## 5. 全局设计原则
+## 6. 全局设计原则
 
 - Backend 是唯一真相源：任务、消息、邮箱、证据、会话路由都必须落到 backend 数据库。
 - 单用户不是临时实现：MVP 固定 `tenant_id=default`，但所有 service handler 仍必须经过 policy、store、queue、capability 和 adapter 接口。
@@ -109,7 +173,7 @@
 - Git 操作必须在会话内反馈：同步、提交、合并、冲突和回滚结果必须返回给当前 Agent 会话，不允许等会话结束后后台静默处理。
 - 可删除式设计：新增 capability、检查、runtime、adapter 必须通过注册表接入，删除时不改主流程。
 
-## 6. 推荐阅读顺序
+## 7. 推荐阅读顺序
 
 1. `backend/coordplane_single_user_backend_mvp_requirements_2026-07-03.md`
 2. `skills/coordplane_skills_first_agent_workflow_requirements_2026-07-03.md`
