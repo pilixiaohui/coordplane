@@ -16,14 +16,17 @@ func DecodeWithScopeStrict(scope, input json.RawMessage, target any) error {
 		if err := json.Unmarshal(scope, &merged); err != nil {
 			return fmt.Errorf("decode scope: %w", err)
 		}
-	}
-	if merged == nil {
-		merged = make(map[string]any)
+		if merged == nil {
+			return errors.New("decode scope: expected a JSON object, got null")
+		}
 	}
 	if len(input) > 0 {
 		var decoded map[string]any
 		if err := json.Unmarshal(input, &decoded); err != nil {
 			return err
+		}
+		if decoded == nil {
+			return errors.New("decode input: expected a JSON object, got null")
 		}
 		for key, value := range decoded {
 			merged[key] = value
@@ -39,6 +42,9 @@ func DecodeWithScopeStrict(scope, input json.RawMessage, target any) error {
 func DecodeStrict(raw json.RawMessage, target any) error {
 	if len(raw) == 0 {
 		raw = json.RawMessage(`{}`)
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return errors.New("decode input: expected a JSON object, got null")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()

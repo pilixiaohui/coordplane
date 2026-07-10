@@ -18,7 +18,10 @@ import (
 	"coordplane/internal/store"
 )
 
-const defaultCommandCLITimeout = 2 * time.Minute
+const (
+	defaultCommandCLITimeout            = 2 * time.Minute
+	commandCLIFailurePersistenceTimeout = 5 * time.Second
+)
 
 const (
 	providerPolicyModeEnv       = "COORDPLANE_PROVIDER_POLICY_MODE"
@@ -160,8 +163,7 @@ func (a *CommandCLIAdapter) Start(ctx context.Context, req StartRequest) (StartR
 	}
 	result, err := a.exec(ctx, sessionRow.ID, instance, command, req.Env, prompt)
 	if err != nil {
-		_ = a.markExecError(ctx, sessionRow.ID, req.AttemptID, result, err)
-		return StartResult{}, err
+		return StartResult{}, a.persistExecFailure(sessionRow.ID, req.AttemptID, result, err)
 	}
 	if cause, ok := a.authFailureCause(result); ok {
 		transcriptRef := a.failureTranscriptRef(ctx, sessionRow.ID, cause)
@@ -282,8 +284,7 @@ func (a *CommandCLIAdapter) Resume(ctx context.Context, req ResumeRequest) error
 	}
 	result, err := a.exec(ctx, sessionRow.ID, instance, command, req.Env, prompt)
 	if err != nil {
-		_ = a.markExecError(ctx, sessionRow.ID, req.Route.AttemptID, result, err)
-		return err
+		return a.persistExecFailure(sessionRow.ID, req.Route.AttemptID, result, err)
 	}
 	if cause, ok := a.authFailureCause(result); ok {
 		transcriptRef := a.failureTranscriptRef(ctx, sessionRow.ID, cause)
@@ -919,11 +920,25 @@ func (a *CommandCLIAdapter) markExecError(ctx context.Context, sessionID, attemp
 	if result.ProcessRef == "" && len(result.Stdout) == 0 && len(result.Stderr) == 0 {
 		return a.markSessionFailed(ctx, sessionID, cause)
 	}
+	var persistenceErrors []error
 	transcriptRef, err := a.persistTranscript(ctx, attemptID, result)
 	if err != nil {
+		persistenceErrors = append(persistenceErrors, fmt.Errorf("persist CLI failure transcript: %w", err))
 		transcriptRef = a.failureTranscriptRef(ctx, sessionID, cause)
 	}
-	return a.markSessionExited(ctx, sessionID, result, transcriptRef, cause)
+	if err := a.markSessionExited(ctx, sessionID, result, transcriptRef, cause); err != nil {
+		persistenceErrors = append(persistenceErrors, err)
+	}
+	return errors.Join(persistenceErrors...)
+}
+
+func (a *CommandCLIAdapter) persistExecFailure(sessionID, attemptID string, result ContainerExecResult, cause error) error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), commandCLIFailurePersistenceTimeout)
+	defer cancel()
+	if err := a.markExecError(cleanupCtx, sessionID, attemptID, result, cause); err != nil {
+		return errors.Join(cause, fmt.Errorf("command cli: persist exec failure: %w", err))
+	}
+	return cause
 }
 
 func (a *CommandCLIAdapter) markSessionFailed(ctx context.Context, sessionID string, cause error) error {

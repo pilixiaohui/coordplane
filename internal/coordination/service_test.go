@@ -927,6 +927,119 @@ func TestHighRiskCoordinationWritesRejectUnknownFieldsWithoutSideEffects(t *test
 	}
 }
 
+func TestReportSubmitRejectsUnicodeWhitespaceWithoutSideEffects(t *testing.T) {
+	ctx := context.Background()
+	svc, db := newService(t)
+	dispatcher := newCoordinationDispatcher(t, svc)
+	work := addAndClaim(t, ctx, svc, "builder")
+	beforeEvidence := countRows(t, ctx, db, "evidence")
+	beforeObjects := countRows(t, ctx, db, "object_blobs")
+	beforeEvents := countRows(t, ctx, db, "events")
+
+	response := dispatcher.Handle(ctx, capability.Call{
+		CapabilityName: "report.submit",
+		Subject:        agentSubject("builder"),
+		Scope:          mustRaw(t, map[string]any{"lease_id": work.Lease.ID}),
+		Input: mustRaw(t, map[string]any{
+			"summary": "not a readable report",
+			"content": "\u2003\u00a0\n\t",
+		}),
+	})
+	if response.Status == capability.StatusAccepted || response.ErrorCode != "REPORT_SUBMIT_FAILED" {
+		t.Fatalf("report.submit whitespace response = %+v, want REPORT_SUBMIT_FAILED", response)
+	}
+	if countRows(t, ctx, db, "evidence") != beforeEvidence ||
+		countRows(t, ctx, db, "object_blobs") != beforeObjects ||
+		countRows(t, ctx, db, "events") != beforeEvents {
+		t.Fatal("rejected whitespace report created evidence, object, or event side effects")
+	}
+	if got := contractStatus(t, ctx, db, work.Contract.ID); got != "open" {
+		t.Fatalf("contract after whitespace report = %s, want open", got)
+	}
+	if got := assignmentState(t, ctx, db, work.Add.AssignmentID); got != "claimed" {
+		t.Fatalf("assignment after whitespace report = %s, want claimed", got)
+	}
+	if got := leaseState(t, ctx, db, work.Lease.ID); got != "active" {
+		t.Fatalf("lease after whitespace report = %s, want active", got)
+	}
+}
+
+func TestHighRiskCoordinationWritesRejectInternalIdentityAndNullWithoutSideEffects(t *testing.T) {
+	tests := []struct {
+		name       string
+		capability string
+		input      func(reportID string) json.RawMessage
+	}{
+		{
+			name:       "report agent_id",
+			capability: "report.submit",
+			input: func(string) json.RawMessage {
+				return mustRaw(t, map[string]any{"summary": "done", "content": "readable", "agent_id": "intruder"})
+			},
+		},
+		{name: "report null", capability: "report.submit", input: func(string) json.RawMessage { return json.RawMessage(`null`) }},
+		{
+			name:       "complete agent_id",
+			capability: "contract.complete",
+			input: func(reportID string) json.RawMessage {
+				return mustRaw(t, map[string]any{"evidence_ids": []string{reportID}, "summary": "done", "agent_id": "intruder"})
+			},
+		},
+		{name: "complete null", capability: "contract.complete", input: func(string) json.RawMessage { return json.RawMessage(`null`) }},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			svc, db := newService(t)
+			dispatcher := newCoordinationDispatcher(t, svc)
+			work := addAndClaim(t, ctx, svc, "builder")
+			reportID := ""
+			if tc.capability == "contract.complete" {
+				report, err := svc.SubmitReport(ctx, coordination.SubmitReportInput{
+					LeaseID: work.Lease.ID,
+					AgentID: "builder",
+					Summary: "canonical report",
+					Content: "canonical report content",
+				})
+				if err != nil {
+					t.Fatalf("submit canonical report: %v", err)
+				}
+				reportID = report.ID
+			}
+			tables := []string{"work_contracts", "assignments", "leases", "evidence", "object_blobs", "agent_communication_envelopes", "mailbox_items", "events"}
+			before := make(map[string]int, len(tables))
+			for _, table := range tables {
+				before[table] = countRows(t, ctx, db, table)
+			}
+
+			response := dispatcher.Handle(ctx, capability.Call{
+				CapabilityName: tc.capability,
+				Subject:        agentSubject("builder"),
+				Scope:          mustRaw(t, map[string]any{"lease_id": work.Lease.ID}),
+				Input:          tc.input(reportID),
+			})
+			if response.Status != capability.StatusRejected || response.ErrorCode != "INVALID_CAPABILITY_INPUT" {
+				t.Fatalf("%s response = %+v, want INVALID_CAPABILITY_INPUT", tc.capability, response)
+			}
+			for _, table := range tables {
+				if got := countRows(t, ctx, db, table); got != before[table] {
+					t.Fatalf("%s rows after rejected %s = %d, want %d", table, tc.capability, got, before[table])
+				}
+			}
+			if got := contractStatus(t, ctx, db, work.Contract.ID); got != "open" {
+				t.Fatalf("contract after rejected %s = %s, want open", tc.capability, got)
+			}
+			if got := assignmentState(t, ctx, db, work.Add.AssignmentID); got != "claimed" {
+				t.Fatalf("assignment after rejected %s = %s, want claimed", tc.capability, got)
+			}
+			if got := leaseState(t, ctx, db, work.Lease.ID); got != "active" {
+				t.Fatalf("lease after rejected %s = %s, want active", tc.capability, got)
+			}
+		})
+	}
+}
+
 func TestHighRiskCoordinationCapabilitySchemasAreStrict(t *testing.T) {
 	svc, _ := newService(t)
 	registry := capability.NewRegistry()

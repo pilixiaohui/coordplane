@@ -24,6 +24,18 @@ type assignmentNextCallInput struct {
 	LeaseSeconds int64 `json:"lease_seconds,omitempty"`
 }
 
+type reportSubmitCallInput struct {
+	LeaseID string `json:"lease_id"`
+	Summary string `json:"summary"`
+	Content string `json:"content,omitempty"`
+}
+
+type contractCompleteCallInput struct {
+	LeaseID     string   `json:"lease_id"`
+	EvidenceIDs []string `json:"evidence_ids,omitempty"`
+	Summary     string   `json:"summary,omitempty"`
+}
+
 // RegisterCapabilities exposes the coordination state machine through the
 // shared capability registry used by HTTP and coordlink adapters.
 func RegisterCapabilities(registry *capability.Registry, service *Service) error {
@@ -172,12 +184,16 @@ func (s *Service) handleContractWait(ctx context.Context, call capability.Call) 
 }
 
 func (s *Service) handleContractComplete(ctx context.Context, call capability.Call) capability.Response[json.RawMessage] {
-	var input CompleteContractInput
+	var input contractCompleteCallInput
 	if err := capability.DecodeWithScopeStrict(call.Scope, call.Input, &input); err != nil {
 		return invalidInput("contract.complete", err)
 	}
-	input.AgentID = agentIDFromCall(call)
-	return responseToRaw(s.CompleteContract(ctx, input))
+	return responseToRaw(s.CompleteContract(ctx, CompleteContractInput{
+		LeaseID:     input.LeaseID,
+		AgentID:     agentIDFromCall(call),
+		EvidenceIDs: input.EvidenceIDs,
+		Summary:     input.Summary,
+	}))
 }
 
 func (s *Service) handleMessageSend(ctx context.Context, call capability.Call) capability.Response[json.RawMessage] {
@@ -228,12 +244,16 @@ func (s *Service) handleMailboxResolve(ctx context.Context, call capability.Call
 }
 
 func (s *Service) handleReportSubmit(ctx context.Context, call capability.Call) capability.Response[json.RawMessage] {
-	var input SubmitReportInput
+	var input reportSubmitCallInput
 	if err := capability.DecodeWithScopeStrict(call.Scope, call.Input, &input); err != nil {
 		return invalidInput("report.submit", err)
 	}
-	input.AgentID = agentIDFromCall(call)
-	result, err := s.SubmitReport(ctx, input)
+	result, err := s.SubmitReport(ctx, SubmitReportInput{
+		LeaseID: input.LeaseID,
+		AgentID: agentIDFromCall(call),
+		Summary: input.Summary,
+		Content: input.Content,
+	})
 	if err != nil {
 		return capability.Error[json.RawMessage]("REPORT_SUBMIT_FAILED", err.Error(), false)
 	}

@@ -1332,6 +1332,24 @@ func TestOperatorBusinessGateRejectsEachMissingCondition(t *testing.T) {
 			failureContains: "non-empty readable report",
 		},
 		{
+			name: "unicode whitespace report object",
+			mutate: func(t *testing.T, ctx context.Context, db *sql.DB, rootContractID string) {
+				t.Helper()
+				if _, err := db.ExecContext(ctx, `
+UPDATE object_blobs
+SET content = ?
+WHERE object_ref = (
+  SELECT content_ref FROM evidence WHERE contract_id = ? AND kind = 'report' LIMIT 1
+)`, "\u2003\u00a0\n\t", rootContractID); err != nil {
+					t.Fatalf("replace report content with Unicode whitespace: %v", err)
+				}
+			},
+			wantReports:     0,
+			wantLinked:      0,
+			wantIndependent: 0,
+			failureContains: "non-empty readable report",
+		},
+		{
 			name: "passing assessment does not reference report",
 			mutate: func(t *testing.T, ctx context.Context, db *sql.DB, rootContractID string) {
 				t.Helper()

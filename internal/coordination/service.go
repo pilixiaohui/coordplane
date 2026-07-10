@@ -626,6 +626,9 @@ func (s *Service) SubmitReport(ctx context.Context, in SubmitReportInput) (Evide
 	if in.Summary == "" {
 		return Evidence{}, errors.New("report.submit: summary is required")
 	}
+	if in.Content != "" && strings.TrimSpace(in.Content) == "" {
+		return Evidence{}, errors.New("report.submit: content must include non-whitespace text")
+	}
 	var evidence Evidence
 	err := withTx(ctx, s.db, func(tx *sql.Tx) error {
 		scope, err := activeLeaseScope(ctx, tx, in.LeaseID, in.AgentID)

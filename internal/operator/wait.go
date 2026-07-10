@@ -973,11 +973,10 @@ func (s *Service) businessAcceptance(ctx context.Context, contractIDs []string) 
 	}
 	reports := make(map[string]string)
 	rows, err := s.db.QueryContext(ctx, `
-SELECT e.id, e.produced_by
+SELECT e.id, e.produced_by, o.content
 FROM evidence e
 JOIN object_blobs o ON o.object_ref = e.content_ref
 WHERE e.kind = 'report'
-  AND length(o.content) > 0
   AND e.contract_id IN (`+placeholders(len(contractIDs))+`)
 ORDER BY e.created_at ASC, e.id ASC`, stringArgs(contractIDs)...)
 	if err != nil {
@@ -985,9 +984,13 @@ ORDER BY e.created_at ASC, e.id ASC`, stringArgs(contractIDs)...)
 	}
 	for rows.Next() {
 		var id, producer string
-		if err := rows.Scan(&id, &producer); err != nil {
+		var content []byte
+		if err := rows.Scan(&id, &producer, &content); err != nil {
 			rows.Close()
 			return out, err
+		}
+		if strings.TrimSpace(string(content)) == "" {
+			continue
 		}
 		reports[id] = producer
 	}

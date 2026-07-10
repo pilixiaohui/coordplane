@@ -1022,6 +1022,118 @@ func TestCommandCLIAdapterTimeoutPreservesDiagnosticTranscript(t *testing.T) {
 	}
 }
 
+func TestCommandCLIAdapterCancelledDeadlinePersistsDiagnosticsAndConvergesRunner(t *testing.T) {
+	exec := &deadlineContainerExecutor{
+		started: make(chan struct{}),
+		result: cpruntime.ContainerExecResult{
+			ProcessRef: "docker-exec:coordplane-cancelled-deadline",
+			ExitCode:   -1,
+			Stdout:     []byte("partial stdout before deadline"),
+			Stderr:     []byte("partial stderr before deadline"),
+		},
+	}
+	h := newCommandCLIHarness(t, exec)
+	add := addContract(t, context.Background(), h.coordination, "developer")
+
+	deadlineCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	_, err := h.runner.StartNext(deadlineCtx, "developer")
+	if err == nil {
+		t.Fatal("StartNext succeeded after execution deadline")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("StartNext error = %v, want deadline cause", err)
+	}
+	if class, ok := cpruntime.ErrorFailureClass(err); !ok || class != cpruntime.FailureClassRuntimeExecTimeout {
+		t.Fatalf("failure class = %s/%v, want runtime_exec_timeout", class, ok)
+	}
+	select {
+	case <-exec.started:
+	default:
+		t.Fatal("deadline expired before executor boundary")
+	}
+
+	ctx := context.Background()
+	cliSessions, err := cpruntime.ListCLISessions(ctx, h.db)
+	if err != nil {
+		t.Fatalf("list cli sessions: %v", err)
+	}
+	if len(cliSessions) != 1 ||
+		cliSessions[0].State != "failed" ||
+		cliSessions[0].ProcessRef != exec.result.ProcessRef ||
+		cliSessions[0].ExitCode == nil || *cliSessions[0].ExitCode != -1 ||
+		!strings.Contains(cliSessions[0].LastError, cpruntime.TerminalReasonRuntimeExecTimeout) ||
+		!strings.HasPrefix(cliSessions[0].TranscriptRef, "obj_sha256_") {
+		t.Fatalf("cli session after cancelled deadline = %+v, want failed with durable diagnostics", cliSessions)
+	}
+	transcript := transcriptContentForAttempt(t, ctx, h.db, cliSessions[0].AttemptID)
+	if !strings.Contains(transcript, "partial stdout before deadline") || !strings.Contains(transcript, "partial stderr before deadline") {
+		t.Fatalf("cancelled deadline transcript = %q, want partial stdout/stderr", transcript)
+	}
+	if got := assignmentState(t, ctx, h.db, add.AssignmentID); got != "queued" {
+		t.Fatalf("assignment after deadline = %s, want queued", got)
+	}
+	for _, check := range []struct {
+		table string
+		where string
+		want  int
+	}{
+		{table: "attempts", where: "status = 'failed'", want: 1},
+		{table: "leases", where: "state = 'released'", want: 1},
+		{table: "session_routes", where: "state = 'failed'", want: 1},
+		{table: "runtime_tokens", where: "state = 'active'", want: 0},
+		{table: "runtime_tokens", where: "state = 'revoked'", want: 1},
+		{table: "active_guards", where: "state = 'active'", want: 0},
+		{table: "active_guards", where: "state = 'released'", want: 2},
+		{table: "prepare_leases", where: "state = 'released'", want: 1},
+	} {
+		if got := countRowsWhere(t, ctx, h.db, check.table, check.where); got != check.want {
+			t.Fatalf("%s where %s = %d, want %d", check.table, check.where, got, check.want)
+		}
+	}
+}
+
+func TestCommandCLIAdapterExecErrorIncludesDiagnosticPersistenceFailure(t *testing.T) {
+	execFailure := errors.New("executor failed after partial output")
+	var db *sql.DB
+	exec := &recordingContainerExecutor{
+		err: execFailure,
+		errResult: cpruntime.ContainerExecResult{
+			ProcessRef: "docker-exec:coordplane-persistence-failure",
+			ExitCode:   -1,
+			Stdout:     []byte("partial output"),
+		},
+		onExec: func(cpruntime.ContainerExecSpec) {
+			if _, err := db.Exec(`
+CREATE TRIGGER reject_cli_session_failure
+BEFORE UPDATE ON cli_sessions
+WHEN NEW.state = 'failed'
+BEGIN
+  SELECT RAISE(FAIL, 'forced cli diagnostic persistence failure');
+END`); err != nil {
+				t.Fatalf("install cli persistence failure trigger: %v", err)
+			}
+		},
+	}
+	h := newCommandCLIHarness(t, exec)
+	db = h.db
+	add := addContract(t, context.Background(), h.coordination, "developer")
+
+	_, err := h.runner.StartNext(context.Background(), "developer")
+	if !errors.Is(err, execFailure) {
+		t.Fatalf("StartNext error = %v, want original executor error", err)
+	}
+	if !strings.Contains(err.Error(), "forced cli diagnostic persistence failure") {
+		t.Fatalf("StartNext error = %v, want joined diagnostic persistence error", err)
+	}
+	if got := assignmentState(t, context.Background(), h.db, add.AssignmentID); got != "queued" {
+		t.Fatalf("assignment after diagnostic persistence failure = %s, want queued", got)
+	}
+	if got := countRowsWhere(t, context.Background(), h.db, "attempts", "status = 'failed'"); got != 1 {
+		t.Fatalf("failed attempts = %d, want 1", got)
+	}
+}
+
 func TestCommandCLIAdapterMissingAuthProbeFailsClosedBeforeExecutor(t *testing.T) {
 	ctx := context.Background()
 	exec := &recordingContainerExecutor{results: []cpruntime.ContainerExecResult{{
@@ -1249,7 +1361,7 @@ type commandCLIHarness struct {
 	docker       *recordingDockerClient
 }
 
-func newCommandCLIHarness(t *testing.T, exec *recordingContainerExecutor) commandCLIHarness {
+func newCommandCLIHarness(t *testing.T, exec cpruntime.ContainerExecutor) commandCLIHarness {
 	t.Helper()
 	db, st, coordSvc, skillRegistry := newCommandCLIBase(t)
 	coordlinkPath := filepath.Join(t.TempDir(), "coordlink")
@@ -1304,7 +1416,7 @@ func newCommandCLIHarness(t *testing.T, exec *recordingContainerExecutor) comman
 	return commandCLIHarness{db: db, store: st, coordination: coordSvc, runner: runner, docker: docker}
 }
 
-func newExternalCommandCLIHarness(t *testing.T, exec *recordingContainerExecutor) commandCLIHarness {
+func newExternalCommandCLIHarness(t *testing.T, exec cpruntime.ContainerExecutor) commandCLIHarness {
 	t.Helper()
 	db, st, coordSvc, skillRegistry := newCommandCLIBase(t)
 	adapter, err := cpruntime.NewClaudeCommandCLIAdapter(cpruntime.CommandCLIAdapterConfig{
@@ -1385,6 +1497,17 @@ type recordingContainerExecutor struct {
 	results   []cpruntime.ContainerExecResult
 	specs     []cpruntime.ContainerExecSpec
 	onExec    func(cpruntime.ContainerExecSpec)
+}
+
+type deadlineContainerExecutor struct {
+	started chan struct{}
+	result  cpruntime.ContainerExecResult
+}
+
+func (e *deadlineContainerExecutor) Exec(ctx context.Context, _ cpruntime.ContainerExecSpec) (cpruntime.ContainerExecResult, error) {
+	close(e.started)
+	<-ctx.Done()
+	return e.result, cpruntime.NewRuntimeExecTimeout("docker exec cancelled by execution deadline", ctx.Err())
 }
 
 func (e *recordingContainerExecutor) Exec(ctx context.Context, spec cpruntime.ContainerExecSpec) (cpruntime.ContainerExecResult, error) {
