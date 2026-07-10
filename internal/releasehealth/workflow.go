@@ -380,8 +380,13 @@ func (s *workflowState) run(ctx context.Context) error {
 	if _, err := s.app.Delivery.NotifyMailbox(ctx, mailboxID); err != nil {
 		return fmt.Errorf("notify coordinator mailbox: %w", err)
 	}
-	if _, err := s.app.Runner.ProcessResumeQueue(ctx, "release-health"); err != nil {
+	resumed, err := s.app.Runner.ProcessResumeQueue(ctx, "release-health")
+	if err != nil {
 		return fmt.Errorf("process coordinator resume queue: %w", err)
+	}
+	if strings.TrimSpace(resumed.Env["COORDPLANE_TOKEN"]) != "" {
+		coordinator.Env = resumed.Env
+		s.coordinator.Env = resumed.Env
 	}
 	if _, err := s.driver.call(ctx, coordinator, "mailbox.resolve", map[string]any{
 		"mailbox_id":   mailboxID,
@@ -458,9 +463,17 @@ func (s *workflowState) prepareChangeset(ctx context.Context) (codemanagement.Su
 	if err != nil {
 		return codemanagement.SubmitChangeSetResult{}, err
 	}
+	repo, err := s.app.CodeManagement.RegisterRepository(ctx, codemanagement.RegisterRepositoryInput{
+		RepoPath:        repoPath,
+		Alias:           "cp-accept-001",
+		CanonicalBranch: "main",
+	})
+	if err != nil {
+		return codemanagement.SubmitChangeSetResult{}, fmt.Errorf("register release-health repository: %w", err)
+	}
 	workspaceRoot := s.prepareChangesetWorkspaceRoot()
 	prepared, err := callData[codemanagement.WorkspacePrepareResult](ctx, s.driver, s.developer, "workspace.prepare", map[string]any{
-		"repo_path":        repoPath,
+		"repo_id":          repo.ID,
 		"canonical_branch": "main",
 		"workspace_root":   workspaceRoot,
 		"contract_id":      s.developerWork.ContractID,
@@ -540,6 +553,9 @@ func (d *driver) callAny(ctx context.Context, session cpruntime.AssignmentSessio
 		return typedResponse{}, err
 	}
 	command := []string{cpruntime.ContainerCoordlinkPath, "call", name, "--input", string(raw)}
+	if session.LeaseID != "" {
+		command = append(command, "--lease-id", session.LeaseID)
+	}
 	if idempotencyKey != "" {
 		command = append(command, "--idempotency-key", idempotencyKey)
 	}

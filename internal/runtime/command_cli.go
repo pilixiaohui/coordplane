@@ -159,13 +159,8 @@ func (a *CommandCLIAdapter) Start(ctx context.Context, req StartRequest) (StartR
 	}
 	result, err := a.exec(ctx, sessionRow.ID, instance, command, req.Env, prompt)
 	if err != nil {
-		_ = a.markSessionFailed(ctx, sessionRow.ID, err)
+		_ = a.markExecError(ctx, sessionRow.ID, req.AttemptID, result, err)
 		return StartResult{}, err
-	}
-	if cause, ok := a.approvalFailureCause(instance, result); ok {
-		transcriptRef := a.failureTranscriptRef(ctx, sessionRow.ID, cause)
-		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
-		return StartResult{}, cause
 	}
 	if cause, ok := a.authFailureCause(result); ok {
 		transcriptRef := a.failureTranscriptRef(ctx, sessionRow.ID, cause)
@@ -176,6 +171,10 @@ func (a *CommandCLIAdapter) Start(ctx context.Context, req StartRequest) (StartR
 	if err != nil {
 		_ = a.markSessionFailed(ctx, sessionRow.ID, err)
 		return StartResult{}, err
+	}
+	if cause, ok := a.approvalFailureCause(instance, result); ok {
+		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
+		return StartResult{}, cause
 	}
 	if result.ExitCode != 0 {
 		cause := fmt.Errorf("command cli: %s exited with code %d", a.profile.Backend, result.ExitCode)
@@ -282,13 +281,8 @@ func (a *CommandCLIAdapter) Resume(ctx context.Context, req ResumeRequest) error
 	}
 	result, err := a.exec(ctx, sessionRow.ID, instance, command, req.Env, prompt)
 	if err != nil {
-		_ = a.markSessionFailed(ctx, sessionRow.ID, err)
+		_ = a.markExecError(ctx, sessionRow.ID, req.Route.AttemptID, result, err)
 		return err
-	}
-	if cause, ok := a.approvalFailureCause(instance, result); ok {
-		transcriptRef := a.failureTranscriptRef(ctx, sessionRow.ID, cause)
-		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
-		return cause
 	}
 	if cause, ok := a.authFailureCause(result); ok {
 		transcriptRef := a.failureTranscriptRef(ctx, sessionRow.ID, cause)
@@ -299,6 +293,10 @@ func (a *CommandCLIAdapter) Resume(ctx context.Context, req ResumeRequest) error
 	if err != nil {
 		_ = a.markSessionFailed(ctx, sessionRow.ID, err)
 		return err
+	}
+	if cause, ok := a.approvalFailureCause(instance, result); ok {
+		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
+		return cause
 	}
 	if result.ExitCode != 0 {
 		cause := fmt.Errorf("command cli: %s resume exited with code %d", a.profile.Backend, result.ExitCode)
@@ -541,7 +539,7 @@ func (a *CommandCLIAdapter) exec(ctx context.Context, sessionID string, instance
 		Timeout:       a.profile.Timeout,
 	})
 	if err != nil {
-		return ContainerExecResult{}, err
+		return result, err
 	}
 	return result, nil
 }
@@ -628,6 +626,7 @@ func claudeProviderPermissionArgs(policy RuntimeCommandPolicy) ([]string, error)
 		}
 		rules = append(rules, "Bash("+ContainerCoordlinkPath+" call "+capabilityName+" *)")
 	}
+	rules = append(rules, providerBootstrapReadRules()...)
 	sort.Strings(rules)
 	denyRules := []string{
 		"Bash(sh *)",
@@ -669,6 +668,16 @@ func claudeProviderPermissionArgs(policy RuntimeCommandPolicy) ([]string, error)
 		"--allowedTools", strings.Join(rules, ","),
 		"--disallowedTools", strings.Join(denyRules, ","),
 	}, nil
+}
+
+func providerBootstrapReadRules() []string {
+	return []string{
+		"Bash(" + ContainerCoordlinkPath + " capability list)",
+		"Bash(" + ContainerCoordlinkPath + " skill list)",
+		"Bash(" + ContainerCoordlinkPath + " skill read contract-delegation)",
+		"Bash(" + ContainerCoordlinkPath + " skill read controlled-git)",
+		"Bash(" + ContainerCoordlinkPath + " skill read coordplane-service)",
+	}
 }
 
 func allowedProviderCapabilities(policy RuntimeCommandPolicy) []string {
@@ -892,6 +901,17 @@ WHERE id = ?`,
 	})
 }
 
+func (a *CommandCLIAdapter) markExecError(ctx context.Context, sessionID, attemptID string, result ContainerExecResult, cause error) error {
+	if result.ProcessRef == "" && len(result.Stdout) == 0 && len(result.Stderr) == 0 {
+		return a.markSessionFailed(ctx, sessionID, cause)
+	}
+	transcriptRef, err := a.persistTranscript(ctx, attemptID, result)
+	if err != nil {
+		transcriptRef = a.failureTranscriptRef(ctx, sessionID, cause)
+	}
+	return a.markSessionExited(ctx, sessionID, result, transcriptRef, cause)
+}
+
 func (a *CommandCLIAdapter) markSessionFailed(ctx context.Context, sessionID string, cause error) error {
 	transcriptRef := a.failureTranscriptRef(ctx, sessionID, cause)
 	now := formatTime(time.Now())
@@ -1027,6 +1047,9 @@ func composeStartPrompt(bootstrap string) string {
 	return strings.TrimSpace(bootstrap) + "\n\nCoordPlane runtime protocol:\n" +
 		"- You are inside the Docker runtime at /workspace/project with HOME=/home/agent.\n" +
 		"- Use /usr/local/bin/coordlink for all CoordPlane backend reads and writes.\n" +
+		"- Capabilities must be invoked only as /usr/local/bin/coordlink call <capability>.\n" +
+		"- Do not use shortcut forms such as /usr/local/bin/coordlink mailbox list, contract get, assignment get, or raw backend URLs.\n" +
+		"- To inspect current work, call contract.current; to read mailbox, call mailbox.list and mailbox.get; to read context, call contract.context.\n" +
 		"- Do not read host files, backend database paths, or runtime roots.\n"
 }
 
@@ -1038,7 +1061,9 @@ func composeResumePrompt(req ResumeRequest) string {
 	return "Resume the existing CoordPlane session.\n" +
 		"Reason: " + req.Reason + "\n" +
 		"Pending mailbox ids: " + mailboxes + "\n" +
-		"Use /usr/local/bin/coordlink mailbox list/get to read any mailbox body; this signal intentionally omits mailbox content.\n"
+		"Resume handshake only: run exactly `/usr/local/bin/coordlink call contract.current`, then stop and summarize RESUME_HANDSHAKE_DONE.\n" +
+		"Do not call mailbox.get, communication.read, mailbox.resolve, message.send, report.submit, contract.add, contract.complete, or raw backend URLs during resume.\n" +
+		"This signal intentionally omits mailbox content; the canonical driver will process pending mailbox work after the resume handshake.\n"
 }
 
 func commandEnvKeys(env map[string]string) []string {
@@ -1102,7 +1127,7 @@ func (c DockerExecClient) Exec(ctx context.Context, spec ContainerExecSpec) (Con
 	if err != nil {
 		exitCode = -1
 		if ctx.Err() != nil {
-			return ContainerExecResult{ProcessRef: "docker-exec:" + spec.ContainerName, ExitCode: exitCode, Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, fmt.Errorf("docker exec timed out after %s: %w", spec.Timeout, ctx.Err())
+			return ContainerExecResult{ProcessRef: "docker-exec:" + spec.ContainerName, ExitCode: exitCode, Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, NewRuntimeExecTimeout(fmt.Sprintf("docker exec timed out after %s", spec.Timeout), ctx.Err())
 		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {

@@ -10,9 +10,11 @@ import (
 const (
 	FailureClassRuntimeApprovalBlocked = "runtime_approval_blocked"
 	FailureClassRuntimeCommandDenied   = "runtime_command_policy_denied"
+	FailureClassRuntimeExecTimeout     = "runtime_exec_timeout"
 
 	TerminalReasonApprovalPolicyUnavailable = "RUNTIME_APPROVAL_POLICY_UNAVAILABLE"
 	TerminalReasonCommandPolicyDenied       = "RUNTIME_COMMAND_POLICY_DENIED"
+	TerminalReasonRuntimeExecTimeout        = "RUNTIME_EXEC_TIMEOUT"
 )
 
 type RuntimeCommandPolicy struct {
@@ -34,6 +36,7 @@ type runtimePolicyError struct {
 	failureClass   string
 	terminalReason string
 	message        string
+	cause          error
 }
 
 func NewRuntimeApprovalPolicyUnavailable(message string) error {
@@ -58,11 +61,27 @@ func NewRuntimeCommandPolicyDenied(message string) error {
 	}
 }
 
+func NewRuntimeExecTimeout(message string, cause error) error {
+	if strings.TrimSpace(message) == "" {
+		message = "runtime command execution timed out"
+	}
+	return runtimePolicyError{
+		failureClass:   FailureClassRuntimeExecTimeout,
+		terminalReason: TerminalReasonRuntimeExecTimeout,
+		message:        message,
+		cause:          cause,
+	}
+}
+
 func (e runtimePolicyError) Error() string {
 	if e.message == "" {
 		return e.terminalReason
 	}
 	return e.terminalReason + ": " + e.message
+}
+
+func (e runtimePolicyError) Unwrap() error {
+	return e.cause
 }
 
 func (e runtimePolicyError) FailureClass() string {

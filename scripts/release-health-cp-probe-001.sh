@@ -35,7 +35,6 @@ require_command() {
 }
 
 blockers=()
-# Formal Docker replay blockers are reported as CP-PROBE environment_blocked artifacts.
 require_command go || blockers+=("required command not found: go")
 require_command python3 || blockers+=("required command not found: python3")
 if ! command -v docker >/dev/null 2>&1; then

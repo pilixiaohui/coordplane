@@ -665,6 +665,16 @@ func (b *Backend) handleOperatorTaskStart(w http.ResponseWriter, r *http.Request
 			))
 			return
 		}
+		if reason, ok := cpruntime.ErrorTerminalReason(err); ok && reason == cpruntime.TerminalReasonRuntimeExecTimeout {
+			writeTypedResponse(w, capability.Rejected[json.RawMessage](
+				reason,
+				err.Error(),
+				capability.WithRepairHint("inspect operator task evidence, then retry start only after the provider timeout cause is resolved"),
+				capability.WithAllowedNextActions("operator.task.evidence", "operator.task.wait", "operator.task.start"),
+				capability.WithRetryable(true),
+			))
+			return
+		}
 		writeTypedResponse(w, capability.Error[json.RawMessage]("OPERATOR_TASK_START_FAILED", err.Error(), false))
 		return
 	}

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -301,6 +302,98 @@ func TestContractCompleteRequiresEvidenceThenSucceeds(t *testing.T) {
 	payload := eventPayload(t, ctx, db, "contract.satisfied", work.Contract.ID)
 	if payload["lease_id"] != work.Lease.ID || payload["envelope_id"] != done.Data.EnvelopeID {
 		t.Fatalf("contract.satisfied payload = %#v, want lease and envelope ids", payload)
+	}
+}
+
+func TestContractCompleteBindsExistingRequiredEvidenceForCloseout(t *testing.T) {
+	ctx := context.Background()
+	svc, db := newService(t)
+	work := addAndClaim(t, ctx, svc, "builder")
+	setCompletionRequirements(t, ctx, db, work.Contract.ID, []string{"report", "validation_assessment"})
+
+	report, err := svc.SubmitReport(ctx, coordination.SubmitReportInput{
+		LeaseID: work.Lease.ID,
+		AgentID: "builder",
+		Summary: "implemented",
+		Content: "details",
+	})
+	if err != nil {
+		t.Fatalf("report.submit: %v", err)
+	}
+	validationID := "ev_validation_pass"
+	insertEvidence(t, ctx, db, validationID, "validation_assessment", work.Contract.ID, "builder", "validation passed")
+
+	done := svc.CompleteContract(ctx, coordination.CompleteContractInput{
+		LeaseID: work.Lease.ID,
+		AgentID: "builder",
+		Summary: "done with existing evidence",
+	})
+	if done.Status != capability.StatusAccepted {
+		t.Fatalf("complete with existing required evidence = %+v, want accepted", done)
+	}
+	if got := contractStatus(t, ctx, db, work.Contract.ID); got != "satisfied" {
+		t.Fatalf("contract status = %s, want satisfied", got)
+	}
+	if got := leaseState(t, ctx, db, work.Lease.ID); got != "released" {
+		t.Fatalf("lease state = %s, want released", got)
+	}
+	var body string
+	if err := db.QueryRowContext(ctx, `SELECT body_inline FROM agent_communication_envelopes WHERE id = ?`, done.Data.EnvelopeID).Scan(&body); err != nil {
+		t.Fatalf("query result envelope body: %v", err)
+	}
+	if !strings.Contains(body, report.ID) || !strings.Contains(body, validationID) {
+		t.Fatalf("result body = %q, want auto-bound report and validation evidence ids", body)
+	}
+}
+
+func TestContractCompleteMissingRequiredEvidenceReportsActionableRefs(t *testing.T) {
+	ctx := context.Background()
+	svc, db := newService(t)
+	work := addAndClaim(t, ctx, svc, "builder")
+	setCompletionRequirements(t, ctx, db, work.Contract.ID, []string{"report", "validation_assessment"})
+
+	report, err := svc.SubmitReport(ctx, coordination.SubmitReportInput{
+		LeaseID: work.Lease.ID,
+		AgentID: "builder",
+		Summary: "implemented",
+		Content: "details",
+	})
+	if err != nil {
+		t.Fatalf("report.submit: %v", err)
+	}
+
+	missing := svc.CompleteContract(ctx, coordination.CompleteContractInput{
+		LeaseID: work.Lease.ID,
+		AgentID: "builder",
+		Summary: "premature closeout",
+	})
+	if missing.Status != capability.StatusRejected || missing.ErrorCode != "MISSING_REQUIRED_EVIDENCE" {
+		t.Fatalf("complete missing validation = %+v, want missing evidence rejected", missing)
+	}
+	if got := contractStatus(t, ctx, db, work.Contract.ID); got != "open" {
+		t.Fatalf("contract status after rejected complete = %s, want open", got)
+	}
+	if got := leaseState(t, ctx, db, work.Lease.ID); got != "active" {
+		t.Fatalf("lease state after rejected complete = %s, want active", got)
+	}
+	if missing.CanonicalIDs["available_report_evidence_id"] != report.ID {
+		t.Fatalf("canonical ids = %#v, want available report evidence id", missing.CanonicalIDs)
+	}
+	if !strings.Contains(missing.RepairHint, report.ID) {
+		t.Fatalf("repair hint = %q, want available report evidence id", missing.RepairHint)
+	}
+	if len(missing.Missing) != 1 ||
+		missing.Missing[0].Kind != "validation_assessment" ||
+		missing.Missing[0].Action != "validation.assessment" {
+		t.Fatalf("missing = %+v, want validation.assessment repair action", missing.Missing)
+	}
+	for _, action := range missing.AllowedNextActions {
+		if action == "validation_assessment.submit" {
+			t.Fatalf("allowed next actions = %#v, must not include bogus validation_assessment.submit", missing.AllowedNextActions)
+		}
+	}
+	if !containsString(missing.AllowedNextActions, "validation.assessment") {
+		t.Fatalf("allowed next actions = %#v, want validation.assessment", missing.AllowedNextActions)
 	}
 }
 
@@ -1147,6 +1240,40 @@ func countRowsWhere(t *testing.T, ctx context.Context, db *sql.DB, table, where 
 		t.Fatalf("count %s where %s: %v", table, where, err)
 	}
 	return count
+}
+
+func setCompletionRequirements(t *testing.T, ctx context.Context, db *sql.DB, contractID string, kinds []string) {
+	t.Helper()
+	raw, err := json.Marshal(map[string][]string{"required_evidence": kinds})
+	if err != nil {
+		t.Fatalf("marshal completion requirements: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE work_contracts SET completion_requirements_json = ? WHERE id = ?`, string(raw), contractID); err != nil {
+		t.Fatalf("set completion requirements: %v", err)
+	}
+}
+
+func insertEvidence(t *testing.T, ctx context.Context, db *sql.DB, id, kind, contractID, producedBy, summary string) {
+	t.Helper()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO evidence (
+  id, tenant_id, kind, contract_id, produced_by, content_ref,
+  inline_content, summary, verdict, created_at
+) VALUES (?, 'default', ?, ?, ?, '', '', ?, 'pass', ?)`,
+		id, kind, contractID, producedBy, summary, now,
+	); err != nil {
+		t.Fatalf("insert evidence %s: %v", id, err)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func envelopeKind(t *testing.T, ctx context.Context, db *sql.DB, envelopeID string) string {

@@ -3,8 +3,10 @@ package runtime
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -152,7 +154,7 @@ func (r *Runner) ResumeRoute(ctx context.Context, in ResumeRouteInput) (ResumeRe
 		if !resumableAttemptStatus(attempt.Status) {
 			return fmt.Errorf("session.resume: attempt %s is %s, not resumable", attempt.ID, attempt.Status)
 		}
-		alreadyResumed, err = sessionResumeEventExists(ctx, tx, route.ID)
+		alreadyResumed, err = sessionResumeEventExists(ctx, tx, route.ID, in.MailboxIDs)
 		if err != nil {
 			return err
 		}
@@ -177,6 +179,9 @@ func (r *Runner) ResumeRoute(ctx context.Context, in ResumeRouteInput) (ResumeRe
 	}); err != nil {
 		return ResumeResult{}, err
 	}
+	if err := r.activateResumeScope(ctx, attempt, route); err != nil {
+		return ResumeResult{}, err
+	}
 
 	if err := resumer.Resume(ctx, ResumeRequest{
 		Route:      route,
@@ -184,10 +189,33 @@ func (r *Runner) ResumeRoute(ctx context.Context, in ResumeRouteInput) (ResumeRe
 		MailboxIDs: append([]string(nil), in.MailboxIDs...),
 		Env:        env,
 	}); err != nil {
+		_ = r.deactivateFailedResumeScope(ctx, attempt, route)
 		return ResumeResult{}, err
 	}
 
 	err = withTx(ctx, r.db, func(tx *sql.Tx) error {
+		if _, err := appendEvent(ctx, tx, "session.resumed", "session_route", route.ID, map[string]any{
+			"attempt_id":  attempt.ID,
+			"mailbox_ids": in.MailboxIDs,
+			"reason":      in.Reason,
+		}); err != nil {
+			return err
+		}
+		if capabilities, ok := AdapterCapabilitiesForBackend(r.adapter, route.CLIBackend); ok {
+			if _, err := appendAdapterCapabilityEvent(ctx, tx, route.ID, route.CLIBackend, capabilities); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return ResumeResult{}, err
+	}
+	return ResumeResult{AttemptID: attempt.ID, RouteID: route.ID, State: "resumed", MailboxIDs: append([]string(nil), in.MailboxIDs...), Env: cloneStringMap(env)}, nil
+}
+
+func (r *Runner) activateResumeScope(ctx context.Context, attempt Attempt, route SessionRoute) error {
+	return withTx(ctx, r.db, func(tx *sql.Tx) error {
 		now := formatTime(time.Now())
 		if _, err := ensureActiveGuardTx(ctx, tx, activeGuardInput{
 			ResourceKind:   "session_resume",
@@ -212,24 +240,42 @@ UPDATE session_routes SET state = 'active', updated_at = ? WHERE id = ?`,
 		); err != nil {
 			return fmt.Errorf("mark resumed route active: %w", err)
 		}
-		if _, err := appendEvent(ctx, tx, "session.resumed", "session_route", route.ID, map[string]any{
-			"attempt_id":  attempt.ID,
-			"mailbox_ids": in.MailboxIDs,
-			"reason":      in.Reason,
-		}); err != nil {
-			return err
+		return nil
+	})
+}
+
+func (r *Runner) deactivateFailedResumeScope(ctx context.Context, attempt Attempt, route SessionRoute) error {
+	return withTx(ctx, r.db, func(tx *sql.Tx) error {
+		now := formatTime(time.Now())
+		if _, err := tx.ExecContext(ctx, `
+UPDATE attempts
+SET status = 'waiting'
+WHERE id = ? AND status = 'running'`,
+			attempt.ID,
+		); err != nil {
+			return fmt.Errorf("restore failed resume attempt waiting: %w", err)
 		}
-		if capabilities, ok := AdapterCapabilitiesForBackend(r.adapter, route.CLIBackend); ok {
-			if _, err := appendAdapterCapabilityEvent(ctx, tx, route.ID, route.CLIBackend, capabilities); err != nil {
-				return err
-			}
+		if _, err := tx.ExecContext(ctx, `
+UPDATE session_routes
+SET state = 'waiting', updated_at = ?
+WHERE id = ? AND state = 'active'`,
+			now, route.ID,
+		); err != nil {
+			return fmt.Errorf("restore failed resume route waiting: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+UPDATE runtime_tokens
+SET state = 'revoked', updated_at = ?
+WHERE attempt_id = ? AND lease_id = ? AND runtime_id = ? AND state = 'active'`,
+			now, attempt.ID, attempt.LeaseID, route.RuntimeID,
+		); err != nil {
+			return fmt.Errorf("revoke failed resume tokens: %w", err)
+		}
+		if err := releaseActiveGuardsTx(ctx, tx, attempt.ID, now); err != nil {
+			return err
 		}
 		return nil
 	})
-	if err != nil {
-		return ResumeResult{}, err
-	}
-	return ResumeResult{AttemptID: attempt.ID, RouteID: route.ID, State: "resumed", MailboxIDs: append([]string(nil), in.MailboxIDs...), Env: cloneStringMap(env)}, nil
 }
 
 func (r *Runner) ProcessResumeQueue(ctx context.Context, owner string) (ResumeQueueResult, error) {
@@ -531,22 +577,85 @@ WHERE attempt_id = ? AND state = 'active'`,
 	return err
 }
 
-func sessionResumeEventExists(ctx context.Context, tx *sql.Tx, routeID string) (bool, error) {
-	var id string
-	err := tx.QueryRowContext(ctx, `
+func sessionResumeEventExists(ctx context.Context, tx *sql.Tx, routeID string, mailboxIDs []string) (bool, error) {
+	normalizedMailboxIDs := normalizeMailboxIDs(mailboxIDs)
+	if len(normalizedMailboxIDs) == 0 {
+		var id string
+		err := tx.QueryRowContext(ctx, `
 SELECT id
 FROM events
 WHERE event_type = 'session.resumed'
   AND aggregate_type = 'session_route'
   AND aggregate_id = ?
 LIMIT 1`, routeID).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return true, nil
 	}
+
+	rows, err := tx.QueryContext(ctx, `
+SELECT payload_json
+FROM events
+WHERE event_type = 'session.resumed'
+  AND aggregate_type = 'session_route'
+  AND aggregate_id = ?`, routeID)
 	if err != nil {
 		return false, err
 	}
-	return true, nil
+	defer rows.Close()
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return false, err
+		}
+		var payload struct {
+			MailboxIDs []string `json:"mailbox_ids"`
+		}
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+			return false, fmt.Errorf("decode session.resumed payload: %w", err)
+		}
+		if sameStringSet(normalizeMailboxIDs(payload.MailboxIDs), normalizedMailboxIDs) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+func normalizeMailboxIDs(mailboxIDs []string) []string {
+	if len(mailboxIDs) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(mailboxIDs))
+	out := make([]string, 0, len(mailboxIDs))
+	for _, id := range mailboxIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func markRouteTerminalForLease(ctx context.Context, tx *sql.Tx, leaseID, state, now string) error {

@@ -895,6 +895,132 @@ func TestOperatorTaskWaitReturnsRuntimeApprovalBlockedEvidence(t *testing.T) {
 	}
 }
 
+func TestOperatorTaskStartReturnsRuntimeTimeoutDiagnosticInsteadOfInternalError(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "coordplane.db")
+	app, err := backend.Open(ctx, backend.Config{
+		DBPath:            dbPath,
+		ListenAddr:        "127.0.0.1:0",
+		TeamConfigPath:    threeAgentFixturePath(t),
+		OperatorToken:     "operator-secret",
+		OperatorSubjectID: "ops-user",
+	})
+	if err != nil {
+		t.Fatalf("open backend with operator token: %v", err)
+	}
+	defer app.Close()
+	app.OperatorTasks, err = operator.NewService(operator.Config{
+		Store:            app.Store,
+		TeamConfig:       app.TeamConfig,
+		TeamConfigLoaded: app.TeamConfigLoaded,
+		Runner:           &timeoutRunner{db: app.DB, coordination: app.Coordination},
+	})
+	if err != nil {
+		t.Fatalf("replace operator runner: %v", err)
+	}
+
+	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest("operator-start-runtime-timeout", nil), http.StatusOK))
+	taskRunID := stringField(t, created, "task_run_id")
+	rootAssignmentID := stringField(t, created, "root_assignment_id")
+	startRaw := postOperatorTaskStartRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{"idempotency_key": "start-timeout"}, http.StatusBadRequest)
+	assertNoOperatorSensitiveLeak(t, startRaw, "operator-secret", dbPath, "Authorization", "Bearer", "/home/", "/tmp/")
+	var start capability.Response[json.RawMessage]
+	if err := json.Unmarshal(startRaw, &start); err != nil {
+		t.Fatalf("decode start timeout response: %v\nbody=%s", err, string(startRaw))
+	}
+	if start.Status != capability.StatusRejected ||
+		start.ErrorCode != cpruntime.TerminalReasonRuntimeExecTimeout ||
+		start.Retryable == nil || !*start.Retryable {
+		t.Fatalf("start timeout response = %+v, want runtime timeout rejected envelope; body=%s", start, string(startRaw))
+	}
+	assertAssignmentState(t, ctx, app.DB, rootAssignmentID, "queued", "")
+	if got := countRowsWhere(t, ctx, app.DB, "attempts", "status = 'failed'"); got != 1 {
+		t.Fatalf("failed attempts = %d, want durable timeout attempt", got)
+	}
+
+	evidenceRaw := getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK)
+	assertNoOperatorSensitiveLeak(t, evidenceRaw, "operator-secret", dbPath, "Authorization", "Bearer", "/home/", "/tmp/")
+	evidence := decodeOperatorTaskData(t, evidenceRaw)
+	if evidence["status"] != "blocked" ||
+		evidence["failure_class"] != cpruntime.FailureClassRuntimeExecTimeout ||
+		evidence["terminal_reason"] != cpruntime.TerminalReasonRuntimeExecTimeout {
+		t.Fatalf("evidence = %#v, want runtime exec timeout blocker", evidence)
+	}
+	terminal := objectField(t, evidence, "terminal")
+	if terminal["status"] != "blocked" ||
+		terminal["failure_class"] != cpruntime.FailureClassRuntimeExecTimeout ||
+		terminal["terminal_reason"] != cpruntime.TerminalReasonRuntimeExecTimeout {
+		t.Fatalf("terminal evidence = %#v, want runtime exec timeout blocker", terminal)
+	}
+}
+
+func TestOperatorTaskTerminalPassedIsNotOverwrittenByPostCloseoutRuntimeTimeout(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "coordplane.db")
+	app, err := backend.Open(ctx, backend.Config{
+		DBPath:            dbPath,
+		ListenAddr:        "127.0.0.1:0",
+		TeamConfigPath:    threeAgentFixturePath(t),
+		OperatorToken:     "operator-secret",
+		OperatorSubjectID: "ops-user",
+	})
+	if err != nil {
+		t.Fatalf("open backend with operator token: %v", err)
+	}
+	defer app.Close()
+
+	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest("operator-post-closeout-timeout", nil), http.StatusOK))
+	taskRunID := stringField(t, created, "task_run_id")
+	rootContractID := stringField(t, created, "root_contract_id")
+	rootAssignmentID := stringField(t, created, "root_assignment_id")
+	rootStarted := decodeOperatorTaskData(t, postOperatorTaskStartRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{"idempotency_key": "start-post-closeout-timeout"}, http.StatusOK))
+	rootLeaseID := stringField(t, rootStarted, "lease_id")
+	rootAttemptID := stringField(t, rootStarted, "attempt_id")
+	rootRouteID := stringField(t, rootStarted, "session_route_id")
+
+	completeRootWithPassingValidation(t, ctx, app, rootContractID, rootLeaseID)
+	insertAcceptedAgentCapabilityCall(t, ctx, app.DB, rootLeaseID, "coordinator", "contract.complete")
+	assertAssignmentState(t, ctx, app.DB, rootAssignmentID, "returned", rootRouteID)
+	if active := countActiveLeasesForAssignment(t, ctx, app.DB, rootAssignmentID); active != 0 {
+		t.Fatalf("active root leases after closeout = %d, want 0", active)
+	}
+	markAttemptRuntimeExecTimeout(t, ctx, app.DB, rootAttemptID)
+
+	waitRaw := postOperatorTaskWaitRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{
+		"timeout_millis":       20,
+		"poll_interval_millis": 1,
+	}, http.StatusOK)
+	assertNoOperatorSensitiveLeak(t, waitRaw, "operator-secret", dbPath, "Authorization", "Bearer", "/home/", "/tmp/")
+	waitData := decodeOperatorTaskData(t, waitRaw)
+	if waitData["status"] != "passed" || waitData["failure_class"] != nil || waitData["terminal_reason"] != nil {
+		t.Fatalf("wait data = %#v, want passed without runtime timeout override", waitData)
+	}
+	waitEvidence := objectField(t, waitData, "evidence")
+	terminal := objectField(t, waitEvidence, "terminal")
+	if terminal["status"] != "passed" ||
+		terminal["root_contract_status"] != "satisfied" ||
+		terminal["queued_assignment_count"].(float64) != 0 ||
+		terminal["active_assignment_count"].(float64) != 0 ||
+		terminal["active_lease_count"].(float64) != 0 ||
+		terminal["failure_class"] != nil ||
+		terminal["terminal_reason"] != nil {
+		t.Fatalf("terminal evidence = %#v, want passed final state despite post-closeout timeout", terminal)
+	}
+	counts := objectField(t, waitEvidence, "capability_call_counts")
+	if counts["contract.complete"].(float64) < 1 {
+		t.Fatalf("capability counts = %#v, want accepted contract.complete evidence", counts)
+	}
+
+	rebuildRaw := getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK)
+	assertNoOperatorSensitiveLeak(t, rebuildRaw, "operator-secret", dbPath, "Authorization", "Bearer", "/home/", "/tmp/")
+	rebuild := decodeOperatorTaskData(t, rebuildRaw)
+	if rebuild["status"] != "passed" || rebuild["failure_class"] != nil || rebuild["terminal_reason"] != nil {
+		t.Fatalf("rebuilt evidence = %#v, want passed without runtime timeout override", rebuild)
+	}
+}
+
 func TestOperatorTaskWaitDispatchesQueuedLineageAndBuildsEvidence(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -2904,6 +3030,57 @@ INSERT INTO attempts (
 	return cpruntime.AssignmentSession{}, cpruntime.NewRuntimeApprovalPolicyUnavailable("command runtime provider is not configured for non-interactive approval")
 }
 
+type timeoutRunner struct {
+	db           *sql.DB
+	coordination *coordination.Service
+}
+
+func (r *timeoutRunner) StartAssignment(ctx context.Context, agentID, assignmentID string) (cpruntime.AssignmentSession, error) {
+	next, err := r.coordination.AssignmentClaim(ctx, coordination.AssignmentClaimInput{
+		AgentID:      agentID,
+		AssignmentID: assignmentID,
+		LeaseFor:     time.Hour,
+	})
+	if err != nil {
+		return cpruntime.AssignmentSession{}, err
+	}
+	attemptID := "att_runtime_exec_timeout"
+	runtimeID := "rt_runtime_exec_timeout"
+	sessionID := "cli_runtime_exec_timeout"
+	nativeID := "native-runtime-exec-timeout"
+	timeoutErr := cpruntime.NewRuntimeExecTimeout("docker exec timed out after 2m0s", context.DeadlineExceeded)
+	reason := timeoutErr.Error()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := r.db.ExecContext(ctx, `
+INSERT INTO attempts (
+  id, tenant_id, lease_id, cli_backend, runtime_kind, session_native_id,
+  start_reason, status, transcript_ref, started_at, ended_at
+) VALUES (?, 'default', ?, 'claude', 'docker', ?, 'new_assignment', 'failed', ?, ?, ?)`,
+		attemptID, next.Lease.ID, nativeID, reason, now, now,
+	); err != nil {
+		return cpruntime.AssignmentSession{}, err
+	}
+	if _, err := r.db.ExecContext(ctx, `
+INSERT INTO cli_sessions (
+  id, tenant_id, attempt_id, runtime_id, agent_id, cli_backend, profile_name,
+  session_native_id, container_name, process_ref, state, start_reason,
+  exit_code, last_error, transcript_ref, command_json, env_keys_json,
+  started_at, ended_at, updated_at
+) VALUES (?, 'default', ?, ?, ?, 'claude', 'claude', ?, 'coordplane-timeout',
+  'docker-exec:coordplane-timeout', 'failed', 'start', -1, ?, ?, '[]', '[]', ?, ?, ?)`,
+		sessionID, attemptID, runtimeID, agentID, nativeID, reason, "obj_timeout_redacted", now, now, now,
+	); err != nil {
+		return cpruntime.AssignmentSession{}, err
+	}
+	if _, err := r.db.ExecContext(ctx, `UPDATE leases SET state = 'released', updated_at = ? WHERE id = ?`, now, next.Lease.ID); err != nil {
+		return cpruntime.AssignmentSession{}, err
+	}
+	if _, err := r.db.ExecContext(ctx, `UPDATE assignments SET state = 'queued', session_route_id = NULL, updated_at = ? WHERE id = ?`, now, next.Assignment.ID); err != nil {
+		return cpruntime.AssignmentSession{}, err
+	}
+	return cpruntime.AssignmentSession{}, timeoutErr
+}
+
 type capturingRunner struct {
 	inner    *cpruntime.Runner
 	mu       sync.Mutex
@@ -3283,6 +3460,53 @@ WHERE assignment_id = ? AND state = 'active'`, assignmentID).Scan(&count); err !
 		t.Fatalf("count active leases for assignment %s: %v", assignmentID, err)
 	}
 	return count
+}
+
+func markAttemptRuntimeExecTimeout(t *testing.T, ctx context.Context, db *sql.DB, attemptID string) {
+	t.Helper()
+	reason := cpruntime.NewRuntimeExecTimeout("docker exec timed out after 2m0s", context.DeadlineExceeded).Error()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := db.ExecContext(ctx, `
+UPDATE attempts
+SET status = 'failed', transcript_ref = ?, ended_at = ?
+WHERE id = ?`,
+		reason, now, attemptID,
+	)
+	if err != nil {
+		t.Fatalf("mark attempt runtime timeout: %v", err)
+	}
+	if rows, err := result.RowsAffected(); err != nil {
+		t.Fatalf("count updated timeout attempts: %v", err)
+	} else if rows != 1 {
+		t.Fatalf("updated timeout attempts = %d, want 1", rows)
+	}
+	if _, err := db.ExecContext(ctx, `
+UPDATE cli_sessions
+SET state = 'failed', last_error = ?, ended_at = COALESCE(ended_at, ?), updated_at = ?
+WHERE attempt_id = ?`,
+		reason, now, now, attemptID,
+	); err != nil {
+		t.Fatalf("mark cli session runtime timeout: %v", err)
+	}
+}
+
+func insertAcceptedAgentCapabilityCall(t *testing.T, ctx context.Context, db *sql.DB, leaseID, agentID, capabilityName string) {
+	t.Helper()
+	callID := "capcall_test_" + strings.NewReplacer(".", "_", "-", "_").Replace(capabilityName) + "_" + leaseID
+	scopeJSON, err := json.Marshal(map[string]string{"lease_id": leaseID})
+	if err != nil {
+		t.Fatalf("marshal capability scope: %v", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO capability_calls (
+  id, tenant_id, trace_id, capability_name, subject_kind, subject_id,
+  scope_json, status, idempotency_key, created_at
+) VALUES (?, 'default', ?, ?, 'agent', ?, ?, 'accepted', '', ?)`,
+		callID, "trace_"+callID, capabilityName, agentID, string(scopeJSON), now,
+	); err != nil {
+		t.Fatalf("insert accepted capability call: %v", err)
+	}
 }
 
 type assignmentSession struct {

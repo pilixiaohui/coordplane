@@ -364,6 +364,84 @@ func TestTaskRunCommandWritesEvidenceWhenStartFails(t *testing.T) {
 	}
 }
 
+func TestTaskRunCommandWritesEvidenceWhenStartReturnsRuntimeTimeout(t *testing.T) {
+	payloadPath := writeTaskPayload(t)
+	evidencePath := filepath.Join(t.TempDir(), "runtime-timeout-evidence.json")
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.Header.Get("Authorization") != "Bearer operator-secret" {
+			t.Fatalf("%s auth = %q", r.URL.Path, r.Header.Get("Authorization"))
+		}
+		switch r.URL.Path {
+		case "/operator/tasks":
+			writeAccepted(t, w, map[string]any{
+				"task_run_id":        "taskrun_runtime_timeout",
+				"root_contract_id":   "ctr_runtime_timeout",
+				"root_assignment_id": "asg_runtime_timeout",
+				"status":             "created",
+			})
+		case "/operator/tasks/taskrun_runtime_timeout/start":
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok":                   false,
+				"status":               "rejected",
+				"error_code":           "RUNTIME_EXEC_TIMEOUT",
+				"message":              "RUNTIME_EXEC_TIMEOUT: docker exec timed out after 2m0s",
+				"retryable":            true,
+				"repair_hint":          "inspect operator task evidence",
+				"allowed_next_actions": []string{"operator.task.evidence", "operator.task.wait", "operator.task.start"},
+				"canonical_ids":        map[string]string{"task_run_id": "taskrun_runtime_timeout"},
+				"missing":              []any{},
+			})
+		case "/operator/tasks/taskrun_runtime_timeout/evidence":
+			writeAccepted(t, w, map[string]any{
+				"schema_version":  "operator.task.evidence.v1",
+				"task_run_id":     "taskrun_runtime_timeout",
+				"status":          "blocked",
+				"failure_class":   "runtime_exec_timeout",
+				"terminal_reason": "RUNTIME_EXEC_TIMEOUT",
+				"terminal": map[string]any{
+					"status":          "blocked",
+					"failure_class":   "runtime_exec_timeout",
+					"terminal_reason": "RUNTIME_EXEC_TIMEOUT",
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("TEST_OPERATOR_TOKEN", "operator-secret")
+	var stdout, stderr bytes.Buffer
+	err := run([]string{
+		"task", "run",
+		"--backend-url", server.URL,
+		"--operator-token-env", "TEST_OPERATOR_TOKEN",
+		"--payload", payloadPath,
+		"--wait",
+		"--evidence-out", evidencePath,
+	}, &stdout, &stderr, server.Client())
+	if err == nil ||
+		!strings.Contains(err.Error(), "RUNTIME_EXEC_TIMEOUT") ||
+		strings.Contains(err.Error(), "HTTP 500") ||
+		strings.Contains(err.Error(), "OPERATOR_TASK_START_FAILED") {
+		t.Fatalf("task run timeout error = %v; stderr=%s", err, stderr.String())
+	}
+	if strings.Join(paths, ",") != "/operator/tasks,/operator/tasks/taskrun_runtime_timeout/start,/operator/tasks/taskrun_runtime_timeout/evidence" {
+		t.Fatalf("paths = %v, want create start evidence", paths)
+	}
+	rawEvidence, readErr := os.ReadFile(evidencePath)
+	if readErr != nil {
+		t.Fatalf("read evidence out after runtime timeout: %v", readErr)
+	}
+	if !strings.Contains(string(rawEvidence), `"failure_class":"runtime_exec_timeout"`) ||
+		!strings.Contains(string(rawEvidence), `"terminal_reason":"RUNTIME_EXEC_TIMEOUT"`) {
+		t.Fatalf("runtime timeout evidence file = %s, want runtime timeout blocker", string(rawEvidence))
+	}
+}
+
 func writeTaskPayload(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "task.json")

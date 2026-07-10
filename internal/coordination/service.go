@@ -513,12 +513,12 @@ func (s *Service) CompleteContract(ctx context.Context, in CompleteContractInput
 		if err != nil {
 			return err
 		}
-		missing, err := missingEvidence(ctx, tx, scope.Contract.ID, in.EvidenceIDs)
+		evidenceIDs, requirements, err := bindRequiredEvidence(ctx, tx, scope.Contract.ID, in.EvidenceIDs)
 		if err != nil {
 			return err
 		}
-		if len(missing) > 0 {
-			return rejectedErr{response: missingEvidenceResponse[CompleteContractResult](scope.Contract.ID, in.LeaseID, missing)}
+		if missing := missingRequiredEvidence(requirements); len(missing) > 0 {
+			return rejectedErr{response: missingEvidenceResponse[CompleteContractResult](scope.Contract.ID, in.LeaseID, requirements)}
 		}
 		now := formatTime(time.Now())
 		if _, err := tx.ExecContext(ctx, `UPDATE work_contracts SET status = 'satisfied', updated_at = ? WHERE id = ?`, now, scope.Contract.ID); err != nil {
@@ -547,14 +547,14 @@ func (s *Service) CompleteContract(ctx context.Context, in CompleteContractInput
 			ContractID:       scope.Contract.ID,
 			ParentEnvelopeID: parentEnvelopeID,
 			Summary:          resultSummary,
-			BodyInline:       resultBody(scope.Contract.ID, in.EvidenceIDs, resultSummary),
+			BodyInline:       resultBody(scope.Contract.ID, evidenceIDs, resultSummary),
 			TriggerTurn:      triggerTurn,
 		})
 		if err != nil {
 			return fmt.Errorf("insert result envelope: %w", err)
 		}
 		if scope.Contract.IssuerAgentID != "" && scope.Contract.IssuerContract != "" {
-			if err := createChildCompletedMailbox(ctx, tx, scope.Contract, in.EvidenceIDs, envelopeID, triggerTurn); err != nil {
+			if err := createChildCompletedMailbox(ctx, tx, scope.Contract, evidenceIDs, envelopeID, triggerTurn); err != nil {
 				return err
 			}
 		}
@@ -1022,13 +1022,21 @@ WHERE contract_id = ?
 	return out, err
 }
 
-func missingEvidence(ctx context.Context, tx *sql.Tx, contractID string, evidenceIDs []string) ([]string, error) {
+type evidenceRequirementStatus struct {
+	Kind       string
+	PresentIDs []string
+}
+
+func bindRequiredEvidence(ctx context.Context, tx *sql.Tx, contractID string, evidenceIDs []string) ([]string, []evidenceRequirementStatus, error) {
 	required, err := requiredEvidence(ctx, tx, contractID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	present := make(map[string]bool)
+	bound := make([]string, 0, len(evidenceIDs)+len(required))
+	seenEvidence := make(map[string]bool)
+	presentByKind := make(map[string][]string)
 	for _, id := range evidenceIDs {
+		id = strings.TrimSpace(id)
 		if id == "" {
 			continue
 		}
@@ -1038,17 +1046,70 @@ func missingEvidence(ctx context.Context, tx *sql.Tx, contractID string, evidenc
 			continue
 		}
 		if err != nil {
+			return nil, nil, err
+		}
+		if !seenEvidence[id] {
+			bound = append(bound, id)
+			seenEvidence[id] = true
+		}
+		presentByKind[kind] = append(presentByKind[kind], id)
+	}
+	requirements := make([]evidenceRequirementStatus, 0, len(required))
+	for _, kind := range required {
+		status := evidenceRequirementStatus{
+			Kind:       kind,
+			PresentIDs: append([]string(nil), presentByKind[kind]...),
+		}
+		if len(status.PresentIDs) == 0 {
+			available, err := latestEvidenceIDsForKind(ctx, tx, contractID, kind)
+			if err != nil {
+				return nil, nil, err
+			}
+			if len(available) > 0 {
+				chosen := available[0]
+				status.PresentIDs = []string{chosen}
+				if !seenEvidence[chosen] {
+					bound = append(bound, chosen)
+					seenEvidence[chosen] = true
+				}
+			}
+		}
+		requirements = append(requirements, status)
+	}
+	return bound, requirements, nil
+}
+
+func latestEvidenceIDsForKind(ctx context.Context, tx *sql.Tx, contractID, kind string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `
+SELECT id
+FROM evidence
+WHERE contract_id = ? AND kind = ?
+ORDER BY created_at DESC, id DESC`,
+		contractID, kind,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
 			return nil, err
 		}
-		present[kind] = true
+		ids = append(ids, id)
 	}
-	var missing []string
-	for _, kind := range required {
-		if !present[kind] {
-			missing = append(missing, kind)
+	return ids, rows.Err()
+}
+
+func missingRequiredEvidence(requirements []evidenceRequirementStatus) []evidenceRequirementStatus {
+	var missing []evidenceRequirementStatus
+	for _, req := range requirements {
+		if len(req.PresentIDs) == 0 {
+			missing = append(missing, req)
 		}
 	}
-	return missing, nil
+	return missing
 }
 
 func requiredEvidence(ctx context.Context, tx *sql.Tx, contractID string) ([]string, error) {
@@ -1232,26 +1293,80 @@ func communicationDenied(message string) capability.Response[AgentCommunicationE
 	)
 }
 
-func missingEvidenceResponse[T any](contractID, leaseID string, missing []string) capability.Response[T] {
+func missingEvidenceResponse[T any](contractID, leaseID string, requirements []evidenceRequirementStatus) capability.Response[T] {
+	missing := missingRequiredEvidence(requirements)
 	opts := []capability.RejectedOption{
 		capability.WithCanonicalID("contract_id", contractID),
 		capability.WithCanonicalID("lease_id", leaseID),
-		capability.WithRepairHint("submit the missing evidence, then retry contract.complete"),
-		capability.WithAllowedNextActions("report.submit", "contract.context", "message.send"),
+		capability.WithRepairHint(missingEvidenceRepairHint(requirements)),
+		capability.WithAllowedNextActions(missingEvidenceNextActions(missing)...),
 		capability.WithRetryable(true),
 	}
-	for _, kind := range missing {
-		action := "report.submit"
-		if kind != "report" {
-			action = kind + ".submit"
+	for _, req := range requirements {
+		if len(req.PresentIDs) > 0 {
+			opts = append(opts, capability.WithCanonicalID("available_"+canonicalEvidenceKey(req.Kind)+"_evidence_id", req.PresentIDs[0]))
+			continue
 		}
-		opts = append(opts, capability.WithMissing(kind, action))
+		opts = append(opts, capability.WithMissing(req.Kind, evidenceAction(req.Kind)))
 	}
 	return capability.Rejected[T](
 		"MISSING_REQUIRED_EVIDENCE",
-		"contract.complete requires required evidence before this contract can be satisfied",
+		"contract.complete requires all required evidence refs before this contract can be satisfied",
 		opts...,
 	)
+}
+
+func missingEvidenceRepairHint(requirements []evidenceRequirementStatus) string {
+	var available []string
+	for _, req := range requirements {
+		if len(req.PresentIDs) > 0 {
+			available = append(available, req.Kind+"="+req.PresentIDs[0])
+		}
+	}
+	hint := "submit the missing evidence, then retry contract.complete with evidence_ids containing one evidence ref for each required kind"
+	if len(available) > 0 {
+		hint += "; available required evidence refs: " + strings.Join(available, ", ")
+	}
+	return hint
+}
+
+func missingEvidenceNextActions(missing []evidenceRequirementStatus) []string {
+	seen := make(map[string]bool)
+	actions := make([]string, 0, len(missing)+3)
+	add := func(action string) {
+		if action == "" || seen[action] {
+			return
+		}
+		seen[action] = true
+		actions = append(actions, action)
+	}
+	for _, req := range missing {
+		add(evidenceAction(req.Kind))
+	}
+	add("contract.context")
+	add("message.send")
+	add("contract.complete")
+	return actions
+}
+
+func evidenceAction(kind string) string {
+	switch kind {
+	case "report":
+		return "report.submit"
+	case "validation_assessment":
+		return "validation.assessment"
+	case "command_run":
+		return "command.run"
+	case "changeset":
+		return "changeset.submit"
+	default:
+		return kind + ".submit"
+	}
+}
+
+func canonicalEvidenceKey(kind string) string {
+	replacer := strings.NewReplacer(".", "_", "-", "_", " ", "_")
+	return replacer.Replace(kind)
 }
 
 type rejectedErr struct {

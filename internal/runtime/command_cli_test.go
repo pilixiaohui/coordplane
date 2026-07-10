@@ -946,6 +946,52 @@ func TestCommandCLIAdapterExitFailureFailsClosedWithoutRunningAttempt(t *testing
 	}
 }
 
+func TestCommandCLIAdapterTimeoutPreservesDiagnosticTranscript(t *testing.T) {
+	ctx := context.Background()
+	timeoutErr := cpruntime.NewRuntimeExecTimeout("docker exec timed out after 10ms", context.DeadlineExceeded)
+	exec := &recordingContainerExecutor{
+		err: timeoutErr,
+		errResult: cpruntime.ContainerExecResult{
+			ProcessRef: "docker-exec:coordplane-timeout",
+			ExitCode:   -1,
+			Stdout:     []byte("partial provider stdout"),
+			Stderr:     []byte("partial provider stderr"),
+		},
+	}
+	h := newCommandCLIHarness(t, exec)
+	add := addContract(t, ctx, h.coordination, "developer")
+
+	_, err := h.runner.StartNext(ctx, "developer")
+	if err == nil {
+		t.Fatal("StartNext succeeded with timed out CLI process")
+	}
+	if class, ok := cpruntime.ErrorFailureClass(err); !ok || class != cpruntime.FailureClassRuntimeExecTimeout {
+		t.Fatalf("failure class = %s/%v, want runtime_exec_timeout", class, ok)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("StartNext error = %v, want deadline cause", err)
+	}
+	if got := assignmentState(t, ctx, h.db, add.AssignmentID); got != "queued" {
+		t.Fatalf("assignment after timeout = %s, want queued for retry", got)
+	}
+	cliSessions, err := cpruntime.ListCLISessions(ctx, h.db)
+	if err != nil {
+		t.Fatalf("list cli sessions: %v", err)
+	}
+	if len(cliSessions) != 1 ||
+		cliSessions[0].State != "failed" ||
+		cliSessions[0].ProcessRef != "docker-exec:coordplane-timeout" ||
+		cliSessions[0].ExitCode == nil || *cliSessions[0].ExitCode != -1 ||
+		!strings.Contains(cliSessions[0].LastError, cpruntime.TerminalReasonRuntimeExecTimeout) ||
+		!strings.HasPrefix(cliSessions[0].TranscriptRef, "obj_sha256_") {
+		t.Fatalf("cli session after timeout = %+v, want failed timeout with process/ref diagnostics", cliSessions)
+	}
+	transcript := transcriptContentForAttempt(t, ctx, h.db, cliSessions[0].AttemptID)
+	if !strings.Contains(transcript, "partial provider stdout") || !strings.Contains(transcript, "partial provider stderr") {
+		t.Fatalf("timeout transcript = %q, want executor stdout/stderr diagnostics", transcript)
+	}
+}
+
 func TestCommandCLIAdapterMissingAuthProbeFailsClosedBeforeExecutor(t *testing.T) {
 	ctx := context.Background()
 	exec := &recordingContainerExecutor{results: []cpruntime.ContainerExecResult{{
@@ -1304,10 +1350,11 @@ func commandCLITeamConfig(runtimeProfile string) teamconfig.Config {
 }
 
 type recordingContainerExecutor struct {
-	err     error
-	results []cpruntime.ContainerExecResult
-	specs   []cpruntime.ContainerExecSpec
-	onExec  func(cpruntime.ContainerExecSpec)
+	err       error
+	errResult cpruntime.ContainerExecResult
+	results   []cpruntime.ContainerExecResult
+	specs     []cpruntime.ContainerExecSpec
+	onExec    func(cpruntime.ContainerExecSpec)
 }
 
 func (e *recordingContainerExecutor) Exec(ctx context.Context, spec cpruntime.ContainerExecSpec) (cpruntime.ContainerExecResult, error) {
@@ -1321,7 +1368,7 @@ func (e *recordingContainerExecutor) Exec(ctx context.Context, spec cpruntime.Co
 		e.onExec(cloneExecSpec(spec))
 	}
 	if e.err != nil {
-		return cpruntime.ContainerExecResult{}, e.err
+		return e.errResult, e.err
 	}
 	if len(e.results) == 0 {
 		return cpruntime.ContainerExecResult{}, errors.New("no fake exec result")

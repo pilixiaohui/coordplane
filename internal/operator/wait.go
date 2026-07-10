@@ -819,15 +819,6 @@ WHERE l.state = 'active' AND a.contract_id IN (`+placeholders(len(contractIDs))+
 	).Scan(&out.ActiveLeaseCount); err != nil {
 		return out, fmt.Errorf("count active leases: %w", err)
 	}
-	if failure, ok, err := s.evidenceRuntimePolicyFailure(ctx, contractIDs); err != nil {
-		return out, err
-	} else if ok {
-		out.Status = failure.status
-		out.FailureSummary = failure.summary
-		out.FailureClass = failure.failureClass
-		out.TerminalReason = failure.terminalReason
-		return out, nil
-	}
 
 	unfinishedLineage := out.QueuedAssignmentCount > 0 || out.ActiveAssignmentCount > 0 || out.ActiveLeaseCount > 0
 	switch {
@@ -845,6 +836,19 @@ WHERE l.state = 'active' AND a.contract_id IN (`+placeholders(len(contractIDs))+
 		out.FailureSummary = "root task has report and validation evidence but contract lineage still has unfinished assignments or active leases"
 	case out.RootContractStatus == "satisfied":
 		out.Status = "passed"
+	default:
+		if failure, ok, err := s.evidenceRuntimePolicyFailure(ctx, contractIDs); err != nil {
+			return out, err
+		} else if ok {
+			out.Status = failure.status
+			out.FailureSummary = failure.summary
+			out.FailureClass = failure.failureClass
+			out.TerminalReason = failure.terminalReason
+			return out, nil
+		}
+	}
+	switch {
+	case out.Status != "":
 	case out.ValidationFailureCount > 0:
 		out.Status = "failed"
 		out.FailureSummary = "contract lineage contains a failing or blocked validation assessment"
@@ -914,6 +918,13 @@ func runtimePolicyFailureFromText(text string) (runtimePolicyFailureEvidence, bo
 			summary:        "runtime command policy denied an unauthorized command before execution",
 			failureClass:   cpruntime.FailureClassRuntimeCommandDenied,
 			terminalReason: cpruntime.TerminalReasonCommandPolicyDenied,
+		}, true
+	case strings.Contains(text, cpruntime.TerminalReasonRuntimeExecTimeout):
+		return runtimePolicyFailureEvidence{
+			status:         "blocked",
+			summary:        "runtime command execution timed out before the provider session reached a terminal closeout",
+			failureClass:   cpruntime.FailureClassRuntimeExecTimeout,
+			terminalReason: cpruntime.TerminalReasonRuntimeExecTimeout,
 		}, true
 	default:
 		return runtimePolicyFailureEvidence{}, false

@@ -89,6 +89,7 @@ type cpProbeDockerState struct {
 	cfg              CPProbe001Config
 	driver           *driver
 	tinyLedger       cpprobe.TinyLedgerFixture
+	repository       codemanagement.Repository
 	root             coordination.AddContractResult
 	coordinator      cpruntime.AssignmentSession
 	developerA       cpruntime.AssignmentSession
@@ -415,15 +416,15 @@ func (s *cpProbeState) run(ctx context.Context) (cpprobe.ReportArtifacts, string
 }
 
 func (s *cpProbeState) driveCoordinatorAndDevelopers(ctx context.Context, tinyLedger cpprobe.TinyLedgerFixture) error {
-	coordinator, err := cpProbeCallData[coordination.AssignmentNextResult](ctx, s, "coordinator", "", "assignment.next", "claim CP-PROBE root", nil, nil)
+	coordinator, err := cpProbeOperatorDebugCallData[coordination.AssignmentNextResult](ctx, s, "coordinator", "assignment.next", "claim CP-PROBE root", nil, nil)
 	if err != nil {
 		return err
 	}
 	s.coordinator = coordinator
-	if _, err := cpProbeCallData[coordination.Contract](ctx, s, "coordinator", "", "contract.current", "read current root contract", map[string]string{"lease_id": coordinator.Lease.ID}, nil); err != nil {
+	if _, err := cpProbeOperatorDebugCallData[coordination.Contract](ctx, s, "coordinator", "contract.current", "read current root contract", map[string]string{"lease_id": coordinator.Lease.ID}, nil); err != nil {
 		return err
 	}
-	developerAWork, err := cpProbeCallData[coordination.AddContractResult](ctx, s, "coordinator", "", "contract.add", "dispatch developer-a workspace evidence", map[string]any{
+	developerAWork, err := cpProbeOperatorDebugCallData[coordination.AddContractResult](ctx, s, "coordinator", "contract.add", "dispatch developer-a workspace evidence", map[string]any{
 		"lease_id":        coordinator.Lease.ID,
 		"title":           "Developer A: CP-PROBE formal workspace evidence",
 		"objective":       "Prepare Tiny Ledger workspace and submit report evidence through public capabilities.",
@@ -436,7 +437,7 @@ func (s *cpProbeState) driveCoordinatorAndDevelopers(ctx context.Context, tinyLe
 		return err
 	}
 	s.developerAWork = developerAWork
-	developerBWork, err := cpProbeCallData[coordination.AddContractResult](ctx, s, "coordinator", "", "contract.add", "dispatch developer-b workspace evidence", map[string]any{
+	developerBWork, err := cpProbeOperatorDebugCallData[coordination.AddContractResult](ctx, s, "coordinator", "contract.add", "dispatch developer-b workspace evidence", map[string]any{
 		"lease_id":        coordinator.Lease.ID,
 		"title":           "Developer B: CP-PROBE formal workspace evidence",
 		"objective":       "Prepare an isolated Tiny Ledger workspace from the same canonical base.",
@@ -449,18 +450,26 @@ func (s *cpProbeState) driveCoordinatorAndDevelopers(ctx context.Context, tinyLe
 		return err
 	}
 	s.developerBWork = developerBWork
-	developerA, err := cpProbeCallData[coordination.AssignmentNextResult](ctx, s, "developer-a", "", "assignment.next", "claim developer-a contract", nil, nil)
+	developerA, err := cpProbeOperatorDebugCallData[coordination.AssignmentNextResult](ctx, s, "developer-a", "assignment.next", "claim developer-a contract", nil, nil)
 	if err != nil {
 		return err
 	}
-	developerB, err := cpProbeCallData[coordination.AssignmentNextResult](ctx, s, "developer-b", "", "assignment.next", "claim developer-b contract", nil, nil)
+	developerB, err := cpProbeOperatorDebugCallData[coordination.AssignmentNextResult](ctx, s, "developer-b", "assignment.next", "claim developer-b contract", nil, nil)
 	if err != nil {
 		return err
 	}
 	s.developerA = developerA
 	s.developerB = developerB
-	preparedA, err := cpProbeCallData[codemanagement.WorkspacePrepareResult](ctx, s, "developer-a", "", "workspace.prepare", "prepare developer-a workspace", map[string]string{
-		"repo_path":        tinyLedger.RepoPath,
+	repo, err := s.app.CodeManagement.RegisterRepository(ctx, codemanagement.RegisterRepositoryInput{
+		RepoPath:        tinyLedger.RepoPath,
+		Alias:           "cp-probe-001-manual",
+		CanonicalBranch: tinyLedger.CanonicalBranch,
+	})
+	if err != nil {
+		return fmt.Errorf("register CP-PROBE Tiny Ledger repository: %w", err)
+	}
+	preparedA, err := cpProbeOperatorDebugCallData[codemanagement.WorkspacePrepareResult](ctx, s, "developer-a", "workspace.prepare", "prepare developer-a workspace", map[string]string{
+		"repo_id":          repo.ID,
 		"canonical_branch": tinyLedger.CanonicalBranch,
 		"workspace_root":   filepath.Join(s.cfg.WorkDir, "git-workspaces", "developer-a"),
 		"contract_id":      developerA.Contract.ID,
@@ -469,8 +478,8 @@ func (s *cpProbeState) driveCoordinatorAndDevelopers(ctx context.Context, tinyLe
 		return err
 	}
 	s.repository = preparedA.Repository
-	preparedB, err := cpProbeCallData[codemanagement.WorkspacePrepareResult](ctx, s, "developer-b", "", "workspace.prepare", "prepare developer-b workspace", map[string]string{
-		"repo_path":        tinyLedger.RepoPath,
+	preparedB, err := cpProbeOperatorDebugCallData[codemanagement.WorkspacePrepareResult](ctx, s, "developer-b", "workspace.prepare", "prepare developer-b workspace", map[string]string{
+		"repo_id":          repo.ID,
 		"canonical_branch": tinyLedger.CanonicalBranch,
 		"workspace_root":   filepath.Join(s.cfg.WorkDir, "git-workspaces", "developer-b"),
 		"contract_id":      developerB.Contract.ID,
@@ -481,13 +490,13 @@ func (s *cpProbeState) driveCoordinatorAndDevelopers(ctx context.Context, tinyLe
 	if preparedA.Workspace.BaseRef != tinyLedger.BaseRef || preparedB.Workspace.BaseRef != tinyLedger.BaseRef {
 		return fmt.Errorf("CP-PROBE developer workspace base refs diverged from fixture base")
 	}
-	if _, err := cpProbeCallData[codemanagement.WorkspaceStatus](ctx, s, "developer-a", "", "workspace.status", "read developer-a workspace status", map[string]string{"workspace_id": preparedA.Workspace.ID}, nil); err != nil {
+	if _, err := cpProbeOperatorDebugCallData[codemanagement.WorkspaceStatus](ctx, s, "developer-a", "workspace.status", "read developer-a workspace status", map[string]string{"workspace_id": preparedA.Workspace.ID}, nil); err != nil {
 		return err
 	}
-	if _, err := cpProbeCallData[codemanagement.GitLogResult](ctx, s, "developer-b", "", "git.log", "read developer-b git log", map[string]any{"workspace_id": preparedB.Workspace.ID, "max_count": 3}, nil); err != nil {
+	if _, err := cpProbeOperatorDebugCallData[codemanagement.GitLogResult](ctx, s, "developer-b", "git.log", "read developer-b git log", map[string]any{"workspace_id": preparedB.Workspace.ID, "max_count": 3}, nil); err != nil {
 		return err
 	}
-	reportA, err := cpProbeCallData[coordination.Evidence](ctx, s, "developer-a", "", "report.submit", "submit developer-a formal report", map[string]string{
+	reportA, err := cpProbeOperatorDebugCallData[coordination.Evidence](ctx, s, "developer-a", "report.submit", "submit developer-a formal report", map[string]string{
 		"lease_id": developerA.Lease.ID,
 		"summary":  "developer-a prepared isolated Tiny Ledger workspace",
 		"content":  "workspace_id=" + preparedA.Workspace.ID,
@@ -495,14 +504,14 @@ func (s *cpProbeState) driveCoordinatorAndDevelopers(ctx context.Context, tinyLe
 	if err != nil {
 		return err
 	}
-	if _, err := cpProbeCallData[coordination.CompleteContractResult](ctx, s, "developer-a", "", "contract.complete", "complete developer-a contract", map[string]any{
+	if _, err := cpProbeOperatorDebugCallData[coordination.CompleteContractResult](ctx, s, "developer-a", "contract.complete", "complete developer-a contract", map[string]any{
 		"lease_id":     developerA.Lease.ID,
 		"evidence_ids": []string{reportA.ID},
 		"summary":      "developer-a formal workspace evidence complete",
 	}, nil); err != nil {
 		return err
 	}
-	reportB, err := cpProbeCallData[coordination.Evidence](ctx, s, "developer-b", "", "report.submit", "submit developer-b formal report", map[string]string{
+	reportB, err := cpProbeOperatorDebugCallData[coordination.Evidence](ctx, s, "developer-b", "report.submit", "submit developer-b formal report", map[string]string{
 		"lease_id": developerB.Lease.ID,
 		"summary":  "developer-b prepared isolated Tiny Ledger workspace",
 		"content":  "workspace_id=" + preparedB.Workspace.ID,
@@ -510,7 +519,7 @@ func (s *cpProbeState) driveCoordinatorAndDevelopers(ctx context.Context, tinyLe
 	if err != nil {
 		return err
 	}
-	if _, err := cpProbeCallData[coordination.CompleteContractResult](ctx, s, "developer-b", "", "contract.complete", "complete developer-b contract", map[string]any{
+	if _, err := cpProbeOperatorDebugCallData[coordination.CompleteContractResult](ctx, s, "developer-b", "contract.complete", "complete developer-b contract", map[string]any{
 		"lease_id":     developerB.Lease.ID,
 		"evidence_ids": []string{reportB.ID},
 		"summary":      "developer-b formal workspace evidence complete",
@@ -521,7 +530,7 @@ func (s *cpProbeState) driveCoordinatorAndDevelopers(ctx context.Context, tinyLe
 }
 
 func (s *cpProbeState) driveVerifierAndRootCloseout(ctx context.Context) error {
-	verifierWork, err := cpProbeCallData[coordination.AddContractResult](ctx, s, "coordinator", "", "contract.add", "dispatch verifier assessment", map[string]any{
+	verifierWork, err := cpProbeOperatorDebugCallData[coordination.AddContractResult](ctx, s, "coordinator", "contract.add", "dispatch verifier assessment", map[string]any{
 		"lease_id":        s.coordinator.Lease.ID,
 		"title":           "Verifier: CP-PROBE formal assessment",
 		"objective":       "Record non-Docker manual CP-PROBE validation assessment.",
@@ -552,7 +561,7 @@ func (s *cpProbeState) driveVerifierAndRootCloseout(ctx context.Context) error {
 			"runtime_id":       session.Route.RuntimeID,
 		},
 	})
-	report, err := cpProbeCallData[coordination.Evidence](ctx, s, "verifier", session.Route.RuntimeID, "report.submit", "submit verifier review report", map[string]string{
+	report, err := cpProbeAgentRuntimeCallData[coordination.Evidence](ctx, s, "verifier", session.Route.RuntimeID, "report.submit", "submit verifier review report", map[string]string{
 		"lease_id": session.LeaseID,
 		"summary":  "CP-PROBE non-Docker manual closeout reviewed",
 		"content":  "root_contract_id=" + s.root.ContractID,
@@ -560,7 +569,7 @@ func (s *cpProbeState) driveVerifierAndRootCloseout(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	assessment, err := cpProbeCallData[validation.Result](ctx, s, "verifier", session.Route.RuntimeID, "validation.assessment", "record verifier validation assessment", map[string]any{
+	assessment, err := cpProbeAgentRuntimeCallData[validation.Result](ctx, s, "verifier", session.Route.RuntimeID, "validation.assessment", "record verifier validation assessment", map[string]any{
 		"lease_id":             session.LeaseID,
 		"assessed_contract_id": s.root.ContractID,
 		"verdict":              "pass",
@@ -573,7 +582,7 @@ func (s *cpProbeState) driveVerifierAndRootCloseout(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if _, err := cpProbeCallData[coordination.CompleteContractResult](ctx, s, "verifier", session.Route.RuntimeID, "contract.complete", "complete verifier contract", map[string]any{
+	if _, err := cpProbeAgentRuntimeCallData[coordination.CompleteContractResult](ctx, s, "verifier", session.Route.RuntimeID, "contract.complete", "complete verifier contract", map[string]any{
 		"lease_id":     session.LeaseID,
 		"evidence_ids": []string{assessment.EvidenceID},
 		"summary":      "verifier validation assessment complete",
@@ -587,7 +596,7 @@ func (s *cpProbeState) driveVerifierAndRootCloseout(ctx context.Context) error {
 	}); err != nil {
 		return fmt.Errorf("finish verifier manual session: %w", err)
 	}
-	mailboxes, err := cpProbeCallData[[]coordination.MailboxItem](ctx, s, "coordinator", "", "mailbox.list", "coordinator reads child completion mailbox", nil, nil)
+	mailboxes, err := cpProbeOperatorDebugCallData[[]coordination.MailboxItem](ctx, s, "coordinator", "mailbox.list", "coordinator reads child completion mailbox", nil, nil)
 	if err != nil {
 		return err
 	}
@@ -595,16 +604,16 @@ func (s *cpProbeState) driveVerifierAndRootCloseout(ctx context.Context) error {
 	if verifierMailbox.ID == "" {
 		return fmt.Errorf("verifier child completion mailbox not found")
 	}
-	if _, err := cpProbeCallData[coordination.MailboxItem](ctx, s, "coordinator", "", "mailbox.get", "coordinator opens verifier mailbox", map[string]string{"mailbox_id": verifierMailbox.ID}, nil); err != nil {
+	if _, err := cpProbeOperatorDebugCallData[coordination.MailboxItem](ctx, s, "coordinator", "mailbox.get", "coordinator opens verifier mailbox", map[string]string{"mailbox_id": verifierMailbox.ID}, nil); err != nil {
 		return err
 	}
-	if _, err := cpProbeCallData[coordination.MailboxItem](ctx, s, "coordinator", "", "mailbox.resolve", "coordinator resolves verifier mailbox", map[string]string{
+	if _, err := cpProbeOperatorDebugCallData[coordination.MailboxItem](ctx, s, "coordinator", "mailbox.resolve", "coordinator resolves verifier mailbox", map[string]string{
 		"mailbox_id":   verifierMailbox.ID,
 		"followup_ref": "validation_assessment:" + assessment.AssessmentID,
 	}, nil); err != nil {
 		return err
 	}
-	rootReport, err := cpProbeCallData[coordination.Evidence](ctx, s, "coordinator", "", "report.submit", "submit root closeout report", map[string]string{
+	rootReport, err := cpProbeOperatorDebugCallData[coordination.Evidence](ctx, s, "coordinator", "report.submit", "submit root closeout report", map[string]string{
 		"lease_id": s.coordinator.Lease.ID,
 		"summary":  "CP-PROBE formal root closeout report",
 		"content":  "validation_assessment=" + assessment.AssessmentID,
@@ -612,7 +621,7 @@ func (s *cpProbeState) driveVerifierAndRootCloseout(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if _, err := cpProbeCallData[coordination.CompleteContractResult](ctx, s, "coordinator", "", "contract.complete", "complete CP-PROBE root contract", map[string]any{
+	if _, err := cpProbeOperatorDebugCallData[coordination.CompleteContractResult](ctx, s, "coordinator", "contract.complete", "complete CP-PROBE root contract", map[string]any{
 		"lease_id":     s.coordinator.Lease.ID,
 		"evidence_ids": []string{rootReport.ID},
 		"summary":      "CP-PROBE formal non-Docker root complete",
@@ -736,11 +745,23 @@ func runCPProbeDockerReplay(ctx context.Context, cfg CPProbe001Config, manualRep
 		_ = server.Shutdown(context.Background())
 	}()
 
+	repo, err := app.CodeManagement.RegisterRepository(ctx, codemanagement.RegisterRepositoryInput{
+		RepoPath:        tinyLedger.RepoPath,
+		Alias:           "cp-probe-001-docker",
+		CanonicalBranch: tinyLedger.CanonicalBranch,
+	})
+	if err != nil {
+		outcome.Blocker = cpProbeRedact("register Docker Tiny Ledger repository: "+err.Error(), cfg)
+		outcome.TraceSteps = append(outcome.TraceSteps, cpProbeBlockedStep("release-health", "repo.register", outcome.Blocker))
+		outcome.CleanupPassed = cpProbeCleanupPassed(ctx, cfg, &outcome)
+		return outcome
+	}
 	state := &cpProbeDockerState{
 		app:        app,
 		cfg:        cfg,
 		driver:     &driver{executor: cpruntime.DockerExecClient{}},
 		tinyLedger: tinyLedger,
+		repository: repo,
 		root:       root,
 		trace:      outcome.TraceSteps,
 	}
@@ -761,9 +782,15 @@ func runCPProbeDockerReplay(ctx context.Context, cfg CPProbe001Config, manualRep
 	outcome.TraceSteps = state.trace
 	inspect := cpProbeDockerInspect(ctx, app, root.ContractID, nil)
 	outcome.Inspect = inspect
-	if summary, err := cpProbeGitSummary(ctx, app.DB); err == nil {
-		outcome.GitSummary = &summary
+	summary, err := cpProbeGitSummary(ctx, app.DB)
+	if err != nil {
+		outcome.Status = cpprobe.ConclusionFailed
+		outcome.Blocker = cpProbeRedact("CP-PROBE git operation summary invalid: "+err.Error(), cfg)
+		outcome.TraceSteps = append(outcome.TraceSteps, cpProbeBlockedStep("release-health", "git.summary", outcome.Blocker))
+		outcome.CleanupPassed = cpProbeCleanupPassed(ctx, cfg, &outcome)
+		return outcome
 	}
+	outcome.GitSummary = &summary
 	outcome.CleanupPassed = cpProbeCleanupPassed(ctx, cfg, &outcome)
 	if !outcome.CleanupPassed {
 		outcome.Status = cpprobe.ConclusionEnvironmentBlocked
@@ -780,7 +807,7 @@ func cpProbeClaudeStartArgs() []string {
 	return []string{
 		"--session-id", "{{session_id}}",
 		"--print",
-		"CP-PROBE release-health runtime smoke start. Do not call tools or coordlink. Print CP-PROBE runtime ready and exit.",
+		"CP-PROBE release-health runtime smoke start. Run exactly `/usr/local/bin/coordlink call contract.current`, then print CP-PROBE runtime ready and exit. Do not call any other tool or coordlink capability.",
 	}
 }
 
@@ -788,7 +815,7 @@ func cpProbeClaudeResumeArgs() []string {
 	return []string{
 		"--resume", "{{session_id}}",
 		"--print",
-		"CP-PROBE release-health runtime smoke resume. Do not call tools or coordlink. Print CP-PROBE runtime resumed and exit.",
+		"CP-PROBE release-health runtime smoke resume. Run exactly `/usr/local/bin/coordlink call contract.current`, then print CP-PROBE runtime resumed and exit. Do not call any other tool or coordlink capability.",
 	}
 }
 
@@ -1037,6 +1064,9 @@ func (s *cpProbeDockerState) run(ctx context.Context) error {
 	}
 	developerB.ResumeMailboxID = resumeMessage.MailboxID
 	developerB.ResumeQueueState = resumed.State
+	if strings.TrimSpace(resumed.Env["COORDPLANE_TOKEN"]) != "" {
+		developerB.Session.Env = resumed.Env
+	}
 	s.trace = append(s.trace, cpprobe.TraceStep{
 		Actor:        "developer-b",
 		EntryPoint:   "runtime.runner",
@@ -1148,7 +1178,7 @@ func (s *cpProbeDockerState) startDeveloperWorkspace(ctx context.Context, agentI
 	out.Session = session
 	out.Work = work
 	prepared, err := cpProbeDockerCallData[codemanagement.WorkspacePrepareResult](ctx, s, session, "workspace.prepare", map[string]any{
-		"repo_path":        s.tinyLedger.RepoPath,
+		"repo_id":          s.repository.ID,
 		"canonical_branch": s.tinyLedger.CanonicalBranch,
 		"workspace_root":   cpruntime.ContainerWorkspacePath,
 		"contract_id":      work.ContractID,
@@ -1287,7 +1317,7 @@ func (s *cpProbeDockerState) driveDockerVerifierAndRootCloseout(ctx context.Cont
 		return err
 	}
 	prepared, err := cpProbeDockerCallData[codemanagement.WorkspacePrepareResult](ctx, s, verifier, "workspace.prepare", map[string]any{
-		"repo_path":        s.tinyLedger.RepoPath,
+		"repo_id":          s.repository.ID,
 		"canonical_branch": s.tinyLedger.CanonicalBranch,
 		"workspace_root":   cpruntime.ContainerWorkspacePath,
 		"contract_id":      verifierWork.ContractID,
@@ -1590,13 +1620,17 @@ func cpProbeGitSummary(ctx context.Context, db *sql.DB) (cpprobe.GitOperationSum
 	if err != nil {
 		return cpprobe.GitOperationSummary{}, err
 	}
-	return cpprobe.GitOperationSummary{
+	summary := cpprobe.GitOperationSummary{
 		Scenario:      cpprobe.ScenarioID,
 		Repositories:  repos,
 		Workspaces:    workspaces,
 		Operations:    ops,
 		NoActiveLocks: countRowsWhere(ctx, db, "git_locks", "state = 'active'") == 0,
-	}, nil
+	}
+	if err := summary.Validate(); err != nil {
+		return cpprobe.GitOperationSummary{}, err
+	}
+	return summary, nil
 }
 
 func cpProbeCleanupPassed(ctx context.Context, cfg CPProbe001Config, outcome *cpProbeDockerReplayOutcome) bool {
@@ -1893,7 +1927,7 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
-func (s *cpProbeState) call(ctx context.Context, actor, runtimeID, capabilityName, inputSummary string, input, scope any) (capability.Response[json.RawMessage], error) {
+func (s *cpProbeState) call(ctx context.Context, actor, subjectKind, runtimeID, capabilityName, inputSummary string, input, scope any) (capability.Response[json.RawMessage], error) {
 	raw := json.RawMessage(`{}`)
 	if input != nil {
 		encoded, err := json.Marshal(input)
@@ -1914,7 +1948,7 @@ func (s *cpProbeState) call(ctx context.Context, actor, runtimeID, capabilityNam
 		CapabilityName: capabilityName,
 		TraceID:        "cp-probe-001-release-health",
 		Subject: capability.Subject{
-			Kind:      "agent",
+			Kind:      subjectKind,
 			ID:        actor,
 			AgentID:   actor,
 			RuntimeID: runtimeID,
@@ -1938,9 +1972,17 @@ func (s *cpProbeState) call(ctx context.Context, actor, runtimeID, capabilityNam
 	return response, nil
 }
 
-func cpProbeCallData[T any](ctx context.Context, state *cpProbeState, actor, runtimeID, capabilityName, inputSummary string, input, scope any) (T, error) {
+func cpProbeOperatorDebugCallData[T any](ctx context.Context, state *cpProbeState, actor, capabilityName, inputSummary string, input, scope any) (T, error) {
+	return cpProbeCallDataWithSubjectKind[T](ctx, state, actor, "operator_debug", "", capabilityName, inputSummary, input, scope)
+}
+
+func cpProbeAgentRuntimeCallData[T any](ctx context.Context, state *cpProbeState, actor, runtimeID, capabilityName, inputSummary string, input, scope any) (T, error) {
+	return cpProbeCallDataWithSubjectKind[T](ctx, state, actor, "agent", runtimeID, capabilityName, inputSummary, input, scope)
+}
+
+func cpProbeCallDataWithSubjectKind[T any](ctx context.Context, state *cpProbeState, actor, subjectKind, runtimeID, capabilityName, inputSummary string, input, scope any) (T, error) {
 	var out T
-	response, err := state.call(ctx, actor, runtimeID, capabilityName, inputSummary, input, scope)
+	response, err := state.call(ctx, actor, subjectKind, runtimeID, capabilityName, inputSummary, input, scope)
 	if err != nil {
 		return out, err
 	}
@@ -1966,13 +2008,17 @@ func (s *cpProbeState) gitSummary(ctx context.Context) (cpprobe.GitOperationSumm
 	if err != nil {
 		return cpprobe.GitOperationSummary{}, err
 	}
-	return cpprobe.GitOperationSummary{
+	summary := cpprobe.GitOperationSummary{
 		Scenario:      cpprobe.ScenarioID,
 		Repositories:  repos,
 		Workspaces:    workspaces,
 		Operations:    ops,
 		NoActiveLocks: countRowsWhere(ctx, s.app.DB, "git_locks", "state = 'active'") == 0,
-	}, nil
+	}
+	if err := summary.Validate(); err != nil {
+		return cpprobe.GitOperationSummary{}, err
+	}
+	return summary, nil
 }
 
 func repositorySummaries(ctx context.Context, db *sql.DB) ([]cpprobe.RepositorySummary, error) {
@@ -2034,7 +2080,8 @@ ORDER BY created_at, id`)
 
 func gitOperationBriefs(ctx context.Context, db *sql.DB) ([]cpprobe.GitOperationBrief, error) {
 	rows, err := db.QueryContext(ctx, `
-SELECT id, operation_type, actor_agent_id, COALESCE(workspace_id, ''), repo_id, before_ref, after_ref, state
+SELECT id, operation_type, actor_agent_id, COALESCE(workspace_id, ''), repo_id,
+  subject_kind, runtime_id, execution_location, before_ref, after_ref, state
 FROM git_operations
 ORDER BY created_at, id`)
 	if err != nil {
@@ -2044,7 +2091,7 @@ ORDER BY created_at, id`)
 	var out []cpprobe.GitOperationBrief
 	for rows.Next() {
 		var item cpprobe.GitOperationBrief
-		if err := rows.Scan(&item.ID, &item.OperationType, &item.ActorAgentID, &item.WorkspaceID, &item.RepoID, &item.BeforeRef, &item.AfterRef, &item.State); err != nil {
+		if err := rows.Scan(&item.ID, &item.OperationType, &item.ActorAgentID, &item.WorkspaceID, &item.RepoID, &item.SubjectKind, &item.RuntimeID, &item.ExecutionLocation, &item.BeforeRef, &item.AfterRef, &item.State); err != nil {
 			return nil, err
 		}
 		out = append(out, item)

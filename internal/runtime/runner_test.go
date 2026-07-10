@@ -327,6 +327,110 @@ func TestRunnerProcessesFallbackResumeQueueWithPinnedRouteAndDuplicateRecoveryIs
 	}
 }
 
+func TestRunnerProcessesDistinctMailboxResumeForSameRoute(t *testing.T) {
+	ctx := context.Background()
+	h := newRuntimeHarness(t, true)
+	addContract(t, ctx, h.coordination, "coordinator")
+	coordinator, err := h.runner.StartNext(ctx, "coordinator")
+	if err != nil {
+		t.Fatalf("start coordinator: %v", err)
+	}
+	callAccepted[coordination.Assignment](t, h.dispatcher, capability.Call{
+		CapabilityName: "contract.wait",
+		Subject:        agentSubject("coordinator"),
+		Scope:          mustRaw(t, map[string]any{"lease_id": coordinator.LeaseID}),
+		Input: mustRaw(t, map[string]any{
+			"reason":           "waiting for builder messages",
+			"waiting_for_ref":  "mailbox:builder-feedback",
+			"session_route_id": coordinator.Route.ID,
+		}),
+	})
+	if _, err := h.runner.FinishSession(ctx, cpruntime.TerminalReport{
+		AttemptID:     coordinator.AttemptID,
+		Status:        "waiting",
+		Summary:       "waiting for feedback",
+		TranscriptRef: "waiting-transcript",
+	}); err != nil {
+		t.Fatalf("finish coordinator waiting: %v", err)
+	}
+
+	builder := addAndClaim(t, ctx, h.coordination, "builder")
+	first := h.coordination.SendMessage(ctx, coordination.SendMessageInput{
+		LeaseID:          builder.Lease.ID,
+		AgentID:          "builder",
+		RecipientAgentID: "coordinator",
+		Intent:           "feedback",
+		Body:             "first feedback",
+	})
+	if first.Status != capability.StatusAccepted || first.Data == nil || first.Data.MailboxID == "" {
+		t.Fatalf("first message.send = %+v, want accepted mailbox", first)
+	}
+	second := h.coordination.SendMessage(ctx, coordination.SendMessageInput{
+		LeaseID:          builder.Lease.ID,
+		AgentID:          "builder",
+		RecipientAgentID: "coordinator",
+		Intent:           "feedback",
+		Body:             "second feedback",
+	})
+	if second.Status != capability.StatusAccepted || second.Data == nil || second.Data.MailboxID == "" {
+		t.Fatalf("second message.send = %+v, want accepted mailbox", second)
+	}
+
+	deliverySvc, err := delivery.NewService(h.store, h.runner)
+	if err != nil {
+		t.Fatalf("new delivery service: %v", err)
+	}
+	firstDelivery, err := deliverySvc.NotifyMailbox(ctx, first.Data.MailboxID)
+	if err != nil {
+		t.Fatalf("notify first mailbox: %v", err)
+	}
+	secondDelivery, err := deliverySvc.NotifyMailbox(ctx, second.Data.MailboxID)
+	if err != nil {
+		t.Fatalf("notify second mailbox: %v", err)
+	}
+	if firstDelivery.State != "fallback" || secondDelivery.State != "fallback" {
+		t.Fatalf("delivery states = %s/%s, want fallback for both distinct mailboxes", firstDelivery.State, secondDelivery.State)
+	}
+	if firstDelivery.QueueItemID == "" || secondDelivery.QueueItemID == "" || firstDelivery.QueueItemID == secondDelivery.QueueItemID {
+		t.Fatalf("queue ids = %q/%q, want distinct queue items", firstDelivery.QueueItemID, secondDelivery.QueueItemID)
+	}
+
+	firstResume, err := h.runner.ProcessResumeQueue(ctx, "resume-worker")
+	if err != nil {
+		t.Fatalf("process first resume queue: %v", err)
+	}
+	if firstResume.State != "resumed" || firstResume.RouteID != coordinator.Route.ID || firstResume.MailboxID != first.Data.MailboxID {
+		t.Fatalf("first resume result = %+v, want first mailbox resumed on coordinator route", firstResume)
+	}
+	secondResume, err := h.runner.ProcessResumeQueue(ctx, "resume-worker")
+	if err != nil {
+		t.Fatalf("process second resume queue: %v", err)
+	}
+	if secondResume.State != "resumed" || secondResume.RouteID != coordinator.Route.ID || secondResume.MailboxID != second.Data.MailboxID {
+		t.Fatalf("second resume result = %+v, want distinct mailbox to resume rather than route-level already_resumed", secondResume)
+	}
+
+	resumes := h.fake.Resumes()
+	if len(resumes) != 2 {
+		t.Fatalf("fake resumes = %d, want one adapter resume per distinct pending mailbox: %+v", len(resumes), resumes)
+	}
+	if got := resumes[0].MailboxIDs; len(got) != 1 || got[0] != first.Data.MailboxID {
+		t.Fatalf("first adapter resume mailboxes = %+v, want %s", got, first.Data.MailboxID)
+	}
+	if got := resumes[1].MailboxIDs; len(got) != 1 || got[0] != second.Data.MailboxID {
+		t.Fatalf("second adapter resume mailboxes = %+v, want %s", got, second.Data.MailboxID)
+	}
+	if firstState, firstFollowup := mailboxState(t, ctx, h.db, first.Data.MailboxID); firstState != "pending" || firstFollowup != "" {
+		t.Fatalf("first mailbox after resume = %s/%s, want pending without implicit resolution", firstState, firstFollowup)
+	}
+	if secondState, secondFollowup := mailboxState(t, ctx, h.db, second.Data.MailboxID); secondState != "pending" || secondFollowup != "" {
+		t.Fatalf("second mailbox after resume = %s/%s, want pending without implicit resolution", secondState, secondFollowup)
+	}
+	if got := countRowsWhere(t, ctx, h.db, "events", "event_type = 'session.resumed' AND aggregate_id = '"+coordinator.Route.ID+"'"); got != 2 {
+		t.Fatalf("session.resumed events for route = %d, want distinct events for both mailboxes", got)
+	}
+}
+
 func TestResumeRouteRejectsTerminalAndStaleRoutesWithoutAdapterCall(t *testing.T) {
 	ctx := context.Background()
 	h := newRuntimeHarness(t, true)

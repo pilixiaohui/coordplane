@@ -10,12 +10,26 @@ runtime_profiles:
       allow_coordlink_capabilities:
         - assignment.next
         - assignment.watch
+        - changeset.abandon
+        - changeset.submit
+        - command.run
         - communication.read
         - contract.add
         - contract.complete
         - contract.context
         - contract.current
         - contract.wait
+        - git.abort
+        - git.commit
+        - git.conflicts
+        - git.diff
+        - git.log
+        - git.merge_apply
+        - git.merge_preview
+        - git.recover
+        - git.resolve
+        - git.rollback
+        - git.status
         - mailbox.get
         - mailbox.list
         - mailbox.resolve
@@ -24,6 +38,9 @@ runtime_profiles:
         - object.read
         - report.submit
         - validation.assessment
+        - workspace.prepare
+        - workspace.status
+        - workspace.sync
 termination:
   terminal_contract_type: root
   accepted_by_capability: validation.assessment
@@ -41,8 +58,10 @@ communication:
 agents:
   - id: coordinator
     role_prompt: |-
-      Coordinate CP-ACCEPT-001 through explicit contracts, mailbox review, and concise release evidence.
-      Delegate implementation and verification work only through CoordPlane capabilities.
+      CP-ACCEPT-001 release-health uses a deterministic driver after this real Docker/Claude session starts.
+      Startup handshake only: run exactly `/usr/local/bin/coordlink call contract.current`, then stop and summarize HANDSHAKE_DONE.
+      Do not call contract.add, contract.wait, mailbox.*, report.submit, validation.assessment, or contract.complete during startup.
+      Do not ask for approval and do not use coordlink shortcut forms.
     runtime_profile: docker-default
     cli_backend: claude
     skills:
@@ -66,8 +85,10 @@ agents:
       - report.submit
   - id: developer
     role_prompt: |-
-      Claim the developer contract and produce command, report, and controlled Git release-health evidence.
-      Work only through assigned CoordPlane capabilities and assigned workspace state.
+      CP-ACCEPT-001 release-health uses a deterministic driver after this real Docker/Claude session starts.
+      Startup handshake only: run exactly `/usr/local/bin/coordlink call contract.current`, then stop and summarize HANDSHAKE_DONE.
+      Do not call command.run, report.submit, git.*, changeset.*, or contract.complete during startup.
+      Do not ask for approval and do not use coordlink shortcut forms.
     runtime_profile: docker-default
     cli_backend: claude
     skills:
@@ -102,8 +123,10 @@ agents:
       - workspace.sync
   - id: verifier
     role_prompt: |-
-      Verify CP-ACCEPT-001 from contract context, command evidence, changeset evidence, and validation state.
-      Submit the validation assessment before the coordinator closes the root contract.
+      CP-ACCEPT-001 release-health uses a deterministic driver after this real Docker/Claude session starts.
+      Startup handshake only: run exactly `/usr/local/bin/coordlink call contract.current`, then stop and summarize HANDSHAKE_DONE.
+      Do not call validation.assessment, report.submit, or contract.complete during startup.
+      Do not ask for approval and do not use coordlink shortcut forms.
     runtime_profile: docker-default
     cli_backend: claude
     skills:
