@@ -1,6 +1,7 @@
 package runtime_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -924,6 +925,101 @@ WHERE id || cli_session_id || attempt_id || lease_id || runtime_id || source_sta
 				if leaked != 0 {
 					t.Fatalf("provider outcome leaked %q", forbidden)
 				}
+			}
+		})
+	}
+}
+
+func TestCommandCLIAdapterFailsClosedOnUnverifiableProviderTranscripts(t *testing.T) {
+	secret := "PROVIDER_RAW_SECRET_MUST_NOT_PROJECT"
+	cases := []struct {
+		name   string
+		stdout []byte
+	}{
+		{
+			name:   "malformed JSON",
+			stdout: []byte(`{"type":"result","secret":"` + secret + `"` + "\n"),
+		},
+		{
+			name:   "scanner record overflow",
+			stdout: append([]byte(secret+":"), bytes.Repeat([]byte("x"), 2*1024*1024+1)...),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			exec := &recordingContainerExecutor{results: []cpruntime.ContainerExecResult{{
+				ProcessRef: "provider-unverifiable",
+				ExitCode:   0,
+				Stdout:     tc.stdout,
+			}}}
+			db, st, _, _ := newCommandCLIBase(t)
+			attemptID := "att_provider_unverifiable_" + strings.ReplaceAll(strings.ToLower(tc.name), " ", "_")
+			insertAttemptOwnershipRows(t, ctx, db, attemptID, "lease_missing_prompt", "asg_missing_prompt", "ctr_missing_prompt", "developer", "rt_provider_unverifiable")
+			insertReadyRuntimeInstance(t, ctx, db, "rt_provider_unverifiable", attemptID, "developer")
+			adapter, err := cpruntime.NewClaudeCommandCLIAdapter(cpruntime.CommandCLIAdapterConfig{
+				Store: st,
+				Profile: cpruntime.CommandCLIProfile{
+					Name:    "claude",
+					Backend: "claude",
+					Binary:  "/usr/local/bin/claude",
+					Timeout: timeSecond(),
+					RuntimeCommandPolicies: map[string]cpruntime.RuntimeCommandPolicy{
+						"docker-default": {
+							NonInteractiveApproval:     true,
+							AllowCoordlinkCapabilities: []string{"contract.current"},
+						},
+					},
+				},
+				Executor: exec,
+			})
+			if err != nil {
+				t.Fatalf("new command adapter: %v", err)
+			}
+			_, startErr := adapter.Start(ctx, cpruntime.StartRequest{
+				AgentID:         "developer",
+				AttemptID:       attemptID,
+				AssignmentID:    "asg_missing_prompt",
+				LeaseID:         "lease_missing_prompt",
+				ContractID:      "ctr_missing_prompt",
+				RuntimeID:       "rt_provider_unverifiable",
+				CLIBackend:      "claude",
+				Workspace:       cpruntime.ContainerWorkspacePath,
+				HomeDir:         cpruntime.ContainerHomePath,
+				Env:             runtimeEnv(t, "developer", "rt_provider_unverifiable", attemptID),
+				BootstrapPrompt: "unverifiable provider transcript must fail closed",
+			})
+			if startErr == nil || !strings.Contains(startErr.Error(), cpruntime.TerminalReasonApprovalPolicyUnavailable) {
+				t.Fatalf("Start error = %v, want provider audit fail-closed", startErr)
+			}
+			if strings.Contains(startErr.Error(), secret) {
+				t.Fatalf("provider audit error leaked raw transcript secret: %v", startErr)
+			}
+			if class, ok := cpruntime.ErrorFailureClass(startErr); !ok || class != cpruntime.FailureClassRuntimeApprovalBlocked {
+				t.Fatalf("failure class = %s/%v, want runtime_approval_blocked", class, ok)
+			}
+			cliSessions, err := cpruntime.ListCLISessions(ctx, db)
+			if err != nil {
+				t.Fatalf("list CLI sessions: %v", err)
+			}
+			if len(cliSessions) != 1 || cliSessions[0].State != "failed" ||
+				cliSessions[0].ProviderAuditState != "failed" ||
+				cliSessions[0].ProviderAuditErrorCode != "PROVIDER_AUDIT_PARSE_FAILED" {
+				t.Fatalf("CLI session after unverifiable provider transcript = %+v", cliSessions)
+			}
+			if got := countRowsWhere(t, ctx, db, "provider_tool_outcomes", "1 = 1"); got != 0 {
+				t.Fatalf("provider outcomes after unverifiable transcript = %d, want 0", got)
+			}
+			var projectedLeaks int
+			if err := db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM provider_tool_outcomes
+WHERE id || cli_session_id || attempt_id || lease_id || runtime_id || source_stage ||
+  outcome_kind || tool_use_id || capability_name || status || error_code ||
+  transcript_ref || transcript_sha256 LIKE ?`, "%"+secret+"%").Scan(&projectedLeaks); err != nil {
+				t.Fatalf("scan provider outcome leakage: %v", err)
+			}
+			if projectedLeaks != 0 {
+				t.Fatalf("provider outcome projection leaked raw transcript secret")
 			}
 		})
 	}
