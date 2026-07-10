@@ -3,6 +3,7 @@ package runtime_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -82,6 +83,109 @@ func TestDockerRuntimeGateRequiresExplicitEnvironment(t *testing.T) {
 		if !prepared.Checks[name] {
 			t.Fatalf("prepared docker checks = %#v, want %s", prepared.Checks, name)
 		}
+	}
+}
+
+func TestDockerManagedCleanupFileSQLiteGate(t *testing.T) {
+	if os.Getenv("COORDPLANE_DOCKER_CLEANUP_GATE") != "1" {
+		t.Skip("set COORDPLANE_DOCKER_CLEANUP_GATE=1 to run the real Docker/file-SQLite cleanup matrix")
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skipf("docker CLI unavailable: %v", err)
+	}
+	image := os.Getenv("COORDPLANE_DOCKER_IMAGE")
+	if image == "" {
+		image = "alpine:3.20"
+	}
+	network := os.Getenv("COORDPLANE_DOCKER_NETWORK")
+	if network == "" {
+		network = "bridge"
+	}
+	for _, tc := range []struct {
+		name          string
+		coordlinkExit int
+		wantState     string
+	}{
+		{name: "terminal success removes owned container", wantState: "stopped"},
+		{name: "post-create check failure removes owned container", coordlinkExit: 7, wantState: "failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+			dir := t.TempDir()
+			dbPath := filepath.Join(dir, "coordplane.db")
+			db := newFileIntegrationDB(t, dbPath)
+			defer db.Close()
+			attemptID := "att_cleanup_gate"
+			leaseID := "lease_cleanup_gate"
+			seedDockerCleanupScope(t, ctx, db, attemptID, leaseID)
+			coordlinkPath := filepath.Join(dir, "coordlink")
+			coordlink := "#!/bin/sh\nexit 0\n"
+			if tc.coordlinkExit != 0 {
+				coordlink = "#!/bin/sh\nexit 7\n"
+			}
+			if err := os.WriteFile(coordlinkPath, []byte(coordlink), 0o755); err != nil {
+				t.Fatalf("write cleanup gate coordlink: %v", err)
+			}
+			managed := cpruntime.NewDockerRuntime(cpruntime.DockerRuntimeConfig{
+				DB:            db,
+				ProfileName:   "docker-cleanup-gate",
+				TeamID:        "docker-cleanup-gate",
+				Image:         image,
+				Network:       network,
+				RuntimeRoot:   dir + "-runtime",
+				CoordlinkPath: coordlinkPath,
+				DBPath:        dbPath,
+				Ready:         true,
+			})
+			prepared, prepareErr := managed.Prepare(ctx, cpruntime.PrepareRequest{
+				AgentID:        "developer",
+				AttemptID:      attemptID,
+				AssignmentID:   "asg_cleanup_gate",
+				LeaseID:        leaseID,
+				ContractID:     "ctr_cleanup_gate",
+				TeamID:         "docker-cleanup-gate",
+				RuntimeProfile: "docker-cleanup-gate",
+				CLIBackend:     "fake",
+				BackendURL:     "http://coordplane.invalid",
+				WorkspaceName:  "docker-cleanup-gate",
+			})
+			var containerName string
+			if err := db.QueryRowContext(ctx, `SELECT container_name FROM runtime_instances WHERE attempt_id = ?`, attemptID).Scan(&containerName); err != nil {
+				t.Fatalf("query cleanup gate container name: %v (prepare error: %v)", err, prepareErr)
+			}
+			t.Cleanup(func() {
+				_ = exec.Command("docker", "rm", "-f", containerName).Run()
+			})
+			if tc.coordlinkExit == 0 {
+				if prepareErr != nil || prepared.ContainerID == "" {
+					t.Fatalf("prepare managed container = %+v, err=%v", prepared, prepareErr)
+				}
+				now := time.Now().UTC().Format(time.RFC3339Nano)
+				if _, err := db.ExecContext(ctx, `UPDATE attempts SET status = 'completed', ended_at = ? WHERE id = ?`, now, attemptID); err != nil {
+					t.Fatalf("complete cleanup gate attempt: %v", err)
+				}
+				if _, err := db.ExecContext(ctx, `UPDATE leases SET state = 'released', updated_at = ? WHERE id = ?`, now, leaseID); err != nil {
+					t.Fatalf("release cleanup gate lease: %v", err)
+				}
+				if err := managed.FinalizeRuntime(context.Background(), attemptID, "real Docker cleanup gate complete"); err != nil {
+					t.Fatalf("finalize managed container: %v", err)
+				}
+			} else if prepareErr == nil {
+				t.Fatal("post-create coordlink check unexpectedly succeeded")
+			}
+			var state, cleanupState string
+			if err := db.QueryRowContext(ctx, `SELECT state, cleanup_state FROM runtime_instances WHERE attempt_id = ?`, attemptID).Scan(&state, &cleanupState); err != nil {
+				t.Fatalf("query cleanup gate runtime state: %v", err)
+			}
+			if state != tc.wantState || cleanupState != "removed" {
+				t.Fatalf("cleanup gate runtime state = %s/%s, want %s/removed", state, cleanupState, tc.wantState)
+			}
+			if _, err := (cpruntime.DockerCLIClient{}).InspectContainer(ctx, containerName); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("docker inspect after cleanup = %v, want NotFound", err)
+			}
+			assertSQLiteIntegrity(t, ctx, db)
+		})
 	}
 }
 
@@ -221,6 +325,63 @@ func newIntegrationDB(t *testing.T) (*sql.DB, func()) {
 	}
 	return db, func() {
 		_ = db.Close()
+	}
+}
+
+func newFileIntegrationDB(t *testing.T, path string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open file SQLite: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
+		_ = db.Close()
+		t.Fatalf("enable SQLite foreign keys: %v", err)
+	}
+	if _, err := store.New(db).Migrate(context.Background()); err != nil {
+		_ = db.Close()
+		t.Fatalf("migrate file SQLite: %v", err)
+	}
+	return db
+}
+
+func seedDockerCleanupScope(t *testing.T, ctx context.Context, db *sql.DB, attemptID, leaseID string) {
+	t.Helper()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	expires := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	statements := []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO work_contracts (id, title, objective, target_kind, target_id, status, completion_requirements_json, acceptance_policy_json, created_at, updated_at) VALUES ('ctr_cleanup_gate', 'cleanup gate', 'verify real Docker cleanup', 'agent', 'developer', 'open', '["report"]', '{}', ?, ?)`, []any{now, now}},
+		{`INSERT INTO assignments (id, contract_id, assignee_agent_id, state, reason, created_at, updated_at) VALUES ('asg_cleanup_gate', 'ctr_cleanup_gate', 'developer', 'claimed', 'cleanup_gate', ?, ?)`, []any{now, now}},
+		{`INSERT INTO leases (id, assignment_id, agent_id, state, expires_at, created_at, updated_at) VALUES (?, 'asg_cleanup_gate', 'developer', 'active', ?, ?, ?)`, []any{leaseID, expires, now, now}},
+		{`INSERT INTO attempts (id, lease_id, cli_backend, runtime_kind, start_reason, status, started_at) VALUES (?, ?, 'fake', 'docker', 'cleanup_gate', 'preparing', ?)`, []any{attemptID, leaseID, now}},
+	}
+	for _, statement := range statements {
+		if _, err := db.ExecContext(ctx, statement.query, statement.args...); err != nil {
+			t.Fatalf("seed Docker cleanup scope: %v", err)
+		}
+	}
+}
+
+func assertSQLiteIntegrity(t *testing.T, ctx context.Context, db *sql.DB) {
+	t.Helper()
+	var integrity string
+	if err := db.QueryRowContext(ctx, `PRAGMA integrity_check`).Scan(&integrity); err != nil || integrity != "ok" {
+		t.Fatalf("SQLite integrity_check = %q, err=%v", integrity, err)
+	}
+	rows, err := db.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		t.Fatalf("SQLite foreign_key_check: %v", err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		t.Fatal("SQLite foreign_key_check reported a violation")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("SQLite foreign_key_check rows: %v", err)
 	}
 }
 
