@@ -102,12 +102,14 @@ func TestDockerManagedCleanupFileSQLiteGate(t *testing.T) {
 		network = "bridge"
 	}
 	for _, tc := range []struct {
-		name          string
-		coordlinkExit int
-		wantState     string
+		name                 string
+		coordlinkExit        int
+		wantState            string
+		removedBeforeConfirm bool
 	}{
 		{name: "terminal success removes owned container", wantState: "stopped"},
 		{name: "post-create check failure removes owned container", coordlinkExit: 7, wantState: "failed"},
+		{name: "removed before database confirmation converges from NotFound", wantState: "stopped", removedBeforeConfirm: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -168,7 +170,23 @@ func TestDockerManagedCleanupFileSQLiteGate(t *testing.T) {
 				if _, err := db.ExecContext(ctx, `UPDATE leases SET state = 'released', updated_at = ? WHERE id = ?`, now, leaseID); err != nil {
 					t.Fatalf("release cleanup gate lease: %v", err)
 				}
-				if err := managed.FinalizeRuntime(context.Background(), attemptID, "real Docker cleanup gate complete"); err != nil {
+				if tc.removedBeforeConfirm {
+					expired := time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano)
+					if _, err := db.ExecContext(ctx, `
+UPDATE runtime_instances
+SET cleanup_state = 'in_progress', cleanup_reason = 'removed before confirmation',
+  cleanup_owner = 'cleanup-crashed-gate', cleanup_lease_expires_at = ?,
+  cleanup_attempts = 1, updated_at = ?
+WHERE attempt_id = ?`, expired, expired, attemptID); err != nil {
+						t.Fatalf("seed removed-before-confirm cleanup claim: %v", err)
+					}
+					if raw, err := exec.CommandContext(ctx, "docker", "rm", "-f", containerName).CombinedOutput(); err != nil {
+						t.Fatalf("externally remove managed container before DB confirmation: %v: %s", err, raw)
+					}
+					if err := managed.ReconcileRuntimeCleanup(context.Background()); err != nil {
+						t.Fatalf("reconcile removed-before-confirm managed container: %v", err)
+					}
+				} else if err := managed.FinalizeRuntime(context.Background(), attemptID, "real Docker cleanup gate complete"); err != nil {
 					t.Fatalf("finalize managed container: %v", err)
 				}
 			} else if prepareErr == nil {
@@ -183,6 +201,23 @@ func TestDockerManagedCleanupFileSQLiteGate(t *testing.T) {
 			}
 			if _, err := (cpruntime.DockerCLIClient{}).InspectContainer(ctx, containerName); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("docker inspect after cleanup = %v, want NotFound", err)
+			}
+			var removedEvents int
+			if err := db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM events
+WHERE event_type = 'runtime.cleanup_removed'
+  AND aggregate_id = (SELECT runtime_id FROM runtime_instances WHERE attempt_id = ?)`, attemptID).Scan(&removedEvents); err != nil {
+				t.Fatalf("count cleanup removed events: %v", err)
+			}
+			if removedEvents != 1 {
+				t.Fatalf("runtime.cleanup_removed events = %d, want 1", removedEvents)
+			}
+			raw, err := exec.CommandContext(ctx, "docker", "ps", "-aq", "--filter", "label=coordplane.attempt_id="+attemptID).CombinedOutput()
+			if err != nil {
+				t.Fatalf("list matching managed containers: %v: %s", err, raw)
+			}
+			if strings.TrimSpace(string(raw)) != "" {
+				t.Fatalf("managed containers remain for attempt %s: %s", attemptID, raw)
 			}
 			assertSQLiteIntegrity(t, ctx, db)
 		})
