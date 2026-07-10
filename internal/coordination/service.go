@@ -522,6 +522,23 @@ func (s *Service) CompleteContract(ctx context.Context, in CompleteContractInput
 			return rejectedErr{response: missingEvidenceResponse[CompleteContractResult](scope.Contract.ID, in.LeaseID, requirements)}
 		}
 		now := formatTime(time.Now())
+		for ordinal, evidenceID := range evidenceIDs {
+			result, err := tx.ExecContext(ctx, `
+INSERT INTO contract_completion_evidence (
+  contract_id, lease_id, evidence_id, kind, ordinal, created_at
+)
+SELECT ?, ?, id, kind, ?, ?
+FROM evidence
+WHERE id = ?`, scope.Contract.ID, in.LeaseID, ordinal, now, evidenceID)
+			if err != nil {
+				return fmt.Errorf("bind contract completion evidence: %w", err)
+			}
+			if count, err := result.RowsAffected(); err != nil {
+				return fmt.Errorf("count contract completion evidence binding: %w", err)
+			} else if count != 1 {
+				return fmt.Errorf("bind contract completion evidence: evidence %s disappeared", evidenceID)
+			}
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE work_contracts SET status = 'satisfied', updated_at = ? WHERE id = ?`, now, scope.Contract.ID); err != nil {
 			return fmt.Errorf("satisfy contract: %w", err)
 		}
@@ -562,7 +579,11 @@ func (s *Service) CompleteContract(ctx context.Context, in CompleteContractInput
 				return err
 			}
 		}
-		if _, err := appendFact(ctx, tx, "contract.satisfied", "work_contract", scope.Contract.ID, map[string]string{"lease_id": in.LeaseID, "envelope_id": envelopeID}); err != nil {
+		if _, err := appendFact(ctx, tx, "contract.satisfied", "work_contract", scope.Contract.ID, map[string]any{
+			"lease_id":     in.LeaseID,
+			"envelope_id":  envelopeID,
+			"evidence_ids": append([]string(nil), evidenceIDs...),
+		}); err != nil {
 			return err
 		}
 		result = CompleteContractResult{ContractID: scope.Contract.ID, Status: "satisfied", EnvelopeID: envelopeID, EvidenceIDs: evidenceIDs}

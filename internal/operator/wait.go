@@ -162,6 +162,7 @@ type EvidenceValidationAssessment struct {
 	ContractID         string `json:"contract_id"`
 	AssessedContractID string `json:"assessed_contract_id"`
 	Verdict            string `json:"verdict"`
+	BindingStatus      string `json:"binding_status"`
 	CreatedAt          string `json:"created_at"`
 }
 
@@ -182,21 +183,25 @@ type EvidenceCapabilityOutcome struct {
 }
 
 type EvidenceTerminal struct {
-	Status                         string `json:"status"`
-	FailureSummary                 string `json:"failure_summary,omitempty"`
-	FailureClass                   string `json:"failure_class,omitempty"`
-	TerminalReason                 string `json:"terminal_reason,omitempty"`
-	RootContractStatus             string `json:"root_contract_status"`
-	ReportCount                    int64  `json:"report_count"`
-	ValidationPassCount            int64  `json:"validation_pass_count"`
-	ValidationFailureCount         int64  `json:"validation_failure_count"`
-	QueuedAssignmentCount          int64  `json:"queued_assignment_count"`
-	ActiveAssignmentCount          int64  `json:"active_assignment_count"`
-	ActiveLeaseCount               int64  `json:"active_lease_count"`
-	GateMode                       string `json:"gate_mode"`
-	BusinessReportCount            int64  `json:"business_report_count"`
-	LinkedValidationPassCount      int64  `json:"linked_validation_pass_count"`
-	IndependentValidationPassCount int64  `json:"independent_validation_pass_count"`
+	Status                                string `json:"status"`
+	FailureSummary                        string `json:"failure_summary,omitempty"`
+	FailureClass                          string `json:"failure_class,omitempty"`
+	TerminalReason                        string `json:"terminal_reason,omitempty"`
+	RootContractStatus                    string `json:"root_contract_status"`
+	ReportCount                           int64  `json:"report_count"`
+	ValidationPassCount                   int64  `json:"validation_pass_count"`
+	TotalValidationPassCount              int64  `json:"total_validation_pass_count"`
+	CompletionBoundValidationPassCount    int64  `json:"completion_bound_validation_pass_count"`
+	CompletionValidationPassCount         int64  `json:"completion_validation_pass_count"`
+	ValidationFailureCount                int64  `json:"validation_failure_count"`
+	CompletionBoundValidationFailureCount int64  `json:"completion_bound_validation_failure_count"`
+	QueuedAssignmentCount                 int64  `json:"queued_assignment_count"`
+	ActiveAssignmentCount                 int64  `json:"active_assignment_count"`
+	ActiveLeaseCount                      int64  `json:"active_lease_count"`
+	GateMode                              string `json:"gate_mode"`
+	BusinessReportCount                   int64  `json:"business_report_count"`
+	LinkedValidationPassCount             int64  `json:"linked_validation_pass_count"`
+	IndependentValidationPassCount        int64  `json:"independent_validation_pass_count"`
 }
 
 func (s *Service) WaitTask(ctx context.Context, subject Subject, taskRunID string, in WaitTaskInput) (WaitTaskResult, error) {
@@ -430,7 +435,7 @@ func (s *Service) buildTaskEvidence(ctx context.Context, taskRunID string) (Task
 		return TaskEvidence{}, err
 	}
 	evidence := TaskEvidence{
-		SchemaVersion:  "operator.task.evidence.v2",
+		SchemaVersion:  "operator.task.evidence.v3",
 		TaskRunID:      run.ID,
 		Status:         terminal.Status,
 		FailureSummary: terminal.FailureSummary,
@@ -655,11 +660,23 @@ func (s *Service) evidenceValidations(ctx context.Context, contractIDs []string)
 	}
 	args := append(stringArgs(contractIDs), stringArgs(contractIDs)...)
 	query := `
-SELECT id, evidence_id, verifier_agent_id, contract_id, assessed_contract_id, verdict, created_at
-FROM validation_assessments
-WHERE contract_id IN (` + placeholders(len(contractIDs)) + `)
-  AND assessed_contract_id IN (` + placeholders(len(contractIDs)) + `)
-ORDER BY created_at ASC, id ASC`
+SELECT va.id, va.evidence_id, va.verifier_agent_id, va.contract_id,
+  va.assessed_contract_id, va.verdict,
+  CASE
+    WHEN cce.evidence_id IS NOT NULL THEN 'bound'
+    WHEN wc.status = 'satisfied' AND wc.updated_at < COALESCE((
+      SELECT applied_at FROM schema_migrations WHERE version = '020_contract_completion_evidence'
+    ), '') THEN 'legacy_unverifiable'
+    ELSE 'unbound'
+  END AS binding_status,
+  va.created_at
+FROM validation_assessments va
+JOIN work_contracts wc ON wc.id = va.contract_id
+LEFT JOIN contract_completion_evidence cce
+  ON cce.evidence_id = va.evidence_id AND cce.contract_id = va.contract_id
+WHERE va.contract_id IN (` + placeholders(len(contractIDs)) + `)
+  AND va.assessed_contract_id IN (` + placeholders(len(contractIDs)) + `)
+ORDER BY va.created_at ASC, va.id ASC`
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("lookup validation assessments: %w", err)
@@ -675,6 +692,7 @@ ORDER BY created_at ASC, id ASC`
 			&assessment.ContractID,
 			&assessment.AssessedContractID,
 			&assessment.Verdict,
+			&assessment.BindingStatus,
 			&assessment.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -837,6 +855,7 @@ func (s *Service) evidenceInspectSummary(ctx context.Context) (map[string]int64,
 		"delivery_attempts",
 		"evidence",
 		"validation_assessments",
+		"contract_completion_evidence",
 	}
 	out := make(map[string]int64, len(tables))
 	for _, table := range tables {
@@ -873,11 +892,37 @@ func (s *Service) evidenceTerminal(ctx context.Context, rootContractID string, c
 	).Scan(&out.ValidationPassCount); err != nil {
 		return out, fmt.Errorf("count passing validation: %w", err)
 	}
+	out.TotalValidationPassCount = out.ValidationPassCount
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*)
+FROM validation_assessments va
+JOIN contract_completion_evidence cce
+  ON cce.evidence_id = va.evidence_id AND cce.contract_id = va.contract_id
+WHERE va.verdict = 'pass'
+  AND va.contract_id IN (`+placeholders(len(contractIDs))+`)
+  AND va.assessed_contract_id IN (`+placeholders(len(contractIDs))+`)`,
+		validationArgs...,
+	).Scan(&out.CompletionBoundValidationPassCount); err != nil {
+		return out, fmt.Errorf("count completion-bound passing validation: %w", err)
+	}
+	out.CompletionValidationPassCount = out.CompletionBoundValidationPassCount
 	if err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM validation_assessments WHERE verdict IN ('fail', 'blocked') AND contract_id IN (`+placeholders(len(contractIDs))+`) AND assessed_contract_id IN (`+placeholders(len(contractIDs))+`)`,
 		validationArgs...,
 	).Scan(&out.ValidationFailureCount); err != nil {
 		return out, fmt.Errorf("count failing validation: %w", err)
+	}
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*)
+FROM validation_assessments va
+JOIN contract_completion_evidence cce
+  ON cce.evidence_id = va.evidence_id AND cce.contract_id = va.contract_id
+WHERE va.verdict IN ('fail', 'blocked')
+  AND va.contract_id IN (`+placeholders(len(contractIDs))+`)
+  AND va.assessed_contract_id IN (`+placeholders(len(contractIDs))+`)`,
+		validationArgs...,
+	).Scan(&out.CompletionBoundValidationFailureCount); err != nil {
+		return out, fmt.Errorf("count completion-bound failing validation: %w", err)
 	}
 	if err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM assignments WHERE state = 'queued' AND contract_id IN (`+placeholders(len(contractIDs))+`)`,
@@ -924,12 +969,12 @@ WHERE l.state = 'active' AND a.contract_id IN (`+placeholders(len(contractIDs))+
 	case out.RootContractStatus == "satisfied" && s.teamConfig.Termination.RequireIndependentVerifier && out.IndependentValidationPassCount == 0:
 		out.Status = "failed"
 		out.FailureSummary = "business gate requires a passing verifier that is independent from the report producer"
-	case out.RootContractStatus == "satisfied" && out.ValidationFailureCount > 0:
+	case out.RootContractStatus == "satisfied" && out.CompletionBoundValidationFailureCount > 0:
 		out.Status = "failed"
-		out.FailureSummary = "contract lineage contains a failing or blocked validation assessment"
-	case out.RootContractStatus == "satisfied" && out.ValidationPassCount == 0:
+		out.FailureSummary = "contract lineage completion binds a failing or blocked validation assessment"
+	case out.RootContractStatus == "satisfied" && out.CompletionBoundValidationPassCount == 0:
 		out.Status = "failed"
-		out.FailureSummary = "root task is satisfied without a passing validation assessment in its contract lineage"
+		out.FailureSummary = "root task is satisfied without a completion-bound passing validation assessment in its contract lineage"
 	case out.RootContractStatus == "satisfied" && unfinishedLineage:
 		out.Status = "running"
 		out.FailureSummary = "root task has report and validation evidence but contract lineage still has unfinished assignments or active leases"
@@ -948,9 +993,9 @@ WHERE l.state = 'active' AND a.contract_id IN (`+placeholders(len(contractIDs))+
 	}
 	switch {
 	case out.Status != "":
-	case out.ValidationFailureCount > 0:
+	case out.CompletionBoundValidationFailureCount > 0:
 		out.Status = "failed"
-		out.FailureSummary = "contract lineage contains a failing or blocked validation assessment"
+		out.FailureSummary = "contract lineage completion binds a failing or blocked validation assessment"
 	case out.QueuedAssignmentCount == 0 && out.ActiveAssignmentCount == 0 && out.ActiveLeaseCount == 0:
 		out.Status = "blocked"
 		out.FailureSummary = "dead queue: root contract is open and no queued or active lineage assignments remain"
@@ -1005,11 +1050,13 @@ ORDER BY e.created_at ASC, e.id ASC`, stringArgs(contractIDs)...)
 	args := append(stringArgs(contractIDs), stringArgs(contractIDs)...)
 	rows, err = s.db.QueryContext(ctx, `
 SELECT verifier_agent_id, checked_refs_json
-FROM validation_assessments
-WHERE verdict = 'pass'
-  AND contract_id IN (`+placeholders(len(contractIDs))+`)
-  AND assessed_contract_id IN (`+placeholders(len(contractIDs))+`)
-ORDER BY created_at ASC, id ASC`, args...)
+FROM validation_assessments va
+JOIN contract_completion_evidence cce
+  ON cce.evidence_id = va.evidence_id AND cce.contract_id = va.contract_id
+WHERE va.verdict = 'pass'
+  AND va.contract_id IN (`+placeholders(len(contractIDs))+`)
+  AND va.assessed_contract_id IN (`+placeholders(len(contractIDs))+`)
+ORDER BY va.created_at ASC, va.id ASC`, args...)
 	if err != nil {
 		return out, fmt.Errorf("lookup business validation evidence: %w", err)
 	}

@@ -132,6 +132,11 @@ var migrations = []migration{
 		Name:    "managed runtime cleanup ownership and recovery ledger",
 		SQL:     managedRuntimeCleanupSchemaSQL,
 	},
+	{
+		Version: "020_contract_completion_evidence",
+		Name:    "canonical contract completion evidence bindings",
+		SQL:     contractCompletionEvidenceSchemaSQL,
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) (MigrationResult, error) {

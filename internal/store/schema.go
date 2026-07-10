@@ -820,3 +820,22 @@ ALTER TABLE runtime_instances ADD COLUMN removed_at TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS runtime_instances_cleanup_idx
   ON runtime_instances(runtime_kind, cleanup_state, cleanup_lease_expires_at);
 `
+
+const contractCompletionEvidenceSchemaSQL = `
+CREATE TABLE IF NOT EXISTS contract_completion_evidence (
+  contract_id TEXT NOT NULL,
+  lease_id TEXT NOT NULL,
+  evidence_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(contract_id, evidence_id),
+  UNIQUE(contract_id, ordinal),
+  FOREIGN KEY(contract_id) REFERENCES work_contracts(id),
+  FOREIGN KEY(evidence_id) REFERENCES evidence(id),
+  FOREIGN KEY(lease_id) REFERENCES leases(id)
+);
+
+CREATE INDEX IF NOT EXISTS contract_completion_evidence_evidence_idx
+  ON contract_completion_evidence(evidence_id, contract_id);
+`
