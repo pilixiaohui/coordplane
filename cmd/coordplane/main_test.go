@@ -73,6 +73,7 @@ func TestTaskRunCommandCreatesThenStartsOperatorTask(t *testing.T) {
 	payloadPath := writeTaskPayload(t)
 	var paths []string
 	var startAuth string
+	var createPayload map[string]any
 	var startPayload map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
@@ -80,6 +81,9 @@ func TestTaskRunCommandCreatesThenStartsOperatorTask(t *testing.T) {
 		case "/operator/tasks":
 			if r.Header.Get("Authorization") != "Bearer operator-secret" {
 				t.Fatalf("create auth = %q", r.Header.Get("Authorization"))
+			}
+			if err := json.NewDecoder(r.Body).Decode(&createPayload); err != nil {
+				t.Fatalf("decode create payload: %v", err)
 			}
 			writeAccepted(t, w, map[string]any{
 				"task_run_id":        "taskrun_run",
@@ -126,6 +130,9 @@ func TestTaskRunCommandCreatesThenStartsOperatorTask(t *testing.T) {
 	}
 	if startAuth != "Bearer operator-secret" || startPayload["idempotency_key"] != "start-cli-test" {
 		t.Fatalf("start auth/payload = %s/%#v", startAuth, startPayload)
+	}
+	if createPayload["require_startable"] != true {
+		t.Fatalf("task run create payload = %#v, want require_startable=true", createPayload)
 	}
 	if !strings.Contains(stdout.String(), `"session_route_id":"route_run"`) {
 		t.Fatalf("stdout = %s, want start response", stdout.String())

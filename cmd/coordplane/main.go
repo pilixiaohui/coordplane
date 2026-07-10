@@ -172,6 +172,10 @@ func runTaskRun(args []string, stdout, stderr io.Writer, client *http.Client) er
 	if err != nil {
 		return err
 	}
+	payload, err = taskRunStartablePayload(payload)
+	if err != nil {
+		return err
+	}
 	createRaw, createResponse, err := postOperatorJSON(client, cfg.backendURL, "/operator/tasks", token, payload)
 	if err != nil {
 		return err
@@ -250,6 +254,19 @@ func runTaskRun(args []string, stdout, stderr io.Writer, client *http.Client) er
 	}
 	_, err = stdout.Write(append(startRaw, '\n'))
 	return err
+}
+
+func taskRunStartablePayload(payload []byte) ([]byte, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &object); err != nil || object == nil {
+		return nil, errors.New("task run payload must be a JSON object")
+	}
+	object["require_startable"] = json.RawMessage("true")
+	out, err := json.Marshal(object)
+	if err != nil {
+		return nil, fmt.Errorf("encode startable task run payload: %w", err)
+	}
+	return out, nil
 }
 
 func (cfg taskFlags) writeEvidenceAfterStartFailure(client *http.Client, token, taskRunID string) error {
