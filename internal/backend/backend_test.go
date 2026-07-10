@@ -26,6 +26,7 @@ import (
 	"coordplane/internal/coordlinkcli"
 	operator "coordplane/internal/operator"
 	cpruntime "coordplane/internal/runtime"
+	"coordplane/internal/store"
 	"coordplane/internal/validation"
 
 	_ "modernc.org/sqlite"
@@ -85,6 +86,108 @@ func TestServeBackendInitializesRealSQLiteFileAndInspectReadiness(t *testing.T) 
 	defer reopened.Close()
 	if !reopened.TeamConfigLoaded || reopened.TeamConfig.TeamID != "accept-test" {
 		t.Fatalf("reopened TeamConfig = loaded:%v cfg:%+v, want persisted accept-test", reopened.TeamConfigLoaded, reopened.TeamConfig)
+	}
+}
+
+func TestServeBackendRetriesManagedCleanupAfterFutureCrashLeaseExpires(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "coordplane.db")
+	dockerLog := filepath.Join(dir, "docker.log")
+	dockerPath := filepath.Join(dir, "docker")
+	dockerScript := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" >> %q
+echo 'Error: No such container: coordplane-crash-retry' >&2
+exit 1
+`, dockerLog)
+	if err := os.WriteFile(dockerPath, []byte(dockerScript), 0o755); err != nil {
+		t.Fatalf("write Docker CLI fixture: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open crash-retry SQLite: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := store.New(db).Migrate(ctx); err != nil {
+		_ = db.Close()
+		t.Fatalf("migrate crash-retry SQLite: %v", err)
+	}
+	now := time.Now().UTC()
+	nowText := now.Format(time.RFC3339Nano)
+	futureLease := now.Add(250 * time.Millisecond).Format(time.RFC3339Nano)
+	for _, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO work_contracts (id, title, objective, target_kind, target_id, status, created_at, updated_at) VALUES ('ctr_crash_retry', 'crash retry', 'converge cleanup', 'agent', 'developer', 'active', ?, ?)`, []any{nowText, nowText}},
+		{`INSERT INTO assignments (id, contract_id, assignee_agent_id, state, reason, created_at, updated_at) VALUES ('asg_crash_retry', 'ctr_crash_retry', 'developer', 'returned', 'crash retry', ?, ?)`, []any{nowText, nowText}},
+		{`INSERT INTO leases (id, assignment_id, agent_id, state, expires_at, created_at, updated_at) VALUES ('lease_crash_retry', 'asg_crash_retry', 'developer', 'released', ?, ?, ?)`, []any{now.Add(time.Hour).Format(time.RFC3339Nano), nowText, nowText}},
+		{`INSERT INTO attempts (id, lease_id, cli_backend, runtime_kind, start_reason, status, started_at, ended_at) VALUES ('att_crash_retry', 'lease_crash_retry', 'fake', 'docker', 'crash retry', 'failed', ?, ?)`, []any{nowText, nowText}},
+		{`INSERT INTO runtime_instances (
+  id, runtime_id, runtime_profile, runtime_kind, agent_id, attempt_id, lease_id,
+  container_id, container_name, image, network, state, workspace_path, home_path,
+  cleanup_state, cleanup_reason, cleanup_owner, cleanup_lease_expires_at,
+  cleanup_attempts, created_at, updated_at
+) VALUES (
+  'ri_crash_retry', 'rt_crash_retry', 'docker-default', 'docker', 'developer',
+  'att_crash_retry', 'lease_crash_retry', 'container-crash-retry',
+  'coordplane-crash-retry', 'alpine:3.20', 'bridge', 'stopped', '/workspace',
+  '/home/agent', 'in_progress', 'crash recovery', 'cleanup-dead-process', ?, 1, ?, ?
+)`, []any{futureLease, nowText, nowText}},
+	} {
+		if _, err := db.ExecContext(ctx, statement.query, statement.args...); err != nil {
+			_ = db.Close()
+			t.Fatalf("seed crash-retry SQLite: %v", err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close seeded crash-retry SQLite: %v", err)
+	}
+
+	app, err := backend.Open(ctx, backend.Config{
+		DBPath:                 dbPath,
+		ListenAddr:             "127.0.0.1:0",
+		TeamConfigPath:         writeDockerCleanupTeamConfig(t, dir),
+		CoordlinkPath:          dockerPath,
+		RuntimeCleanupInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("open crash-retry backend: %v", err)
+	}
+	defer app.Close()
+
+	var cleanupState string
+	if err := app.DB.QueryRowContext(ctx, `SELECT cleanup_state FROM runtime_instances WHERE id = 'ri_crash_retry'`).Scan(&cleanupState); err != nil {
+		t.Fatalf("query cleanup before lease expiry: %v", err)
+	}
+	if cleanupState != "in_progress" {
+		t.Fatalf("cleanup before lease expiry = %s, want in_progress", cleanupState)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := app.DB.QueryRowContext(ctx, `SELECT cleanup_state FROM runtime_instances WHERE id = 'ri_crash_retry'`).Scan(&cleanupState); err != nil {
+			t.Fatalf("poll cleanup state: %v", err)
+		}
+		if cleanupState == "removed" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if cleanupState != "removed" {
+		t.Fatalf("cleanup after future lease expiry = %s, want removed without backend restart", cleanupState)
+	}
+	if got := countRowsWhere(t, ctx, app.DB, "events", "event_type = 'runtime.cleanup_removed' AND entity_id = 'rt_crash_retry'"); got != 1 {
+		t.Fatalf("runtime.cleanup_removed events = %d, want 1", got)
+	}
+	rawLog, err := os.ReadFile(dockerLog)
+	if err != nil {
+		t.Fatalf("read Docker CLI log: %v", err)
+	}
+	if got := string(rawLog); !strings.Contains(got, "inspect") || strings.Contains(got, "rm -f") {
+		t.Fatalf("Docker CLI calls = %q, want inspect NotFound and no remove", got)
 	}
 }
 
@@ -3423,6 +3526,31 @@ agents:
 `)
 	if err := os.WriteFile(path, raw, 0o644); err != nil {
 		t.Fatalf("write TeamConfig: %v", err)
+	}
+	return path
+}
+
+func writeDockerCleanupTeamConfig(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "docker-cleanup-team.yaml")
+	raw := []byte(`team_id: docker-cleanup-team
+version: 1
+runtime_profiles:
+  docker-default:
+    kind: docker
+    image: alpine:3.20
+    workspace_mode: isolated
+agents:
+  - id: developer
+    runtime_profile: docker-default
+    cli_backend: fake
+    skills:
+      - coordplane-service
+    capabilities:
+      - contract.current
+`)
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatalf("write Docker cleanup TeamConfig: %v", err)
 	}
 	return path
 }

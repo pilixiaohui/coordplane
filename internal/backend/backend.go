@@ -43,23 +43,24 @@ import (
 const defaultTeamID = "default-go-team"
 
 type Config struct {
-	DBPath               string
-	ListenAddr           string
-	TeamConfigPath       string
-	TeamID               string
-	BackendURL           string
-	RuntimeWorkspaceRoot string
-	RuntimeHomeRoot      string
-	DockerNetwork        string
-	CoordlinkPath        string
-	ClaudeBinary         string
-	ClaudeEnvKeys        []string
-	ClaudeStartArgs      []string
-	ClaudeResumeArgs     []string
-	ClaudeTimeout        time.Duration
-	OperatorToken        string
-	OperatorTokenEnv     string
-	OperatorSubjectID    string
+	DBPath                 string
+	ListenAddr             string
+	TeamConfigPath         string
+	TeamID                 string
+	BackendURL             string
+	RuntimeWorkspaceRoot   string
+	RuntimeHomeRoot        string
+	DockerNetwork          string
+	CoordlinkPath          string
+	ClaudeBinary           string
+	ClaudeEnvKeys          []string
+	ClaudeStartArgs        []string
+	ClaudeResumeArgs       []string
+	ClaudeTimeout          time.Duration
+	RuntimeCleanupInterval time.Duration
+	OperatorToken          string
+	OperatorTokenEnv       string
+	OperatorSubjectID      string
 }
 
 type Backend struct {
