@@ -352,10 +352,40 @@ WHERE l.id = ? AND EXISTS (SELECT 1 FROM attempts att WHERE att.id = ? AND att.l
 		return err
 	default:
 		cause := NewAgentExitedWithoutTerminalAction("one-shot provider exited successfully without contract.complete or contract.wait")
-		if err := r.failAttempt(cleanupCtx, attemptID, cause.Error()); err != nil {
+		failed, err := r.failAttemptIfActive(cleanupCtx, attemptID, cause.Error())
+		if err != nil {
 			return fmt.Errorf("%w; cleanup failed: %v", cause, err)
 		}
+		if !failed {
+			return r.convergeOneShotAfterSkippedFailure(cleanupCtx, leaseID, attemptID)
+		}
 		return cause
+	}
+}
+
+func (r *Runner) convergeOneShotAfterSkippedFailure(ctx context.Context, leaseID, attemptID string) error {
+	var leaseState, assignmentState string
+	if err := r.db.QueryRowContext(ctx, `
+SELECT l.state, a.state
+FROM leases l
+JOIN assignments a ON a.id = l.assignment_id
+WHERE l.id = ? AND EXISTS (SELECT 1 FROM attempts att WHERE att.id = ? AND att.lease_id = l.id)`,
+		leaseID, attemptID,
+	).Scan(&leaseState, &assignmentState); err != nil {
+		return fmt.Errorf("runtime runner: recheck one-shot final state: %w", err)
+	}
+	switch {
+	case leaseState == "released":
+		return r.convergeReleasedLeaseBookkeeping(ctx, leaseID, attemptID)
+	case assignmentState == "waiting":
+		_, err := r.FinishSession(ctx, TerminalReport{
+			AttemptID: attemptID,
+			Status:    "waiting",
+			Summary:   "one-shot provider exited after concurrent contract.wait",
+		})
+		return err
+	default:
+		return errors.New("runtime runner: one-shot failure was skipped without a released or waiting canonical state")
 	}
 }
 
@@ -834,12 +864,35 @@ func (r *Runner) setTranscriptRef(ctx context.Context, attemptID, transcriptRef 
 }
 
 func (r *Runner) failAttempt(ctx context.Context, attemptID, reason string) error {
-	return withTx(ctx, r.db, func(tx *sql.Tx) error {
+	_, err := r.failAttemptIfActive(ctx, attemptID, reason)
+	return err
+}
+
+func (r *Runner) failAttemptIfActive(ctx context.Context, attemptID, reason string) (bool, error) {
+	failed := false
+	err := withTx(ctx, r.db, func(tx *sql.Tx) error {
 		current, err := attemptByIDTx(ctx, tx, attemptID)
 		if err != nil {
 			return err
 		}
 		now := formatTime(time.Now())
+		var leaseState, assignmentState string
+		if err := tx.QueryRowContext(ctx, `
+SELECT l.state, a.state
+FROM leases l
+JOIN assignments a ON a.id = l.assignment_id
+WHERE l.id = ?`, current.LeaseID).Scan(&leaseState, &assignmentState); err != nil {
+			return err
+		}
+		if current.EndedAt != nil && terminalStatus(current.Status) {
+			return nil
+		}
+		if leaseState != "active" || assignmentState != "claimed" {
+			if leaseState == "released" {
+				return convergeReleasedLeaseBookkeepingTx(ctx, tx, current.LeaseID, attemptID, now)
+			}
+			return nil
+		}
 		if _, err := tx.ExecContext(ctx, `
 		UPDATE attempts SET status = 'failed', transcript_ref = COALESCE(NULLIF(transcript_ref, ''), ?), ended_at = ? WHERE id = ?`,
 			reason, now, attemptID,
@@ -880,9 +933,13 @@ UPDATE runtime_tokens SET state = 'revoked', updated_at = ? WHERE attempt_id = ?
 		if err := releasePrepareLeasesByAttemptTx(ctx, tx, attemptID, now); err != nil {
 			return err
 		}
-		_, err = appendEvent(ctx, tx, "session.failed", "attempt", attemptID, map[string]string{"reason": reason})
-		return err
+		if _, err = appendEvent(ctx, tx, "session.failed", "attempt", attemptID, map[string]string{"reason": reason}); err != nil {
+			return err
+		}
+		failed = true
+		return nil
 	})
+	return failed, err
 }
 
 func (r *Runner) mailbox(ctx context.Context, mailboxID string) (coordination.MailboxItem, error) {
