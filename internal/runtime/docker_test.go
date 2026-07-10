@@ -215,6 +215,100 @@ func TestManagedDockerRuntimeCleanupConvergesWithDetachedContextAndIsIdempotent(
 	}
 }
 
+func TestManagedDockerRuntimePlainRepeatedCancelConvergesOnce(t *testing.T) {
+	ctx := context.Background()
+	h := newDockerRuntimeHarness(t, nil)
+	add := addContract(t, ctx, h.coordination, "developer")
+	adapter := &blockingCLIAdapter{started: make(chan struct{})}
+	runner, err := cpruntime.NewRunner(cpruntime.RunnerConfig{
+		Store:           h.store,
+		Coordination:    h.coordination,
+		TeamConfig:      dockerRuntimeTeamConfig(),
+		Skills:          skills.NewRegistry(h.store),
+		RuntimeBackends: map[string]cpruntime.RuntimeBackend{"docker-default": h.dockerRuntime},
+		Adapter:         adapter,
+		BackendURL:      "http://coordplane.test",
+		WorkspaceName:   "cancel-test",
+	})
+	if err != nil {
+		t.Fatalf("new managed cancellation runner: %v", err)
+	}
+
+	startCtx, cancel := context.WithCancel(ctx)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := runner.StartNext(startCtx, "developer")
+		errCh <- err
+	}()
+	select {
+	case <-adapter.started:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("managed CLI adapter did not reach Start")
+	}
+	cancel()
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("managed start cancellation error = %v, want context canceled", err)
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "timeout") || strings.Contains(strings.ToLower(err.Error()), "deadline") {
+			t.Fatalf("plain cancellation was classified as timeout: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("managed runner did not return after repeated cancel")
+	}
+
+	var attemptID, attemptStatus, transcriptRef, leaseState, cleanupState, runtimeState, containerName string
+	if err := h.db.QueryRowContext(ctx, `
+SELECT att.id, att.status, COALESCE(att.transcript_ref, ''), l.state,
+  ri.cleanup_state, ri.state, ri.container_name
+FROM attempts att
+JOIN leases l ON l.id = att.lease_id
+JOIN runtime_instances ri ON ri.attempt_id = att.id
+WHERE l.assignment_id = ?`, add.AssignmentID).Scan(
+		&attemptID, &attemptStatus, &transcriptRef, &leaseState, &cleanupState, &runtimeState, &containerName,
+	); err != nil {
+		t.Fatalf("query managed cancellation state: %v", err)
+	}
+	var routeState string
+	if err := h.db.QueryRowContext(ctx, `
+SELECT state FROM session_routes
+WHERE runtime_id = (SELECT runtime_id FROM runtime_instances WHERE attempt_id = ?)`, attemptID).Scan(&routeState); err != nil {
+		t.Fatalf("query cancelled route state: %v", err)
+	}
+	if attemptStatus != "failed" || transcriptRef != context.Canceled.Error() || leaseState != "released" ||
+		routeState != "failed" || cleanupState != "removed" || runtimeState != "stopped" {
+		t.Fatalf("managed cancellation durable state = attempt %s/%q lease %s route %s runtime %s/%s",
+			attemptStatus, transcriptRef, leaseState, routeState, runtimeState, cleanupState)
+	}
+	for table, where := range map[string]string{
+		"runtime_tokens": "attempt_id = '" + attemptID + "' AND state = 'active'",
+		"active_guards":  "attempt_id = '" + attemptID + "' AND state = 'active'",
+		"prepare_leases": "attempt_id = '" + attemptID + "' AND state = 'active'",
+	} {
+		if got := countRowsWhere(t, ctx, h.db, table, where); got != 0 {
+			t.Fatalf("active %s rows after repeated cancel = %d, want 0", table, got)
+		}
+	}
+	if h.docker.HasContainer(containerName) {
+		t.Fatalf("managed container %s still exists after repeated cancel", containerName)
+	}
+	if got := h.docker.RemovedCount(); got != 1 {
+		t.Fatalf("Docker remove calls after repeated cancel = %d, want 1", got)
+	}
+	if got := countRowsWhere(t, ctx, h.db, "events", "event_type = 'runtime.cleanup_removed'"); got != 1 {
+		t.Fatalf("runtime.cleanup_removed events after repeated cancel = %d, want 1", got)
+	}
+	if err := runner.ReconcileRuntimeCleanup(ctx); err != nil {
+		t.Fatalf("reconcile after repeated cancel: %v", err)
+	}
+	if got := h.docker.RemovedCount(); got != 1 {
+		t.Fatalf("Docker remove calls after repeated cancel reconciliation = %d, want 1", got)
+	}
+}
+
 func TestManagedDockerRuntimeWaitingSurvivesResumeUntilCompletion(t *testing.T) {
 	ctx := context.Background()
 	h := newDockerRuntimeHarness(t, nil)
