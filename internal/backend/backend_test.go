@@ -3369,82 +3369,169 @@ func TestDockerClaudeProviderPolicyRejectsCoordlinkSuffixOverrides(t *testing.T)
 }
 
 func TestOperatorEvidenceV3FailsClosedForSatisfiedContractWithProviderAuditFailure(t *testing.T) {
-	ctx := context.Background()
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "coordplane.db")
-	app, err := backend.Open(ctx, backend.Config{
-		DBPath:            dbPath,
-		ListenAddr:        "127.0.0.1:0",
-		TeamConfigPath:    writeTeamConfig(t, dir),
-		OperatorToken:     "operator-secret",
-		OperatorSubjectID: "ops-user",
-	})
-	if err != nil {
-		t.Fatalf("open provider audit evidence backend: %v", err)
-	}
-	defer app.Close()
-
-	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest("operator-provider-audit-failed", map[string]any{
-		"team_id":         "accept-test",
-		"team_version":    1,
-		"target_agent_id": "builder",
-	}), http.StatusOK))
-	taskRunID := stringField(t, created, "task_run_id")
-	rootContractID := stringField(t, created, "root_contract_id")
-	rootAssignmentID := stringField(t, created, "root_assignment_id")
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := app.DB.ExecContext(ctx, `
-UPDATE work_contracts SET status = 'satisfied', updated_at = ? WHERE id = ?`, now, rootContractID); err != nil {
-		t.Fatalf("satisfy provider-audit root contract: %v", err)
-	}
-	if _, err := app.DB.ExecContext(ctx, `
-UPDATE assignments SET state = 'returned', updated_at = ? WHERE id = ?`, now, rootAssignmentID); err != nil {
-		t.Fatalf("return provider-audit root assignment: %v", err)
-	}
-	for _, statement := range []struct {
-		query string
-		args  []any
+	cases := []struct {
+		name   string
+		secret string
+		stdout func(string) []byte
 	}{
-		{`INSERT INTO leases (id, assignment_id, agent_id, state, expires_at, created_at, updated_at) VALUES ('lease_provider_audit_failed', ?, 'builder', 'released', ?, ?, ?)`, []any{rootAssignmentID, time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano), now, now}},
-		{`INSERT INTO attempts (id, lease_id, cli_backend, runtime_kind, start_reason, status, transcript_ref, started_at, ended_at) VALUES ('att_provider_audit_failed', 'lease_provider_audit_failed', 'claude', 'docker', 'start', 'failed', 'obj_sha256_redacted', ?, ?)`, []any{now, now}},
-		{`INSERT INTO cli_sessions (
-  id, attempt_id, runtime_id, agent_id, cli_backend, profile_name,
-  session_native_id, process_ref, state, start_reason, exit_code, last_error,
-  transcript_ref, command_json, env_keys_json, started_at, ended_at, updated_at,
-  provider_audit_state, provider_audit_error_code
-) VALUES (
-  'cli_provider_audit_failed', 'att_provider_audit_failed', 'rt_provider_audit_failed',
-  'builder', 'claude', 'claude', 'native_provider_audit_failed',
-  'docker-exec:provider-audit-failed', 'failed', 'start', 0,
-  'runtime approval policy unavailable', 'obj_sha256_redacted', '[]', '[]',
-  ?, ?, ?, 'failed', 'PROVIDER_AUDIT_PARSE_FAILED'
-)`, []any{now, now, now}},
-	} {
-		if _, err := app.DB.ExecContext(ctx, statement.query, statement.args...); err != nil {
-			t.Fatalf("seed failed provider audit evidence: %v", err)
-		}
+		{
+			name:   "malformed JSON",
+			secret: "PROVIDER_MALFORMED_LINEAGE_SECRET",
+			stdout: func(secret string) []byte {
+				return []byte(`{"type":"result","secret":"` + secret + `"` + "\n")
+			},
+		},
+		{
+			name:   "scanner record overflow",
+			secret: "PROVIDER_OVERFLOW_LINEAGE_SECRET",
+			stdout: func(secret string) []byte {
+				return append([]byte(`{"secret":"`+secret+`","padding":"`), bytes.Repeat([]byte("x"), 2*1024*1024+1)...)
+			},
+		},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			dbPath := filepath.Join(dir, "coordplane.db")
+			app, err := backend.Open(ctx, backend.Config{
+				DBPath:            dbPath,
+				ListenAddr:        "127.0.0.1:0",
+				TeamConfigPath:    writeTeamConfig(t, dir),
+				OperatorToken:     "operator-secret",
+				OperatorSubjectID: "ops-user",
+			})
+			if err != nil {
+				t.Fatalf("open provider audit evidence backend: %v", err)
+			}
+			defer app.Close()
 
-	before := operatorEvidenceReadOnlySnapshot(t, ctx, app.DB, rootContractID)
-	for i := 0; i < 2; i++ {
-		raw := getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK)
-		assertNoOperatorSensitiveLeak(t, raw, "PROVIDER_RAW_SECRET_MUST_NOT_PROJECT", "Authorization", "Bearer")
-		evidence := decodeOperatorTaskData(t, raw)
-		if evidence["schema_version"] != "operator.task.evidence.v3" || evidence["status"] != "failed" {
-			t.Fatalf("provider audit evidence = %#v, want operator.task.evidence.v3 failed", evidence)
-		}
-		terminal := objectField(t, evidence, "terminal")
-		if terminal["status"] != "failed" || terminal["provider_audit_failure_count"].(float64) != 1 ||
-			!strings.Contains(terminal["failure_summary"].(string), "provider tool audit") {
-			t.Fatalf("provider audit terminal evidence = %#v, want failed provider audit gate", terminal)
-		}
-		if outcomes := arrayField(t, evidence, "provider_tool_outcomes"); len(outcomes) != 0 {
-			t.Fatalf("provider tool outcomes after unparseable transcript = %#v, want none", outcomes)
-		}
-	}
-	after := operatorEvidenceReadOnlySnapshot(t, ctx, app.DB, rootContractID)
-	if !reflect.DeepEqual(after, before) {
-		t.Fatalf("operator evidence projection mutated durable state: before=%#v after=%#v", before, after)
+			suffix := strings.ReplaceAll(strings.ToLower(tc.name), " ", "_")
+			created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest("operator-provider-audit-"+suffix, map[string]any{
+				"team_id":         "accept-test",
+				"team_version":    1,
+				"target_agent_id": "builder",
+			}), http.StatusOK))
+			taskRunID := stringField(t, created, "task_run_id")
+			rootContractID := stringField(t, created, "root_contract_id")
+			rootAssignmentID := stringField(t, created, "root_assignment_id")
+			leaseID := "lease_provider_audit_" + suffix
+			attemptID := "att_provider_audit_" + suffix
+			runtimeID := "rt_provider_audit_" + suffix
+			routeID := "route_provider_audit_" + suffix
+			seedProviderAuditLineage(t, ctx, app.DB, rootAssignmentID, leaseID, attemptID, runtimeID, routeID)
+			executor := providerTranscriptExecutor{result: cpruntime.ContainerExecResult{
+				ProcessRef: "docker-exec:provider-audit-" + suffix,
+				ExitCode:   0,
+				Stdout:     tc.stdout(tc.secret),
+			}}
+			adapter, err := cpruntime.NewClaudeCommandCLIAdapter(cpruntime.CommandCLIAdapterConfig{
+				Store: app.Store,
+				Profile: cpruntime.CommandCLIProfile{
+					Name:    "claude",
+					Backend: "claude",
+					Binary:  "/usr/local/bin/claude",
+					Timeout: time.Second,
+					RuntimeCommandPolicies: map[string]cpruntime.RuntimeCommandPolicy{
+						"docker-default": {
+							NonInteractiveApproval:     true,
+							AllowCoordlinkCapabilities: []string{"contract.current"},
+						},
+					},
+					AgentCapabilities: map[string][]string{"builder": {"contract.current"}},
+				},
+				Executor: executor,
+			})
+			if err != nil {
+				t.Fatalf("new provider audit adapter: %v", err)
+			}
+			env, err := cpruntime.BuildRuntimeEnv(cpruntime.EnvironmentInput{
+				BackendURL:    "http://coordplane.test",
+				AgentID:       "builder",
+				RuntimeID:     runtimeID,
+				AttemptID:     attemptID,
+				AssignmentID:  rootAssignmentID,
+				LeaseID:       leaseID,
+				Workspace:     cpruntime.ContainerWorkspacePath,
+				CLIBackend:    "claude",
+				TeamID:        "accept-test",
+				WorkspaceName: "provider-audit-test",
+			})
+			if err != nil {
+				t.Fatalf("build provider audit runtime env: %v", err)
+			}
+			_, startErr := adapter.Start(ctx, cpruntime.StartRequest{
+				AgentID:         "builder",
+				AttemptID:       attemptID,
+				AssignmentID:    rootAssignmentID,
+				LeaseID:         leaseID,
+				ContractID:      rootContractID,
+				SessionNativeID: "native_" + attemptID,
+				RuntimeID:       runtimeID,
+				CLIBackend:      "claude",
+				Workspace:       cpruntime.ContainerWorkspacePath,
+				HomeDir:         cpruntime.ContainerHomePath,
+				Env:             env,
+				BootstrapPrompt: "provider transcript must be durably audited",
+			})
+			if startErr == nil || !strings.Contains(startErr.Error(), cpruntime.TerminalReasonApprovalPolicyUnavailable) {
+				t.Fatalf("provider Start error = %v, want audit fail-closed", startErr)
+			}
+			if strings.Contains(startErr.Error(), tc.secret) {
+				t.Fatalf("provider Start error leaked transcript secret: %v", startErr)
+			}
+
+			var transcriptRef, lastError, auditState, auditCode string
+			if err := app.DB.QueryRowContext(ctx, `
+SELECT transcript_ref, last_error, provider_audit_state, provider_audit_error_code
+FROM cli_sessions WHERE attempt_id = ?`, attemptID).Scan(&transcriptRef, &lastError, &auditState, &auditCode); err != nil {
+				t.Fatalf("query provider audit CLI session: %v", err)
+			}
+			if !strings.HasPrefix(transcriptRef, "obj_sha256_") || auditState != "failed" || auditCode != "PROVIDER_AUDIT_PARSE_FAILED" {
+				t.Fatalf("provider audit session = ref:%q audit:%s/%s", transcriptRef, auditState, auditCode)
+			}
+			if strings.Contains(lastError, tc.secret) {
+				t.Fatalf("CLI last_error leaked transcript secret: %q", lastError)
+			}
+			var transcriptContent []byte
+			if err := app.DB.QueryRowContext(ctx, `
+SELECT ob.content
+FROM transcripts tr
+JOIN object_blobs ob ON ob.object_ref = tr.object_ref
+WHERE tr.attempt_id = ? AND tr.object_ref = ?`, attemptID, transcriptRef).Scan(&transcriptContent); err != nil {
+				t.Fatalf("read durable provider transcript: %v", err)
+			}
+			if !bytes.Contains(transcriptContent, []byte(tc.secret)) {
+				t.Fatalf("durable provider transcript does not contain test secret")
+			}
+			finalizeProviderAuditLineage(t, ctx, app.DB, rootContractID, rootAssignmentID, leaseID, attemptID, runtimeID, routeID, transcriptRef)
+			assertProviderSecretConfinedToTranscript(t, ctx, app.DB, tc.secret)
+
+			before := operatorEvidenceReadOnlySnapshot(t, ctx, app.DB, rootContractID, attemptID)
+			for i := 0; i < 2; i++ {
+				raw := getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK)
+				assertNoOperatorSensitiveLeak(t, raw, tc.secret, "Authorization", "Bearer")
+				if !bytes.Contains(raw, []byte(transcriptRef)) {
+					t.Fatalf("operator evidence omitted redacted transcript ref %q", transcriptRef)
+				}
+				evidence := decodeOperatorTaskData(t, raw)
+				if evidence["schema_version"] != "operator.task.evidence.v3" || evidence["status"] != "failed" {
+					t.Fatalf("provider audit evidence = %#v, want operator.task.evidence.v3 failed", evidence)
+				}
+				terminal := objectField(t, evidence, "terminal")
+				if terminal["status"] != "failed" || terminal["provider_audit_failure_count"].(float64) != 1 ||
+					!strings.Contains(terminal["failure_summary"].(string), "provider tool audit") {
+					t.Fatalf("provider audit terminal evidence = %#v, want failed/count=1", terminal)
+				}
+				if outcomes := arrayField(t, evidence, "provider_tool_outcomes"); len(outcomes) != 0 {
+					t.Fatalf("provider outcomes after unparseable transcript = %#v, want none", outcomes)
+				}
+			}
+			after := operatorEvidenceReadOnlySnapshot(t, ctx, app.DB, rootContractID, attemptID)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("operator evidence projection mutated durable state: before=%#v after=%#v", before, after)
+			}
+		})
 	}
 }
 
@@ -4585,7 +4672,91 @@ func operatorSeedCounts(t *testing.T, ctx context.Context, db *sql.DB) map[strin
 	return out
 }
 
-func operatorEvidenceReadOnlySnapshot(t *testing.T, ctx context.Context, db *sql.DB, contractID string) map[string]string {
+type providerTranscriptExecutor struct {
+	result cpruntime.ContainerExecResult
+}
+
+func (e providerTranscriptExecutor) Exec(context.Context, cpruntime.ContainerExecSpec) (cpruntime.ContainerExecResult, error) {
+	return e.result, nil
+}
+
+func seedProviderAuditLineage(t *testing.T, ctx context.Context, db *sql.DB, assignmentID, leaseID, attemptID, runtimeID, routeID string) {
+	t.Helper()
+	now := time.Now().UTC().Format("2006-01-02T15:04:05.000000000Z07:00")
+	expires := time.Now().Add(time.Hour).UTC().Format("2006-01-02T15:04:05.000000000Z07:00")
+	checks := `{"workspace_writable":true,"home_writable":true,"git_workspace_writable":true,"cli_user_consistent":true,"home_private":true,"home_persistent":true,"claude_present":true,"claude_auth_configured":true,"claude_auth_probe_passed":true,"claude_auth_probe_redacted":true}`
+	for _, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO session_routes (id, agent_id, runtime_id, cli_backend, session_native_id, route_json, state, created_at, updated_at) VALUES (?, 'builder', ?, 'claude', ?, '{}', 'active', ?, ?)`, []any{routeID, runtimeID, "native_" + attemptID, now, now}},
+		{`UPDATE assignments SET state = 'claimed', session_route_id = ?, updated_at = ? WHERE id = ?`, []any{routeID, now, assignmentID}},
+		{`INSERT INTO leases (id, assignment_id, agent_id, runtime_id, session_route_id, state, expires_at, created_at, updated_at) VALUES (?, ?, 'builder', ?, ?, 'active', ?, ?, ?)`, []any{leaseID, assignmentID, runtimeID, routeID, expires, now, now}},
+		{`INSERT INTO attempts (id, lease_id, cli_backend, runtime_kind, session_native_id, start_reason, status, started_at) VALUES (?, ?, 'claude', 'docker', ?, 'provider audit test', 'running', ?)`, []any{attemptID, leaseID, "native_" + attemptID, now}},
+		{`INSERT INTO runtime_instances (
+  id, runtime_id, runtime_profile, runtime_kind, agent_id, attempt_id, lease_id,
+  container_id, container_name, image, network, state, workspace_path, home_path,
+  checks_json, env_keys_json, created_at, updated_at
+) VALUES (?, ?, 'docker-default', 'docker', 'builder', ?, ?, ?, ?, 'alpine:3.20',
+  'bridge', 'ready', ?, ?, ?, '[]', ?, ?)`, []any{
+			"ri_" + runtimeID, runtimeID, attemptID, leaseID, "container_" + runtimeID,
+			"coordplane_" + runtimeID, cpruntime.ContainerWorkspacePath, cpruntime.ContainerHomePath,
+			checks, now, now,
+		}},
+	} {
+		if _, err := db.ExecContext(ctx, statement.query, statement.args...); err != nil {
+			t.Fatalf("seed provider audit lineage: %v", err)
+		}
+	}
+}
+
+func finalizeProviderAuditLineage(t *testing.T, ctx context.Context, db *sql.DB, contractID, assignmentID, leaseID, attemptID, runtimeID, routeID, transcriptRef string) {
+	t.Helper()
+	now := time.Now().UTC().Format("2006-01-02T15:04:05.000000000Z07:00")
+	for _, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{`UPDATE work_contracts SET status = 'satisfied', updated_at = ? WHERE id = ?`, []any{now, contractID}},
+		{`UPDATE assignments SET state = 'returned', updated_at = ? WHERE id = ?`, []any{now, assignmentID}},
+		{`UPDATE leases SET state = 'released', updated_at = ? WHERE id = ?`, []any{now, leaseID}},
+		{`UPDATE attempts SET status = 'failed', transcript_ref = ?, ended_at = ? WHERE id = ?`, []any{transcriptRef, now, attemptID}},
+		{`UPDATE session_routes SET state = 'failed', updated_at = ? WHERE id = ?`, []any{now, routeID}},
+		{`UPDATE runtime_instances SET state = 'stopped', cleanup_state = 'removed', removed_at = ?, updated_at = ? WHERE runtime_id = ?`, []any{now, now, runtimeID}},
+	} {
+		if _, err := db.ExecContext(ctx, statement.query, statement.args...); err != nil {
+			t.Fatalf("finalize provider audit lineage: %v", err)
+		}
+	}
+}
+
+func assertProviderSecretConfinedToTranscript(t *testing.T, ctx context.Context, db *sql.DB, secret string) {
+	t.Helper()
+	pattern := "%" + secret + "%"
+	checks := []struct {
+		name  string
+		query string
+		args  []any
+		want  int
+	}{
+		{name: "provider outcomes", query: `SELECT COUNT(*) FROM provider_tool_outcomes`, want: 0},
+		{name: "event payloads", query: `SELECT COUNT(*) FROM events WHERE payload_json LIKE ?`, args: []any{pattern}},
+		{name: "CLI projection", query: `SELECT COUNT(*) FROM cli_sessions WHERE last_error || command_json || env_keys_json || transcript_ref LIKE ?`, args: []any{pattern}},
+		{name: "attempt projection", query: `SELECT COUNT(*) FROM attempts WHERE COALESCE(transcript_ref, '') LIKE ?`, args: []any{pattern}},
+		{name: "evidence projection", query: `SELECT COUNT(*) FROM evidence WHERE COALESCE(content_ref, '') || COALESCE(inline_content, '') || summary || COALESCE(verdict, '') LIKE ?`, args: []any{pattern}},
+	}
+	for _, check := range checks {
+		var got int
+		if err := db.QueryRowContext(ctx, check.query, check.args...).Scan(&got); err != nil {
+			t.Fatalf("check provider secret in %s: %v", check.name, err)
+		}
+		if got != check.want {
+			t.Fatalf("provider secret matches in %s = %d, want %d", check.name, got, check.want)
+		}
+	}
+}
+
+func operatorEvidenceReadOnlySnapshot(t *testing.T, ctx context.Context, db *sql.DB, contractID, attemptID string) map[string]string {
 	t.Helper()
 	out := map[string]string{}
 	var contractStatus, contractUpdatedAt string
@@ -4603,7 +4774,7 @@ func operatorEvidenceReadOnlySnapshot(t *testing.T, ctx context.Context, db *sql
 	var cliState, providerAuditState, providerAuditCode, cliUpdatedAt string
 	if err := db.QueryRowContext(ctx, `
 SELECT state, provider_audit_state, provider_audit_error_code, updated_at
-FROM cli_sessions WHERE attempt_id = 'att_provider_audit_failed'`).Scan(
+FROM cli_sessions WHERE attempt_id = ?`, attemptID).Scan(
 		&cliState, &providerAuditState, &providerAuditCode, &cliUpdatedAt,
 	); err != nil {
 		t.Fatalf("snapshot operator evidence CLI session: %v", err)
@@ -4612,7 +4783,7 @@ FROM cli_sessions WHERE attempt_id = 'att_provider_audit_failed'`).Scan(
 	out["provider_audit_state"] = providerAuditState
 	out["provider_audit_code"] = providerAuditCode
 	out["cli_updated_at"] = cliUpdatedAt
-	for _, table := range []string{"events", "provider_tool_outcomes", "evidence", "validation_assessments", "contract_completion_evidence"} {
+	for _, table := range []string{"events", "provider_tool_outcomes", "evidence", "validation_assessments", "contract_completion_evidence", "object_blobs", "transcripts", "cli_sessions"} {
 		var count string
 		if err := db.QueryRowContext(ctx, `SELECT CAST(COUNT(*) AS TEXT) FROM `+table).Scan(&count); err != nil {
 			t.Fatalf("snapshot operator evidence %s: %v", table, err)

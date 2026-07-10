@@ -13,6 +13,9 @@ import (
 )
 
 func TestProviderAuditFailsClosedWhenTranscriptIdentityIsMissing(t *testing.T) {
+	// Public Start/Resume persist an obj_sha256 transcript before auditing and
+	// return early on persistence failure. This direct call locks the defensive
+	// boundary for future internal callers or corrupted transcript identities.
 	ctx := context.Background()
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {

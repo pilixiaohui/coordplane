@@ -1010,17 +1010,6 @@ func TestCommandCLIAdapterFailsClosedOnUnverifiableProviderTranscripts(t *testin
 			if got := countRowsWhere(t, ctx, db, "provider_tool_outcomes", "1 = 1"); got != 0 {
 				t.Fatalf("provider outcomes after unverifiable transcript = %d, want 0", got)
 			}
-			var projectedLeaks int
-			if err := db.QueryRowContext(ctx, `
-SELECT COUNT(*) FROM provider_tool_outcomes
-WHERE id || cli_session_id || attempt_id || lease_id || runtime_id || source_stage ||
-  outcome_kind || tool_use_id || capability_name || status || error_code ||
-  transcript_ref || transcript_sha256 LIKE ?`, "%"+secret+"%").Scan(&projectedLeaks); err != nil {
-				t.Fatalf("scan provider outcome leakage: %v", err)
-			}
-			if projectedLeaks != 0 {
-				t.Fatalf("provider outcome projection leaked raw transcript secret")
-			}
 		})
 	}
 }
