@@ -1647,6 +1647,59 @@ func TestOperatorBusinessGatePassesLinkedIndependentValidation(t *testing.T) {
 	}
 }
 
+func TestOperatorEvidenceWaitsForManagedRuntimeCleanup(t *testing.T) {
+	for _, tc := range []struct {
+		cleanupState string
+		wantStatus   string
+		wantPending  float64
+		wantFailed   float64
+	}{
+		{cleanupState: "pending", wantStatus: "running", wantPending: 1},
+		{cleanupState: "failed", wantStatus: "failed", wantFailed: 1},
+	} {
+		t.Run(tc.cleanupState, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			app, err := backend.Open(ctx, backend.Config{
+				DBPath:            filepath.Join(dir, "coordplane.db"),
+				ListenAddr:        "127.0.0.1:0",
+				TeamConfigPath:    writeBusinessThreeAgentFixture(t, dir),
+				OperatorToken:     "operator-secret",
+				OperatorSubjectID: "ops-user",
+			})
+			if err != nil {
+				t.Fatalf("open business-gate backend: %v", err)
+			}
+			defer app.Close()
+
+			key := "operator-managed-cleanup-" + tc.cleanupState
+			created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest(key, nil), http.StatusOK))
+			taskRunID := stringField(t, created, "task_run_id")
+			rootContractID := stringField(t, created, "root_contract_id")
+			started := decodeOperatorTaskData(t, postOperatorTaskStartRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{"idempotency_key": "start-" + key}, http.StatusOK))
+			completeRootWithPassingValidation(t, ctx, app, rootContractID, stringField(t, started, "lease_id"))
+			if _, err := app.DB.ExecContext(ctx, `
+UPDATE runtime_instances
+SET runtime_kind = 'docker', cleanup_state = ?, cleanup_error = ?, updated_at = ?
+WHERE attempt_id = ?`, tc.cleanupState, "cleanup projection test", time.Now().UTC().Format(time.RFC3339Nano), stringField(t, started, "attempt_id")); err != nil {
+				t.Fatalf("set managed cleanup state: %v", err)
+			}
+			before := operatorStartCounts(t, ctx, app.DB)
+			evidence := decodeOperatorTaskData(t, getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK))
+			terminal := objectField(t, evidence, "terminal")
+			if evidence["status"] != tc.wantStatus ||
+				terminal["managed_runtime_cleanup_pending_count"] != tc.wantPending ||
+				terminal["managed_runtime_cleanup_failed_count"] != tc.wantFailed {
+				t.Fatalf("managed cleanup terminal = %#v, want status=%s pending=%.0f failed=%.0f", terminal, tc.wantStatus, tc.wantPending, tc.wantFailed)
+			}
+			if got := countRowsWhere(t, ctx, app.DB, "work_contracts", "id = '"+rootContractID+"' AND status = 'satisfied'"); got != 1 {
+				t.Fatalf("satisfied root contracts after cleanup projection = %d, want 1", got)
+			}
+			assertOperatorStartCountsEqual(t, ctx, app.DB, before, "read-only managed cleanup projection")
+		})
+	}
+}
+
 func TestOperatorCompletionGateUsesOnlyBoundValidationAssessments(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

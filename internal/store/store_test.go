@@ -39,6 +39,9 @@ func TestMigrateCreatesCanonicalTablesAndIsIdempotent(t *testing.T) {
 		"016_controlled_git_operation_subject_kind",
 		"017_operator_task_runs",
 		"018_capability_audit_outcomes",
+		"019_managed_runtime_cleanup",
+		"020_contract_completion_evidence",
+		"021_provider_tool_outcomes",
 	}; !equalStrings(got, want) {
 		t.Fatalf("applied migrations = %v, want %v", got, want)
 	}
@@ -91,6 +94,8 @@ func TestMigrateCreatesCanonicalTablesAndIsIdempotent(t *testing.T) {
 		"release_acceptances",
 		"contract_team_scopes",
 		"operator_task_runs",
+		"contract_completion_evidence",
+		"provider_tool_outcomes",
 	} {
 		var name string
 		err := s.DB().QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
