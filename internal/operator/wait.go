@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"coordplane/internal/buildinfo"
 	"coordplane/internal/coordination"
 	"coordplane/internal/ids"
 	cpruntime "coordplane/internal/runtime"
@@ -45,6 +46,7 @@ type TaskEvidence struct {
 	FailureClass           string                         `json:"failure_class,omitempty"`
 	TerminalReason         string                         `json:"terminal_reason,omitempty"`
 	Audience               string                         `json:"audience"`
+	Build                  buildinfo.Info                 `json:"build"`
 	Operator               TaskEvidenceOperator           `json:"operator"`
 	AgentFacing            TaskEvidenceAgentFacing        `json:"agent_facing"`
 	Redaction              TaskEvidenceRedaction          `json:"redaction"`
@@ -435,6 +437,7 @@ func (s *Service) buildTaskEvidence(ctx context.Context, taskRunID string) (Task
 		FailureClass:   terminal.FailureClass,
 		TerminalReason: terminal.TerminalReason,
 		Audience:       "operator",
+		Build:          buildinfo.Current(),
 		Operator: TaskEvidenceOperator{
 			TaskRun: run,
 			Root:    root,

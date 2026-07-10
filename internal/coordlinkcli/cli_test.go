@@ -22,6 +22,21 @@ import (
 	cpruntime "coordplane/internal/runtime"
 )
 
+func TestCoordlinkVersionReportsBuildProvenanceWithoutRuntimeEnv(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := coordlinkcli.Run(context.Background(), []string{"version"}, nil, nil, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("coordlink version exit = %d; stderr=%s", code, stderr.String())
+	}
+	var info map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &info); err != nil {
+		t.Fatalf("decode coordlink version: %v; output=%s", err, stdout.String())
+	}
+	if info["schema_version"] != "coordplane.build.v1" || info["executable_sha256"] == "" {
+		t.Fatalf("coordlink version = %#v, want build schema and executable digest", info)
+	}
+}
+
 func TestCoordlinkCLIUsesBackendTypedResponsesAndDurableCallAudit(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

@@ -11,6 +11,20 @@ import (
 	"testing"
 )
 
+func TestVersionCommandReportsBuildProvenance(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if err := run([]string{"version"}, &stdout, &stderr, nil); err != nil {
+		t.Fatalf("version error = %v; stderr=%s", err, stderr.String())
+	}
+	var info map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &info); err != nil {
+		t.Fatalf("decode version output: %v; output=%s", err, stdout.String())
+	}
+	if info["schema_version"] != "coordplane.build.v1" || info["executable_sha256"] == "" {
+		t.Fatalf("version output = %#v, want build schema and executable digest", info)
+	}
+}
+
 func TestTaskCreateCommandPostsToOperatorTasksEndpoint(t *testing.T) {
 	payloadPath := writeTaskPayload(t)
 	var gotPath, gotAuth string

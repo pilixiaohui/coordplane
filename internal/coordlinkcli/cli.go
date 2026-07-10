@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 
+	"coordplane/internal/buildinfo"
 	"coordplane/internal/capability"
 )
 
@@ -53,6 +54,12 @@ func Run(ctx context.Context, args []string, getenv EnvFunc, stdin io.Reader, st
 		return 2
 	}
 	switch args[0] {
+	case "version":
+		if err := json.NewEncoder(stdout).Encode(buildinfo.Current()); err != nil {
+			fmt.Fprintf(stderr, "coordlink version: %v\n", err)
+			return 1
+		}
+		return 0
 	case "capability":
 		return runCapability(ctx, args[1:], getenv, stdout, stderr)
 	case "call":
@@ -499,6 +506,7 @@ func do(ctx context.Context, method, endpoint string, body []byte, cfg commonCon
 
 func usage(w io.Writer) {
 	fmt.Fprintln(w, "usage:")
+	fmt.Fprintln(w, "  coordlink version")
 	fmt.Fprintln(w, "  coordlink capability list [--backend URL] [--agent AGENT]")
 	fmt.Fprintln(w, "  coordlink call CAPABILITY [--input JSON|-] [--input-file PATH] [--scope JSON] [--lease-id ID]")
 	fmt.Fprintln(w, "  coordlink skill list [--backend URL] [--agent AGENT]")

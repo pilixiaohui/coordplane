@@ -971,6 +971,35 @@ func TestOperatorTaskWaitReturnsRuntimeApprovalBlockedEvidence(t *testing.T) {
 	}
 }
 
+func TestOperatorTaskEvidenceIncludesBuildProvenance(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	app, err := backend.Open(ctx, backend.Config{
+		DBPath:            filepath.Join(dir, "coordplane.db"),
+		ListenAddr:        "127.0.0.1:0",
+		TeamConfigPath:    threeAgentFixturePath(t),
+		OperatorToken:     "operator-secret",
+		OperatorSubjectID: "ops-user",
+	})
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	defer app.Close()
+
+	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest("operator-build-provenance", nil), http.StatusOK))
+	taskRunID := stringField(t, created, "task_run_id")
+	evidenceRaw := getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK)
+	assertNoOperatorSensitiveLeak(t, evidenceRaw, "operator-secret", filepath.Join(dir, "coordplane.db"), "/home/", "/tmp/")
+	evidence := decodeOperatorTaskData(t, evidenceRaw)
+	build := objectField(t, evidence, "build")
+	if build["schema_version"] != "coordplane.build.v1" ||
+		build["component"] == "" ||
+		build["commit"] == "" ||
+		build["executable_sha256"] == "" {
+		t.Fatalf("build provenance = %#v, want component, commit, and executable digest", build)
+	}
+}
+
 func TestOperatorTaskStartReturnsRuntimeTimeoutDiagnosticInsteadOfInternalError(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

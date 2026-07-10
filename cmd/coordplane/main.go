@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"coordplane/internal/backend"
+	"coordplane/internal/buildinfo"
 	"coordplane/internal/releasehealth"
 )
 
@@ -45,6 +46,8 @@ func run(args []string, stdout, stderr io.Writer, client *http.Client) error {
 	case "-h", "--help", "help":
 		printUsage(stdout)
 		return nil
+	case "version":
+		return json.NewEncoder(stdout).Encode(buildinfo.Current())
 	case "serve":
 		return runServe(args[1:], stderr)
 	case "task":
@@ -58,6 +61,7 @@ func run(args []string, stdout, stderr io.Writer, client *http.Client) error {
 
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  coordplane version")
 	fmt.Fprintln(w, "  coordplane serve --db PATH [--listen ADDR] [--teamconfig PATH]")
 	fmt.Fprintln(w, "  coordplane task create --backend-url URL --payload FILE [--operator-token-env ENV]")
 	fmt.Fprintln(w, "  coordplane task run --backend-url URL --payload FILE [--wait] [--evidence-out PATH] [--operator-token-env ENV]")
