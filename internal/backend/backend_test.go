@@ -3,6 +3,7 @@ package backend_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -3505,9 +3506,10 @@ WHERE tr.attempt_id = ? AND tr.object_ref = ?`, attemptID, transcriptRef).Scan(&
 				t.Fatalf("durable provider transcript does not contain test secret")
 			}
 			finalizeProviderAuditLineage(t, ctx, app.DB, rootContractID, rootAssignmentID, leaseID, attemptID, runtimeID, routeID, transcriptRef)
-			assertProviderSecretConfinedToTranscript(t, ctx, app.DB, tc.secret)
+			assertProviderSecretConfinedToTranscript(t, ctx, app.DB, attemptID, transcriptRef, tc.secret)
 
-			before := operatorEvidenceReadOnlySnapshot(t, ctx, app.DB, rootContractID, attemptID)
+			before := operatorEvidenceReadOnlySnapshot(t, ctx, app.DB, taskRunID, rootContractID,
+				rootAssignmentID, leaseID, attemptID, routeID, runtimeID, transcriptRef)
 			for i := 0; i < 2; i++ {
 				raw := getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK)
 				assertNoOperatorSensitiveLeak(t, raw, tc.secret, "Authorization", "Bearer")
@@ -3527,10 +3529,22 @@ WHERE tr.attempt_id = ? AND tr.object_ref = ?`, attemptID, transcriptRef).Scan(&
 					t.Fatalf("provider outcomes after unparseable transcript = %#v, want none", outcomes)
 				}
 			}
-			after := operatorEvidenceReadOnlySnapshot(t, ctx, app.DB, rootContractID, attemptID)
+			after := operatorEvidenceReadOnlySnapshot(t, ctx, app.DB, taskRunID, rootContractID,
+				rootAssignmentID, leaseID, attemptID, routeID, runtimeID, transcriptRef)
+			if !bytes.Equal(after.TranscriptContent, before.TranscriptContent) ||
+				after.TranscriptContentSHA256 != before.TranscriptContentSHA256 ||
+				after.TranscriptDBChecksum != before.TranscriptDBChecksum {
+				t.Fatalf("operator evidence GET changed transcript provenance: before=%s/%s/%d bytes after=%s/%s/%d bytes",
+					before.TranscriptContentSHA256, before.TranscriptDBChecksum, len(before.TranscriptContent),
+					after.TranscriptContentSHA256, after.TranscriptDBChecksum, len(after.TranscriptContent))
+			}
 			if !reflect.DeepEqual(after, before) {
 				t.Fatalf("operator evidence projection mutated durable state: before=%#v after=%#v", before, after)
 			}
+			if !bytes.Contains(after.TranscriptContent, []byte(tc.secret)) {
+				t.Fatal("operator evidence GET removed secret from controlled transcript object")
+			}
+			assertProviderSecretConfinedToTranscript(t, ctx, app.DB, attemptID, transcriptRef, tc.secret)
 		})
 	}
 }
@@ -4730,7 +4744,7 @@ func finalizeProviderAuditLineage(t *testing.T, ctx context.Context, db *sql.DB,
 	}
 }
 
-func assertProviderSecretConfinedToTranscript(t *testing.T, ctx context.Context, db *sql.DB, secret string) {
+func assertProviderSecretConfinedToTranscript(t *testing.T, ctx context.Context, db *sql.DB, attemptID, transcriptRef, secret string) {
 	t.Helper()
 	pattern := "%" + secret + "%"
 	checks := []struct {
@@ -4744,6 +4758,13 @@ func assertProviderSecretConfinedToTranscript(t *testing.T, ctx context.Context,
 		{name: "CLI projection", query: `SELECT COUNT(*) FROM cli_sessions WHERE last_error || command_json || env_keys_json || transcript_ref LIKE ?`, args: []any{pattern}},
 		{name: "attempt projection", query: `SELECT COUNT(*) FROM attempts WHERE COALESCE(transcript_ref, '') LIKE ?`, args: []any{pattern}},
 		{name: "evidence projection", query: `SELECT COUNT(*) FROM evidence WHERE COALESCE(content_ref, '') || COALESCE(inline_content, '') || summary || COALESCE(verdict, '') LIKE ?`, args: []any{pattern}},
+		{name: "all secret-bearing objects", query: `SELECT COUNT(*) FROM object_blobs WHERE instr(CAST(content AS TEXT), ?) > 0`, args: []any{secret}, want: 1},
+		{name: "controlled transcript object", query: `
+SELECT COUNT(*)
+FROM object_blobs ob
+JOIN transcripts tr ON tr.object_ref = ob.object_ref
+WHERE tr.attempt_id = ? AND tr.object_ref = ?
+  AND instr(CAST(ob.content AS TEXT), ?) > 0`, args: []any{attemptID, transcriptRef, secret}, want: 1},
 	}
 	for _, check := range checks {
 		var got int
@@ -4756,41 +4777,127 @@ func assertProviderSecretConfinedToTranscript(t *testing.T, ctx context.Context,
 	}
 }
 
-func operatorEvidenceReadOnlySnapshot(t *testing.T, ctx context.Context, db *sql.DB, contractID, attemptID string) map[string]string {
+type operatorEvidenceProvenanceSnapshot struct {
+	Rows                     map[string]map[string]string
+	TableCounts              map[string]int64
+	TranscriptContent        []byte
+	TranscriptContentSHA256  string
+	TranscriptDBChecksum     string
+	TranscriptRecordChecksum string
+}
+
+func operatorEvidenceReadOnlySnapshot(
+	t *testing.T,
+	ctx context.Context,
+	db *sql.DB,
+	taskRunID, contractID, assignmentID, leaseID, attemptID, routeID, runtimeID, transcriptRef string,
+) operatorEvidenceProvenanceSnapshot {
 	t.Helper()
-	out := map[string]string{}
-	var contractStatus, contractUpdatedAt string
-	if err := db.QueryRowContext(ctx, `SELECT status, updated_at FROM work_contracts WHERE id = ?`, contractID).Scan(&contractStatus, &contractUpdatedAt); err != nil {
-		t.Fatalf("snapshot operator evidence contract: %v", err)
+	out := operatorEvidenceProvenanceSnapshot{
+		Rows: map[string]map[string]string{
+			"operator_task_runs": snapshotDatabaseRow(t, ctx, db, "operator_task_runs", "id = ?", taskRunID),
+			"work_contracts":     snapshotDatabaseRow(t, ctx, db, "work_contracts", "id = ?", contractID),
+			"assignments":        snapshotDatabaseRow(t, ctx, db, "assignments", "id = ?", assignmentID),
+			"leases":             snapshotDatabaseRow(t, ctx, db, "leases", "id = ?", leaseID),
+			"attempts":           snapshotDatabaseRow(t, ctx, db, "attempts", "id = ?", attemptID),
+			"session_routes":     snapshotDatabaseRow(t, ctx, db, "session_routes", "id = ?", routeID),
+			"runtime_instances":  snapshotDatabaseRow(t, ctx, db, "runtime_instances", "runtime_id = ?", runtimeID),
+			"cli_sessions":       snapshotDatabaseRow(t, ctx, db, "cli_sessions", "attempt_id = ?", attemptID),
+			"transcripts":        snapshotDatabaseRow(t, ctx, db, "transcripts", "attempt_id = ? AND object_ref = ?", attemptID, transcriptRef),
+			"object_blobs":       snapshotDatabaseRow(t, ctx, db, "object_blobs", "object_ref = ?", transcriptRef),
+		},
+		TableCounts: make(map[string]int64),
 	}
-	out["contract_status"] = contractStatus
-	out["contract_updated_at"] = contractUpdatedAt
-	var assignmentState, assignmentUpdatedAt string
-	if err := db.QueryRowContext(ctx, `SELECT state, updated_at FROM assignments WHERE contract_id = ?`, contractID).Scan(&assignmentState, &assignmentUpdatedAt); err != nil {
-		t.Fatalf("snapshot operator evidence assignment: %v", err)
-	}
-	out["assignment_state"] = assignmentState
-	out["assignment_updated_at"] = assignmentUpdatedAt
-	var cliState, providerAuditState, providerAuditCode, cliUpdatedAt string
-	if err := db.QueryRowContext(ctx, `
-SELECT state, provider_audit_state, provider_audit_error_code, updated_at
-FROM cli_sessions WHERE attempt_id = ?`, attemptID).Scan(
-		&cliState, &providerAuditState, &providerAuditCode, &cliUpdatedAt,
-	); err != nil {
-		t.Fatalf("snapshot operator evidence CLI session: %v", err)
-	}
-	out["cli_state"] = cliState
-	out["provider_audit_state"] = providerAuditState
-	out["provider_audit_code"] = providerAuditCode
-	out["cli_updated_at"] = cliUpdatedAt
-	for _, table := range []string{"events", "provider_tool_outcomes", "evidence", "validation_assessments", "contract_completion_evidence", "object_blobs", "transcripts", "cli_sessions"} {
-		var count string
-		if err := db.QueryRowContext(ctx, `SELECT CAST(COUNT(*) AS TEXT) FROM `+table).Scan(&count); err != nil {
-			t.Fatalf("snapshot operator evidence %s: %v", table, err)
+	for _, table := range []string{
+		"events", "provider_tool_outcomes", "evidence", "validation_assessments",
+		"contract_completion_evidence", "object_blobs", "transcripts", "cli_sessions",
+		"operator_task_runs", "work_contracts", "assignments", "leases", "attempts",
+		"session_routes", "runtime_instances",
+	} {
+		var count int64
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+table).Scan(&count); err != nil {
+			t.Fatalf("snapshot operator evidence %s count: %v", table, err)
 		}
-		out[table] = count
+		out.TableCounts[table] = count
+	}
+	var blobSize, transcriptSize int64
+	if err := db.QueryRowContext(ctx, `
+SELECT ob.content, ob.checksum, ob.size_bytes, tr.checksum, tr.size_bytes
+FROM object_blobs ob
+JOIN transcripts tr ON tr.object_ref = ob.object_ref
+WHERE tr.attempt_id = ? AND tr.object_ref = ?`, attemptID, transcriptRef).Scan(
+		&out.TranscriptContent,
+		&out.TranscriptDBChecksum,
+		&blobSize,
+		&out.TranscriptRecordChecksum,
+		&transcriptSize,
+	); err != nil {
+		t.Fatalf("snapshot transcript provenance: %v", err)
+	}
+	out.TranscriptContent = append([]byte(nil), out.TranscriptContent...)
+	sum := sha256.Sum256(out.TranscriptContent)
+	out.TranscriptContentSHA256 = fmt.Sprintf("%x", sum[:])
+	if out.TranscriptDBChecksum != out.TranscriptContentSHA256 ||
+		out.TranscriptRecordChecksum != out.TranscriptContentSHA256 ||
+		transcriptRef != "obj_sha256_"+out.TranscriptContentSHA256 ||
+		blobSize != int64(len(out.TranscriptContent)) || transcriptSize != blobSize {
+		t.Fatalf("inconsistent transcript provenance ref=%s hash=%s blob=%s transcript=%s sizes=%d/%d/%d",
+			transcriptRef, out.TranscriptContentSHA256, out.TranscriptDBChecksum,
+			out.TranscriptRecordChecksum, len(out.TranscriptContent), blobSize, transcriptSize)
 	}
 	return out
+}
+
+func snapshotDatabaseRow(t *testing.T, ctx context.Context, db *sql.DB, table, predicate string, args ...any) map[string]string {
+	t.Helper()
+	rows, err := db.QueryContext(ctx, `SELECT * FROM `+table+` WHERE `+predicate, args...)
+	if err != nil {
+		t.Fatalf("snapshot %s row: %v", table, err)
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("snapshot %s columns: %v", table, err)
+	}
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			t.Fatalf("snapshot %s row: %v", table, err)
+		}
+		t.Fatalf("snapshot %s row: no matching row", table)
+	}
+	values := make([]any, len(columns))
+	destinations := make([]any, len(columns))
+	for index := range values {
+		destinations[index] = &values[index]
+	}
+	if err := rows.Scan(destinations...); err != nil {
+		t.Fatalf("snapshot %s values: %v", table, err)
+	}
+	out := make(map[string]string, len(columns))
+	for index, column := range columns {
+		out[column] = canonicalDatabaseValue(values[index])
+	}
+	if rows.Next() {
+		t.Fatalf("snapshot %s row: predicate matched multiple rows", table)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("snapshot %s row: %v", table, err)
+	}
+	return out
+}
+
+func canonicalDatabaseValue(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return "null"
+	case []byte:
+		sum := sha256.Sum256(typed)
+		return fmt.Sprintf("bytes:%d:%x", len(typed), sum[:])
+	case time.Time:
+		return "time:" + typed.UTC().Format(time.RFC3339Nano)
+	default:
+		return fmt.Sprintf("%T:%v", typed, typed)
+	}
 }
 
 func legacyEvidenceReadOnlySnapshot(t *testing.T, ctx context.Context, db *sql.DB, contractID string) map[string]string {
