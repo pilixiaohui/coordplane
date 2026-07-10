@@ -179,7 +179,7 @@ exit 1
 	if cleanupState != "removed" {
 		t.Fatalf("cleanup after future lease expiry = %s, want removed without backend restart", cleanupState)
 	}
-	if got := countRowsWhere(t, ctx, app.DB, "events", "event_type = 'runtime.cleanup_removed' AND entity_id = 'rt_crash_retry'"); got != 1 {
+	if got := countRowsWhere(t, ctx, app.DB, "events", "event_type = 'runtime.cleanup_removed' AND aggregate_id = 'rt_crash_retry'"); got != 1 {
 		t.Fatalf("runtime.cleanup_removed events = %d, want 1", got)
 	}
 	rawLog, err := os.ReadFile(dockerLog)

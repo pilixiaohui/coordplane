@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"coordplane/internal/adapters/httpapi"
@@ -40,7 +41,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const defaultTeamID = "default-go-team"
+const (
+	defaultTeamID                       = "default-go-team"
+	defaultRuntimeCleanupReconcileEvery = 5 * time.Second
+)
 
 type Config struct {
 	DBPath                 string
@@ -96,6 +100,10 @@ type Backend struct {
 	authenticator            *sessionauth.Authenticator
 	operatorToken            string
 	operatorSubjectID        string
+	runtimeCleanupCancel     context.CancelFunc
+	runtimeCleanupDone       chan struct{}
+	closeOnce                sync.Once
+	closeErr                 error
 }
 
 type RuntimeEntry struct {
@@ -369,6 +377,7 @@ func Open(ctx context.Context, cfg Config) (*Backend, error) {
 		operatorSubjectID:  cfg.OperatorSubjectID,
 	}
 	backend.Handler = backend.routes(httpapi.NewWithAuthenticator(auditedDispatcher, authenticator))
+	backend.startRuntimeCleanupReconciler(cfg.RuntimeCleanupInterval)
 	closeOnError = false
 	return backend, nil
 }
@@ -412,10 +421,44 @@ func RunServe(ctx context.Context, cfg Config) error {
 }
 
 func (b *Backend) Close() error {
-	if b == nil || b.DB == nil {
+	if b == nil {
 		return nil
 	}
-	return b.DB.Close()
+	b.closeOnce.Do(func() {
+		if b.runtimeCleanupCancel != nil {
+			b.runtimeCleanupCancel()
+		}
+		if b.runtimeCleanupDone != nil {
+			<-b.runtimeCleanupDone
+		}
+		if b.DB != nil {
+			b.closeErr = b.DB.Close()
+		}
+	})
+	return b.closeErr
+}
+
+func (b *Backend) startRuntimeCleanupReconciler(interval time.Duration) {
+	if b == nil || b.Runner == nil || interval <= 0 {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	b.runtimeCleanupCancel = cancel
+	b.runtimeCleanupDone = done
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_ = b.Runner.ReconcileRuntimeCleanup(ctx)
+			}
+		}
+	}()
 }
 
 func (b *Backend) Inspect(ctx context.Context) (Inspect, error) {
@@ -1035,6 +1078,9 @@ func (cfg Config) withDefaults() Config {
 	}
 	if cfg.BackendURL == "" {
 		cfg.BackendURL = "http://" + listenAddrForURL(cfg.ListenAddr)
+	}
+	if cfg.RuntimeCleanupInterval <= 0 {
+		cfg.RuntimeCleanupInterval = defaultRuntimeCleanupReconcileEvery
 	}
 	return cfg
 }
