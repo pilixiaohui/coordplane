@@ -1143,6 +1143,16 @@ runtime_profiles:
     kind: docker
     image: alpine:3.20
     workspace_mode: isolated
+    command_policy:
+      non_interactive_approval: true
+      allow_coordlink_capabilities:
+        - assignment.next
+        - changeset.submit
+        - command.run
+        - contract.complete
+        - mailbox.resolve
+        - report.submit
+        - validation.assessment
 termination:
   terminal_contract_type: root
   accepted_by_capability: validation.assessment
@@ -1207,6 +1217,16 @@ runtime_profiles:
     kind: docker
     image: alpine:3.20
     workspace_mode: isolated
+    command_policy:
+      non_interactive_approval: true
+      allow_coordlink_capabilities:
+        - assignment.next
+        - changeset.submit
+        - command.run
+        - contract.complete
+        - mailbox.resolve
+        - report.submit
+        - validation.assessment
 termination:
   terminal_contract_type: root
   accepted_by_capability: validation.assessment
