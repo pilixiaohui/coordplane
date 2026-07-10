@@ -871,3 +871,11 @@ CREATE TABLE IF NOT EXISTS provider_tool_outcomes (
 CREATE INDEX IF NOT EXISTS provider_tool_outcomes_scope_idx
   ON provider_tool_outcomes(lease_id, attempt_id, runtime_id, created_at);
 `
+
+const providerAuditRequirementSchemaSQL = `
+ALTER TABLE cli_sessions ADD COLUMN provider_audit_required INTEGER NOT NULL DEFAULT 0
+  CHECK (provider_audit_required IN (0, 1));
+
+CREATE INDEX IF NOT EXISTS cli_sessions_provider_audit_gate_idx
+  ON cli_sessions(provider_audit_required, provider_audit_state, attempt_id);
+`

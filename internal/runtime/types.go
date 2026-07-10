@@ -150,6 +150,7 @@ type CLISession struct {
 	ExitCode               *int       `json:"exit_code,omitempty"`
 	LastError              string     `json:"last_error,omitempty"`
 	TranscriptRef          string     `json:"transcript_ref,omitempty"`
+	ProviderAuditRequired  bool       `json:"provider_audit_required"`
 	ProviderAuditState     string     `json:"provider_audit_state"`
 	ProviderAuditErrorCode string     `json:"provider_audit_error_code,omitempty"`
 	Command                []string   `json:"command,omitempty"`

@@ -248,6 +248,12 @@ WHERE attempt_id = (SELECT id FROM attempts ORDER BY started_at DESC LIMIT 1)`).
 	if contractStatus != "satisfied" || auditRequired != 1 || auditState != "failed" {
 		t.Fatalf("post-completion provider state = contract:%s audit:%d/%s, want satisfied required/failed", contractStatus, auditRequired, auditState)
 	}
+	if _, err := app.DB.ExecContext(ctx, `
+UPDATE cli_sessions
+SET provider_audit_state = 'not_requested', provider_audit_error_code = ''
+WHERE provider_audit_required = 1`); err != nil {
+		t.Fatalf("seed required pending audit gate: %v", err)
+	}
 	evidenceRaw := getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK)
 	evidence := decodeOperatorTaskData(t, evidenceRaw)
 	if evidence["status"] == "passed" {
@@ -255,7 +261,7 @@ WHERE attempt_id = (SELECT id FROM attempts ORDER BY started_at DESC LIMIT 1)`).
 	}
 	terminal := objectField(t, evidence, "terminal")
 	if terminal["provider_audit_failure_count"].(float64) != 1 {
-		t.Fatalf("operator terminal = %#v, want one required incomplete provider audit", terminal)
+		t.Fatalf("operator terminal = %#v, want one required pending provider audit", terminal)
 	}
 }
 

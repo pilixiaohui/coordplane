@@ -138,28 +138,33 @@ func (a *CommandCLIAdapter) Start(ctx context.Context, req StartRequest) (StartR
 	prompt := prepared.Prompt
 	command := prepared.Command
 	sessionRow, err := a.insertSession(ctx, commandSessionInput{
-		AttemptID:       req.AttemptID,
-		RuntimeID:       req.RuntimeID,
-		AgentID:         req.AgentID,
-		SessionNativeID: sessionID,
-		ContainerID:     instance.ContainerID,
-		ContainerName:   instance.ContainerName,
-		StartReason:     "start",
-		State:           "starting",
-		Command:         prepared.PersistedCommand,
-		EnvKeys:         commandEnvKeys(req.Env),
+		AttemptID:             req.AttemptID,
+		RuntimeID:             req.RuntimeID,
+		AgentID:               req.AgentID,
+		SessionNativeID:       sessionID,
+		ContainerID:           instance.ContainerID,
+		ContainerName:         instance.ContainerName,
+		StartReason:           "start",
+		State:                 "starting",
+		Command:               prepared.PersistedCommand,
+		EnvKeys:               commandEnvKeys(req.Env),
+		ProviderAuditRequired: a.providerAuditRequired(instance),
 	})
 	if err != nil {
 		return StartResult{}, err
 	}
 	if strings.TrimSpace(req.BootstrapPrompt) == "" {
 		cause := errors.New("command cli: bootstrap prompt is required")
-		_ = a.markSessionFailed(ctx, sessionRow.ID, cause)
-		return StartResult{}, cause
+		return StartResult{}, errors.Join(cause,
+			a.markSessionFailed(ctx, sessionRow.ID, cause),
+			a.settleProviderAuditFailure(sessionRow.ID, providerAuditInputFailedCode),
+		)
 	}
 	if err := a.requireAuthProbe(instance); err != nil {
-		_ = a.markSessionFailed(ctx, sessionRow.ID, err)
-		return StartResult{}, err
+		return StartResult{}, errors.Join(err,
+			a.markSessionFailed(ctx, sessionRow.ID, err),
+			a.settleProviderAuditFailure(sessionRow.ID, providerAuditAuthFailedCode),
+		)
 	}
 	result, err := a.exec(ctx, sessionRow.ID, instance, command, req.Env, prompt)
 	if err != nil {
@@ -167,13 +172,17 @@ func (a *CommandCLIAdapter) Start(ctx context.Context, req StartRequest) (StartR
 	}
 	if cause, ok := a.authFailureCause(result); ok {
 		transcriptRef := a.failureTranscriptRef(ctx, sessionRow.ID, cause)
-		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
-		return StartResult{}, cause
+		return StartResult{}, errors.Join(cause,
+			a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause),
+			a.settleProviderAuditFailure(sessionRow.ID, providerAuditAuthFailedCode),
+		)
 	}
 	transcriptRef, err := a.persistTranscript(ctx, req.AttemptID, result)
 	if err != nil {
-		_ = a.markSessionFailed(ctx, sessionRow.ID, err)
-		return StartResult{}, err
+		return StartResult{}, errors.Join(err,
+			a.markSessionFailed(ctx, sessionRow.ID, err),
+			a.settleProviderAuditFailure(sessionRow.ID, providerAuditTranscriptFailedCode),
+		)
 	}
 	providerAudit, err := a.projectProviderToolOutcomes(ctx, sessionRow.ID, instance, result, transcriptRef)
 	if err != nil {
@@ -268,29 +277,34 @@ func (a *CommandCLIAdapter) Resume(ctx context.Context, req ResumeRequest) error
 	}
 	resumeOf, _ := a.firstSessionID(ctx, req.Route.AttemptID, req.Route.SessionNativeID)
 	sessionRow, err := a.insertSession(ctx, commandSessionInput{
-		AttemptID:       req.Route.AttemptID,
-		RuntimeID:       req.Route.RuntimeID,
-		AgentID:         req.Route.AgentID,
-		SessionNativeID: req.Route.SessionNativeID,
-		ContainerID:     instance.ContainerID,
-		ContainerName:   instance.ContainerName,
-		StartReason:     "resume",
-		ResumeOf:        resumeOf,
-		State:           "resumed",
-		Command:         persistedCommand,
-		EnvKeys:         commandEnvKeys(req.Env),
+		AttemptID:             req.Route.AttemptID,
+		RuntimeID:             req.Route.RuntimeID,
+		AgentID:               req.Route.AgentID,
+		SessionNativeID:       req.Route.SessionNativeID,
+		ContainerID:           instance.ContainerID,
+		ContainerName:         instance.ContainerName,
+		StartReason:           "resume",
+		ResumeOf:              resumeOf,
+		State:                 "resumed",
+		Command:               persistedCommand,
+		EnvKeys:               commandEnvKeys(req.Env),
+		ProviderAuditRequired: a.providerAuditRequired(instance),
 	})
 	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(req.Reason) == "" && len(req.MailboxIDs) == 0 {
 		cause := errors.New("command cli: resume prompt is required")
-		_ = a.markSessionFailed(ctx, sessionRow.ID, cause)
-		return cause
+		return errors.Join(cause,
+			a.markSessionFailed(ctx, sessionRow.ID, cause),
+			a.settleProviderAuditFailure(sessionRow.ID, providerAuditInputFailedCode),
+		)
 	}
 	if err := a.requireAuthProbe(instance); err != nil {
-		_ = a.markSessionFailed(ctx, sessionRow.ID, err)
-		return err
+		return errors.Join(err,
+			a.markSessionFailed(ctx, sessionRow.ID, err),
+			a.settleProviderAuditFailure(sessionRow.ID, providerAuditAuthFailedCode),
+		)
 	}
 	result, err := a.exec(ctx, sessionRow.ID, instance, command, req.Env, prompt)
 	if err != nil {
@@ -298,13 +312,17 @@ func (a *CommandCLIAdapter) Resume(ctx context.Context, req ResumeRequest) error
 	}
 	if cause, ok := a.authFailureCause(result); ok {
 		transcriptRef := a.failureTranscriptRef(ctx, sessionRow.ID, cause)
-		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
-		return cause
+		return errors.Join(cause,
+			a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause),
+			a.settleProviderAuditFailure(sessionRow.ID, providerAuditAuthFailedCode),
+		)
 	}
 	transcriptRef, err := a.persistTranscript(ctx, req.Route.AttemptID, result)
 	if err != nil {
-		_ = a.markSessionFailed(ctx, sessionRow.ID, err)
-		return err
+		return errors.Join(err,
+			a.markSessionFailed(ctx, sessionRow.ID, err),
+			a.settleProviderAuditFailure(sessionRow.ID, providerAuditTranscriptFailedCode),
+		)
 	}
 	providerAudit, err := a.projectProviderToolOutcomes(ctx, sessionRow.ID, instance, result, transcriptRef)
 	if err != nil {
@@ -457,17 +475,18 @@ WHERE runtime_id = ? AND attempt_id = ?`,
 }
 
 type commandSessionInput struct {
-	AttemptID       string
-	RuntimeID       string
-	AgentID         string
-	SessionNativeID string
-	ContainerID     string
-	ContainerName   string
-	StartReason     string
-	ResumeOf        string
-	State           string
-	Command         []string
-	EnvKeys         []string
+	AttemptID             string
+	RuntimeID             string
+	AgentID               string
+	SessionNativeID       string
+	ContainerID           string
+	ContainerName         string
+	StartReason           string
+	ResumeOf              string
+	State                 string
+	Command               []string
+	EnvKeys               []string
+	ProviderAuditRequired bool
 }
 
 func (a *CommandCLIAdapter) insertSession(ctx context.Context, in commandSessionInput) (CLISession, error) {
@@ -489,11 +508,11 @@ func (a *CommandCLIAdapter) insertSession(ctx context.Context, in commandSession
 INSERT INTO cli_sessions (
   id, tenant_id, attempt_id, runtime_id, agent_id, cli_backend, profile_name,
   session_native_id, container_id, container_name, state, start_reason, resume_of,
-  command_json, env_keys_json, started_at, updated_at
-) VALUES (?, 'default', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  command_json, env_keys_json, provider_audit_required, started_at, updated_at
+) VALUES (?, 'default', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			sessionID, in.AttemptID, in.RuntimeID, in.AgentID, a.profile.Backend,
 			a.profile.Name, in.SessionNativeID, in.ContainerID, in.ContainerName,
-			in.State, in.StartReason, in.ResumeOf, string(commandJSON), string(envKeysJSON),
+			in.State, in.StartReason, in.ResumeOf, string(commandJSON), string(envKeysJSON), in.ProviderAuditRequired,
 			now, now,
 		); err != nil {
 			return fmt.Errorf("insert cli session: %w", err)
@@ -517,22 +536,23 @@ INSERT INTO cli_sessions (
 		return CLISession{}, err
 	}
 	return CLISession{
-		ID:              sessionID,
-		AttemptID:       in.AttemptID,
-		RuntimeID:       in.RuntimeID,
-		AgentID:         in.AgentID,
-		CLIBackend:      a.profile.Backend,
-		ProfileName:     a.profile.Name,
-		SessionNativeID: in.SessionNativeID,
-		ContainerID:     in.ContainerID,
-		ContainerName:   in.ContainerName,
-		State:           in.State,
-		StartReason:     in.StartReason,
-		ResumeOf:        in.ResumeOf,
-		Command:         append([]string(nil), in.Command...),
-		EnvKeys:         append([]string(nil), in.EnvKeys...),
-		StartedAt:       time.Now().UTC(),
-		UpdatedAt:       time.Now().UTC(),
+		ID:                    sessionID,
+		AttemptID:             in.AttemptID,
+		RuntimeID:             in.RuntimeID,
+		AgentID:               in.AgentID,
+		CLIBackend:            a.profile.Backend,
+		ProfileName:           a.profile.Name,
+		SessionNativeID:       in.SessionNativeID,
+		ContainerID:           in.ContainerID,
+		ContainerName:         in.ContainerName,
+		State:                 in.State,
+		StartReason:           in.StartReason,
+		ResumeOf:              in.ResumeOf,
+		ProviderAuditRequired: in.ProviderAuditRequired,
+		Command:               append([]string(nil), in.Command...),
+		EnvKeys:               append([]string(nil), in.EnvKeys...),
+		StartedAt:             time.Now().UTC(),
+		UpdatedAt:             time.Now().UTC(),
 	}, nil
 }
 
@@ -955,10 +975,18 @@ func (a *CommandCLIAdapter) markExecError(ctx context.Context, sessionID, attemp
 func (a *CommandCLIAdapter) persistExecFailure(sessionID, attemptID string, result ContainerExecResult, cause error) error {
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), commandCLIFailurePersistenceTimeout)
 	defer cancel()
-	if err := a.markExecError(cleanupCtx, sessionID, attemptID, result, cause); err != nil {
-		return errors.Join(cause, fmt.Errorf("command cli: persist exec failure: %w", err))
+	return errors.Join(
+		cause,
+		wrapPersistenceError("command cli: persist exec failure", a.markExecError(cleanupCtx, sessionID, attemptID, result, cause)),
+		a.settleProviderAuditFailure(sessionID, providerAuditExecFailedCode),
+	)
+}
+
+func wrapPersistenceError(message string, err error) error {
+	if err == nil {
+		return nil
 	}
-	return cause
+	return fmt.Errorf("%s: %w", message, err)
 }
 
 func (a *CommandCLIAdapter) markSessionFailed(ctx context.Context, sessionID string, cause error) error {
@@ -1198,7 +1226,7 @@ func ListCLISessions(ctx context.Context, db *sql.DB) ([]CLISession, error) {
 SELECT id, attempt_id, runtime_id, agent_id, cli_backend, profile_name,
   session_native_id, container_id, container_name, process_ref, state,
   start_reason, resume_of, exit_code, last_error, transcript_ref,
-  provider_audit_state, provider_audit_error_code,
+  provider_audit_required, provider_audit_state, provider_audit_error_code,
   command_json, env_keys_json, started_at, COALESCE(ended_at, ''), updated_at
 FROM cli_sessions
 ORDER BY started_at, id`)
@@ -1210,6 +1238,7 @@ ORDER BY started_at, id`)
 	for rows.Next() {
 		var session CLISession
 		var exitCode sql.NullInt64
+		var providerAuditRequired bool
 		var commandJSON, envKeysJSON, startedAt, endedAt, updatedAt string
 		if err := rows.Scan(
 			&session.ID,
@@ -1228,6 +1257,7 @@ ORDER BY started_at, id`)
 			&exitCode,
 			&session.LastError,
 			&session.TranscriptRef,
+			&providerAuditRequired,
 			&session.ProviderAuditState,
 			&session.ProviderAuditErrorCode,
 			&commandJSON,
@@ -1245,6 +1275,12 @@ ORDER BY started_at, id`)
 		if commandJSON != "" {
 			if err := json.Unmarshal([]byte(commandJSON), &session.Command); err != nil {
 				return nil, err
+			}
+			session.ProviderAuditRequired = providerAuditRequired
+			if !providerAuditRequired {
+				session.ProviderAuditState = "not_required"
+			} else if session.ProviderAuditState == "not_requested" {
+				session.ProviderAuditState = "pending"
 			}
 		}
 		if envKeysJSON != "" {

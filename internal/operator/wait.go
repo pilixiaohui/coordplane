@@ -1010,7 +1010,8 @@ FROM cli_sessions cs
 JOIN attempts att ON att.id = cs.attempt_id
 JOIN leases l ON l.id = att.lease_id
 JOIN assignments a ON a.id = l.assignment_id
-WHERE cs.provider_audit_state = 'failed'
+WHERE cs.provider_audit_required = 1
+  AND cs.provider_audit_state <> 'complete'
   AND a.contract_id IN (`+placeholders(len(contractIDs))+`)`, args...).Scan(&out.ProviderAuditFailureCount); err != nil {
 		return out, fmt.Errorf("count provider audit failures: %w", err)
 	}

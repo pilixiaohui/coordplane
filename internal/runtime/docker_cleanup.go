@@ -80,11 +80,12 @@ JOIN attempts a ON a.id = ri.attempt_id
 LEFT JOIN leases l ON l.id = ri.lease_id
 LEFT JOIN session_routes sr ON sr.id = l.session_route_id
 WHERE ri.runtime_kind = 'docker'
-  AND ri.cleanup_state <> 'removed'
+	  AND ri.runtime_profile = ?
+	  AND ri.cleanup_state <> 'removed'
   AND a.status <> 'waiting'
   AND COALESCE(sr.state, '') <> 'waiting'
   AND (ri.state = 'failed' OR a.status IN ('completed', 'failed', 'interrupted', 'expired'))
-ORDER BY ri.created_at, ri.id`)
+ORDER BY ri.created_at, ri.id`, r.profileName)
 	if err != nil {
 		return fmt.Errorf("list runtime cleanup reconciliation candidates: %w", err)
 	}
@@ -128,7 +129,7 @@ FROM runtime_instances ri
 JOIN attempts a ON a.id = ri.attempt_id
 JOIN leases l ON l.id = ri.lease_id
 LEFT JOIN session_routes sr ON sr.id = l.session_route_id
-WHERE ri.attempt_id = ? AND ri.runtime_kind = 'docker'`, attemptID), &record); err != nil {
+WHERE ri.attempt_id = ? AND ri.runtime_kind = 'docker' AND ri.runtime_profile = ?`, attemptID, r.profileName), &record); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil
 			}
@@ -146,7 +147,7 @@ WHERE ri.attempt_id = ? AND ri.runtime_kind = 'docker'`, attemptID), &record); e
 		requested, err := tx.ExecContext(ctx, `
 UPDATE runtime_instances
 SET cleanup_state = 'pending', cleanup_reason = ?, cleanup_error = '', updated_at = ?
-WHERE id = ? AND cleanup_state IN ('not_requested', 'failed')`, reason, nowText, record.ID)
+WHERE id = ? AND runtime_profile = ? AND cleanup_state IN ('not_requested', 'failed')`, reason, nowText, record.ID, r.profileName)
 		if err != nil {
 			return fmt.Errorf("request managed runtime cleanup: %w", err)
 		}
@@ -163,11 +164,12 @@ UPDATE runtime_instances
 SET cleanup_state = 'in_progress', cleanup_owner = ?, cleanup_lease_expires_at = ?,
   cleanup_attempts = cleanup_attempts + 1, updated_at = ?
 WHERE id = ?
-  AND (
+	  AND runtime_profile = ?
+	  AND (
     cleanup_state = 'pending'
     OR cleanup_state = 'failed'
     OR (cleanup_state = 'in_progress' AND cleanup_lease_expires_at < ?)
-  )`, owner, leaseExpires, nowText, record.ID, nowText)
+	  )`, owner, leaseExpires, nowText, record.ID, r.profileName, nowText)
 		if err != nil {
 			return fmt.Errorf("claim managed runtime cleanup: %w", err)
 		}

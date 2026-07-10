@@ -1014,6 +1014,127 @@ func TestCommandCLIAdapterFailsClosedOnUnverifiableProviderTranscripts(t *testin
 	}
 }
 
+func TestPolicyGovernedCommandCLIAdapterSettlesAuditOnPreAuditFailures(t *testing.T) {
+	cases := []struct {
+		name       string
+		result     cpruntime.ContainerExecResult
+		execErr    error
+		installSQL string
+		wantCode   string
+	}{
+		{
+			name:     "executor failure",
+			result:   cpruntime.ContainerExecResult{ProcessRef: "provider-exec-failed", Stderr: []byte("executor failed")},
+			execErr:  errors.New("provider executor unavailable"),
+			wantCode: "PROVIDER_AUDIT_EXEC_FAILED",
+		},
+		{
+			name:     "auth failure",
+			result:   cpruntime.ContainerExecResult{ProcessRef: "provider-auth-failed", ExitCode: 1, Stderr: []byte("claude auth unavailable: not logged in")},
+			wantCode: "PROVIDER_AUDIT_AUTH_FAILED",
+		},
+		{
+			name:       "transcript write failure",
+			result:     cpruntime.ContainerExecResult{ProcessRef: "provider-transcript-failed", Stdout: []byte(`{"type":"result"}` + "\n")},
+			installSQL: `CREATE TRIGGER fail_provider_transcript BEFORE INSERT ON transcripts BEGIN SELECT RAISE(ABORT, 'forced transcript failure'); END`,
+			wantCode:   "PROVIDER_AUDIT_TRANSCRIPT_FAILED",
+		},
+		{
+			name:       "audit complete write failure",
+			result:     cpruntime.ContainerExecResult{ProcessRef: "provider-audit-write-failed", Stdout: []byte(`{"type":"result"}` + "\n")},
+			installSQL: `CREATE TRIGGER fail_provider_audit_complete BEFORE UPDATE OF provider_audit_state ON cli_sessions WHEN NEW.provider_audit_state = 'complete' BEGIN SELECT RAISE(ABORT, 'forced audit complete failure'); END`,
+			wantCode:   "PROVIDER_AUDIT_WRITE_FAILED",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, st, _, _ := newCommandCLIBase(t)
+			if tc.installSQL != "" {
+				if _, err := db.ExecContext(ctx, tc.installSQL); err != nil {
+					t.Fatalf("install failure trigger: %v", err)
+				}
+			}
+			insertAttemptOwnershipRows(t, ctx, db, "att_provider_terminal", "lease_missing_prompt", "asg_missing_prompt", "ctr_missing_prompt", "developer", "rt_provider_terminal")
+			insertReadyRuntimeInstance(t, ctx, db, "rt_provider_terminal", "att_provider_terminal", "developer")
+			executor := &recordingContainerExecutor{err: tc.execErr, errResult: tc.result, results: []cpruntime.ContainerExecResult{tc.result}}
+			adapter, err := cpruntime.NewClaudeCommandCLIAdapter(cpruntime.CommandCLIAdapterConfig{
+				Store: st,
+				Profile: cpruntime.CommandCLIProfile{
+					Name:    "claude",
+					Backend: "claude",
+					Binary:  "/usr/local/bin/claude",
+					Timeout: timeSecond(),
+					RuntimeCommandPolicies: map[string]cpruntime.RuntimeCommandPolicy{
+						"docker-default": {NonInteractiveApproval: true, AllowCoordlinkCapabilities: []string{"contract.current"}},
+					},
+					AgentCapabilities: map[string][]string{"developer": {"contract.current"}},
+				},
+				Executor: executor,
+			})
+			if err != nil {
+				t.Fatalf("new policy-governed adapter: %v", err)
+			}
+			_, startErr := adapter.Start(ctx, cpruntime.StartRequest{
+				AgentID: "developer", AttemptID: "att_provider_terminal", AssignmentID: "asg_missing_prompt",
+				LeaseID: "lease_missing_prompt", ContractID: "ctr_missing_prompt", RuntimeID: "rt_provider_terminal",
+				CLIBackend: "claude", Workspace: cpruntime.ContainerWorkspacePath, HomeDir: cpruntime.ContainerHomePath,
+				Env: runtimeEnv(t, "developer", "rt_provider_terminal", "att_provider_terminal"), BootstrapPrompt: "settle provider audit",
+			})
+			if startErr == nil {
+				t.Fatal("policy-governed provider failure unexpectedly succeeded")
+			}
+			var required int
+			var state, code string
+			if err := db.QueryRowContext(ctx, `
+SELECT provider_audit_required, provider_audit_state, provider_audit_error_code
+FROM cli_sessions WHERE attempt_id = 'att_provider_terminal'`).Scan(&required, &state, &code); err != nil {
+				t.Fatalf("query durable provider audit: %v", err)
+			}
+			if required != 1 || state != "failed" || code != tc.wantCode {
+				t.Fatalf("provider audit = %d/%s/%s, want 1/failed/%s; error=%v", required, state, code, tc.wantCode, startErr)
+			}
+			sessions, err := cpruntime.ListCLISessions(ctx, db)
+			if err != nil {
+				t.Fatalf("list CLI sessions: %v", err)
+			}
+			if len(sessions) != 1 || !sessions[0].ProviderAuditRequired || sessions[0].ProviderAuditState != "failed" {
+				t.Fatalf("public CLI sessions = %+v, want required failed", sessions)
+			}
+		})
+	}
+}
+
+func TestCommandCLIAdapterWithoutProviderPolicyReportsAuditNotRequired(t *testing.T) {
+	ctx := context.Background()
+	db, st, _, _ := newCommandCLIBase(t)
+	insertAttemptOwnershipRows(t, ctx, db, "att_provider_not_required", "lease_missing_prompt", "asg_missing_prompt", "ctr_missing_prompt", "developer", "rt_provider_not_required")
+	insertReadyRuntimeInstance(t, ctx, db, "rt_provider_not_required", "att_provider_not_required", "developer")
+	adapter, err := cpruntime.NewClaudeCommandCLIAdapter(cpruntime.CommandCLIAdapterConfig{
+		Store:    st,
+		Profile:  cpruntime.CommandCLIProfile{Name: "claude", Backend: "claude", Binary: "/usr/local/bin/claude", Timeout: timeSecond()},
+		Executor: &recordingContainerExecutor{results: []cpruntime.ContainerExecResult{{ProcessRef: "provider-not-required"}}},
+	})
+	if err != nil {
+		t.Fatalf("new non-policy adapter: %v", err)
+	}
+	if _, err := adapter.Start(ctx, cpruntime.StartRequest{
+		AgentID: "developer", AttemptID: "att_provider_not_required", AssignmentID: "asg_missing_prompt",
+		LeaseID: "lease_missing_prompt", ContractID: "ctr_missing_prompt", RuntimeID: "rt_provider_not_required",
+		CLIBackend: "claude", Workspace: cpruntime.ContainerWorkspacePath, HomeDir: cpruntime.ContainerHomePath,
+		Env: runtimeEnv(t, "developer", "rt_provider_not_required", "att_provider_not_required"), BootstrapPrompt: "ordinary Claude session",
+	}); err != nil {
+		t.Fatalf("start non-policy session: %v", err)
+	}
+	sessions, err := cpruntime.ListCLISessions(ctx, db)
+	if err != nil {
+		t.Fatalf("list non-policy CLI sessions: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ProviderAuditRequired || sessions[0].ProviderAuditState != "not_required" {
+		t.Fatalf("non-policy CLI session = %+v, want audit not_required", sessions)
+	}
+}
+
 func TestDockerExecClientAttachesStdinWhenProvided(t *testing.T) {
 	dir := t.TempDir()
 	argsPath := filepath.Join(dir, "args.txt")

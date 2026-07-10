@@ -142,6 +142,11 @@ var migrations = []migration{
 		Name:    "redacted provider tool outcome projection",
 		SQL:     providerToolOutcomeSchemaSQL,
 	},
+	{
+		Version: "022_provider_audit_requirement",
+		Name:    "durable provider audit requirement",
+		SQL:     providerAuditRequirementSchemaSQL,
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) (MigrationResult, error) {
