@@ -1064,6 +1064,80 @@ func TestOperatorTaskCloseoutConvergesReleasedLeaseBookkeeping(t *testing.T) {
 	}
 }
 
+func TestOperatorBusinessGateRejectsEmptyOrSelfValidatedReport(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	app, err := backend.Open(ctx, backend.Config{
+		DBPath:            filepath.Join(dir, "coordplane.db"),
+		ListenAddr:        "127.0.0.1:0",
+		TeamConfigPath:    writeBusinessThreeAgentFixture(t, dir),
+		OperatorToken:     "operator-secret",
+		OperatorSubjectID: "ops-user",
+	})
+	if err != nil {
+		t.Fatalf("open business-gate backend: %v", err)
+	}
+	defer app.Close()
+
+	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest("operator-business-empty-report", nil), http.StatusOK))
+	taskRunID := stringField(t, created, "task_run_id")
+	rootContractID := stringField(t, created, "root_contract_id")
+	started := decodeOperatorTaskData(t, postOperatorTaskStartRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{"idempotency_key": "start-business-empty-report"}, http.StatusOK))
+	completeRootWithPassingValidation(t, ctx, app, rootContractID, stringField(t, started, "lease_id"))
+
+	if _, err := app.DB.ExecContext(ctx, `
+UPDATE evidence SET content_ref = NULL WHERE contract_id = ? AND kind = 'report'`, rootContractID); err != nil {
+		t.Fatalf("remove report content ref: %v", err)
+	}
+	if _, err := app.DB.ExecContext(ctx, `
+UPDATE validation_assessments SET verifier_agent_id = 'coordinator' WHERE assessed_contract_id = ?`, rootContractID); err != nil {
+		t.Fatalf("make validation self-authored: %v", err)
+	}
+
+	evidence := decodeOperatorTaskData(t, getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK))
+	if evidence["status"] != "failed" {
+		t.Fatalf("business evidence status = %#v, want failed: %#v", evidence["status"], evidence)
+	}
+	terminal := objectField(t, evidence, "terminal")
+	if terminal["gate_mode"] != "business" || terminal["business_report_count"].(float64) != 0 {
+		t.Fatalf("business terminal = %#v, want business mode with zero readable reports", terminal)
+	}
+}
+
+func TestOperatorBusinessGatePassesLinkedIndependentValidation(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	app, err := backend.Open(ctx, backend.Config{
+		DBPath:            filepath.Join(dir, "coordplane.db"),
+		ListenAddr:        "127.0.0.1:0",
+		TeamConfigPath:    writeBusinessThreeAgentFixture(t, dir),
+		OperatorToken:     "operator-secret",
+		OperatorSubjectID: "ops-user",
+	})
+	if err != nil {
+		t.Fatalf("open business-gate backend: %v", err)
+	}
+	defer app.Close()
+
+	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest("operator-business-linked-validation", nil), http.StatusOK))
+	taskRunID := stringField(t, created, "task_run_id")
+	rootContractID := stringField(t, created, "root_contract_id")
+	started := decodeOperatorTaskData(t, postOperatorTaskStartRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{"idempotency_key": "start-business-linked-validation"}, http.StatusOK))
+	completeRootWithPassingValidation(t, ctx, app, rootContractID, stringField(t, started, "lease_id"))
+
+	evidence := decodeOperatorTaskData(t, getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK))
+	if evidence["status"] != "passed" {
+		t.Fatalf("business evidence status = %#v, want passed: %#v", evidence["status"], evidence)
+	}
+	terminal := objectField(t, evidence, "terminal")
+	if terminal["gate_mode"] != "business" ||
+		terminal["business_report_count"].(float64) != 1 ||
+		terminal["linked_validation_pass_count"].(float64) != 1 ||
+		terminal["independent_validation_pass_count"].(float64) != 1 {
+		t.Fatalf("business terminal = %#v, want one linked independent pass", terminal)
+	}
+}
+
 func TestOperatorTaskWaitDispatchesQueuedLineageAndBuildsEvidence(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -2967,6 +3041,24 @@ func threeAgentFixturePath(t *testing.T) string {
 	return filepath.Join(filepath.Dir(file), "..", "..", "team_config", "fixtures", "cp_accept_001_three_agent.yaml")
 }
 
+func writeBusinessThreeAgentFixture(t *testing.T, dir string) string {
+	t.Helper()
+	raw, err := os.ReadFile(threeAgentFixturePath(t))
+	if err != nil {
+		t.Fatalf("read three-agent fixture: %v", err)
+	}
+	raw = bytes.Replace(raw,
+		[]byte("  accepted_by_capability: validation.assessment\n"),
+		[]byte("  accepted_by_capability: validation.assessment\n  gate_mode: business\n  require_independent_verifier: true\n"),
+		1,
+	)
+	path := filepath.Join(dir, "business-team.yaml")
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatalf("write business TeamConfig: %v", err)
+	}
+	return path
+}
+
 func dockerThreeAgentFixturePath(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
@@ -3646,6 +3738,7 @@ func completeRootWithPassingValidation(t *testing.T, ctx context.Context, app *b
 		LeaseID: rootLeaseID,
 		AgentID: "coordinator",
 		Summary: "root report before unfinished descendant quiesces",
+		Content: "durable root report content reviewed by the verifier",
 	})
 	if err != nil {
 		t.Fatalf("submit root report: %v", err)

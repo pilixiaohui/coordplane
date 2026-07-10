@@ -12,6 +12,7 @@ import (
 	"coordplane/internal/coordination"
 	"coordplane/internal/ids"
 	cpruntime "coordplane/internal/runtime"
+	"coordplane/internal/teamconfig"
 )
 
 const (
@@ -167,17 +168,21 @@ type EvidenceCommunicationCounts struct {
 }
 
 type EvidenceTerminal struct {
-	Status                 string `json:"status"`
-	FailureSummary         string `json:"failure_summary,omitempty"`
-	FailureClass           string `json:"failure_class,omitempty"`
-	TerminalReason         string `json:"terminal_reason,omitempty"`
-	RootContractStatus     string `json:"root_contract_status"`
-	ReportCount            int64  `json:"report_count"`
-	ValidationPassCount    int64  `json:"validation_pass_count"`
-	ValidationFailureCount int64  `json:"validation_failure_count"`
-	QueuedAssignmentCount  int64  `json:"queued_assignment_count"`
-	ActiveAssignmentCount  int64  `json:"active_assignment_count"`
-	ActiveLeaseCount       int64  `json:"active_lease_count"`
+	Status                         string `json:"status"`
+	FailureSummary                 string `json:"failure_summary,omitempty"`
+	FailureClass                   string `json:"failure_class,omitempty"`
+	TerminalReason                 string `json:"terminal_reason,omitempty"`
+	RootContractStatus             string `json:"root_contract_status"`
+	ReportCount                    int64  `json:"report_count"`
+	ValidationPassCount            int64  `json:"validation_pass_count"`
+	ValidationFailureCount         int64  `json:"validation_failure_count"`
+	QueuedAssignmentCount          int64  `json:"queued_assignment_count"`
+	ActiveAssignmentCount          int64  `json:"active_assignment_count"`
+	ActiveLeaseCount               int64  `json:"active_lease_count"`
+	GateMode                       string `json:"gate_mode"`
+	BusinessReportCount            int64  `json:"business_report_count"`
+	LinkedValidationPassCount      int64  `json:"linked_validation_pass_count"`
+	IndependentValidationPassCount int64  `json:"independent_validation_pass_count"`
 }
 
 func (s *Service) WaitTask(ctx context.Context, subject Subject, taskRunID string, in WaitTaskInput) (WaitTaskResult, error) {
@@ -407,7 +412,7 @@ func (s *Service) buildTaskEvidence(ctx context.Context, taskRunID string) (Task
 		return TaskEvidence{}, err
 	}
 	evidence := TaskEvidence{
-		SchemaVersion:  "operator.task.evidence.v1",
+		SchemaVersion:  "operator.task.evidence.v2",
 		TaskRunID:      run.ID,
 		Status:         terminal.Status,
 		FailureSummary: terminal.FailureSummary,
@@ -769,7 +774,7 @@ func (s *Service) evidenceInspectSummary(ctx context.Context) (map[string]int64,
 }
 
 func (s *Service) evidenceTerminal(ctx context.Context, rootContractID string, contractIDs []string) (EvidenceTerminal, error) {
-	var out EvidenceTerminal
+	out := EvidenceTerminal{GateMode: s.teamConfig.Termination.EffectiveGateMode()}
 	if err := s.db.QueryRowContext(ctx, `SELECT status FROM work_contracts WHERE id = ?`, rootContractID).Scan(&out.RootContractStatus); err != nil {
 		return out, fmt.Errorf("lookup root contract status: %w", err)
 	}
@@ -819,12 +824,30 @@ WHERE l.state = 'active' AND a.contract_id IN (`+placeholders(len(contractIDs))+
 	).Scan(&out.ActiveLeaseCount); err != nil {
 		return out, fmt.Errorf("count active leases: %w", err)
 	}
+	if out.GateMode == teamconfig.GateModeBusiness {
+		business, err := s.businessAcceptance(ctx, contractIDs)
+		if err != nil {
+			return out, err
+		}
+		out.BusinessReportCount = business.reportCount
+		out.LinkedValidationPassCount = business.linkedPassCount
+		out.IndependentValidationPassCount = business.independentPassCount
+	}
 
 	unfinishedLineage := out.QueuedAssignmentCount > 0 || out.ActiveAssignmentCount > 0 || out.ActiveLeaseCount > 0
 	switch {
 	case out.RootContractStatus == "satisfied" && out.ReportCount == 0:
 		out.Status = "failed"
 		out.FailureSummary = "root task is satisfied without durable report evidence in its contract lineage"
+	case out.RootContractStatus == "satisfied" && out.GateMode == teamconfig.GateModeBusiness && out.BusinessReportCount == 0:
+		out.Status = "failed"
+		out.FailureSummary = "business gate requires a non-empty readable report object in the contract lineage"
+	case out.RootContractStatus == "satisfied" && out.GateMode == teamconfig.GateModeBusiness && out.LinkedValidationPassCount == 0:
+		out.Status = "failed"
+		out.FailureSummary = "business gate requires a passing validation assessment that explicitly references a readable report"
+	case out.RootContractStatus == "satisfied" && s.teamConfig.Termination.RequireIndependentVerifier && out.IndependentValidationPassCount == 0:
+		out.Status = "failed"
+		out.FailureSummary = "business gate requires a passing verifier that is independent from the report producer"
 	case out.RootContractStatus == "satisfied" && out.ValidationFailureCount > 0:
 		out.Status = "failed"
 		out.FailureSummary = "contract lineage contains a failing or blocked validation assessment"
@@ -859,6 +882,91 @@ WHERE l.state = 'active' AND a.contract_id IN (`+placeholders(len(contractIDs))+
 		out.Status = "running"
 	}
 	return out, nil
+}
+
+type businessAcceptanceCounts struct {
+	reportCount          int64
+	linkedPassCount      int64
+	independentPassCount int64
+}
+
+func (s *Service) businessAcceptance(ctx context.Context, contractIDs []string) (businessAcceptanceCounts, error) {
+	var out businessAcceptanceCounts
+	if len(contractIDs) == 0 {
+		return out, nil
+	}
+	reports := make(map[string]string)
+	rows, err := s.db.QueryContext(ctx, `
+SELECT e.id, e.produced_by
+FROM evidence e
+JOIN object_blobs o ON o.object_ref = e.content_ref
+WHERE e.kind = 'report'
+  AND length(o.content) > 0
+  AND e.contract_id IN (`+placeholders(len(contractIDs))+`)
+ORDER BY e.created_at ASC, e.id ASC`, stringArgs(contractIDs)...)
+	if err != nil {
+		return out, fmt.Errorf("lookup business report evidence: %w", err)
+	}
+	for rows.Next() {
+		var id, producer string
+		if err := rows.Scan(&id, &producer); err != nil {
+			rows.Close()
+			return out, err
+		}
+		reports[id] = producer
+	}
+	if err := rows.Close(); err != nil {
+		return out, err
+	}
+	out.reportCount = int64(len(reports))
+	if len(reports) == 0 {
+		return out, nil
+	}
+
+	args := append(stringArgs(contractIDs), stringArgs(contractIDs)...)
+	rows, err = s.db.QueryContext(ctx, `
+SELECT verifier_agent_id, checked_refs_json
+FROM validation_assessments
+WHERE verdict = 'pass'
+  AND contract_id IN (`+placeholders(len(contractIDs))+`)
+  AND assessed_contract_id IN (`+placeholders(len(contractIDs))+`)
+ORDER BY created_at ASC, id ASC`, args...)
+	if err != nil {
+		return out, fmt.Errorf("lookup business validation evidence: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var verifier, refsJSON string
+		if err := rows.Scan(&verifier, &refsJSON); err != nil {
+			return out, err
+		}
+		var refs []struct {
+			Kind string `json:"kind"`
+			ID   string `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(refsJSON), &refs); err != nil {
+			return out, fmt.Errorf("decode business validation checked refs: %w", err)
+		}
+		linked := false
+		independent := false
+		for _, ref := range refs {
+			producer, ok := reports[ref.ID]
+			if ref.Kind != "evidence" || !ok {
+				continue
+			}
+			linked = true
+			if verifier != producer {
+				independent = true
+			}
+		}
+		if linked {
+			out.linkedPassCount++
+		}
+		if independent {
+			out.independentPassCount++
+		}
+	}
+	return out, rows.Err()
 }
 
 type runtimePolicyFailureEvidence struct {

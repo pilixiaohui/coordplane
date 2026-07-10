@@ -51,9 +51,22 @@ type RuntimeCommandPolicy struct {
 }
 
 type TerminationConfig struct {
-	TerminalContractType string `json:"terminal_contract_type,omitempty" yaml:"terminal_contract_type"`
-	AcceptedByCapability string `json:"accepted_by_capability,omitempty" yaml:"accepted_by_capability"`
-	GateMode             string `json:"gate_mode,omitempty" yaml:"gate_mode"`
+	TerminalContractType       string `json:"terminal_contract_type,omitempty" yaml:"terminal_contract_type"`
+	AcceptedByCapability       string `json:"accepted_by_capability,omitempty" yaml:"accepted_by_capability"`
+	GateMode                   string `json:"gate_mode,omitempty" yaml:"gate_mode"`
+	RequireIndependentVerifier bool   `json:"require_independent_verifier,omitempty" yaml:"require_independent_verifier"`
+}
+
+const (
+	GateModeProtocolSmoke = "protocol_smoke"
+	GateModeBusiness      = "business"
+)
+
+func (c TerminationConfig) EffectiveGateMode() string {
+	if c.GateMode == "" {
+		return GateModeProtocolSmoke
+	}
+	return c.GateMode
 }
 
 type CommunicationConfig struct {
@@ -159,6 +172,14 @@ func (c Config) Validate() error {
 		if err := validateRuntimeCommandPolicy(name, profile.CommandPolicy); err != nil {
 			return err
 		}
+	}
+	switch c.Termination.EffectiveGateMode() {
+	case GateModeProtocolSmoke, GateModeBusiness:
+	default:
+		return fmt.Errorf("teamconfig: termination gate_mode %q is invalid", c.Termination.GateMode)
+	}
+	if c.Termination.RequireIndependentVerifier && c.Termination.EffectiveGateMode() != GateModeBusiness {
+		return errors.New("teamconfig: require_independent_verifier requires termination gate_mode business")
 	}
 	return nil
 }

@@ -3,6 +3,7 @@ package teamconfig_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -162,6 +163,47 @@ agents:
 `))
 	if err == nil || !strings.Contains(err.Error(), "duplicates coordlink capability") {
 		t.Fatalf("ParseYAML duplicate policy capability error = %v, want validation rejection", err)
+	}
+}
+
+func TestParseYAMLValidatesTerminationGateMode(t *testing.T) {
+	base := `
+team_id: gate-team
+version: 1
+termination:
+  gate_mode: %s
+  require_independent_verifier: %t
+agents:
+  - id: verifier
+    runtime_profile: external-debug
+    cli_backend: fake
+`
+	for _, tc := range []struct {
+		name        string
+		mode        string
+		independent bool
+		wantError   string
+	}{
+		{name: "protocol smoke", mode: teamconfig.GateModeProtocolSmoke},
+		{name: "business independent", mode: teamconfig.GateModeBusiness, independent: true},
+		{name: "unknown", mode: "semantic_magic", wantError: "gate_mode"},
+		{name: "independent protocol smoke", mode: teamconfig.GateModeProtocolSmoke, independent: true, wantError: "requires termination gate_mode business"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := teamconfig.ParseYAML([]byte(fmt.Sprintf(base, tc.mode, tc.independent)))
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("ParseYAML error = %v, want %q", err, tc.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseYAML: %v", err)
+			}
+			if cfg.Termination.EffectiveGateMode() != tc.mode || cfg.Termination.RequireIndependentVerifier != tc.independent {
+				t.Fatalf("termination = %+v", cfg.Termination)
+			}
+		})
 	}
 }
 
