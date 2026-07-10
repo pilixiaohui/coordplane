@@ -208,7 +208,9 @@ type EvidenceTerminal struct {
 	CompletionValidationPassCount         int64  `json:"completion_validation_pass_count"`
 	ValidationFailureCount                int64  `json:"validation_failure_count"`
 	CompletionBoundValidationFailureCount int64  `json:"completion_bound_validation_failure_count"`
+	ProviderAuditPendingCount             int64  `json:"provider_audit_pending_count"`
 	ProviderAuditFailureCount             int64  `json:"provider_audit_failure_count"`
+	ProviderAuditUnresolvedCount          int64  `json:"provider_audit_unresolved_count"`
 	ManagedRuntimeCleanupPendingCount     int64  `json:"managed_runtime_cleanup_pending_count"`
 	ManagedRuntimeCleanupFailedCount      int64  `json:"managed_runtime_cleanup_failed_count"`
 	QueuedAssignmentCount                 int64  `json:"queued_assignment_count"`
@@ -1005,15 +1007,20 @@ WHERE l.state = 'active' AND a.contract_id IN (`+placeholders(len(contractIDs))+
 		return out, fmt.Errorf("count active leases: %w", err)
 	}
 	if err := s.db.QueryRowContext(ctx, `
-SELECT COUNT(*)
-FROM cli_sessions cs
-JOIN attempts att ON att.id = cs.attempt_id
-JOIN leases l ON l.id = att.lease_id
-JOIN assignments a ON a.id = l.assignment_id
-WHERE cs.provider_audit_required = 1
-  AND cs.provider_audit_state <> 'complete'
-  AND a.contract_id IN (`+placeholders(len(contractIDs))+`)`, args...).Scan(&out.ProviderAuditFailureCount); err != nil {
-		return out, fmt.Errorf("count provider audit failures: %w", err)
+	SELECT
+	  COALESCE(SUM(CASE WHEN cs.provider_audit_requirement_state = 'required' AND cs.provider_audit_state = 'not_requested' THEN 1 ELSE 0 END), 0),
+	  COALESCE(SUM(CASE WHEN cs.provider_audit_requirement_state = 'required' AND cs.provider_audit_state = 'failed' THEN 1 ELSE 0 END), 0),
+	  COALESCE(SUM(CASE WHEN cs.provider_audit_requirement_state = 'unresolved' THEN 1 ELSE 0 END), 0)
+	FROM cli_sessions cs
+	JOIN attempts att ON att.id = cs.attempt_id
+	JOIN leases l ON l.id = att.lease_id
+	JOIN assignments a ON a.id = l.assignment_id
+	WHERE a.contract_id IN (`+placeholders(len(contractIDs))+`)`, args...).Scan(
+		&out.ProviderAuditPendingCount,
+		&out.ProviderAuditFailureCount,
+		&out.ProviderAuditUnresolvedCount,
+	); err != nil {
+		return out, fmt.Errorf("count provider audit states: %w", err)
 	}
 	if err := s.db.QueryRowContext(ctx, `
 SELECT COUNT(*)
@@ -1057,9 +1064,15 @@ WHERE ri.runtime_kind = 'docker'
 	case out.RootContractStatus == "satisfied" && out.ManagedRuntimeCleanupPendingCount > 0:
 		out.Status = "running"
 		out.FailureSummary = "managed runtime cleanup is still pending for a contract lineage session"
+	case out.RootContractStatus == "satisfied" && out.ProviderAuditUnresolvedCount > 0:
+		out.Status = "failed"
+		out.FailureSummary = "provider tool audit requirement is unresolved for a contract lineage session"
 	case out.RootContractStatus == "satisfied" && out.ProviderAuditFailureCount > 0:
 		out.Status = "failed"
-		out.FailureSummary = "provider tool audit is incomplete for a contract lineage session"
+		out.FailureSummary = "provider tool audit failed for a contract lineage session"
+	case out.RootContractStatus == "satisfied" && out.ProviderAuditPendingCount > 0:
+		out.Status = "running"
+		out.FailureSummary = "provider tool audit is pending for a contract lineage session"
 	case out.RootContractStatus == "satisfied" && out.ReportCount == 0:
 		out.Status = "failed"
 		out.FailureSummary = "root task is satisfied without durable report evidence in its contract lineage"

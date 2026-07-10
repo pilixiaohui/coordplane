@@ -134,30 +134,32 @@ type RuntimeInstance struct {
 }
 
 type CLISession struct {
-	ID                     string     `json:"id"`
-	AttemptID              string     `json:"attempt_id"`
-	RuntimeID              string     `json:"runtime_id"`
-	AgentID                string     `json:"agent_id"`
-	CLIBackend             string     `json:"cli_backend"`
-	ProfileName            string     `json:"profile_name"`
-	SessionNativeID        string     `json:"session_native_id"`
-	ContainerID            string     `json:"container_id,omitempty"`
-	ContainerName          string     `json:"container_name,omitempty"`
-	ProcessRef             string     `json:"process_ref,omitempty"`
-	State                  string     `json:"state"`
-	StartReason            string     `json:"start_reason"`
-	ResumeOf               string     `json:"resume_of,omitempty"`
-	ExitCode               *int       `json:"exit_code,omitempty"`
-	LastError              string     `json:"last_error,omitempty"`
-	TranscriptRef          string     `json:"transcript_ref,omitempty"`
-	ProviderAuditRequired  bool       `json:"provider_audit_required"`
-	ProviderAuditState     string     `json:"provider_audit_state"`
-	ProviderAuditErrorCode string     `json:"provider_audit_error_code,omitempty"`
-	Command                []string   `json:"command,omitempty"`
-	EnvKeys                []string   `json:"env_keys,omitempty"`
-	StartedAt              time.Time  `json:"started_at"`
-	EndedAt                *time.Time `json:"ended_at,omitempty"`
-	UpdatedAt              time.Time  `json:"updated_at"`
+	ID                             string     `json:"id"`
+	AttemptID                      string     `json:"attempt_id"`
+	RuntimeID                      string     `json:"runtime_id"`
+	AgentID                        string     `json:"agent_id"`
+	CLIBackend                     string     `json:"cli_backend"`
+	ProfileName                    string     `json:"profile_name"`
+	SessionNativeID                string     `json:"session_native_id"`
+	ContainerID                    string     `json:"container_id,omitempty"`
+	ContainerName                  string     `json:"container_name,omitempty"`
+	ProcessRef                     string     `json:"process_ref,omitempty"`
+	State                          string     `json:"state"`
+	StartReason                    string     `json:"start_reason"`
+	ResumeOf                       string     `json:"resume_of,omitempty"`
+	ExitCode                       *int       `json:"exit_code,omitempty"`
+	LastError                      string     `json:"last_error,omitempty"`
+	TranscriptRef                  string     `json:"transcript_ref,omitempty"`
+	ProviderAuditRequired          bool       `json:"provider_audit_required"`
+	ProviderAuditRequirementState  string     `json:"provider_audit_requirement_state"`
+	ProviderAuditRequirementReason string     `json:"provider_audit_requirement_reason"`
+	ProviderAuditState             string     `json:"provider_audit_state"`
+	ProviderAuditErrorCode         string     `json:"provider_audit_error_code,omitempty"`
+	Command                        []string   `json:"command,omitempty"`
+	EnvKeys                        []string   `json:"env_keys,omitempty"`
+	StartedAt                      time.Time  `json:"started_at"`
+	EndedAt                        *time.Time `json:"ended_at,omitempty"`
+	UpdatedAt                      time.Time  `json:"updated_at"`
 }
 
 type StartRequest struct {

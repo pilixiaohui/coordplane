@@ -34,6 +34,7 @@ type migration struct {
 	Version string
 	Name    string
 	SQL     string
+	ApplyTx func(context.Context, *sql.Tx) error
 }
 
 var migrations = []migration{
@@ -147,6 +148,12 @@ var migrations = []migration{
 		Name:    "durable provider audit requirement",
 		SQL:     providerAuditRequirementSchemaSQL,
 	},
+	{
+		Version: "023_provider_audit_requirement_backfill",
+		Name:    "canonical provider audit requirement and legacy backfill",
+		SQL:     providerAuditRequirementBackfillSchemaSQL,
+		ApplyTx: backfillProviderAuditRequirements,
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) (MigrationResult, error) {
@@ -184,6 +191,11 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 		if err := execStatements(ctx, tx, m.SQL); err != nil {
 			return MigrationResult{}, fmt.Errorf("apply migration %s: %w", m.Version, err)
+		}
+		if m.ApplyTx != nil {
+			if err := m.ApplyTx(ctx, tx); err != nil {
+				return MigrationResult{}, fmt.Errorf("backfill migration %s: %w", m.Version, err)
+			}
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)`,

@@ -296,8 +296,8 @@ WHERE provider_audit_required = 1`); err != nil {
 		t.Fatalf("operator evidence passed with required incomplete provider audit: %s", evidenceRaw)
 	}
 	terminal := objectField(t, evidence, "terminal")
-	if terminal["provider_audit_failure_count"].(float64) != 1 {
-		t.Fatalf("operator terminal = %#v, want one required pending provider audit", terminal)
+	if terminal["provider_audit_pending_count"].(float64) != 1 || terminal["provider_audit_failure_count"].(float64) != 0 {
+		t.Fatalf("operator terminal = %#v, want one required pending provider audit and zero failures", terminal)
 	}
 }
 

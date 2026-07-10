@@ -15,14 +15,17 @@ import (
 )
 
 const (
-	providerPermissionDeniedCode      = "PROVIDER_PERMISSION_DENIED"
-	coordlinkPolicyRejectedCode       = "COORDLINK_PROVIDER_POLICY_REJECTED"
-	providerAuditParseFailedCode      = "PROVIDER_AUDIT_PARSE_FAILED"
-	providerAuditInputFailedCode      = "PROVIDER_AUDIT_INPUT_FAILED"
-	providerAuditAuthFailedCode       = "PROVIDER_AUDIT_AUTH_FAILED"
-	providerAuditExecFailedCode       = "PROVIDER_AUDIT_EXEC_FAILED"
-	providerAuditTranscriptFailedCode = "PROVIDER_AUDIT_TRANSCRIPT_FAILED"
-	providerAuditWriteFailedCode      = "PROVIDER_AUDIT_WRITE_FAILED"
+	providerPermissionDeniedCode        = "PROVIDER_PERMISSION_DENIED"
+	coordlinkPolicyRejectedCode         = "COORDLINK_PROVIDER_POLICY_REJECTED"
+	providerAuditParseFailedCode        = "PROVIDER_AUDIT_PARSE_FAILED"
+	providerAuditInputFailedCode        = "PROVIDER_AUDIT_INPUT_FAILED"
+	providerAuditAuthFailedCode         = "PROVIDER_AUDIT_AUTH_FAILED"
+	providerAuditExecFailedCode         = "PROVIDER_AUDIT_EXEC_FAILED"
+	providerAuditTranscriptFailedCode   = "PROVIDER_AUDIT_TRANSCRIPT_FAILED"
+	providerAuditWriteFailedCode        = "PROVIDER_AUDIT_WRITE_FAILED"
+	providerAuditRequirementRequired    = "required"
+	providerAuditRequirementNotRequired = "not_required"
+	providerAuditRequirementUnresolved  = "unresolved"
 )
 
 type providerToolOutcome struct {
@@ -145,7 +148,7 @@ ON CONFLICT(cli_session_id, tool_use_id, outcome_kind) DO UPDATE SET
 		_, err := tx.ExecContext(ctx, `
 UPDATE cli_sessions
 SET provider_audit_state = 'complete', provider_audit_error_code = '', updated_at = ?
-WHERE id = ? AND provider_audit_required = 1`, now, sessionID)
+WHERE id = ? AND provider_audit_requirement_state = 'required'`, now, sessionID)
 		return err
 	})
 	if err != nil {
@@ -175,7 +178,7 @@ func (a *CommandCLIAdapter) markProviderAuditFailed(ctx context.Context, session
 	_, err := a.db.ExecContext(ctx, `
 UPDATE cli_sessions
 SET provider_audit_state = 'failed', provider_audit_error_code = ?, updated_at = ?
-WHERE id = ? AND provider_audit_required = 1 AND provider_audit_state <> 'complete'`, code, formatTime(time.Now()), sessionID)
+WHERE id = ? AND provider_audit_requirement_state = 'required' AND provider_audit_state <> 'complete'`, code, formatTime(time.Now()), sessionID)
 	return err
 }
 
@@ -188,12 +191,18 @@ func (a *CommandCLIAdapter) settleProviderAuditFailure(sessionID, code string) e
 	return nil
 }
 
-func (a *CommandCLIAdapter) providerAuditRequired(instance RuntimeInstance) bool {
-	if a.profile.Backend != "claude" {
-		return false
+type providerAuditRequirement struct {
+	State  string
+	Reason string
+}
+
+func (a *CommandCLIAdapter) providerAuditRequirement(instance RuntimeInstance) providerAuditRequirement {
+	if a.profile.Backend == "claude" {
+		if _, configured := a.runtimeCommandPolicy(instance); configured {
+			return providerAuditRequirement{State: providerAuditRequirementRequired, Reason: "explicit_required"}
+		}
 	}
-	_, configured := a.runtimeCommandPolicy(instance)
-	return configured
+	return providerAuditRequirement{State: providerAuditRequirementNotRequired, Reason: "explicit_not_required"}
 }
 
 func parseProviderToolOutcomes(raw []byte) ([]providerToolOutcome, error) {

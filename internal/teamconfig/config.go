@@ -224,6 +224,20 @@ func (r *Repository) SaveYAML(ctx context.Context, raw []byte) (Config, error) {
 		_ = tx.Rollback()
 	}()
 	now := formatTime(time.Now())
+	var existingConfigJSON string
+	err = tx.QueryRowContext(ctx, `
+SELECT config_json FROM team_config_versions WHERE team_id = ? AND version = ?`,
+		cfg.TeamID, cfg.Version,
+	).Scan(&existingConfigJSON)
+	switch {
+	case err == nil && existingConfigJSON == string(configJSON):
+		return cloneConfig(cfg), nil
+	case err == nil:
+		return Config{}, fmt.Errorf("teamconfig: team %q version %d is immutable; use a new version for different content", cfg.TeamID, cfg.Version)
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
+		return Config{}, fmt.Errorf("read existing TeamConfig version: %w", err)
+	}
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM team_config_agents WHERE team_id = ? AND version = ?`, cfg.TeamID, cfg.Version); err != nil {
 		return Config{}, fmt.Errorf("replace TeamConfig agents: %w", err)

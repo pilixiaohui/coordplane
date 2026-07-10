@@ -130,10 +130,11 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 func seedLegacyProviderAuditMatrix(t *testing.T, ctx context.Context, db *sql.DB, hasRequirementBool bool) {
 	t.Helper()
 	const (
-		snapshotAt = "2026-01-01T00:00:00.000000000Z"
-		scopeAt    = "2026-01-01T00:01:00.000000000Z"
-		rowAt      = "2026-01-01T00:02:00.000000000Z"
-		configJSON = `{"team_id":"audit-team","version":1,"runtime_profiles":{"docker-policy":{"kind":"docker","command_policy":{"non_interactive_approval":true,"allow_coordlink_capabilities":["contract.current"]}},"external-plain":{"kind":"external"}},"agents":[{"id":"policy-agent","runtime_profile":"docker-policy","cli_backend":"claude","capabilities":["contract.current"]},{"id":"plain-agent","runtime_profile":"external-plain","cli_backend":"claude"},{"id":"fake-agent","runtime_profile":"external-plain","cli_backend":"fake"}]}`
+		snapshotAt         = "2026-01-01T00:00:00.000000000Z"
+		scopeAt            = "2026-01-01T00:01:00.000000000Z"
+		rowAt              = "2026-01-01T00:02:00.000000000Z"
+		configJSON         = `{"team_id":"audit-team","version":1,"runtime_profiles":{"docker-policy":{"kind":"docker","command_policy":{"non_interactive_approval":true,"allow_coordlink_capabilities":["contract.current"]}},"external-plain":{"kind":"external"}},"agents":[{"id":"policy-agent","runtime_profile":"docker-policy","cli_backend":"claude","capabilities":["contract.current"]},{"id":"plain-agent","runtime_profile":"external-plain","cli_backend":"claude"},{"id":"fake-agent","runtime_profile":"external-plain","cli_backend":"fake"}]}`
+		driftedCurrentJSON = `{"team_id":"audit-team","version":1,"runtime_profiles":{"docker-policy":{"kind":"docker"},"external-plain":{"kind":"external","command_policy":{"non_interactive_approval":true,"allow_coordlink_capabilities":["contract.current"]}}},"agents":[{"id":"policy-agent","runtime_profile":"docker-policy","cli_backend":"claude","capabilities":["contract.current"]},{"id":"plain-agent","runtime_profile":"external-plain","cli_backend":"claude"},{"id":"fake-agent","runtime_profile":"external-plain","cli_backend":"fake"}]}`
 	)
 	for _, statement := range []struct {
 		query string
@@ -145,6 +146,9 @@ func seedLegacyProviderAuditMatrix(t *testing.T, ctx context.Context, db *sql.DB
 		if _, err := db.ExecContext(ctx, statement.query, statement.args...); err != nil {
 			t.Fatalf("seed TeamConfig snapshot: %v", err)
 		}
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE team_config_versions SET config_json = ? WHERE team_id = 'audit-team' AND version = 1`, driftedCurrentJSON); err != nil {
+		t.Fatalf("seed legacy same-version current-config drift: %v", err)
 	}
 	type legacyCase struct {
 		id, backend, agent, profile, runtimeKind string

@@ -879,3 +879,13 @@ ALTER TABLE cli_sessions ADD COLUMN provider_audit_required INTEGER NOT NULL DEF
 CREATE INDEX IF NOT EXISTS cli_sessions_provider_audit_gate_idx
   ON cli_sessions(provider_audit_required, provider_audit_state, attempt_id);
 `
+
+const providerAuditRequirementBackfillSchemaSQL = `
+ALTER TABLE cli_sessions ADD COLUMN provider_audit_requirement_state TEXT NOT NULL DEFAULT 'unresolved'
+  CHECK (provider_audit_requirement_state IN ('required', 'not_required', 'unresolved'));
+ALTER TABLE cli_sessions ADD COLUMN provider_audit_requirement_reason TEXT NOT NULL DEFAULT 'unclassified'
+  CHECK (provider_audit_requirement_reason <> '');
+
+CREATE INDEX IF NOT EXISTS cli_sessions_provider_audit_requirement_idx
+  ON cli_sessions(provider_audit_requirement_state, provider_audit_state, attempt_id);
+`

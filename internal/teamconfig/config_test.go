@@ -71,7 +71,7 @@ func TestSaveYAMLRejectsDifferentContentForExistingTeamVersion(t *testing.T) {
 	if _, err := repo.SaveYAML(ctx, []byte(testTeamConfigYAML)); err != nil {
 		t.Fatalf("idempotent TeamConfig save: %v", err)
 	}
-	changed := strings.Replace(testTeamConfigYAML, "builder role", "builder changed role", 1)
+	changed := strings.Replace(testTeamConfigYAML, "Build assigned work and report concise evidence.", "Build changed work and report concise evidence.", 1)
 	if _, err := repo.SaveYAML(ctx, []byte(changed)); err == nil || !strings.Contains(err.Error(), "version") {
 		t.Fatalf("same-version different TeamConfig error = %v, want immutable version rejection", err)
 	}

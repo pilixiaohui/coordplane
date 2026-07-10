@@ -43,6 +43,7 @@ func TestMigrateCreatesCanonicalTablesAndIsIdempotent(t *testing.T) {
 		"020_contract_completion_evidence",
 		"021_provider_tool_outcomes",
 		"022_provider_audit_requirement",
+		"023_provider_audit_requirement_backfill",
 	}; !equalStrings(got, want) {
 		t.Fatalf("applied migrations = %v, want %v", got, want)
 	}
