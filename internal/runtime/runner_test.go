@@ -237,7 +237,7 @@ func TestRunnerCancellationUsesIndependentCleanupContext(t *testing.T) {
 	ctx := context.Background()
 	h := newRuntimeHarness(t, true)
 	add := addContract(t, ctx, h.coordination, "builder")
-	adapter := &blockingCLIAdapter{}
+	adapter := &blockingCLIAdapter{started: make(chan struct{})}
 	runner, err := cpruntime.NewRunner(cpruntime.RunnerConfig{
 		Store:         h.store,
 		Coordination:  h.coordination,
@@ -251,10 +251,26 @@ func TestRunnerCancellationUsesIndependentCleanupContext(t *testing.T) {
 		t.Fatalf("new cancellation runner: %v", err)
 	}
 
-	startCtx, cancel := context.WithTimeout(ctx, 5*time.Millisecond)
-	defer cancel()
-	if _, err := runner.StartNext(startCtx, "builder"); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("start cancellation error = %v, want context deadline exceeded", err)
+	startCtx, cancel := context.WithCancel(ctx)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := runner.StartNext(startCtx, "builder")
+		errCh <- err
+	}()
+	select {
+	case <-adapter.started:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("CLI adapter did not reach Start")
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("start cancellation error = %v, want context canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runner did not return after cancellation")
 	}
 	if got := assignmentState(t, ctx, h.db, add.AssignmentID); got != "queued" {
 		t.Fatalf("assignment after cancelled start = %s, want queued", got)
@@ -938,9 +954,12 @@ type runtimeHarness struct {
 	fake         *cpruntime.FakeCLIAdapter
 }
 
-type blockingCLIAdapter struct{}
+type blockingCLIAdapter struct {
+	started chan struct{}
+}
 
 func (a *blockingCLIAdapter) Start(ctx context.Context, req cpruntime.StartRequest) (cpruntime.StartResult, error) {
+	close(a.started)
 	<-ctx.Done()
 	return cpruntime.StartResult{}, ctx.Err()
 }
