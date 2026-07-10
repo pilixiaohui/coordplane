@@ -394,6 +394,54 @@ func TestDockerRuntimeMissingWritableCheckFailsClosedWithoutAdapterStart(t *test
 	}
 }
 
+func TestManagedDockerRuntimeAdapterPreflightFailureConvergesFailedRemoved(t *testing.T) {
+	ctx := context.Background()
+	h := newDockerRuntimeHarness(t, nil)
+	runner, err := cpruntime.NewRunner(cpruntime.RunnerConfig{
+		Store:           h.store,
+		Coordination:    h.coordination,
+		TeamConfig:      dockerRuntimeTeamConfig(),
+		Skills:          skills.NewRegistry(h.store),
+		RuntimeBackends: map[string]cpruntime.RuntimeBackend{"docker-default": h.dockerRuntime},
+		Adapter:         rejectingPreflightAdapter{},
+		BackendURL:      "http://coordplane.test",
+		WorkspaceName:   "test-workspace",
+	})
+	if err != nil {
+		t.Fatalf("new rejecting preflight runner: %v", err)
+	}
+	addContract(t, ctx, h.coordination, "developer")
+	if _, err := runner.StartNext(ctx, "developer"); err == nil || !strings.Contains(err.Error(), "test preflight rejection") {
+		t.Fatalf("StartNext error = %v, want preflight rejection", err)
+	}
+	var attemptID, containerName string
+	if err := h.db.QueryRowContext(ctx, `SELECT attempt_id, container_name FROM runtime_instances ORDER BY created_at DESC LIMIT 1`).Scan(&attemptID, &containerName); err != nil {
+		t.Fatalf("query preflight-failed runtime: %v", err)
+	}
+	assertRuntimeCleanup(t, ctx, h.db, attemptID, "failed", "removed")
+	if h.docker.HasContainer(containerName) {
+		t.Fatalf("preflight-failed managed container %s still exists", containerName)
+	}
+}
+
+type rejectingPreflightAdapter struct{}
+
+func (rejectingPreflightAdapter) PreflightStart(context.Context, cpruntime.StartRequest) error {
+	return errors.New("test preflight rejection")
+}
+
+func (rejectingPreflightAdapter) Start(context.Context, cpruntime.StartRequest) (cpruntime.StartResult, error) {
+	return cpruntime.StartResult{}, errors.New("start must not run after preflight rejection")
+}
+
+func (rejectingPreflightAdapter) Steer(context.Context, cpruntime.SteerRequest) error {
+	return nil
+}
+
+func (rejectingPreflightAdapter) Finish(context.Context, cpruntime.TerminalReport) error {
+	return nil
+}
+
 func TestDockerRuntimeInjectsClaudeAuthEnvAndStoresOnlyRedactedEvidence(t *testing.T) {
 	ctx := context.Background()
 	db, err := sql.Open("sqlite", ":memory:")

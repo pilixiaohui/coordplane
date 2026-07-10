@@ -677,6 +677,7 @@ func TestOperatorTaskReadinessAdmissionProtectsCreateAndStart(t *testing.T) {
 			beforeCreate := operatorStartCounts(t, ctx, app.DB)
 			rejected := postOperatorTaskRaw(t, app.Handler, "operator-secret", request, http.StatusBadRequest)
 			assertOperatorTaskRejected(t, rejected, tc.wantCode)
+			assertOperatorTaskRetryable(t, rejected)
 			assertOperatorStartCountsEqual(t, ctx, app.DB, beforeCreate, "require_startable create rejection")
 
 			delete(request, "require_startable")
@@ -691,6 +692,7 @@ func TestOperatorTaskReadinessAdmissionProtectsCreateAndStart(t *testing.T) {
 				"idempotency_key": "readiness-start-" + tc.wantCode,
 			}, http.StatusBadRequest)
 			assertOperatorTaskRejected(t, startRejected, tc.wantCode)
+			assertOperatorTaskRetryable(t, startRejected)
 			assertOperatorStartCountsEqual(t, ctx, app.DB, beforeStart, "parked start readiness rejection")
 			assertAssignmentState(t, ctx, app.DB, assignmentID, "queued", "")
 			for _, table := range []string{"leases", "attempts", "prepare_leases", "runtime_instances", "runtime_tokens", "session_routes"} {
@@ -4185,6 +4187,17 @@ func assertOperatorTaskRejected(t *testing.T, raw []byte, code string) {
 	}
 	if response.Data != nil {
 		t.Fatalf("operator rejected response leaked data: %s", string(raw))
+	}
+}
+
+func assertOperatorTaskRetryable(t *testing.T, raw []byte) {
+	t.Helper()
+	var response capability.Response[json.RawMessage]
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatalf("decode retryable operator response: %v\nbody=%s", err, string(raw))
+	}
+	if response.Retryable == nil || !*response.Retryable {
+		t.Fatalf("operator response retryable = %#v, want true; body=%s", response.Retryable, string(raw))
 	}
 }
 

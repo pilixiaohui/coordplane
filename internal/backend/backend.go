@@ -619,7 +619,7 @@ func (b *Backend) handleOperatorTasks(w http.ResponseWriter, r *http.Request) {
 				rejected.Message,
 				capability.WithRepairHint("retry with a valid operator task create payload and loaded TeamConfig"),
 				capability.WithAllowedNextActions("operator.task.create"),
-				capability.WithRetryable(false),
+				capability.WithRetryable(operatorRejectionRetryable(rejected.Code)),
 			))
 			return
 		}
@@ -681,7 +681,7 @@ func (b *Backend) handleOperatorTaskStart(w http.ResponseWriter, r *http.Request
 				rejected.Message,
 				capability.WithRepairHint("retry with a valid operator task run and operator token"),
 				capability.WithAllowedNextActions("operator.task.start"),
-				capability.WithRetryable(false),
+				capability.WithRetryable(operatorRejectionRetryable(rejected.Code)),
 			))
 			return
 		}
@@ -716,6 +716,11 @@ func (b *Backend) handleOperatorTaskStart(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeTypedResponse(w, response)
+}
+
+func operatorRejectionRetryable(code string) bool {
+	return code == cpruntime.StartabilityCodeCLIBackendNotReady ||
+		code == cpruntime.StartabilityCodeRuntimeProfileNotReady
 }
 
 func (b *Backend) handleOperatorTaskWait(w http.ResponseWriter, r *http.Request, subject operator.Subject, taskRunID string) {

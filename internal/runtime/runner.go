@@ -231,6 +231,9 @@ func (r *Runner) startClaimed(ctx context.Context, agent teamconfig.AgentConfig,
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		var cleanupErrors []error
+		if err := r.markPreparedRuntimeFailed(cleanupCtx, attemptID, cause); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("fail prepared runtime: %w", err))
+		}
 		if err := r.failAttempt(cleanupCtx, attemptID, cause.Error()); err != nil {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("fail attempt: %w", err))
 		}
@@ -375,6 +378,26 @@ func (r *Runner) startClaimed(ctx context.Context, agent teamconfig.AgentConfig,
 		Env:           cloneStringMap(env),
 		ContainerName: prepared.ContainerName,
 	}, nil
+}
+
+func (r *Runner) markPreparedRuntimeFailed(ctx context.Context, attemptID string, cause error) error {
+	lastError := "runtime preparation failed"
+	if cause != nil {
+		lastError = cause.Error()
+	}
+	_, err := r.db.ExecContext(ctx, `
+UPDATE runtime_instances
+SET state = 'failed', last_error = ?, updated_at = ?
+WHERE attempt_id = ?
+  AND state IN ('preparing', 'ready', 'stopped')
+  AND EXISTS (
+    SELECT 1 FROM attempts
+    WHERE attempts.id = runtime_instances.attempt_id
+      AND attempts.status IN ('preparing', 'ready_to_launch')
+  )`,
+		lastError, formatTime(time.Now()), attemptID,
+	)
+	return err
 }
 
 func (r *Runner) finalizeOneShotExit(leaseID, attemptID string) error {
