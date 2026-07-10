@@ -1021,6 +1021,49 @@ func TestOperatorTaskTerminalPassedIsNotOverwrittenByPostCloseoutRuntimeTimeout(
 	}
 }
 
+func TestOperatorTaskCloseoutConvergesReleasedLeaseBookkeeping(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "coordplane.db")
+	app, err := backend.Open(ctx, backend.Config{
+		DBPath:            dbPath,
+		ListenAddr:        "127.0.0.1:0",
+		TeamConfigPath:    threeAgentFixturePath(t),
+		OperatorToken:     "operator-secret",
+		OperatorSubjectID: "ops-user",
+	})
+	if err != nil {
+		t.Fatalf("open backend with operator token: %v", err)
+	}
+	defer app.Close()
+
+	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest("operator-closeout-bookkeeping", nil), http.StatusOK))
+	taskRunID := stringField(t, created, "task_run_id")
+	rootContractID := stringField(t, created, "root_contract_id")
+	rootAssignmentID := stringField(t, created, "root_assignment_id")
+	rootStarted := decodeOperatorTaskData(t, postOperatorTaskStartRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{"idempotency_key": "start-closeout-bookkeeping"}, http.StatusOK))
+	rootLeaseID := stringField(t, rootStarted, "lease_id")
+	rootAttemptID := stringField(t, rootStarted, "attempt_id")
+	rootRouteID := stringField(t, rootStarted, "session_route_id")
+
+	if got := countRuntimeTokens(t, ctx, app.DB, rootLeaseID, rootAttemptID, "active"); got != 1 {
+		t.Fatalf("active root runtime tokens before closeout = %d, want 1", got)
+	}
+	if got := countActiveGuards(t, ctx, app.DB, rootLeaseID, rootAttemptID, "active"); got != 2 {
+		t.Fatalf("active root guards before closeout = %d, want 2", got)
+	}
+
+	completeRootWithPassingValidation(t, ctx, app, rootContractID, rootLeaseID)
+
+	assertAssignmentState(t, ctx, app.DB, rootAssignmentID, "returned", rootRouteID)
+	assertReleasedLeaseBookkeepingConverged(t, ctx, app.DB, rootLeaseID, rootAttemptID, rootRouteID)
+
+	evidence := decodeOperatorTaskData(t, getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK))
+	if evidence["status"] != "passed" {
+		t.Fatalf("evidence status = %#v, want passed after closeout bookkeeping convergence", evidence["status"])
+	}
+}
+
 func TestOperatorTaskWaitDispatchesQueuedLineageAndBuildsEvidence(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -3458,6 +3501,70 @@ SELECT COUNT(*)
 FROM leases
 WHERE assignment_id = ? AND state = 'active'`, assignmentID).Scan(&count); err != nil {
 		t.Fatalf("count active leases for assignment %s: %v", assignmentID, err)
+	}
+	return count
+}
+
+func assertReleasedLeaseBookkeepingConverged(t *testing.T, ctx context.Context, db *sql.DB, leaseID, attemptID, routeID string) {
+	t.Helper()
+	var leaseState string
+	if err := db.QueryRowContext(ctx, `SELECT state FROM leases WHERE id = ?`, leaseID).Scan(&leaseState); err != nil {
+		t.Fatalf("read lease %s: %v", leaseID, err)
+	}
+	if leaseState != "released" {
+		t.Fatalf("lease %s state = %s, want released", leaseID, leaseState)
+	}
+	var attemptStatus, endedAt string
+	if err := db.QueryRowContext(ctx, `
+SELECT status, COALESCE(ended_at, '')
+FROM attempts
+WHERE id = ? AND lease_id = ?`, attemptID, leaseID).Scan(&attemptStatus, &endedAt); err != nil {
+		t.Fatalf("read attempt %s: %v", attemptID, err)
+	}
+	if attemptStatus != "completed" || endedAt == "" {
+		t.Fatalf("attempt %s status/ended_at = %s/%q, want completed with ended_at", attemptID, attemptStatus, endedAt)
+	}
+	var routeState string
+	if err := db.QueryRowContext(ctx, `SELECT state FROM session_routes WHERE id = ?`, routeID).Scan(&routeState); err != nil {
+		t.Fatalf("read route %s: %v", routeID, err)
+	}
+	if routeState != "completed" {
+		t.Fatalf("route %s state = %s, want completed", routeID, routeState)
+	}
+	if got := countRuntimeTokens(t, ctx, db, leaseID, attemptID, "active"); got != 0 {
+		t.Fatalf("active runtime tokens for lease/attempt = %d, want 0", got)
+	}
+	if got := countRuntimeTokens(t, ctx, db, leaseID, attemptID, "revoked"); got != 1 {
+		t.Fatalf("revoked runtime tokens for lease/attempt = %d, want 1", got)
+	}
+	if got := countActiveGuards(t, ctx, db, leaseID, attemptID, "active"); got != 0 {
+		t.Fatalf("active guards for lease/attempt = %d, want 0", got)
+	}
+	if got := countActiveGuards(t, ctx, db, leaseID, attemptID, "released"); got != 2 {
+		t.Fatalf("released guards for lease/attempt = %d, want 2", got)
+	}
+}
+
+func countRuntimeTokens(t *testing.T, ctx context.Context, db *sql.DB, leaseID, attemptID, state string) int64 {
+	t.Helper()
+	var count int64
+	if err := db.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM runtime_tokens
+WHERE lease_id = ? AND attempt_id = ? AND state = ?`, leaseID, attemptID, state).Scan(&count); err != nil {
+		t.Fatalf("count runtime tokens for lease %s attempt %s state %s: %v", leaseID, attemptID, state, err)
+	}
+	return count
+}
+
+func countActiveGuards(t *testing.T, ctx context.Context, db *sql.DB, leaseID, attemptID, state string) int64 {
+	t.Helper()
+	var count int64
+	if err := db.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM active_guards
+WHERE lease_id = ? AND attempt_id = ? AND state = ?`, leaseID, attemptID, state).Scan(&count); err != nil {
+		t.Fatalf("count active guards for lease %s attempt %s state %s: %v", leaseID, attemptID, state, err)
 	}
 	return count
 }

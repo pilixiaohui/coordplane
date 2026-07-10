@@ -164,6 +164,50 @@ func TestRunnerActiveSessionGuardPreventsDuplicateStart(t *testing.T) {
 	}
 }
 
+func TestRunnerFinishWaitingKeepsRouteTokenAndGuardsResumable(t *testing.T) {
+	ctx := context.Background()
+	h := newRuntimeHarness(t, true)
+	addContract(t, ctx, h.coordination, "coordinator")
+	coordinator, err := h.runner.StartNext(ctx, "coordinator")
+	if err != nil {
+		t.Fatalf("start coordinator: %v", err)
+	}
+	callAccepted[coordination.Assignment](t, h.dispatcher, capability.Call{
+		CapabilityName: "contract.wait",
+		Subject:        agentSubject("coordinator"),
+		Scope:          mustRaw(t, map[string]any{"lease_id": coordinator.LeaseID}),
+		Input: mustRaw(t, map[string]any{
+			"reason":           "waiting for resumable work",
+			"waiting_for_ref":  "contract:pending-child",
+			"session_route_id": coordinator.Route.ID,
+		}),
+	})
+	if _, err := h.runner.FinishSession(ctx, cpruntime.TerminalReport{
+		AttemptID:     coordinator.AttemptID,
+		Status:        "waiting",
+		Summary:       "waiting for resume",
+		TranscriptRef: "waiting-transcript",
+	}); err != nil {
+		t.Fatalf("finish coordinator waiting: %v", err)
+	}
+
+	if state := routeState(t, ctx, h.db, coordinator.Route.ID); state != "waiting" {
+		t.Fatalf("coordinator route state = %s, want waiting", state)
+	}
+	if status := attemptRow(t, ctx, h.db, coordinator.AttemptID).Status; status != "waiting" {
+		t.Fatalf("coordinator attempt status = %s, want waiting", status)
+	}
+	if state := leaseState(t, ctx, h.db, coordinator.LeaseID); state != "active" {
+		t.Fatalf("coordinator lease state = %s, want active for resume", state)
+	}
+	if got := countRowsWhere(t, ctx, h.db, "runtime_tokens", "attempt_id = '"+coordinator.AttemptID+"' AND state = 'active'"); got != 1 {
+		t.Fatalf("active runtime tokens for waiting attempt = %d, want 1", got)
+	}
+	if got := countRowsWhere(t, ctx, h.db, "active_guards", "attempt_id = '"+coordinator.AttemptID+"' AND state = 'active'"); got != 2 {
+		t.Fatalf("active guards for waiting attempt = %d, want 2", got)
+	}
+}
+
 func TestRunnerDoesNotMarkRunningWhenExternalRuntimeIsNotReady(t *testing.T) {
 	ctx := context.Background()
 	h := newRuntimeHarness(t, false)
@@ -825,14 +869,23 @@ func TestSimplifiedTA13FakeCLIMultiAgentLoop(t *testing.T) {
 	if steers := h.fake.Steers(); len(steers) != 2 {
 		t.Fatalf("fake steers = %d, want 2", len(steers))
 	}
-	if reports := h.fake.TerminalReports(); len(reports) != 3 {
-		t.Fatalf("terminal reports = %d, want 3", len(reports))
+	if reports := h.fake.TerminalReports(); len(reports) != 0 {
+		t.Fatalf("terminal reports = %d, want no duplicate adapter finish after contract closeout", len(reports))
 	}
 	if got := countRowsWhere(t, ctx, h.db, "delivery_attempts", "1 = 1"); got != 0 {
 		t.Fatalf("delivery attempts = %d, want 0 because delivery service is out of scope", got)
 	}
 	if got := countRowsWhere(t, ctx, h.db, "attempts", "status = 'completed'"); got != 3 {
 		t.Fatalf("completed attempts = %d, want 3", got)
+	}
+	if got := countRowsWhere(t, ctx, h.db, "session_routes", "state = 'active'"); got != 0 {
+		t.Fatalf("active routes after closeout = %d, want 0", got)
+	}
+	if got := countRowsWhere(t, ctx, h.db, "runtime_tokens", "state = 'active'"); got != 0 {
+		t.Fatalf("active runtime tokens after closeout = %d, want 0", got)
+	}
+	if got := countRowsWhere(t, ctx, h.db, "active_guards", "state = 'active'"); got != 0 {
+		t.Fatalf("active guards after closeout = %d, want 0", got)
 	}
 }
 

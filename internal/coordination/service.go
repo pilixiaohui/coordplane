@@ -530,6 +530,9 @@ func (s *Service) CompleteContract(ctx context.Context, in CompleteContractInput
 		if _, err := tx.ExecContext(ctx, `UPDATE assignments SET state = 'returned', updated_at = ? WHERE id = ?`, now, scope.Assignment.ID); err != nil {
 			return fmt.Errorf("return assignment: %w", err)
 		}
+		if err := convergeReleasedLeaseBookkeeping(ctx, tx, in.LeaseID, now); err != nil {
+			return err
+		}
 		resultSummary := strings.TrimSpace(in.Summary)
 		if resultSummary == "" {
 			resultSummary = "contract satisfied"
@@ -572,6 +575,50 @@ func (s *Service) CompleteContract(ctx context.Context, in CompleteContractInput
 		return capability.Error[CompleteContractResult]("CONTRACT_COMPLETE_FAILED", err.Error(), false)
 	}
 	return capability.Accepted(result)
+}
+
+func convergeReleasedLeaseBookkeeping(ctx context.Context, tx *sql.Tx, leaseID, now string) error {
+	var leaseState string
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM leases WHERE id = ?`, leaseID).Scan(&leaseState); err != nil {
+		return fmt.Errorf("lookup released lease bookkeeping scope: %w", err)
+	}
+	if leaseState != "released" {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE attempts
+SET status = 'completed', ended_at = COALESCE(ended_at, ?)
+WHERE lease_id = ? AND status IN ('preparing', 'ready_to_launch', 'running')`,
+		now, leaseID,
+	); err != nil {
+		return fmt.Errorf("complete released lease attempts: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE session_routes
+SET state = 'completed', updated_at = ?
+WHERE id = (SELECT session_route_id FROM leases WHERE id = ?)
+  AND state = 'active'`,
+		now, leaseID,
+	); err != nil {
+		return fmt.Errorf("complete released lease route: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE runtime_tokens
+SET state = 'revoked', updated_at = ?
+WHERE lease_id = ? AND state = 'active'`,
+		now, leaseID,
+	); err != nil {
+		return fmt.Errorf("revoke released lease runtime tokens: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE active_guards
+SET state = 'released', updated_at = ?
+WHERE lease_id = ? AND state = 'active'`,
+		now, leaseID,
+	); err != nil {
+		return fmt.Errorf("release released lease active guards: %w", err)
+	}
+	return nil
 }
 
 func (s *Service) SubmitReport(ctx context.Context, in SubmitReportInput) (Evidence, error) {

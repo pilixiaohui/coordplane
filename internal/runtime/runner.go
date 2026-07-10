@@ -293,6 +293,9 @@ func (r *Runner) startClaimed(ctx context.Context, agent teamconfig.AgentConfig,
 			return failPreparedAttempt(err)
 		}
 	}
+	if err := r.convergeReleasedLeaseBookkeeping(ctx, next.Lease.ID, attemptID); err != nil {
+		return AssignmentSession{}, err
+	}
 	if err := r.ReleasePrepareLease(ctx, prepareLease.ID); err != nil {
 		return AssignmentSession{}, err
 	}
@@ -507,6 +510,13 @@ WHERE id = (SELECT assignment_id FROM leases WHERE id = ?) AND state = 'claimed'
 			if err := markRouteTerminalForLease(ctx, tx, current.LeaseID, report.Status, now); err != nil {
 				return err
 			}
+			if _, err := tx.ExecContext(ctx, `
+UPDATE runtime_tokens SET state = 'revoked', updated_at = ?
+WHERE attempt_id = ? AND state = 'active'`,
+				now, current.ID,
+			); err != nil {
+				return fmt.Errorf("revoke completed runtime tokens: %w", err)
+			}
 			if err := releaseActiveGuardsTx(ctx, tx, current.ID, now); err != nil {
 				return err
 			}
@@ -593,6 +603,51 @@ INSERT INTO attempts (
 		return err
 	})
 	return attemptID, err
+}
+
+func (r *Runner) convergeReleasedLeaseBookkeeping(ctx context.Context, leaseID, attemptID string) error {
+	return withTx(ctx, r.db, func(tx *sql.Tx) error {
+		return convergeReleasedLeaseBookkeepingTx(ctx, tx, leaseID, attemptID, formatTime(time.Now()))
+	})
+}
+
+func convergeReleasedLeaseBookkeepingTx(ctx context.Context, tx *sql.Tx, leaseID, attemptID, now string) error {
+	var leaseState string
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM leases WHERE id = ?`, leaseID).Scan(&leaseState); err != nil {
+		return fmt.Errorf("lookup released lease bookkeeping scope: %w", err)
+	}
+	if leaseState != "released" {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE attempts
+SET status = 'completed', ended_at = COALESCE(ended_at, ?)
+WHERE id = ? AND lease_id = ? AND status IN ('preparing', 'ready_to_launch', 'running')`,
+		now, attemptID, leaseID,
+	); err != nil {
+		return fmt.Errorf("complete released lease attempt: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE session_routes
+SET state = 'completed', updated_at = ?
+WHERE id = (SELECT session_route_id FROM leases WHERE id = ?)
+  AND state = 'active'`,
+		now, leaseID,
+	); err != nil {
+		return fmt.Errorf("complete released lease route: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE runtime_tokens
+SET state = 'revoked', updated_at = ?
+WHERE attempt_id = ? AND lease_id = ? AND state = 'active'`,
+		now, attemptID, leaseID,
+	); err != nil {
+		return fmt.Errorf("revoke released lease runtime tokens: %w", err)
+	}
+	if err := releaseActiveGuardsTx(ctx, tx, attemptID, now); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (r *Runner) bootstrapPrompt(ctx context.Context, agent teamconfig.AgentConfig, next coordination.AssignmentNextResult) (string, error) {
