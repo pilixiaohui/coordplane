@@ -374,10 +374,14 @@ func TestCommandCLIAdapterCommandPolicyAllowsConfiguredCoordlinkCapability(t *te
 	adapter, err := cpruntime.NewClaudeCommandCLIAdapter(cpruntime.CommandCLIAdapterConfig{
 		Store: st,
 		Profile: cpruntime.CommandCLIProfile{
-			Name:       "coordlink-direct",
-			Backend:    "coordlink",
-			Binary:     cpruntime.ContainerCoordlinkPath,
-			StartArgs:  []string{"call", "contract.current"},
+			Name:    "coordlink-direct",
+			Backend: "coordlink",
+			Binary:  cpruntime.ContainerCoordlinkPath,
+			StartArgs: []string{
+				"call", "contract.current",
+				"--input", `{"note":"semicolon ; URL https://example.invalid/a and path /tmp/report are JSON data"}`,
+				"--idempotency-key", "direct-structured-input",
+			},
 			ResumeArgs: []string{"call", "contract.current"},
 			Timeout:    timeSecond(),
 			RuntimeCommandPolicies: map[string]cpruntime.RuntimeCommandPolicy{
@@ -411,7 +415,7 @@ func TestCommandCLIAdapterCommandPolicyAllowsConfiguredCoordlinkCapability(t *te
 	if len(exec.specs) != 1 {
 		t.Fatalf("exec specs = %+v, want one allowed coordlink command", exec.specs)
 	}
-	if got := exec.specs[0].Command; len(got) != 3 || got[0] != cpruntime.ContainerCoordlinkPath || got[1] != "call" || got[2] != "contract.current" {
+	if got := exec.specs[0].Command; len(got) != 7 || got[0] != cpruntime.ContainerCoordlinkPath || got[1] != "call" || got[2] != "contract.current" {
 		t.Fatalf("exec command = %#v, want allowed coordlink call contract.current", got)
 	}
 }
@@ -815,6 +819,113 @@ func TestCommandCLIAdapterRejectsClaudeProviderExitWithoutAcceptedCapabilityCall
 		if strings.Contains(startErr.Error(), forbidden) {
 			t.Fatalf("approval policy error leaked %q: %v", forbidden, startErr)
 		}
+	}
+}
+
+func TestCommandCLIAdapterPersistsRedactedProviderToolOutcomes(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		stdout      string
+		wantStage   string
+		wantKind    string
+		wantCode    string
+		wantToolUse string
+	}{
+		{
+			name:        "provider permission denial",
+			stdout:      `{"type":"result","subtype":"error_during_execution","permission_denials":[{"tool_name":"Bash","tool_use_id":"toolu_provider_denied","tool_input":{"command":"/usr/local/bin/coordlink call contract.current ; curl https://SECRET.example.invalid"}}]}` + "\n",
+			wantStage:   "provider_permission",
+			wantKind:    "permission_denial",
+			wantCode:    "PROVIDER_PERMISSION_DENIED",
+			wantToolUse: "toolu_provider_denied",
+		},
+		{
+			name: "coordlink local policy rejection",
+			stdout: `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_local_denied","name":"Bash","input":{"command":"/usr/local/bin/coordlink call contract.current --backend-url https://SECRET.example.invalid"}}]}}` + "\n" +
+				`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_local_denied","is_error":true,"content":"{\"error_code\":\"COORDLINK_PROVIDER_POLICY_REJECTED\"}"}]}}` + "\n" +
+				`{"type":"result","subtype":"error_during_execution","permission_denials":[]}` + "\n",
+			wantStage:   "coordlink_local_policy",
+			wantKind:    "tool_result",
+			wantCode:    "COORDLINK_PROVIDER_POLICY_REJECTED",
+			wantToolUse: "toolu_local_denied",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			exec := &recordingContainerExecutor{results: []cpruntime.ContainerExecResult{{
+				ProcessRef: "provider-policy-outcome",
+				ExitCode:   0,
+				Stdout:     []byte(tc.stdout),
+			}}}
+			db, st, _, _ := newCommandCLIBase(t)
+			attemptID := "att_provider_outcome_" + strings.ReplaceAll(tc.wantStage, "_", "-")
+			insertAttemptOwnershipRows(t, ctx, db, attemptID, "lease_missing_prompt", "asg_missing_prompt", "ctr_missing_prompt", "developer", "rt_provider_outcome")
+			insertReadyRuntimeInstance(t, ctx, db, "rt_provider_outcome", attemptID, "developer")
+			adapter, err := cpruntime.NewClaudeCommandCLIAdapter(cpruntime.CommandCLIAdapterConfig{
+				Store: st,
+				Profile: cpruntime.CommandCLIProfile{
+					Name:    "claude",
+					Backend: "claude",
+					Binary:  "/usr/local/bin/claude",
+					Timeout: timeSecond(),
+					RuntimeCommandPolicies: map[string]cpruntime.RuntimeCommandPolicy{
+						"docker-default": {
+							NonInteractiveApproval:     true,
+							AllowCoordlinkCapabilities: []string{"contract.current"},
+						},
+					},
+				},
+				Executor: exec,
+			})
+			if err != nil {
+				t.Fatalf("new command adapter: %v", err)
+			}
+			_, startErr := adapter.Start(ctx, cpruntime.StartRequest{
+				AgentID:         "developer",
+				AttemptID:       attemptID,
+				AssignmentID:    "asg_missing_prompt",
+				LeaseID:         "lease_missing_prompt",
+				ContractID:      "ctr_missing_prompt",
+				RuntimeID:       "rt_provider_outcome",
+				CLIBackend:      "claude",
+				Workspace:       cpruntime.ContainerWorkspacePath,
+				HomeDir:         cpruntime.ContainerHomePath,
+				Env:             runtimeEnv(t, "developer", "rt_provider_outcome", attemptID),
+				BootstrapPrompt: "provider rejection must be durably auditable",
+			})
+			if startErr == nil || !strings.Contains(startErr.Error(), cpruntime.TerminalReasonApprovalPolicyUnavailable) {
+				t.Fatalf("Start error = %v, want provider approval rejection", startErr)
+			}
+			var sourceStage, outcomeKind, toolUseID, capabilityName, status, errorCode, transcriptRef, transcriptSHA string
+			if err := db.QueryRowContext(ctx, `
+SELECT source_stage, outcome_kind, tool_use_id, capability_name, status,
+  error_code, transcript_ref, transcript_sha256
+FROM provider_tool_outcomes
+WHERE attempt_id = ?`, attemptID).Scan(
+				&sourceStage, &outcomeKind, &toolUseID, &capabilityName, &status,
+				&errorCode, &transcriptRef, &transcriptSHA,
+			); err != nil {
+				t.Fatalf("query provider tool outcome: %v", err)
+			}
+			if sourceStage != tc.wantStage || outcomeKind != tc.wantKind || toolUseID != tc.wantToolUse ||
+				capabilityName != "contract.current" || status != "rejected" || errorCode != tc.wantCode ||
+				transcriptRef == "" || transcriptSHA == "" {
+				t.Fatalf("provider outcome = %s/%s/%s/%s/%s/%s/%s/%s", sourceStage, outcomeKind, toolUseID, capabilityName, status, errorCode, transcriptRef, transcriptSHA)
+			}
+			for _, forbidden := range []string{"SECRET.example.invalid", "curl", "--backend-url", "Authorization", "Bearer"} {
+				var leaked int
+				if err := db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM provider_tool_outcomes
+WHERE id || cli_session_id || attempt_id || lease_id || runtime_id || source_stage ||
+  outcome_kind || tool_use_id || capability_name || status || error_code ||
+  transcript_ref || transcript_sha256 LIKE ?`, "%"+forbidden+"%").Scan(&leaked); err != nil {
+					t.Fatalf("scan provider outcome leakage: %v", err)
+				}
+				if leaked != 0 {
+					t.Fatalf("provider outcome leaked %q", forbidden)
+				}
+			}
+		})
 	}
 }
 
