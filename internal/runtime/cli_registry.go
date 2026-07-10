@@ -100,6 +100,11 @@ func (r *CLIAdapterRegistry) CapabilitiesForBackend(backend string) (CLIAdapterC
 	return provider.Capabilities(), true
 }
 
+func (r *CLIAdapterRegistry) IsBackendReady(name string) bool {
+	_, err := r.adapter(name)
+	return err == nil
+}
+
 func (r *CLIAdapterRegistry) adapter(name string) (CLIAdapter, error) {
 	if name == "" {
 		name = "fake"

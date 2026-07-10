@@ -49,6 +49,10 @@ type startPreflightAdapter interface {
 	PreflightStart(context.Context, StartRequest) error
 }
 
+type cliBackendReadiness interface {
+	IsBackendReady(string) bool
+}
+
 func NewRunner(cfg RunnerConfig) (*Runner, error) {
 	if cfg.Store == nil {
 		return nil, errors.New("runtime runner: store is nil")
@@ -124,6 +128,9 @@ func (r *Runner) StartNext(ctx context.Context, agentID string) (AssignmentSessi
 	if err != nil {
 		return AssignmentSession{}, err
 	}
+	if err := r.ensureStartable(agent, runtimeBackend); err != nil {
+		return AssignmentSession{}, err
+	}
 	next, err := r.coordination.AssignmentNext(ctx, coordination.AssignmentNextInput{
 		AgentID:  agentID,
 		LeaseFor: time.Hour,
@@ -149,6 +156,9 @@ func (r *Runner) StartAssignment(ctx context.Context, agentID, assignmentID stri
 	if err != nil {
 		return AssignmentSession{}, err
 	}
+	if err := r.ensureStartable(agent, runtimeBackend); err != nil {
+		return AssignmentSession{}, err
+	}
 	next, err := r.coordination.AssignmentClaim(ctx, coordination.AssignmentClaimInput{
 		AgentID:      agentID,
 		AssignmentID: assignmentID,
@@ -158,6 +168,37 @@ func (r *Runner) StartAssignment(ctx context.Context, agentID, assignmentID stri
 		return AssignmentSession{}, err
 	}
 	return r.startClaimed(ctx, agent, runtimeBackend, next)
+}
+
+func (r *Runner) CheckStartable(_ context.Context, agentID string) error {
+	if agentID == "" {
+		return errors.New("runtime runner: agent id is required")
+	}
+	agent, ok := r.cfg.Agent(agentID)
+	if !ok {
+		return fmt.Errorf("runtime runner: agent %q is not declared in TeamConfig", agentID)
+	}
+	backend, err := r.runtimeForAgent(agent)
+	if err != nil {
+		return err
+	}
+	return r.ensureStartable(agent, backend)
+}
+
+func (r *Runner) ensureStartable(agent teamconfig.AgentConfig, backend RuntimeBackend) error {
+	if backend == nil || !backend.IsReady() {
+		return StartabilityError{
+			Code:    StartabilityCodeRuntimeProfileNotReady,
+			Message: fmt.Sprintf("runtime profile %q is not ready", agent.RuntimeProfile),
+		}
+	}
+	if readiness, ok := r.adapter.(cliBackendReadiness); ok && !readiness.IsBackendReady(agent.CLIBackend) {
+		return StartabilityError{
+			Code:    StartabilityCodeCLIBackendNotReady,
+			Message: fmt.Sprintf("CLI backend %q is not ready", agent.CLIBackend),
+		}
+	}
+	return nil
 }
 
 func (r *Runner) startClaimed(ctx context.Context, agent teamconfig.AgentConfig, runtimeBackend RuntimeBackend, next coordination.AssignmentNextResult) (AssignmentSession, error) {

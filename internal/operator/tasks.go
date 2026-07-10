@@ -26,6 +26,10 @@ type RunnerStarter interface {
 	StartAssignment(ctx context.Context, agentID, assignmentID string) (cpruntime.AssignmentSession, error)
 }
 
+type runnerStartability interface {
+	CheckStartable(context.Context, string) error
+}
+
 type Config struct {
 	Store            *store.Store
 	TeamConfig       teamconfig.Config
@@ -69,6 +73,7 @@ type CreateTaskInput struct {
 	TargetAgentID          string   `json:"target_agent_id,omitempty"`
 	TargetRole             string   `json:"target_role,omitempty"`
 	CompletionRequirements []string `json:"completion_requirements,omitempty"`
+	RequireStartable       bool     `json:"require_startable,omitempty"`
 }
 
 type CreateTaskResult struct {
@@ -124,6 +129,11 @@ func (s *Service) CreateTask(ctx context.Context, subject Subject, in CreateTask
 	normalized, err := s.normalizeInput(in)
 	if err != nil {
 		return CreateTaskResult{}, err
+	}
+	if normalized.RequireStartable {
+		if err := s.checkStartable(ctx, normalized.TargetAgentID); err != nil {
+			return CreateTaskResult{}, err
+		}
 	}
 	requestJSON, err := sanitizedRequestJSON(normalized)
 	if err != nil {
@@ -320,6 +330,9 @@ func (s *Service) StartTask(ctx context.Context, subject Subject, taskRunID stri
 		if errors.Is(err, coordination.ErrAssignmentNotFound) || errors.Is(err, coordination.ErrAssignmentNotClaimable) {
 			return StartTaskResult{}, reject("ROOT_ASSIGNMENT_NOT_STARTABLE", "operator task root assignment is not queued for its target agent")
 		}
+		if code, ok := cpruntime.ErrorStartabilityCode(err); ok {
+			return StartTaskResult{}, reject(code, err.Error())
+		}
 		return StartTaskResult{}, fmt.Errorf("operator task start: %w", err)
 	}
 	if session.Route.AssignmentID != root.RootAssignmentID {
@@ -333,6 +346,20 @@ func (s *Service) StartTask(ctx context.Context, subject Subject, taskRunID stri
 		return StartTaskResult{}, err
 	}
 	return out, nil
+}
+
+func (s *Service) checkStartable(ctx context.Context, agentID string) error {
+	admission, ok := s.runner.(runnerStartability)
+	if !ok {
+		return nil
+	}
+	if err := admission.CheckStartable(ctx, agentID); err != nil {
+		if code, ok := cpruntime.ErrorStartabilityCode(err); ok {
+			return reject(code, err.Error())
+		}
+		return err
+	}
+	return nil
 }
 
 func normalizedExecutionTimeout(in StartTaskInput) (time.Duration, error) {
@@ -743,6 +770,7 @@ func sanitizedRequestJSON(in CreateTaskInput) ([]byte, error) {
 		Objective              string   `json:"objective"`
 		TargetAgentID          string   `json:"target_agent_id"`
 		CompletionRequirements []string `json:"completion_requirements"`
+		RequireStartable       bool     `json:"require_startable,omitempty"`
 	}{
 		RunLabel:               in.RunLabel,
 		IdempotencyKey:         in.IdempotencyKey,
@@ -752,6 +780,7 @@ func sanitizedRequestJSON(in CreateTaskInput) ([]byte, error) {
 		Objective:              in.Objective,
 		TargetAgentID:          in.TargetAgentID,
 		CompletionRequirements: append([]string(nil), in.CompletionRequirements...),
+		RequireStartable:       in.RequireStartable,
 	})
 }
 

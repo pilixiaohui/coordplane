@@ -213,8 +213,8 @@ func TestRunnerDoesNotMarkRunningWhenExternalRuntimeIsNotReady(t *testing.T) {
 	h := newRuntimeHarness(t, false)
 	add := addContract(t, ctx, h.coordination, "builder")
 
-	if _, err := h.runner.StartNext(ctx, "builder"); err == nil {
-		t.Fatal("start next succeeded with not-ready external runtime")
+	if _, err := h.runner.StartNext(ctx, "builder"); err == nil || !strings.Contains(err.Error(), cpruntime.StartabilityCodeRuntimeProfileNotReady) {
+		t.Fatalf("start next error = %v, want %s", err, cpruntime.StartabilityCodeRuntimeProfileNotReady)
 	}
 	if len(h.fake.Starts()) != 0 {
 		t.Fatalf("fake adapter was started despite not-ready runtime")
@@ -222,8 +222,8 @@ func TestRunnerDoesNotMarkRunningWhenExternalRuntimeIsNotReady(t *testing.T) {
 	if got := countRowsWhere(t, ctx, h.db, "attempts", "status = 'running'"); got != 0 {
 		t.Fatalf("running attempts = %d, want 0", got)
 	}
-	if got := countRowsWhere(t, ctx, h.db, "attempts", "status = 'failed'"); got != 1 {
-		t.Fatalf("failed attempts = %d, want 1", got)
+	if got := countRowsWhere(t, ctx, h.db, "attempts", "1 = 1"); got != 0 {
+		t.Fatalf("attempts = %d, want 0 before readiness admission", got)
 	}
 	if got := countActiveLeases(t, ctx, h.db, add.AssignmentID); got != 0 {
 		t.Fatalf("active leases after prepare failure = %d, want 0", got)

@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -51,6 +52,31 @@ type RuntimeBackend interface {
 	Kind() string
 	IsReady() bool
 	Prepare(ctx context.Context, req PrepareRequest) (PreparedRuntime, error)
+}
+
+const (
+	StartabilityCodeCLIBackendNotReady     = "CLI_BACKEND_NOT_READY"
+	StartabilityCodeRuntimeProfileNotReady = "RUNTIME_PROFILE_NOT_READY"
+)
+
+type StartabilityError struct {
+	Code    string
+	Message string
+}
+
+func (e StartabilityError) Error() string {
+	if e.Message == "" {
+		return e.Code
+	}
+	return e.Code + ": " + e.Message
+}
+
+func ErrorStartabilityCode(err error) (string, bool) {
+	var classified StartabilityError
+	if !errors.As(err, &classified) || classified.Code == "" {
+		return "", false
+	}
+	return classified.Code, true
 }
 
 type PrepareRequest struct {
