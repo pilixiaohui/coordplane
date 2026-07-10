@@ -1140,7 +1140,7 @@ func TestListCLISessionsProjectsCanonicalProviderAuditRequirement(t *testing.T) 
 	ctx := context.Background()
 	db, _, _, _ := newCommandCLIBase(t)
 	insertAttemptOwnershipRows(t, ctx, db, "att_requirement_projection", "lease_missing_prompt", "asg_missing_prompt", "ctr_missing_prompt", "developer", "rt_requirement_projection")
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := time.Now().UTC().Format("2006-01-02T15:04:05.000000000Z07:00")
 	for _, row := range []struct {
 		id, requirement, reason, auditState, auditCode string
 		compatibleRequired                             int
