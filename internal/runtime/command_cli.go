@@ -175,6 +175,16 @@ func (a *CommandCLIAdapter) Start(ctx context.Context, req StartRequest) (StartR
 		_ = a.markSessionFailed(ctx, sessionRow.ID, err)
 		return StartResult{}, err
 	}
+	providerAudit, err := a.projectProviderToolOutcomes(ctx, sessionRow.ID, instance, result, transcriptRef)
+	if err != nil {
+		cause := NewRuntimeApprovalPolicyUnavailable("provider tool audit could not be completed")
+		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
+		return StartResult{}, errors.Join(cause, err)
+	}
+	if cause := providerAuditRejection(providerAudit); cause != nil {
+		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
+		return StartResult{}, cause
+	}
 	if cause, ok := a.approvalFailureCause(instance, result); ok {
 		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
 		return StartResult{}, cause
@@ -295,6 +305,16 @@ func (a *CommandCLIAdapter) Resume(ctx context.Context, req ResumeRequest) error
 	if err != nil {
 		_ = a.markSessionFailed(ctx, sessionRow.ID, err)
 		return err
+	}
+	providerAudit, err := a.projectProviderToolOutcomes(ctx, sessionRow.ID, instance, result, transcriptRef)
+	if err != nil {
+		cause := NewRuntimeApprovalPolicyUnavailable("provider tool audit could not be completed")
+		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
+		return errors.Join(cause, err)
+	}
+	if cause := providerAuditRejection(providerAudit); cause != nil {
+		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
+		return cause
 	}
 	if cause, ok := a.approvalFailureCause(instance, result); ok {
 		_ = a.markSessionExited(ctx, sessionRow.ID, result, transcriptRef, cause)
@@ -1178,6 +1198,7 @@ func ListCLISessions(ctx context.Context, db *sql.DB) ([]CLISession, error) {
 SELECT id, attempt_id, runtime_id, agent_id, cli_backend, profile_name,
   session_native_id, container_id, container_name, process_ref, state,
   start_reason, resume_of, exit_code, last_error, transcript_ref,
+  provider_audit_state, provider_audit_error_code,
   command_json, env_keys_json, started_at, COALESCE(ended_at, ''), updated_at
 FROM cli_sessions
 ORDER BY started_at, id`)
@@ -1207,6 +1228,8 @@ ORDER BY started_at, id`)
 			&exitCode,
 			&session.LastError,
 			&session.TranscriptRef,
+			&session.ProviderAuditState,
+			&session.ProviderAuditErrorCode,
 			&commandJSON,
 			&envKeysJSON,
 			&startedAt,

@@ -56,6 +56,7 @@ type TaskEvidence struct {
 	ValidationAssessments  []EvidenceValidationAssessment `json:"validation_assessments,omitempty"`
 	CapabilityCallCounts   map[string]int64               `json:"capability_call_counts"`
 	CapabilityCallOutcomes []EvidenceCapabilityOutcome    `json:"capability_call_outcomes"`
+	ProviderToolOutcomes   []EvidenceProviderToolOutcome  `json:"provider_tool_outcomes"`
 	CommunicationCounts    EvidenceCommunicationCounts    `json:"communication_counts"`
 	InspectSummary         map[string]int64               `json:"inspect_summary"`
 	Terminal               EvidenceTerminal               `json:"terminal"`
@@ -182,6 +183,18 @@ type EvidenceCapabilityOutcome struct {
 	Count      int64  `json:"count"`
 }
 
+type EvidenceProviderToolOutcome struct {
+	SourceStage      string `json:"source_stage"`
+	OutcomeKind      string `json:"outcome_kind"`
+	ToolUseID        string `json:"tool_use_id"`
+	Capability       string `json:"capability,omitempty"`
+	Status           string `json:"status"`
+	ErrorCode        string `json:"error_code,omitempty"`
+	Ordinal          int    `json:"ordinal"`
+	TranscriptRef    string `json:"transcript_ref"`
+	TranscriptSHA256 string `json:"transcript_sha256"`
+}
+
 type EvidenceTerminal struct {
 	Status                                string `json:"status"`
 	FailureSummary                        string `json:"failure_summary,omitempty"`
@@ -195,6 +208,7 @@ type EvidenceTerminal struct {
 	CompletionValidationPassCount         int64  `json:"completion_validation_pass_count"`
 	ValidationFailureCount                int64  `json:"validation_failure_count"`
 	CompletionBoundValidationFailureCount int64  `json:"completion_bound_validation_failure_count"`
+	ProviderAuditFailureCount             int64  `json:"provider_audit_failure_count"`
 	QueuedAssignmentCount                 int64  `json:"queued_assignment_count"`
 	ActiveAssignmentCount                 int64  `json:"active_assignment_count"`
 	ActiveLeaseCount                      int64  `json:"active_lease_count"`
@@ -422,6 +436,10 @@ func (s *Service) buildTaskEvidence(ctx context.Context, taskRunID string) (Task
 	if err != nil {
 		return TaskEvidence{}, err
 	}
+	providerOutcomes, err := s.evidenceProviderToolOutcomes(ctx, contractIDs)
+	if err != nil {
+		return TaskEvidence{}, err
+	}
 	communicationCounts, err := s.evidenceCommunicationCounts(ctx, contractIDs)
 	if err != nil {
 		return TaskEvidence{}, err
@@ -473,6 +491,7 @@ func (s *Service) buildTaskEvidence(ctx context.Context, taskRunID string) (Task
 		ValidationAssessments:  validations,
 		CapabilityCallCounts:   capabilityCounts,
 		CapabilityCallOutcomes: capabilityOutcomes,
+		ProviderToolOutcomes:   providerOutcomes,
 		CommunicationCounts:    communicationCounts,
 		InspectSummary:         inspectSummary,
 		Terminal:               terminal,
@@ -795,6 +814,43 @@ ORDER BY capability_name, status, error_code, retryable`, args...)
 	return out, rows.Err()
 }
 
+func (s *Service) evidenceProviderToolOutcomes(ctx context.Context, contractIDs []string) ([]EvidenceProviderToolOutcome, error) {
+	if len(contractIDs) == 0 {
+		return []EvidenceProviderToolOutcome{}, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT p.source_stage, p.outcome_kind, p.tool_use_id, p.capability_name,
+  p.status, p.error_code, p.ordinal, p.transcript_ref, p.transcript_sha256
+FROM provider_tool_outcomes p
+JOIN leases l ON l.id = p.lease_id
+JOIN assignments a ON a.id = l.assignment_id
+WHERE a.contract_id IN (`+placeholders(len(contractIDs))+`)
+ORDER BY p.created_at, p.id`, stringArgs(contractIDs)...)
+	if err != nil {
+		return nil, fmt.Errorf("lookup provider tool outcomes: %w", err)
+	}
+	defer rows.Close()
+	out := []EvidenceProviderToolOutcome{}
+	for rows.Next() {
+		var item EvidenceProviderToolOutcome
+		if err := rows.Scan(
+			&item.SourceStage,
+			&item.OutcomeKind,
+			&item.ToolUseID,
+			&item.Capability,
+			&item.Status,
+			&item.ErrorCode,
+			&item.Ordinal,
+			&item.TranscriptRef,
+			&item.TranscriptSHA256,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
 func (s *Service) evidenceCommunicationCounts(ctx context.Context, contractIDs []string) (EvidenceCommunicationCounts, error) {
 	out := EvidenceCommunicationCounts{
 		EnvelopesByKind: map[string]int64{},
@@ -856,6 +912,7 @@ func (s *Service) evidenceInspectSummary(ctx context.Context) (map[string]int64,
 		"evidence",
 		"validation_assessments",
 		"contract_completion_evidence",
+		"provider_tool_outcomes",
 	}
 	out := make(map[string]int64, len(tables))
 	for _, table := range tables {
@@ -945,6 +1002,16 @@ WHERE l.state = 'active' AND a.contract_id IN (`+placeholders(len(contractIDs))+
 	).Scan(&out.ActiveLeaseCount); err != nil {
 		return out, fmt.Errorf("count active leases: %w", err)
 	}
+	if err := s.db.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM cli_sessions cs
+JOIN attempts att ON att.id = cs.attempt_id
+JOIN leases l ON l.id = att.lease_id
+JOIN assignments a ON a.id = l.assignment_id
+WHERE cs.provider_audit_state = 'failed'
+  AND a.contract_id IN (`+placeholders(len(contractIDs))+`)`, args...).Scan(&out.ProviderAuditFailureCount); err != nil {
+		return out, fmt.Errorf("count provider audit failures: %w", err)
+	}
 	if out.GateMode == teamconfig.GateModeBusiness {
 		business, err := s.businessAcceptance(ctx, contractIDs)
 		if err != nil {
@@ -957,6 +1024,9 @@ WHERE l.state = 'active' AND a.contract_id IN (`+placeholders(len(contractIDs))+
 
 	unfinishedLineage := out.QueuedAssignmentCount > 0 || out.ActiveAssignmentCount > 0 || out.ActiveLeaseCount > 0
 	switch {
+	case out.RootContractStatus == "satisfied" && out.ProviderAuditFailureCount > 0:
+		out.Status = "failed"
+		out.FailureSummary = "provider tool audit is incomplete for a contract lineage session"
 	case out.RootContractStatus == "satisfied" && out.ReportCount == 0:
 		out.Status = "failed"
 		out.FailureSummary = "root task is satisfied without durable report evidence in its contract lineage"

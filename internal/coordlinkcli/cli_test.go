@@ -189,6 +189,11 @@ func TestCoordlinkCLIProviderPolicyStrictModeRejectsSuffixOverridesBeforeSideEff
 	); got != 1 {
 		t.Fatalf("strict idempotent child durable state count = %d, want child contract/assignment/mailbox", got)
 	}
+	richInput := `{"title":"strict rich JSON child","objective":"semicolon ; URL https://example.invalid/a and path /home/agent/report stay JSON data","target_agent_id":"developer"}`
+	richAdd := runCLI(t, env, "call", "contract.add", "--input", richInput, "--idempotency-key", "strict-rich-json")
+	if richAdd.code != 0 {
+		t.Fatalf("strict rich JSON contract.add exit=%d stdout=%s stderr=%s", richAdd.code, richAdd.stdout, richAdd.stderr)
+	}
 	beforeCalls := countRows(t, ctx, app.DB, "capability_calls")
 	beforeContracts := countRows(t, ctx, app.DB, "work_contracts")
 	beforeAssignments := countRows(t, ctx, app.DB, "assignments")
@@ -207,8 +212,9 @@ func TestCoordlinkCLIProviderPolicyStrictModeRejectsSuffixOverridesBeforeSideEff
 		{name: "trace override", args: []string{"call", "contract.current", "--trace-id", "attacker"}},
 		{name: "lease override", args: []string{"call", "contract.current", "--lease-id", "other"}},
 		{name: "scope override", args: []string{"call", "contract.current", "--scope", `{"lease_id":"other"}`}},
-		{name: "url in input", args: []string{"call", "contract.add", "--input", `{"title":"bad","objective":"https://attacker.invalid","target_agent_id":"builder"}`}},
-		{name: "host path in input", args: []string{"call", "contract.add", "--input", `{"title":"bad","objective":"/home/agent/secret","target_agent_id":"builder"}`}},
+		{name: "null input", args: []string{"call", "contract.add", "--input", `null`}},
+		{name: "array input", args: []string{"call", "contract.add", "--input", `[]`}},
+		{name: "duplicate input", args: []string{"call", "contract.add", "--input", `{}`, "--input", `{}`}},
 		{name: "shell metachar", args: []string{"call", "contract.current", "--idempotency-key", "ok; cat /home/agent/secret"}},
 	}
 	for _, tc := range cases {

@@ -137,6 +137,11 @@ var migrations = []migration{
 		Name:    "canonical contract completion evidence bindings",
 		SQL:     contractCompletionEvidenceSchemaSQL,
 	},
+	{
+		Version: "021_provider_tool_outcomes",
+		Name:    "redacted provider tool outcome projection",
+		SQL:     providerToolOutcomeSchemaSQL,
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) (MigrationResult, error) {

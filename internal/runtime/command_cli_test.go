@@ -464,10 +464,10 @@ func TestCommandCLIAdapterCommandPolicyDeniesUnauthorizedCommandsWithoutExecutor
 			forbidden: []string{"command.run"},
 		},
 		{
-			name:      "authorization header in argv",
+			name:      "transport override in argv",
 			binary:    cpruntime.ContainerCoordlinkPath,
-			startArgs: []string{"call", "contract.current", "--input", `{"header":"Authorization: Bearer SECRET_HEADER_SENTINEL"}`},
-			forbidden: []string{"SECRET_HEADER_SENTINEL", "Authorization"},
+			startArgs: []string{"call", "contract.current", "--backend-url", "https://SECRET.example.invalid"},
+			forbidden: []string{"SECRET.example.invalid", "--backend-url"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

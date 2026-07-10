@@ -177,17 +177,19 @@ func validateProviderPolicyCallArgs(capabilityName string, tail []string, getenv
 	if !providerPolicyCapabilityAllowed(capabilityName, getenv(providerPolicyAllowlistEnv)) {
 		return providerPolicyDenied()
 	}
+	seenInput := false
+	seenIdempotency := false
 	for i := 0; i < len(tail); i++ {
 		arg := tail[i]
-		if arg == "" || providerPolicyUnsafeSuffix(arg) {
-			return providerPolicyDenied()
-		}
-		if !strings.HasPrefix(arg, "--") {
+		if arg == "" || !strings.HasPrefix(arg, "--") {
 			return providerPolicyDenied()
 		}
 		name, value, hasValue := strings.Cut(arg, "=")
 		switch name {
 		case "--input":
+			if seenInput {
+				return providerPolicyDenied()
+			}
 			if !hasValue {
 				i++
 				if i >= len(tail) || strings.HasPrefix(tail[i], "--") {
@@ -195,10 +197,14 @@ func validateProviderPolicyCallArgs(capabilityName string, tail []string, getenv
 				}
 				value = tail[i]
 			}
-			if strings.TrimSpace(value) == "-" || providerPolicyUnsafeSuffix(value) {
+			if !providerPolicyJSONObject(value) {
 				return providerPolicyDenied()
 			}
+			seenInput = true
 		case "--idempotency-key":
+			if seenIdempotency {
+				return providerPolicyDenied()
+			}
 			if !hasValue {
 				i++
 				if i >= len(tail) || strings.HasPrefix(tail[i], "--") {
@@ -206,14 +212,46 @@ func validateProviderPolicyCallArgs(capabilityName string, tail []string, getenv
 				}
 				value = tail[i]
 			}
-			if providerPolicyUnsafeSuffix(value) {
+			if !providerPolicyIdempotencyKey(value) {
 				return providerPolicyDenied()
 			}
+			seenIdempotency = true
 		default:
 			return providerPolicyDenied()
 		}
 	}
 	return nil
+}
+
+func providerPolicyJSONObject(raw string) bool {
+	decoder := json.NewDecoder(bytes.NewBufferString(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return false
+	}
+	object, ok := value.(map[string]any)
+	return ok && object != nil
+}
+
+func providerPolicyIdempotencyKey(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for _, char := range value {
+		switch {
+		case char >= 'a' && char <= 'z':
+		case char >= 'A' && char <= 'Z':
+		case char >= '0' && char <= '9':
+		case char == '.', char == '_', char == '-', char == ':':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func validateProviderPolicyCallEnv(capabilityName string, cfg commonConfig, traceID, leaseID string, getenv EnvFunc) error {
@@ -268,53 +306,8 @@ func providerPolicyCapabilityAllowed(capabilityName, rawAllowlist string) bool {
 	return false
 }
 
-func providerPolicyUnsafeSuffix(value string) bool {
-	lower := strings.ToLower(value)
-	if strings.HasPrefix(strings.TrimSpace(value), "/") {
-		return true
-	}
-	for _, marker := range []string{
-		"authorization:",
-		"bearer ",
-		"coordplane_token",
-		"operator_token",
-		"anthropic_auth",
-		"api_key",
-		"secret=",
-		"token=",
-		"password=",
-		"http://",
-		"https://",
-		"://",
-		"/home/",
-		"/tmp/",
-		"/var/",
-		"/etc/",
-		"/root/",
-		"/workspace",
-		"../",
-		"..\\",
-		";",
-		"&&",
-		"||",
-		"|",
-		"$(",
-		"${",
-		"`",
-		">",
-		"<",
-		"\n",
-		"\r",
-	} {
-		if strings.Contains(lower, marker) {
-			return true
-		}
-	}
-	return false
-}
-
 func providerPolicyDenied() error {
-	return fmt.Errorf("coordlink provider policy denied suffix: only inline JSON --input and --idempotency-key are allowed; transport, identity, token, input-file, URL, host path, and shell metachar suffixes are denied")
+	return fmt.Errorf("COORDLINK_PROVIDER_POLICY_REJECTED: only inline JSON object --input and a restricted --idempotency-key are allowed")
 }
 
 func runSkill(ctx context.Context, args []string, getenv EnvFunc, stdout, stderr io.Writer) int {

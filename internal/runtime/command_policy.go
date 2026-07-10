@@ -1,7 +1,10 @@
 package runtime
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"io"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -134,17 +137,80 @@ func EvaluateCommandPolicy(command []string, policy RuntimeCommandPolicy) error 
 	if !isCoordlinkCommand(command) {
 		return NewRuntimeCommandPolicyDenied("runtime command_policy only allows coordlink capability calls")
 	}
-	if len(command) < 3 || command[1] != "call" {
-		return NewRuntimeCommandPolicyDenied("runtime command_policy only allows coordlink call invocations")
+	capabilityName, err := validateCoordlinkPolicyCallArgs(command[1:])
+	if err != nil {
+		return err
 	}
-	if containsForbiddenCommandMarker(command[1:]) {
-		return NewRuntimeCommandPolicyDenied("runtime command contains denied token, host path, DB, Docker, shell, header, or network marker")
-	}
-	capabilityName := strings.TrimSpace(command[2])
 	if capabilityName == "" || !slices.Contains(policy.AllowCoordlinkCapabilities, capabilityName) {
 		return NewRuntimeCommandPolicyDenied("coordlink capability is not in the runtime command_policy allowlist")
 	}
 	return nil
+}
+
+func validateCoordlinkPolicyCallArgs(args []string) (string, error) {
+	if len(args) < 2 || args[0] != "call" {
+		return "", NewRuntimeCommandPolicyDenied("runtime command_policy only allows coordlink call invocations")
+	}
+	capabilityName := strings.TrimSpace(args[1])
+	if capabilityName == "" || strings.HasPrefix(capabilityName, "-") {
+		return "", NewRuntimeCommandPolicyDenied("runtime command_policy requires a capability name")
+	}
+	seenInput := false
+	seenIdempotency := false
+	for index := 2; index < len(args); {
+		flag := args[index]
+		if index+1 >= len(args) {
+			return "", NewRuntimeCommandPolicyDenied("runtime coordlink call flag requires a value")
+		}
+		value := args[index+1]
+		switch flag {
+		case "--input":
+			if seenInput || !validJSONObject(value) {
+				return "", NewRuntimeCommandPolicyDenied("runtime coordlink --input must be one JSON object")
+			}
+			seenInput = true
+		case "--idempotency-key":
+			if seenIdempotency || !validPolicyIdempotencyKey(value) {
+				return "", NewRuntimeCommandPolicyDenied("runtime coordlink idempotency key is invalid")
+			}
+			seenIdempotency = true
+		default:
+			return "", NewRuntimeCommandPolicyDenied("runtime coordlink call contains an unsupported flag or positional argument")
+		}
+		index += 2
+	}
+	return capabilityName, nil
+}
+
+func validJSONObject(raw string) bool {
+	decoder := json.NewDecoder(bytes.NewBufferString(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return false
+	}
+	object, ok := value.(map[string]any)
+	return ok && object != nil
+}
+
+func validPolicyIdempotencyKey(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for _, char := range value {
+		switch {
+		case char >= 'a' && char <= 'z':
+		case char >= 'A' && char <= 'Z':
+		case char >= '0' && char <= '9':
+		case char == '.', char == '_', char == '-', char == ':':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func isCoordlinkCommand(command []string) bool {
@@ -167,39 +233,6 @@ func forbiddenCommandBinary(binary string) bool {
 	default:
 		return false
 	}
-}
-
-func containsForbiddenCommandMarker(args []string) bool {
-	for _, arg := range args {
-		lower := strings.ToLower(arg)
-		for _, marker := range []string{
-			"authorization:",
-			"bearer ",
-			"coordplane_token",
-			"operator_token",
-			"anthropic_auth",
-			"api_key",
-			"secret=",
-			"token=",
-			"password=",
-			"/var/run/docker.sock",
-			"/var/lib/",
-			"/home/",
-			"/tmp/",
-			"coordplane.db",
-			"sqlite",
-			"docker ",
-			"curl ",
-			"wget ",
-			"http://",
-			"https://",
-		} {
-			if strings.Contains(lower, marker) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func LooksLikeRuntimeApprovalPolicyFailure(text string) bool {
