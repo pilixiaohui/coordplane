@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1132,6 +1133,67 @@ func TestCommandCLIAdapterWithoutProviderPolicyReportsAuditNotRequired(t *testin
 	}
 	if len(sessions) != 1 || sessions[0].ProviderAuditRequired || sessions[0].ProviderAuditState != "not_required" {
 		t.Fatalf("non-policy CLI session = %+v, want audit not_required", sessions)
+	}
+}
+
+func TestListCLISessionsProjectsCanonicalProviderAuditRequirement(t *testing.T) {
+	ctx := context.Background()
+	db, _, _, _ := newCommandCLIBase(t)
+	insertAttemptOwnershipRows(t, ctx, db, "att_requirement_projection", "lease_missing_prompt", "asg_missing_prompt", "ctr_missing_prompt", "developer", "rt_requirement_projection")
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, row := range []struct {
+		id, requirement, reason, auditState, auditCode string
+		compatibleRequired                             int
+	}{
+		{id: "cli_requirement_not_required", requirement: "not_required", reason: "contract_policy_absent", auditState: "not_requested"},
+		{id: "cli_requirement_pending", requirement: "required", reason: "explicit_required", auditState: "not_requested", compatibleRequired: 1},
+		{id: "cli_requirement_failed", requirement: "required", reason: "legacy_audit_terminal", auditState: "failed", auditCode: "PROVIDER_AUDIT_PARSE_FAILED", compatibleRequired: 1},
+		{id: "cli_requirement_unresolved", requirement: "unresolved", reason: "scope_missing", auditState: "failed", auditCode: "PROVIDER_AUDIT_REQUIREMENT_UNRESOLVED", compatibleRequired: 1},
+	} {
+		if _, err := db.ExecContext(ctx, `
+INSERT INTO cli_sessions (
+  id, attempt_id, runtime_id, agent_id, cli_backend, profile_name,
+  session_native_id, state, start_reason, provider_audit_required,
+  provider_audit_requirement_state, provider_audit_requirement_reason,
+  provider_audit_state, provider_audit_error_code, started_at, updated_at
+) VALUES (?, 'att_requirement_projection', 'rt_requirement_projection', 'developer',
+  'claude', 'claude', ?, 'finished', 'requirement projection', ?, ?, ?, ?, ?, ?, ?)`,
+			row.id, "native_"+row.id, row.compatibleRequired, row.requirement, row.reason,
+			row.auditState, row.auditCode, now, now); err != nil {
+			t.Fatalf("insert %s: %v", row.id, err)
+		}
+	}
+	sessions, err := cpruntime.ListCLISessions(ctx, db)
+	if err != nil {
+		t.Fatalf("list CLI sessions: %v", err)
+	}
+	if len(sessions) != 4 {
+		t.Fatalf("CLI sessions = %d, want 4", len(sessions))
+	}
+	wantAudit := map[string]string{
+		"cli_requirement_not_required": "not_required",
+		"cli_requirement_pending":      "pending",
+		"cli_requirement_failed":       "failed",
+		"cli_requirement_unresolved":   "failed",
+	}
+	for _, session := range sessions {
+		raw, err := json.Marshal(session)
+		if err != nil {
+			t.Fatalf("marshal CLI session: %v", err)
+		}
+		var projection map[string]any
+		if err := json.Unmarshal(raw, &projection); err != nil {
+			t.Fatalf("decode CLI projection: %v", err)
+		}
+		if projection["provider_audit_requirement_state"] == "" || projection["provider_audit_requirement_reason"] == "" {
+			t.Fatalf("CLI projection lacks canonical requirement: %#v", projection)
+		}
+		if session.ProviderAuditState != wantAudit[session.ID] {
+			t.Fatalf("session %s audit projection = %s, want %s", session.ID, session.ProviderAuditState, wantAudit[session.ID])
+		}
+		if got := projection["provider_audit_required"].(bool); got != (projection["provider_audit_requirement_state"] != "not_required") {
+			t.Fatalf("session %s compatibility bool = %v for requirement %v", session.ID, got, projection["provider_audit_requirement_state"])
+		}
 	}
 }
 

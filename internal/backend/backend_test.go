@@ -120,6 +120,10 @@ exit 1
 	now := time.Now().UTC()
 	nowText := now.Format(time.RFC3339Nano)
 	futureLease := now.Add(time.Hour).Format(time.RFC3339Nano)
+	tx, err := app.DB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin crash-retry sentinel seed: %v", err)
+	}
 	for _, statement := range []struct {
 		query string
 		args  []any
@@ -139,10 +143,26 @@ exit 1
   'coordplane-crash-retry', 'alpine:3.20', 'bridge', 'stopped', '/workspace',
   '/home/agent', 'in_progress', 'crash recovery', 'cleanup-dead-process', ?, 1, ?, ?
 )`, []any{futureLease, nowText, nowText}},
+		{`INSERT INTO leases (id, assignment_id, agent_id, state, expires_at, created_at, updated_at) VALUES ('lease_crash_sentinel', 'asg_crash_retry', 'developer', 'released', ?, ?, ?)`, []any{now.Add(time.Hour).Format(time.RFC3339Nano), nowText, nowText}},
+		{`INSERT INTO attempts (id, lease_id, cli_backend, runtime_kind, start_reason, status, started_at, ended_at) VALUES ('att_crash_sentinel', 'lease_crash_sentinel', 'fake', 'docker', 'crash sentinel', 'completed', ?, ?)`, []any{nowText, nowText}},
+		{`INSERT INTO runtime_instances (
+  id, runtime_id, runtime_profile, runtime_kind, agent_id, attempt_id, lease_id,
+  container_id, container_name, image, network, state, workspace_path, home_path,
+  cleanup_state, cleanup_reason, created_at, updated_at
+) VALUES (
+  'ri_crash_sentinel', 'rt_crash_sentinel', 'docker-default', 'docker', 'developer',
+  'att_crash_sentinel', 'lease_crash_sentinel', 'container-crash-sentinel',
+  'coordplane-crash-sentinel', 'alpine:3.20', 'bridge', 'stopped', '/workspace',
+  '/home/agent', 'pending', 'tick barrier', ?, ?
+)`, []any{nowText, nowText}},
 	} {
-		if _, err := app.DB.ExecContext(ctx, statement.query, statement.args...); err != nil {
+		if _, err := tx.ExecContext(ctx, statement.query, statement.args...); err != nil {
+			_ = tx.Rollback()
 			t.Fatalf("seed crash-retry SQLite: %v", err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit crash-retry sentinel seed: %v", err)
 	}
 
 	var cleanupState string
@@ -152,11 +172,11 @@ exit 1
 	if cleanupState != "in_progress" {
 		t.Fatalf("cleanup before lease expiry = %s, want in_progress", cleanupState)
 	}
-	time.Sleep(30 * time.Millisecond)
-	if rawLog, err := os.ReadFile(dockerLog); err == nil && len(rawLog) != 0 {
-		t.Fatalf("Docker CLI ran before crash lease expiry: %q", string(rawLog))
-	} else if err != nil && !os.IsNotExist(err) {
-		t.Fatalf("read Docker CLI log before expiry: %v", err)
+	waitForEventCount(t, ctx, app.DB, "runtime.cleanup_removed", "rt_crash_sentinel", 1)
+	if rawLog, err := os.ReadFile(dockerLog); err != nil {
+		t.Fatalf("read Docker CLI sentinel log: %v", err)
+	} else if strings.Contains(string(rawLog), "coordplane-crash-retry") {
+		t.Fatalf("future-lease runtime was inspected before expiry: %q", string(rawLog))
 	}
 	expiredLease := now.Add(-time.Second).Format(time.RFC3339Nano)
 	if _, err := app.DB.ExecContext(ctx, `
@@ -189,6 +209,22 @@ WHERE id = 'ri_crash_retry'`, expiredLease, expiredLease); err != nil {
 	if got := string(rawLog); !strings.Contains(got, "inspect") || strings.Contains(got, "rm -f") {
 		t.Fatalf("Docker CLI calls = %q, want inspect NotFound and no remove", got)
 	}
+}
+
+func waitForEventCount(t *testing.T, ctx context.Context, db *sql.DB, eventType, aggregateID string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var count int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE event_type = ? AND aggregate_id = ?`, eventType, aggregateID).Scan(&count); err != nil {
+			t.Fatalf("query event barrier %s/%s: %v", eventType, aggregateID, err)
+		}
+		if count == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("event barrier %s/%s did not reach %d", eventType, aggregateID, want)
 }
 
 func TestPolicyGovernedClaudeAuthFailureAfterHTTPCompletionFailsAuditAndOperatorGate(t *testing.T) {
@@ -262,6 +298,89 @@ WHERE provider_audit_required = 1`); err != nil {
 	terminal := objectField(t, evidence, "terminal")
 	if terminal["provider_audit_failure_count"].(float64) != 1 {
 		t.Fatalf("operator terminal = %#v, want one required pending provider audit", terminal)
+	}
+}
+
+func TestOperatorEvidenceV3SeparatesProviderAuditPendingFailureAndUnresolved(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	app, err := backend.Open(ctx, backend.Config{
+		DBPath:            filepath.Join(dir, "coordplane.db"),
+		ListenAddr:        "127.0.0.1:0",
+		TeamConfigPath:    writeTeamConfig(t, dir),
+		OperatorToken:     "operator-secret",
+		OperatorSubjectID: "ops-user",
+	})
+	if err != nil {
+		t.Fatalf("open provider audit count backend: %v", err)
+	}
+	defer app.Close()
+	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest("operator-provider-audit-counts", map[string]any{
+		"team_id":         "accept-test",
+		"team_version":    1,
+		"target_agent_id": "builder",
+	}), http.StatusOK))
+	taskRunID := stringField(t, created, "task_run_id")
+	rootContractID := stringField(t, created, "root_contract_id")
+	rootAssignmentID := stringField(t, created, "root_assignment_id")
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := app.DB.ExecContext(ctx, `UPDATE work_contracts SET status = 'satisfied', updated_at = ? WHERE id = ?`, now, rootContractID); err != nil {
+		t.Fatalf("satisfy provider audit count contract: %v", err)
+	}
+	if _, err := app.DB.ExecContext(ctx, `UPDATE assignments SET state = 'returned', updated_at = ? WHERE id = ?`, now, rootAssignmentID); err != nil {
+		t.Fatalf("return provider audit count assignment: %v", err)
+	}
+	for _, row := range []struct {
+		id, requirement, reason, auditState, auditCode string
+		active                                         bool
+	}{
+		{id: "pending", requirement: "required", reason: "explicit_required", auditState: "not_requested", active: true},
+		{id: "failed", requirement: "required", reason: "legacy_audit_terminal", auditState: "failed", auditCode: "PROVIDER_AUDIT_PARSE_FAILED"},
+		{id: "unresolved", requirement: "unresolved", reason: "scope_missing", auditState: "failed", auditCode: "PROVIDER_AUDIT_REQUIREMENT_UNRESOLVED"},
+		{id: "not_required", requirement: "not_required", reason: "contract_policy_absent", auditState: "not_requested"},
+	} {
+		leaseState, attemptState, sessionState, endedAt := "released", "completed", "finished", now
+		if row.active {
+			leaseState, attemptState, sessionState, endedAt = "active", "running", "running", ""
+		}
+		leaseID := "lease_provider_count_" + row.id
+		attemptID := "att_provider_count_" + row.id
+		if _, err := app.DB.ExecContext(ctx, `
+INSERT INTO leases (id, assignment_id, agent_id, runtime_id, state, expires_at, created_at, updated_at)
+VALUES (?, ?, 'builder', ?, ?, '2027-01-01T00:00:00.000000000Z', ?, ?)`,
+			leaseID, rootAssignmentID, "rt_provider_count_"+row.id, leaseState, now, now); err != nil {
+			t.Fatalf("insert %s lease: %v", row.id, err)
+		}
+		if _, err := app.DB.ExecContext(ctx, `
+INSERT INTO attempts (id, lease_id, cli_backend, runtime_kind, start_reason, status, started_at, ended_at)
+VALUES (?, ?, 'claude', 'external', 'provider audit count', ?, ?, NULLIF(?, ''))`,
+			attemptID, leaseID, attemptState, now, endedAt); err != nil {
+			t.Fatalf("insert %s attempt: %v", row.id, err)
+		}
+		compatibleRequired := row.requirement != "not_required"
+		if _, err := app.DB.ExecContext(ctx, `
+INSERT INTO cli_sessions (
+  id, attempt_id, runtime_id, agent_id, cli_backend, profile_name,
+  session_native_id, state, start_reason, provider_audit_required,
+  provider_audit_requirement_state, provider_audit_requirement_reason,
+  provider_audit_state, provider_audit_error_code, started_at, ended_at, updated_at
+) VALUES (?, ?, ?, 'builder', 'claude', 'claude', ?, ?, 'provider audit count',
+  ?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?)`,
+			"cli_provider_count_"+row.id, attemptID, "rt_provider_count_"+row.id,
+			"native_provider_count_"+row.id, sessionState, compatibleRequired, row.requirement,
+			row.reason, row.auditState, row.auditCode, now, endedAt, now); err != nil {
+			t.Fatalf("insert %s CLI session: %v", row.id, err)
+		}
+	}
+
+	raw := getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK)
+	evidence := decodeOperatorTaskData(t, raw)
+	terminal := objectField(t, evidence, "terminal")
+	if evidence["status"] == "passed" ||
+		terminal["provider_audit_pending_count"] != float64(1) ||
+		terminal["provider_audit_failure_count"] != float64(1) ||
+		terminal["provider_audit_unresolved_count"] != float64(1) {
+		t.Fatalf("provider audit terminal = %#v, want pending/failure/unresolved=1 and non-passed", terminal)
 	}
 }
 

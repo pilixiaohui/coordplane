@@ -61,6 +61,29 @@ func TestSaveYAMLLoadsTeamConfigIntoCanonicalStore(t *testing.T) {
 	}
 }
 
+func TestSaveYAMLRejectsDifferentContentForExistingTeamVersion(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	repo := teamconfig.NewRepository(s)
+	if _, err := repo.SaveYAML(ctx, []byte(testTeamConfigYAML)); err != nil {
+		t.Fatalf("save initial TeamConfig: %v", err)
+	}
+	if _, err := repo.SaveYAML(ctx, []byte(testTeamConfigYAML)); err != nil {
+		t.Fatalf("idempotent TeamConfig save: %v", err)
+	}
+	changed := strings.Replace(testTeamConfigYAML, "builder role", "builder changed role", 1)
+	if _, err := repo.SaveYAML(ctx, []byte(changed)); err == nil || !strings.Contains(err.Error(), "version") {
+		t.Fatalf("same-version different TeamConfig error = %v, want immutable version rejection", err)
+	}
+	events, err := s.ListEvents(ctx, store.EventFilter{AggregateType: "team_config", AggregateID: "default-go-team:3"})
+	if err != nil {
+		t.Fatalf("list TeamConfig events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("TeamConfig snapshot events = %d, want one immutable snapshot", len(events))
+	}
+}
+
 func TestParseYAMLRejectsDuplicateAgents(t *testing.T) {
 	_, err := teamconfig.ParseYAML([]byte(`
 team_id: default-go-team
