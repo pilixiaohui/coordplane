@@ -919,6 +919,114 @@ LIMIT 1`, taskRunID).Scan(&errorCode, &retryable, &attemptID, &leaseID, &runtime
 	}
 }
 
+func TestAuthenticatedCallRejectsExplicitNullInputBeforeLeaseCanonicalization(t *testing.T) {
+	for _, capabilityName := range []string{"report.submit", "contract.complete"} {
+		t.Run(capabilityName, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			app, err := backend.Open(ctx, backend.Config{
+				DBPath:         filepath.Join(dir, "coordplane.db"),
+				ListenAddr:     "127.0.0.1:0",
+				TeamConfigPath: threeAgentFixturePath(t),
+			})
+			if err != nil {
+				t.Fatalf("open backend: %v", err)
+			}
+			defer app.Close()
+			session := startAuthSession(t, ctx, app, "coordinator")
+			work := authenticatedWorkStateForLease(t, ctx, app.DB, session.LeaseID)
+			if work.contractState != "open" || work.assignmentState != "claimed" || work.leaseState != "active" {
+				t.Fatalf("initial authenticated work state = %+v, want open/claimed/active", work)
+			}
+			if capabilityName == "contract.complete" {
+				if _, err := app.Coordination.SubmitReport(ctx, coordination.SubmitReportInput{
+					LeaseID: session.LeaseID,
+					AgentID: "coordinator",
+					Summary: "canonical unique report",
+					Content: "readable report content",
+				}); err != nil {
+					t.Fatalf("submit canonical report: %v", err)
+				}
+				if got := countRowsWhere(t, ctx, app.DB, "evidence", "contract_id = '"+work.contractID+"' AND kind = 'report'"); got != 1 {
+					t.Fatalf("report evidence for contract = %d, want exactly 1", got)
+				}
+			}
+
+			before := authenticatedBusinessCounts(t, ctx, app.DB)
+			raw := postCapabilityCallRaw(t, app.Handler, session.Token, capability.Call{
+				CapabilityName: capabilityName,
+				TraceID:        "authenticated-null-" + strings.ReplaceAll(capabilityName, ".", "-"),
+				Subject: capability.Subject{
+					Kind:      "agent",
+					ID:        "coordinator",
+					AgentID:   "coordinator",
+					RuntimeID: session.RuntimeID,
+				},
+				Input: json.RawMessage(`null`),
+			}, http.StatusBadRequest)
+			assertCapabilityRejected(t, raw, "INVALID_AUTHENTICATED_CALL")
+			assertAuthenticatedBusinessCounts(t, ctx, app.DB, before, capabilityName+" input:null")
+			if got := authenticatedWorkStateForLease(t, ctx, app.DB, session.LeaseID); got != work {
+				t.Fatalf("work state after %s input:null = %+v, want %+v", capabilityName, got, work)
+			}
+		})
+	}
+}
+
+func TestAuthenticatedContractCompletePreservesMissingAndEmptyInputCompatibility(t *testing.T) {
+	tests := []struct {
+		name  string
+		input json.RawMessage
+	}{
+		{name: "input omitted"},
+		{name: "empty object", input: json.RawMessage(`{}`)},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			app, err := backend.Open(ctx, backend.Config{
+				DBPath:         filepath.Join(dir, "coordplane.db"),
+				ListenAddr:     "127.0.0.1:0",
+				TeamConfigPath: threeAgentFixturePath(t),
+			})
+			if err != nil {
+				t.Fatalf("open backend: %v", err)
+			}
+			defer app.Close()
+			session := startAuthSession(t, ctx, app, "coordinator")
+			work := authenticatedWorkStateForLease(t, ctx, app.DB, session.LeaseID)
+			if _, err := app.Coordination.SubmitReport(ctx, coordination.SubmitReportInput{
+				LeaseID: session.LeaseID,
+				AgentID: "coordinator",
+				Summary: "unique compatibility report",
+				Content: "readable compatibility content",
+			}); err != nil {
+				t.Fatalf("submit compatibility report: %v", err)
+			}
+
+			raw := postCapabilityCallRaw(t, app.Handler, session.Token, capability.Call{
+				CapabilityName: "contract.complete",
+				TraceID:        "authenticated-complete-" + strings.ReplaceAll(tc.name, " ", "-"),
+				Subject: capability.Subject{
+					Kind:      "agent",
+					ID:        "coordinator",
+					AgentID:   "coordinator",
+					RuntimeID: session.RuntimeID,
+				},
+				Input: tc.input,
+			}, http.StatusOK)
+			assertCapabilityAccepted(t, raw)
+			got := authenticatedWorkStateForLease(t, ctx, app.DB, session.LeaseID)
+			if got.contractID != work.contractID || got.assignmentID != work.assignmentID ||
+				got.contractState != "satisfied" || got.assignmentState != "returned" || got.leaseState != "released" {
+				t.Fatalf("completed compatibility work state = %+v, want same work satisfied/returned/released", got)
+			}
+		})
+	}
+}
+
 func TestOperatorTaskWaitReturnsRuntimeApprovalBlockedEvidence(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -4305,6 +4413,82 @@ func assertCapabilityRejected(t *testing.T, raw []byte, code string) {
 	}
 	if response.Data != nil {
 		t.Fatalf("rejected response leaked data: %s", string(raw))
+	}
+}
+
+func assertCapabilityAccepted(t *testing.T, raw []byte) {
+	t.Helper()
+	var response capability.Response[json.RawMessage]
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatalf("decode accepted capability response: %v\nbody=%s", err, string(raw))
+	}
+	if response.Status != capability.StatusAccepted || response.Data == nil {
+		t.Fatalf("response = %+v, want accepted data; body=%s", response, string(raw))
+	}
+}
+
+type authenticatedWorkState struct {
+	contractID      string
+	assignmentID    string
+	contractState   string
+	assignmentState string
+	leaseState      string
+}
+
+func authenticatedWorkStateForLease(t *testing.T, ctx context.Context, db *sql.DB, leaseID string) authenticatedWorkState {
+	t.Helper()
+	var out authenticatedWorkState
+	if err := db.QueryRowContext(ctx, `
+SELECT c.id, a.id, c.status, a.state, l.state
+FROM leases l
+JOIN assignments a ON a.id = l.assignment_id
+JOIN work_contracts c ON c.id = a.contract_id
+WHERE l.id = ?`, leaseID).Scan(
+		&out.contractID,
+		&out.assignmentID,
+		&out.contractState,
+		&out.assignmentState,
+		&out.leaseState,
+	); err != nil {
+		t.Fatalf("read authenticated work state for lease %s: %v", leaseID, err)
+	}
+	return out
+}
+
+func authenticatedBusinessCounts(t *testing.T, ctx context.Context, db *sql.DB) map[string]int64 {
+	t.Helper()
+	tables := []string{
+		"work_contracts",
+		"assignments",
+		"leases",
+		"evidence",
+		"object_blobs",
+		"agent_communication_envelopes",
+		"mailbox_items",
+		"events",
+		"capability_calls",
+		"attempts",
+		"session_routes",
+		"runtime_instances",
+		"runtime_tokens",
+		"prepare_leases",
+		"active_guards",
+		"delivery_attempts",
+	}
+	out := make(map[string]int64, len(tables))
+	for _, table := range tables {
+		out[table] = countRows(t, ctx, db, table)
+	}
+	return out
+}
+
+func assertAuthenticatedBusinessCounts(t *testing.T, ctx context.Context, db *sql.DB, want map[string]int64, label string) {
+	t.Helper()
+	got := authenticatedBusinessCounts(t, ctx, db)
+	for table, wantCount := range want {
+		if got[table] != wantCount {
+			t.Fatalf("%s changed %s rows = %d, want %d", label, table, got[table], wantCount)
+		}
 	}
 }
 

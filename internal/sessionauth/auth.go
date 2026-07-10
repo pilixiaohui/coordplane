@@ -295,7 +295,7 @@ func decodeObject(raw json.RawMessage, label string) (map[string]any, capability
 		return nil, authRejected("INVALID_AUTHENTICATED_CALL", fmt.Sprintf("%s must be a JSON object", label), "retry with JSON object scope/input")
 	}
 	if values == nil {
-		values = map[string]any{}
+		return nil, authRejected("INVALID_AUTHENTICATED_CALL", fmt.Sprintf("%s must be a JSON object", label), "retry with JSON object scope/input")
 	}
 	return values, capability.Response[json.RawMessage]{}
 }
