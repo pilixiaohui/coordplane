@@ -27,7 +27,6 @@ import (
 	"coordplane/internal/coordlinkcli"
 	operator "coordplane/internal/operator"
 	cpruntime "coordplane/internal/runtime"
-	"coordplane/internal/store"
 	"coordplane/internal/validation"
 
 	_ "modernc.org/sqlite"
@@ -106,18 +105,21 @@ exit 1
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	db, err := sql.Open("sqlite", dbPath)
+	app, err := backend.Open(ctx, backend.Config{
+		DBPath:                 dbPath,
+		ListenAddr:             "127.0.0.1:0",
+		TeamConfigPath:         writeDockerCleanupTeamConfig(t, dir),
+		CoordlinkPath:          dockerPath,
+		RuntimeCleanupInterval: 10 * time.Millisecond,
+	})
 	if err != nil {
-		t.Fatalf("open crash-retry SQLite: %v", err)
+		t.Fatalf("open crash-retry backend: %v", err)
 	}
-	db.SetMaxOpenConns(1)
-	if _, err := store.New(db).Migrate(ctx); err != nil {
-		_ = db.Close()
-		t.Fatalf("migrate crash-retry SQLite: %v", err)
-	}
+	defer app.Close()
+
 	now := time.Now().UTC()
 	nowText := now.Format(time.RFC3339Nano)
-	futureLease := now.Add(250 * time.Millisecond).Format(time.RFC3339Nano)
+	futureLease := now.Add(time.Hour).Format(time.RFC3339Nano)
 	for _, statement := range []struct {
 		query string
 		args  []any
@@ -138,26 +140,10 @@ exit 1
   '/home/agent', 'in_progress', 'crash recovery', 'cleanup-dead-process', ?, 1, ?, ?
 )`, []any{futureLease, nowText, nowText}},
 	} {
-		if _, err := db.ExecContext(ctx, statement.query, statement.args...); err != nil {
-			_ = db.Close()
+		if _, err := app.DB.ExecContext(ctx, statement.query, statement.args...); err != nil {
 			t.Fatalf("seed crash-retry SQLite: %v", err)
 		}
 	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("close seeded crash-retry SQLite: %v", err)
-	}
-
-	app, err := backend.Open(ctx, backend.Config{
-		DBPath:                 dbPath,
-		ListenAddr:             "127.0.0.1:0",
-		TeamConfigPath:         writeDockerCleanupTeamConfig(t, dir),
-		CoordlinkPath:          dockerPath,
-		RuntimeCleanupInterval: 10 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatalf("open crash-retry backend: %v", err)
-	}
-	defer app.Close()
 
 	var cleanupState string
 	if err := app.DB.QueryRowContext(ctx, `SELECT cleanup_state FROM runtime_instances WHERE id = 'ri_crash_retry'`).Scan(&cleanupState); err != nil {
@@ -165,6 +151,19 @@ exit 1
 	}
 	if cleanupState != "in_progress" {
 		t.Fatalf("cleanup before lease expiry = %s, want in_progress", cleanupState)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if rawLog, err := os.ReadFile(dockerLog); err == nil && len(rawLog) != 0 {
+		t.Fatalf("Docker CLI ran before crash lease expiry: %q", string(rawLog))
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read Docker CLI log before expiry: %v", err)
+	}
+	expiredLease := now.Add(-time.Second).Format(time.RFC3339Nano)
+	if _, err := app.DB.ExecContext(ctx, `
+UPDATE runtime_instances
+SET cleanup_lease_expires_at = ?, updated_at = ?
+WHERE id = 'ri_crash_retry'`, expiredLease, expiredLease); err != nil {
+		t.Fatalf("expire crash cleanup lease: %v", err)
 	}
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -189,6 +188,74 @@ exit 1
 	}
 	if got := string(rawLog); !strings.Contains(got, "inspect") || strings.Contains(got, "rm -f") {
 		t.Fatalf("Docker CLI calls = %q, want inspect NotFound and no remove", got)
+	}
+}
+
+func TestPolicyGovernedClaudeAuthFailureAfterHTTPCompletionFailsAuditAndOperatorGate(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "coordplane.db")
+	coordlinkPath := filepath.Join(dir, "coordlink")
+	if err := os.WriteFile(coordlinkPath, []byte("fake coordlink"), 0o755); err != nil {
+		t.Fatalf("write coordlink fixture: %v", err)
+	}
+	t.Setenv("COORDPLANE_FAKE_DOCKER_CLAUDE_MODE", "coordlink-validation-auth-fail")
+	installFakeDockerCLI(t, dir)
+	server := httptest.NewUnstartedServer(nil)
+	app, err := backend.Open(ctx, backend.Config{
+		DBPath:            dbPath,
+		ListenAddr:        "127.0.0.1:0",
+		BackendURL:        "http://" + server.Listener.Addr().String(),
+		TeamConfigPath:    writeDockerClaudeValidationProviderPolicyTeamConfig(t, dir),
+		CoordlinkPath:     coordlinkPath,
+		ClaudeBinary:      "/usr/local/bin/claude",
+		OperatorToken:     "operator-secret",
+		OperatorSubjectID: "ops-user",
+	})
+	if err != nil {
+		server.Close()
+		t.Fatalf("open backend with policy-governed Claude fixture: %v", err)
+	}
+	defer app.Close()
+	server.Config.Handler = app.Handler
+	server.Start()
+	defer server.Close()
+
+	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest("operator-provider-auth-fail-after-complete", map[string]any{
+		"team_id":                 "docker-claude-provider-policy-validation",
+		"team_version":            1,
+		"target_agent_id":         "verifier",
+		"completion_requirements": []string{"report", "validation_assessment"},
+	}), http.StatusOK))
+	taskRunID := stringField(t, created, "task_run_id")
+	rootContractID := stringField(t, created, "root_contract_id")
+	startRaw := postOperatorTaskStartRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{
+		"idempotency_key": "start-provider-auth-fail-after-complete",
+	}, http.StatusInternalServerError)
+	assertNoOperatorSensitiveLeak(t, startRaw, "operator-secret", dbPath, "Authorization", "Bearer")
+
+	var contractStatus, auditState string
+	var auditRequired int
+	if err := app.DB.QueryRowContext(ctx, `SELECT status FROM work_contracts WHERE id = ?`, rootContractID).Scan(&contractStatus); err != nil {
+		t.Fatalf("query completed root contract: %v", err)
+	}
+	if err := app.DB.QueryRowContext(ctx, `
+SELECT provider_audit_required, provider_audit_state
+FROM cli_sessions
+WHERE attempt_id = (SELECT id FROM attempts ORDER BY started_at DESC LIMIT 1)`).Scan(&auditRequired, &auditState); err != nil {
+		t.Fatalf("query policy audit terminal state: %v", err)
+	}
+	if contractStatus != "satisfied" || auditRequired != 1 || auditState != "failed" {
+		t.Fatalf("post-completion provider state = contract:%s audit:%d/%s, want satisfied required/failed", contractStatus, auditRequired, auditState)
+	}
+	evidenceRaw := getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK)
+	evidence := decodeOperatorTaskData(t, evidenceRaw)
+	if evidence["status"] == "passed" {
+		t.Fatalf("operator evidence passed with required incomplete provider audit: %s", evidenceRaw)
+	}
+	terminal := objectField(t, evidence, "terminal")
+	if terminal["provider_audit_failure_count"].(float64) != 1 {
+		t.Fatalf("operator terminal = %#v, want one required incomplete provider audit", terminal)
 	}
 }
 
@@ -5779,7 +5846,7 @@ PY
         fi
         exit 0
       fi
-      if [ "${COORDPLANE_FAKE_DOCKER_CLAUDE_MODE:-}" = "coordlink-validation-gate" ] || [ "${COORDPLANE_FAKE_DOCKER_CLAUDE_MODE:-}" = "coordlink-validation-scope-reject" ]; then
+	      if [ "${COORDPLANE_FAKE_DOCKER_CLAUDE_MODE:-}" = "coordlink-validation-gate" ] || [ "${COORDPLANE_FAKE_DOCKER_CLAUDE_MODE:-}" = "coordlink-validation-scope-reject" ] || [ "${COORDPLANE_FAKE_DOCKER_CLAUDE_MODE:-}" = "coordlink-validation-auth-fail" ]; then
         case " $* " in
           *" --session-id "*|*" --resume "*)
             ;;
@@ -5910,7 +5977,11 @@ expect_status("contract.complete", "contract.complete", {
     "summary": "provider verifier completed root contract",
 }, "accepted")
 PY
-        exit 0
+	        if [ "${COORDPLANE_FAKE_DOCKER_CLAUDE_MODE:-}" = "coordlink-validation-auth-fail" ]; then
+	          printf 'claude auth unavailable: not logged in\n' >&2
+	          exit 1
+	        fi
+	        exit 0
       fi
       if [ "${COORDPLANE_FAKE_DOCKER_CLAUDE_MODE:-}" = "coordlink-calls" ] || [ "${COORDPLANE_FAKE_DOCKER_CLAUDE_MODE:-}" = "coordlink-current-only" ]; then
         case " $* " in

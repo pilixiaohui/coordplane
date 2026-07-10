@@ -421,6 +421,88 @@ WHERE attempt_id = ?`, now, session.AttemptID); err != nil {
 	}
 }
 
+func TestManagedDockerCleanupIsFencedByRuntimeProfile(t *testing.T) {
+	orders := [][]string{{"profile-a", "profile-b"}, {"profile-b", "profile-a"}}
+	for _, order := range orders {
+		t.Run(strings.Join(order, "_then_"), func(t *testing.T) {
+			ctx := context.Background()
+			db, _, _, _ := newCommandCLIBase(t)
+			now := time.Now().UTC().Format(time.RFC3339Nano)
+			clients := map[string]*recordingDockerClient{}
+			runtimes := map[string]*cpruntime.DockerRuntime{}
+			for _, profile := range []string{"profile-a", "profile-b"} {
+				suffix := strings.TrimPrefix(profile, "profile-")
+				agentID := "developer-" + suffix
+				contractID := "ctr-profile-" + suffix
+				assignmentID := "asg-profile-" + suffix
+				leaseID := "lease-profile-" + suffix
+				attemptID := "att-profile-" + suffix
+				runtimeID := "rt-profile-" + suffix
+				containerName := "coordplane-profile-" + suffix
+				for _, statement := range []struct {
+					query string
+					args  []any
+				}{
+					{`INSERT INTO agents (id, role, runtime_kind, cli_backend, created_at, updated_at) VALUES (?, 'developer', 'docker', 'fake', ?, ?)`, []any{agentID, now, now}},
+					{`INSERT INTO work_contracts (id, title, objective, target_kind, target_id, status, created_at, updated_at) VALUES (?, 'profile cleanup', 'profile cleanup', 'agent', ?, 'active', ?, ?)`, []any{contractID, agentID, now, now}},
+					{`INSERT INTO assignments (id, contract_id, assignee_agent_id, state, reason, created_at, updated_at) VALUES (?, ?, ?, 'returned', 'terminal', ?, ?)`, []any{assignmentID, contractID, agentID, now, now}},
+					{`INSERT INTO leases (id, assignment_id, agent_id, runtime_id, state, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, 'released', ?, ?, ?)`, []any{leaseID, assignmentID, agentID, runtimeID, now, now, now}},
+					{`INSERT INTO attempts (id, lease_id, cli_backend, runtime_kind, start_reason, status, started_at, ended_at) VALUES (?, ?, 'fake', 'docker', 'profile fence', 'completed', ?, ?)`, []any{attemptID, leaseID, now, now}},
+					{`INSERT INTO runtime_instances (
+  id, runtime_id, runtime_profile, runtime_kind, agent_id, attempt_id, lease_id,
+  container_id, container_name, image, network, state, workspace_path, home_path,
+  cleanup_state, cleanup_reason, created_at, updated_at
+) VALUES (?, ?, ?, 'docker', ?, ?, ?, ?, ?, 'alpine:3.20', 'bridge', 'stopped', '/workspace', '/home/agent', 'pending', 'profile fence', ?, ?)`,
+						[]any{"ri-profile-" + suffix, runtimeID, profile, agentID, attemptID, leaseID, "container-profile-" + suffix, containerName, now, now}},
+				} {
+					if _, err := db.ExecContext(ctx, statement.query, statement.args...); err != nil {
+						t.Fatalf("seed %s cleanup lineage: %v", profile, err)
+					}
+				}
+				client := &recordingDockerClient{containers: map[string]map[string]string{
+					containerName: {
+						"coordplane.managed":    "true",
+						"coordplane.runtime_id": runtimeID,
+						"coordplane.attempt_id": attemptID,
+						"coordplane.lease_id":   leaseID,
+					},
+				}}
+				clients[profile] = client
+				runtimes[profile] = cpruntime.NewDockerRuntime(cpruntime.DockerRuntimeConfig{
+					DB: db, ProfileName: profile, TeamID: "profile-fence", Image: "alpine:3.20",
+					RuntimeRoot: t.TempDir(), CoordlinkPath: "/usr/local/bin/coordlink", DBPath: ":memory:", Ready: true, Docker: client,
+				})
+			}
+
+			for _, profile := range order {
+				if err := runtimes[profile].ReconcileRuntimeCleanup(ctx); err != nil {
+					t.Fatalf("reconcile %s: %v", profile, err)
+				}
+			}
+			for _, profile := range []string{"profile-a", "profile-b"} {
+				suffix := strings.TrimPrefix(profile, "profile-")
+				wantContainer := "coordplane-profile-" + suffix
+				if got := clients[profile].inspected; len(got) == 0 {
+					t.Fatalf("%s inspected no owned container", profile)
+				} else {
+					for _, containerName := range got {
+						if containerName != wantContainer {
+							t.Fatalf("%s inspected cross-profile container %q, want only %q", profile, containerName, wantContainer)
+						}
+					}
+				}
+				var cleanupState string
+				if err := db.QueryRowContext(ctx, `SELECT cleanup_state FROM runtime_instances WHERE runtime_profile = ?`, profile).Scan(&cleanupState); err != nil {
+					t.Fatalf("query %s cleanup state: %v", profile, err)
+				}
+				if cleanupState != "removed" {
+					t.Fatalf("%s cleanup state = %s, want removed", profile, cleanupState)
+				}
+			}
+		})
+	}
+}
+
 func TestDockerRuntimePrepareFailureFailsClosedWithoutAdapterStart(t *testing.T) {
 	ctx := context.Background()
 	h := newDockerRuntimeHarness(t, errors.New("docker daemon unavailable"))
@@ -957,6 +1039,7 @@ type recordingDockerClient struct {
 	specs      []cpruntime.DockerContainerSpec
 	containers map[string]map[string]string
 	removed    []string
+	inspected  []string
 	removeErr  error
 	onInspect  func(context.Context)
 }
@@ -993,6 +1076,7 @@ func (c *recordingDockerClient) PrepareContainer(ctx context.Context, spec cprun
 }
 
 func (c *recordingDockerClient) InspectContainer(ctx context.Context, containerName string) (map[string]string, error) {
+	c.inspected = append(c.inspected, containerName)
 	if c.onInspect != nil {
 		onInspect := c.onInspect
 		c.onInspect = nil
