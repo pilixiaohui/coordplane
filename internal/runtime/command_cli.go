@@ -37,6 +37,7 @@ type CommandCLIProfile struct {
 	ResumeArgs             []string
 	Timeout                time.Duration
 	RuntimeCommandPolicies map[string]RuntimeCommandPolicy
+	AgentCapabilities      map[string][]string
 }
 
 type CommandCLIAdapterConfig struct {
@@ -90,10 +91,10 @@ func NewClaudeCommandCLIAdapter(cfg CommandCLIAdapterConfig) (*CommandCLIAdapter
 		profile.Backend = "claude"
 	}
 	if len(profile.StartArgs) == 0 {
-		profile.StartArgs = []string{"--session-id", "{{session_id}}", "--print"}
+		profile.StartArgs = []string{"--session-id", "{{session_id}}", "--print", "--output-format", "stream-json", "--verbose"}
 	}
 	if len(profile.ResumeArgs) == 0 {
-		profile.ResumeArgs = []string{"--resume", "{{session_id}}", "--print"}
+		profile.ResumeArgs = []string{"--resume", "{{session_id}}", "--print", "--output-format", "stream-json", "--verbose"}
 	}
 	if profile.Timeout <= 0 {
 		profile.Timeout = defaultCommandCLITimeout
@@ -116,7 +117,7 @@ func NewClaudeCommandCLIAdapter(cfg CommandCLIAdapterConfig) (*CommandCLIAdapter
 }
 
 func (a *CommandCLIAdapter) Capabilities() CLIAdapterCapabilities {
-	return CLIAdapterCapabilities{SupportsSameTurnSteer: false}
+	return CLIAdapterCapabilities{SupportsSameTurnSteer: false, ReturnsOnProcessExit: true}
 }
 
 func (a *CommandCLIAdapter) PreflightStart(ctx context.Context, req StartRequest) error {
@@ -548,7 +549,7 @@ func (a *CommandCLIAdapter) addProviderPolicyEnv(instance RuntimeInstance, comma
 	if a.profile.Backend != "claude" || isCoordlinkCommand(command) {
 		return nil
 	}
-	policy, ok := a.runtimeCommandPolicy(instance.RuntimeProfile)
+	policy, ok := a.runtimeCommandPolicy(instance)
 	if !ok {
 		return nil
 	}
@@ -580,7 +581,7 @@ func (a *CommandCLIAdapter) requireAuthProbe(instance RuntimeInstance) error {
 }
 
 func (a *CommandCLIAdapter) enforceCommandPolicy(instance RuntimeInstance, command []string) error {
-	policy, ok := a.runtimeCommandPolicy(instance.RuntimeProfile)
+	policy, ok := a.runtimeCommandPolicy(instance)
 	if !ok {
 		return nil
 	}
@@ -601,7 +602,7 @@ func (a *CommandCLIAdapter) withProviderCommandPolicy(instance RuntimeInstance, 
 	if a.profile.Backend != "claude" || isCoordlinkCommand(command) {
 		return command, persisted, nil
 	}
-	policy, ok := a.runtimeCommandPolicy(instance.RuntimeProfile)
+	policy, ok := a.runtimeCommandPolicy(instance)
 	if !ok {
 		return command, persisted, nil
 	}
@@ -739,7 +740,7 @@ func (a *CommandCLIAdapter) requireProviderPolicyProgress(ctx context.Context, i
 	if a.profile.Backend != "claude" || isCoordlinkCommand(command) {
 		return nil
 	}
-	policy, ok := a.runtimeCommandPolicy(instance.RuntimeProfile)
+	policy, ok := a.runtimeCommandPolicy(instance)
 	if !ok {
 		return nil
 	}
@@ -794,19 +795,32 @@ func scopeMatchesLease(scopeJSON, leaseID string) bool {
 	return value == leaseID
 }
 
-func (a *CommandCLIAdapter) runtimeCommandPolicy(runtimeProfile string) (RuntimeCommandPolicy, bool) {
+func (a *CommandCLIAdapter) runtimeCommandPolicy(instance RuntimeInstance) (RuntimeCommandPolicy, bool) {
 	if a == nil || len(a.profile.RuntimeCommandPolicies) == 0 {
 		return RuntimeCommandPolicy{}, false
 	}
-	policy, ok := a.profile.RuntimeCommandPolicies[runtimeProfile]
+	policy, ok := a.profile.RuntimeCommandPolicies[instance.RuntimeProfile]
 	if !ok {
 		return RuntimeCommandPolicy{}, true
+	}
+	if capabilities, exists := a.profile.AgentCapabilities[instance.AgentID]; exists {
+		allowed := make(map[string]bool, len(capabilities))
+		for _, capabilityName := range capabilities {
+			allowed[strings.TrimSpace(capabilityName)] = true
+		}
+		intersected := make([]string, 0, len(policy.AllowCoordlinkCapabilities))
+		for _, capabilityName := range policy.AllowCoordlinkCapabilities {
+			if allowed[strings.TrimSpace(capabilityName)] {
+				intersected = append(intersected, capabilityName)
+			}
+		}
+		policy.AllowCoordlinkCapabilities = intersected
 	}
 	return policy, true
 }
 
 func (a *CommandCLIAdapter) approvalFailureCause(instance RuntimeInstance, result ContainerExecResult) (error, bool) {
-	if _, ok := a.runtimeCommandPolicy(instance.RuntimeProfile); !ok {
+	if _, ok := a.runtimeCommandPolicy(instance); !ok {
 		return nil, false
 	}
 	if looksLikeInteractiveApprovalPrompt(result.Stdout) || looksLikeInteractiveApprovalPrompt(result.Stderr) {

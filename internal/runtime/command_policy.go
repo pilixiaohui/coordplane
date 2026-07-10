@@ -11,10 +11,12 @@ const (
 	FailureClassRuntimeApprovalBlocked = "runtime_approval_blocked"
 	FailureClassRuntimeCommandDenied   = "runtime_command_policy_denied"
 	FailureClassRuntimeExecTimeout     = "runtime_exec_timeout"
+	FailureClassAgentExited            = "agent_exited_without_terminal_action"
 
 	TerminalReasonApprovalPolicyUnavailable = "RUNTIME_APPROVAL_POLICY_UNAVAILABLE"
 	TerminalReasonCommandPolicyDenied       = "RUNTIME_COMMAND_POLICY_DENIED"
 	TerminalReasonRuntimeExecTimeout        = "RUNTIME_EXEC_TIMEOUT"
+	TerminalReasonAgentExitedWithoutAction  = "AGENT_EXITED_WITHOUT_TERMINAL_ACTION"
 )
 
 type RuntimeCommandPolicy struct {
@@ -70,6 +72,17 @@ func NewRuntimeExecTimeout(message string, cause error) error {
 		terminalReason: TerminalReasonRuntimeExecTimeout,
 		message:        message,
 		cause:          cause,
+	}
+}
+
+func NewAgentExitedWithoutTerminalAction(message string) error {
+	if strings.TrimSpace(message) == "" {
+		message = "one-shot provider exited without a terminal contract action"
+	}
+	return runtimePolicyError{
+		failureClass:   FailureClassAgentExited,
+		terminalReason: TerminalReasonAgentExitedWithoutAction,
+		message:        message,
 	}
 }
 

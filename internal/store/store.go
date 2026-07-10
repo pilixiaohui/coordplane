@@ -122,6 +122,11 @@ var migrations = []migration{
 		Name:    "operator root task run idempotency ledger",
 		SQL:     operatorTaskRunsSchemaSQL,
 	},
+	{
+		Version: "018_capability_audit_outcomes",
+		Name:    "capability audit outcomes and runtime scope",
+		SQL:     capabilityAuditOutcomeSchemaSQL,
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) (MigrationResult, error) {

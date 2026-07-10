@@ -233,6 +233,46 @@ func TestRunnerDoesNotMarkRunningWhenExternalRuntimeIsNotReady(t *testing.T) {
 	}
 }
 
+func TestRunnerCancellationUsesIndependentCleanupContext(t *testing.T) {
+	ctx := context.Background()
+	h := newRuntimeHarness(t, true)
+	add := addContract(t, ctx, h.coordination, "builder")
+	adapter := &blockingCLIAdapter{}
+	runner, err := cpruntime.NewRunner(cpruntime.RunnerConfig{
+		Store:         h.store,
+		Coordination:  h.coordination,
+		TeamConfig:    runtimeTeamConfig(),
+		Runtime:       cpruntime.ExternalRuntime{ID: "external_cancel", WorkspaceRoot: t.TempDir(), HomeRoot: t.TempDir(), Ready: true},
+		Adapter:       adapter,
+		BackendURL:    "http://coordplane.test",
+		WorkspaceName: "cancel-test",
+	})
+	if err != nil {
+		t.Fatalf("new cancellation runner: %v", err)
+	}
+
+	startCtx, cancel := context.WithTimeout(ctx, 5*time.Millisecond)
+	defer cancel()
+	if _, err := runner.StartNext(startCtx, "builder"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("start cancellation error = %v, want context deadline exceeded", err)
+	}
+	if got := assignmentState(t, ctx, h.db, add.AssignmentID); got != "queued" {
+		t.Fatalf("assignment after cancelled start = %s, want queued", got)
+	}
+	if got := countActiveLeases(t, ctx, h.db, add.AssignmentID); got != 0 {
+		t.Fatalf("active leases after cancelled start = %d, want 0", got)
+	}
+	if got := countRowsWhere(t, ctx, h.db, "attempts", "status = 'failed'"); got != 1 {
+		t.Fatalf("failed attempts after cancelled start = %d, want 1", got)
+	}
+	if got := countRowsWhere(t, ctx, h.db, "runtime_tokens", "state = 'active'"); got != 0 {
+		t.Fatalf("active tokens after cancelled start = %d, want 0", got)
+	}
+	if got := countRowsWhere(t, ctx, h.db, "active_guards", "state = 'active'"); got != 0 {
+		t.Fatalf("active guards after cancelled start = %d, want 0", got)
+	}
+}
+
 func TestRunnerProcessesFallbackResumeQueueWithPinnedRouteAndDuplicateRecoveryIsIdle(t *testing.T) {
 	ctx := context.Background()
 	h := newRuntimeHarness(t, true)
@@ -896,6 +936,21 @@ type runtimeHarness struct {
 	dispatcher   *policy.Dispatcher
 	runner       *cpruntime.Runner
 	fake         *cpruntime.FakeCLIAdapter
+}
+
+type blockingCLIAdapter struct{}
+
+func (a *blockingCLIAdapter) Start(ctx context.Context, req cpruntime.StartRequest) (cpruntime.StartResult, error) {
+	<-ctx.Done()
+	return cpruntime.StartResult{}, ctx.Err()
+}
+
+func (a *blockingCLIAdapter) Steer(context.Context, cpruntime.SteerRequest) error {
+	return nil
+}
+
+func (a *blockingCLIAdapter) Finish(context.Context, cpruntime.TerminalReport) error {
+	return nil
 }
 
 func newRuntimeHarness(t *testing.T, runtimeReady bool) runtimeHarness {

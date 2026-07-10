@@ -167,6 +167,11 @@ func (c Config) Validate() error {
 		if err := validateRolePromptRef(agent.ID, agent.RolePromptRef); err != nil {
 			return err
 		}
+		if profile, ok := c.RuntimeProfiles[agent.RuntimeProfile]; ok && profile.Kind == "docker" && agent.CLIBackend == "claude" {
+			if err := validateAgentProviderCapabilities(agent, profile.CommandPolicy); err != nil {
+				return err
+			}
+		}
 	}
 	for name, profile := range c.RuntimeProfiles {
 		if err := validateRuntimeCommandPolicy(name, profile.CommandPolicy); err != nil {
@@ -392,6 +397,23 @@ func validateRuntimeCommandPolicy(profileName string, policy RuntimeCommandPolic
 			return fmt.Errorf("teamconfig: runtime profile %q command_policy duplicates coordlink capability %q", profileName, capabilityName)
 		}
 		seen[capabilityName] = true
+	}
+	return nil
+}
+
+func validateAgentProviderCapabilities(agent AgentConfig, policy RuntimeCommandPolicy) error {
+	if !policy.NonInteractiveApproval || len(policy.AllowCoordlinkCapabilities) == 0 {
+		return fmt.Errorf("teamconfig: docker Claude agent %q requires non_interactive_approval and an explicit provider capability allowlist", agent.ID)
+	}
+	allowed := make(map[string]bool, len(policy.AllowCoordlinkCapabilities))
+	for _, capabilityName := range policy.AllowCoordlinkCapabilities {
+		allowed[strings.TrimSpace(capabilityName)] = true
+	}
+	for _, capabilityName := range agent.Capabilities {
+		capabilityName = strings.TrimSpace(capabilityName)
+		if capabilityName != "" && !allowed[capabilityName] {
+			return fmt.Errorf("teamconfig: docker Claude agent %q declares capability %q but runtime provider policy does not allow it", agent.ID, capabilityName)
+		}
 	}
 	return nil
 }

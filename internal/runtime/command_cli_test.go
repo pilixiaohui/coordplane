@@ -21,7 +21,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func TestCommandCLIAdapterStartsClaudeInsideDockerAndStoresTranscriptRef(t *testing.T) {
+func TestCommandCLIAdapterExitWithoutTerminalActionConvergesFailure(t *testing.T) {
 	ctx := context.Background()
 	exec := &recordingContainerExecutor{results: []cpruntime.ContainerExecResult{{
 		ProcessRef: "exec-start",
@@ -31,9 +31,9 @@ func TestCommandCLIAdapterStartsClaudeInsideDockerAndStoresTranscriptRef(t *test
 	h := newCommandCLIHarness(t, exec)
 	addContract(t, ctx, h.coordination, "developer")
 
-	session, err := h.runner.StartNext(ctx, "developer")
-	if err != nil {
-		t.Fatalf("start command CLI: %v", err)
+	_, err := h.runner.StartNext(ctx, "developer")
+	if err == nil || !strings.Contains(err.Error(), "AGENT_EXITED_WITHOUT_TERMINAL_ACTION") {
+		t.Fatalf("start command CLI error = %v, want terminal-action convergence failure", err)
 	}
 	if len(exec.specs) != 1 {
 		t.Fatalf("container exec calls = %d, want 1", len(exec.specs))
@@ -44,6 +44,9 @@ func TestCommandCLIAdapterStartsClaudeInsideDockerAndStoresTranscriptRef(t *test
 	}
 	if len(spec.Command) == 0 || spec.Command[0] != "/usr/local/bin/claude" || !contains(spec.Command, "--session-id") {
 		t.Fatalf("exec command = %#v, want claude --session-id", spec.Command)
+	}
+	if !contains(spec.Command, "--verbose") || !contains(spec.Command, "stream-json") {
+		t.Fatalf("exec command = %#v, want full stream-json provider transcript", spec.Command)
 	}
 	if !strings.Contains(spec.Stdin, cpruntime.ContainerCoordlinkPath) {
 		t.Fatalf("bootstrap stdin missing coordlink protocol: %s", spec.Stdin)
@@ -57,15 +60,18 @@ func TestCommandCLIAdapterStartsClaudeInsideDockerAndStoresTranscriptRef(t *test
 		t.Fatalf("exec env = %#v, want scoped runtime identity and container HOME", spec.Env)
 	}
 
-	attempt := attemptRow(t, ctx, h.db, session.AttemptID)
-	if attempt.CLIBackend != "claude" || attempt.RuntimeKind != "docker" ||
-		attempt.Status != "running" || attempt.SessionNativeID == "" ||
-		!strings.HasPrefix(attempt.TranscriptRef, "obj_sha256_") {
-		t.Fatalf("attempt = %+v, want running claude docker attempt with object transcript ref", attempt)
+	var attemptID, leaseID, assignmentID, attemptStatus, leaseStatus, assignmentStatus, transcriptRef string
+	if err := h.db.QueryRowContext(ctx, `
+SELECT att.id, l.id, l.assignment_id, att.status, l.state, a.state, COALESCE(att.transcript_ref, '')
+FROM attempts att
+JOIN leases l ON l.id = att.lease_id
+JOIN assignments a ON a.id = l.assignment_id
+ORDER BY att.started_at DESC, att.id DESC
+LIMIT 1`).Scan(&attemptID, &leaseID, &assignmentID, &attemptStatus, &leaseStatus, &assignmentStatus, &transcriptRef); err != nil {
+		t.Fatalf("read converged one-shot state: %v", err)
 	}
-	route := routeRow(t, ctx, h.db, session.Route.ID)
-	if route.CLIBackend != "claude" || route.SessionNativeID != attempt.SessionNativeID {
-		t.Fatalf("route = %+v, want pinned claude native session", route)
+	if attemptStatus != "failed" || leaseStatus != "released" || assignmentStatus != "queued" || !strings.HasPrefix(transcriptRef, "obj_sha256_") {
+		t.Fatalf("one-shot state = attempt:%s lease:%s assignment:%s transcript:%s", attemptStatus, leaseStatus, assignmentStatus, transcriptRef)
 	}
 	cliSessions, err := cpruntime.ListCLISessions(ctx, h.db)
 	if err != nil {
@@ -76,8 +82,7 @@ func TestCommandCLIAdapterStartsClaudeInsideDockerAndStoresTranscriptRef(t *test
 	}
 	cli := cliSessions[0]
 	if cli.State != "exited" || cli.StartReason != "start" ||
-		cli.SessionNativeID != attempt.SessionNativeID ||
-		cli.TranscriptRef != attempt.TranscriptRef ||
+		cli.TranscriptRef != transcriptRef ||
 		cli.ContainerName == "" ||
 		cli.ExitCode == nil || *cli.ExitCode != 0 {
 		t.Fatalf("cli session = %+v, want exited start evidence linked to attempt", cli)
@@ -87,6 +92,12 @@ func TestCommandCLIAdapterStartsClaudeInsideDockerAndStoresTranscriptRef(t *test
 		if strings.Contains(raw, forbidden) {
 			t.Fatalf("cli inspect evidence leaked forbidden value %q: %s", forbidden, raw)
 		}
+	}
+	if got := countRowsWhere(t, ctx, h.db, "runtime_tokens", "attempt_id = '"+attemptID+"' AND state = 'active'"); got != 0 {
+		t.Fatalf("active runtime tokens after one-shot exit = %d, want 0", got)
+	}
+	if got := countRowsWhere(t, ctx, h.db, "active_guards", "attempt_id = '"+attemptID+"' AND state = 'active'"); got != 0 {
+		t.Fatalf("active guards after one-shot exit = %d, want 0", got)
 	}
 	if got := countRowsWhere(t, ctx, h.db, "events", "event_type IN ('cli.start_requested', 'cli.process_started', 'cli.session_id_captured', 'cli.exited')"); got != 4 {
 		t.Fatalf("cli events = %d, want start/process/session/exited", got)
@@ -99,7 +110,21 @@ func TestCommandCLIAdapterResumeUsesLightweightMailboxSignal(t *testing.T) {
 		{ProcessRef: "exec-start", ExitCode: 0, Stdout: []byte("started")},
 		{ProcessRef: "exec-resume", ExitCode: 0, Stdout: []byte("resumed")},
 	}}
+	var coordinationService *coordination.Service
+	exec.onExec = func(spec cpruntime.ContainerExecSpec) {
+		if coordinationService == nil {
+			return
+		}
+		if _, err := coordinationService.WaitContract(ctx, coordination.WaitContractInput{
+			LeaseID: spec.Env["COORDPLANE_LEASE_ID"],
+			AgentID: spec.Env["COORDPLANE_AGENT_ID"],
+			Reason:  "waiting for resumable work",
+		}); err != nil {
+			t.Fatalf("record contract.wait during one-shot exec: %v", err)
+		}
+	}
 	h := newCommandCLIHarness(t, exec)
+	coordinationService = h.coordination
 	addContract(t, ctx, h.coordination, "developer")
 
 	session, err := h.runner.StartNext(ctx, "developer")
@@ -532,6 +557,9 @@ func TestCommandCLIAdapterAppliesClaudeProviderPolicyAndRequiresAcceptedCapabili
 					AllowCoordlinkCapabilities: []string{"contract.current", "contract.add"},
 				},
 			},
+			AgentCapabilities: map[string][]string{
+				"developer": {"contract.current"},
+			},
 		},
 		Executor: exec,
 	})
@@ -566,7 +594,6 @@ func TestCommandCLIAdapterAppliesClaudeProviderPolicyAndRequiresAcceptedCapabili
 		"--permission-mode\ndontAsk",
 		"--tools\nBash",
 		"Bash(" + cpruntime.ContainerCoordlinkPath + " call contract.current *)",
-		"Bash(" + cpruntime.ContainerCoordlinkPath + " call contract.add *)",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("provider command = %#v, missing %q", command, want)
@@ -581,8 +608,11 @@ func TestCommandCLIAdapterAppliesClaudeProviderPolicyAndRequiresAcceptedCapabili
 	if env["COORDPLANE_PROVIDER_POLICY_MODE"] != "strict_coordlink_call" {
 		t.Fatalf("provider policy mode env = %q, want strict_coordlink_call", env["COORDPLANE_PROVIDER_POLICY_MODE"])
 	}
-	if env["COORDPLANE_PROVIDER_ALLOWED_CAPABILITIES"] != "contract.add,contract.current" {
-		t.Fatalf("provider allowlist env = %q, want sorted contract.add,contract.current", env["COORDPLANE_PROVIDER_ALLOWED_CAPABILITIES"])
+	if strings.Contains(joined, "call contract.add") {
+		t.Fatalf("provider command widened beyond agent capabilities: %#v", command)
+	}
+	if env["COORDPLANE_PROVIDER_ALLOWED_CAPABILITIES"] != "contract.current" {
+		t.Fatalf("provider allowlist env = %q, want agent/profile intersection", env["COORDPLANE_PROVIDER_ALLOWED_CAPABILITIES"])
 	}
 	if env["COORDPLANE_PROVIDER_AUDIT_TRACE_ID"] == "" ||
 		env["COORDPLANE_PROVIDER_AUDIT_AGENT_ID"] != "developer" ||

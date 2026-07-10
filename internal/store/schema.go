@@ -795,3 +795,14 @@ CREATE TABLE IF NOT EXISTS operator_task_runs (
 CREATE INDEX IF NOT EXISTS operator_task_runs_root_idx
   ON operator_task_runs(root_contract_id);
 `
+
+const capabilityAuditOutcomeSchemaSQL = `
+ALTER TABLE capability_calls ADD COLUMN error_code TEXT NOT NULL DEFAULT '';
+ALTER TABLE capability_calls ADD COLUMN retryable INTEGER;
+ALTER TABLE capability_calls ADD COLUMN attempt_id TEXT;
+ALTER TABLE capability_calls ADD COLUMN lease_id TEXT;
+ALTER TABLE capability_calls ADD COLUMN runtime_id TEXT;
+
+CREATE INDEX IF NOT EXISTS capability_calls_runtime_scope_idx
+  ON capability_calls(lease_id, attempt_id, runtime_id, created_at);
+`

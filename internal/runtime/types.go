@@ -242,6 +242,7 @@ type CLIAdapter interface {
 
 type CLIAdapterCapabilities struct {
 	SupportsSameTurnSteer bool `json:"supports_same_turn_steer"`
+	ReturnsOnProcessExit  bool `json:"returns_on_process_exit"`
 }
 
 type CLIAdapterCapabilityProvider interface {

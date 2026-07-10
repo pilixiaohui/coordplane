@@ -106,16 +106,18 @@ func runTask(args []string, stdout, stderr io.Writer, client *http.Client) error
 }
 
 type taskFlags struct {
-	backendURL          string
-	payloadPath         string
-	operatorToken       string
-	operatorTokenEnv    string
-	startIdempotencyKey string
-	wait                bool
-	evidenceOut         string
-	waitTimeoutSeconds  int
-	waitTimeoutMillis   int
-	pollIntervalMillis  int
+	backendURL              string
+	payloadPath             string
+	operatorToken           string
+	operatorTokenEnv        string
+	startIdempotencyKey     string
+	executionTimeoutSeconds int
+	executionTimeoutMillis  int
+	wait                    bool
+	evidenceOut             string
+	waitTimeoutSeconds      int
+	waitTimeoutMillis       int
+	pollIntervalMillis      int
 }
 
 func commonTaskFlags(name string, stderr io.Writer) (*flag.FlagSet, *taskFlags) {
@@ -152,6 +154,8 @@ func runTaskCreate(args []string, stdout, stderr io.Writer, client *http.Client)
 func runTaskRun(args []string, stdout, stderr io.Writer, client *http.Client) error {
 	fs, cfg := commonTaskFlags("task run", stderr)
 	fs.StringVar(&cfg.startIdempotencyKey, "start-idempotency-key", "", "operator task start idempotency key")
+	fs.IntVar(&cfg.executionTimeoutSeconds, "execution-timeout-seconds", 0, "explicit operator task execution deadline in seconds")
+	fs.IntVar(&cfg.executionTimeoutMillis, "execution-timeout-ms", 0, "explicit operator task execution deadline in milliseconds")
 	fs.BoolVar(&cfg.wait, "wait", false, "wait for operator task terminal evidence state")
 	fs.StringVar(&cfg.evidenceOut, "evidence-out", "", "write operator evidence bundle JSON to path")
 	fs.IntVar(&cfg.waitTimeoutSeconds, "wait-timeout-seconds", 30, "operator task wait timeout in seconds")
@@ -184,7 +188,11 @@ func runTaskRun(args []string, stdout, stderr io.Writer, client *http.Client) er
 	if startKey == "" {
 		startKey = "start:" + createData.TaskRunID
 	}
-	startBody, err := json.Marshal(map[string]string{"idempotency_key": startKey})
+	startBody, err := json.Marshal(map[string]any{
+		"idempotency_key":           startKey,
+		"execution_timeout_seconds": cfg.executionTimeoutSeconds,
+		"execution_timeout_millis":  cfg.executionTimeoutMillis,
+	})
 	if err != nil {
 		return err
 	}

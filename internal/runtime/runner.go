@@ -175,12 +175,26 @@ func (r *Runner) startClaimed(ctx context.Context, agent teamconfig.AgentConfig,
 		TTL:       5 * time.Minute,
 	})
 	if err != nil {
-		_ = r.failAttempt(ctx, attemptID, err.Error())
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if cleanupErr := r.failAttempt(cleanupCtx, attemptID, err.Error()); cleanupErr != nil {
+			return AssignmentSession{}, errors.Join(err, fmt.Errorf("runtime runner: cleanup failed: %w", cleanupErr))
+		}
 		return AssignmentSession{}, err
 	}
 	failPreparedAttempt := func(cause error) (AssignmentSession, error) {
-		_ = r.failAttempt(ctx, attemptID, cause.Error())
-		_ = r.ReleasePrepareLease(ctx, prepareLease.ID)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var cleanupErrors []error
+		if err := r.failAttempt(cleanupCtx, attemptID, cause.Error()); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("fail attempt: %w", err))
+		}
+		if err := r.ReleasePrepareLease(cleanupCtx, prepareLease.ID); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("release prepare lease: %w", err))
+		}
+		if len(cleanupErrors) > 0 {
+			return AssignmentSession{}, errors.Join(cause, errors.Join(cleanupErrors...))
+		}
 		return AssignmentSession{}, cause
 	}
 
@@ -293,6 +307,11 @@ func (r *Runner) startClaimed(ctx context.Context, agent teamconfig.AgentConfig,
 			return failPreparedAttempt(err)
 		}
 	}
+	if capabilities, ok := AdapterCapabilitiesForBackend(r.adapter, agent.CLIBackend); ok && capabilities.ReturnsOnProcessExit {
+		if err := r.finalizeOneShotExit(next.Lease.ID, attemptID); err != nil {
+			return AssignmentSession{}, err
+		}
+	}
 	if err := r.convergeReleasedLeaseBookkeeping(ctx, next.Lease.ID, attemptID); err != nil {
 		return AssignmentSession{}, err
 	}
@@ -306,6 +325,38 @@ func (r *Runner) startClaimed(ctx context.Context, agent teamconfig.AgentConfig,
 		Env:           cloneStringMap(env),
 		ContainerName: prepared.ContainerName,
 	}, nil
+}
+
+func (r *Runner) finalizeOneShotExit(leaseID, attemptID string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var leaseState, assignmentState string
+	if err := r.db.QueryRowContext(cleanupCtx, `
+SELECT l.state, a.state
+FROM leases l
+JOIN assignments a ON a.id = l.assignment_id
+WHERE l.id = ? AND EXISTS (SELECT 1 FROM attempts att WHERE att.id = ? AND att.lease_id = l.id)`,
+		leaseID, attemptID,
+	).Scan(&leaseState, &assignmentState); err != nil {
+		return fmt.Errorf("runtime runner: finalize one-shot exit: %w", err)
+	}
+	switch {
+	case leaseState == "released":
+		return r.convergeReleasedLeaseBookkeeping(cleanupCtx, leaseID, attemptID)
+	case assignmentState == "waiting":
+		_, err := r.FinishSession(cleanupCtx, TerminalReport{
+			AttemptID: attemptID,
+			Status:    "waiting",
+			Summary:   "one-shot provider exited after contract.wait",
+		})
+		return err
+	default:
+		cause := NewAgentExitedWithoutTerminalAction("one-shot provider exited successfully without contract.complete or contract.wait")
+		if err := r.failAttempt(cleanupCtx, attemptID, cause.Error()); err != nil {
+			return fmt.Errorf("%w; cleanup failed: %v", cause, err)
+		}
+		return cause
+	}
 }
 
 func firstNonEmpty(values ...string) string {
@@ -790,7 +841,7 @@ func (r *Runner) failAttempt(ctx context.Context, attemptID, reason string) erro
 		}
 		now := formatTime(time.Now())
 		if _, err := tx.ExecContext(ctx, `
-UPDATE attempts SET status = 'failed', transcript_ref = ?, ended_at = ? WHERE id = ?`,
+		UPDATE attempts SET status = 'failed', transcript_ref = COALESCE(NULLIF(transcript_ref, ''), ?), ended_at = ? WHERE id = ?`,
 			reason, now, attemptID,
 		); err != nil {
 			return err

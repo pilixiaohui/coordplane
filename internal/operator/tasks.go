@@ -85,7 +85,9 @@ type CreateTaskResult struct {
 }
 
 type StartTaskInput struct {
-	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	IdempotencyKey          string `json:"idempotency_key,omitempty"`
+	ExecutionTimeoutSeconds int    `json:"execution_timeout_seconds,omitempty"`
+	ExecutionTimeoutMillis  int    `json:"execution_timeout_millis,omitempty"`
 }
 
 type StartTaskResult struct {
@@ -287,9 +289,31 @@ func (s *Service) StartTask(ctx context.Context, subject Subject, taskRunID stri
 		existing.IdempotentReplay = true
 		return existing, nil
 	}
-
-	session, err := s.runner.StartAssignment(ctx, root.TargetAgentID, root.RootAssignmentID)
+	executionTimeout, err := normalizedExecutionTimeout(in)
 	if err != nil {
+		return StartTaskResult{}, err
+	}
+	if err := s.appendStartPhaseEvent(ctx, subject, root, "operator.task.start_requested", StartTaskResult{}, nil, executionTimeout); err != nil {
+		return StartTaskResult{}, err
+	}
+	startCtx := ctx
+	cancel := func() {}
+	if executionTimeout > 0 {
+		startCtx, cancel = context.WithTimeout(ctx, executionTimeout)
+	}
+	defer cancel()
+
+	session, err := s.runner.StartAssignment(startCtx, root.TargetAgentID, root.RootAssignmentID)
+	if err != nil {
+		if executionTimeout > 0 && errors.Is(err, context.DeadlineExceeded) {
+			err = cpruntime.NewRuntimeExecTimeout("operator execution deadline reached", err)
+		}
+		finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		finishErr := s.appendStartPhaseEvent(finishCtx, subject, root, "operator.task.start_finished", StartTaskResult{}, err, executionTimeout)
+		finishCancel()
+		if finishErr != nil {
+			err = errors.Join(err, fmt.Errorf("record operator start finish: %w", finishErr))
+		}
 		if errors.Is(err, coordination.ErrAssignmentBusy) {
 			return StartTaskResult{}, reject("TARGET_AGENT_BUSY", "target agent already has an active assignment")
 		}
@@ -305,7 +329,23 @@ func (s *Service) StartTask(ctx context.Context, subject Subject, taskRunID stri
 	if err := s.appendStartAudit(ctx, subject, root, out, in.IdempotencyKey); err != nil {
 		return StartTaskResult{}, err
 	}
+	if err := s.appendStartPhaseEvent(ctx, subject, root, "operator.task.start_finished", out, nil, executionTimeout); err != nil {
+		return StartTaskResult{}, err
+	}
 	return out, nil
+}
+
+func normalizedExecutionTimeout(in StartTaskInput) (time.Duration, error) {
+	if in.ExecutionTimeoutSeconds < 0 || in.ExecutionTimeoutMillis < 0 {
+		return 0, reject("INVALID_EXECUTION_TIMEOUT", "operator execution timeout must not be negative")
+	}
+	if in.ExecutionTimeoutMillis > 0 {
+		return time.Duration(in.ExecutionTimeoutMillis) * time.Millisecond, nil
+	}
+	if in.ExecutionTimeoutSeconds > 0 {
+		return time.Duration(in.ExecutionTimeoutSeconds) * time.Second, nil
+	}
+	return 0, nil
 }
 
 func (s *Service) normalizeInput(in CreateTaskInput) (CreateTaskInput, error) {
@@ -586,6 +626,47 @@ INSERT INTO capability_calls (
 			SubjectID:      subject.ID,
 			CapabilityName: CapabilityNameTaskStart,
 			PayloadJSON:    payload,
+		})
+		return err
+	})
+}
+
+func (s *Service) appendStartPhaseEvent(ctx context.Context, subject Subject, root rootTaskRun, eventType string, out StartTaskResult, startErr error, executionTimeout time.Duration) error {
+	payload := map[string]any{
+		"root_contract_id":         root.RootContractID,
+		"root_assignment_id":       root.RootAssignmentID,
+		"target_agent_id":          root.TargetAgentID,
+		"execution_timeout_millis": executionTimeout.Milliseconds(),
+	}
+	if out.AttemptID != "" {
+		payload["lease_id"] = out.LeaseID
+		payload["attempt_id"] = out.AttemptID
+		payload["session_route_id"] = out.SessionRouteID
+		payload["runtime_id"] = out.RuntimeID
+		payload["status"] = out.Status
+	}
+	if startErr != nil {
+		payload["status"] = "failed"
+		payload["error"] = startErr.Error()
+		if reason, ok := cpruntime.ErrorTerminalReason(startErr); ok {
+			payload["error_code"] = reason
+		}
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return s.store.Tx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		_, err := store.AppendEventTx(ctx, tx, events.Event{
+			TenantID:       "default",
+			TraceID:        root.TaskRunID,
+			Type:           eventType,
+			AggregateType:  "operator_task_run",
+			AggregateID:    root.TaskRunID,
+			SubjectKind:    subject.Kind,
+			SubjectID:      subject.ID,
+			CapabilityName: CapabilityNameTaskStart,
+			PayloadJSON:    raw,
 		})
 		return err
 	})

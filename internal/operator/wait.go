@@ -38,24 +38,25 @@ type WaitTaskResult struct {
 }
 
 type TaskEvidence struct {
-	SchemaVersion         string                         `json:"schema_version"`
-	TaskRunID             string                         `json:"task_run_id"`
-	Status                string                         `json:"status"`
-	FailureSummary        string                         `json:"failure_summary,omitempty"`
-	FailureClass          string                         `json:"failure_class,omitempty"`
-	TerminalReason        string                         `json:"terminal_reason,omitempty"`
-	Audience              string                         `json:"audience"`
-	Operator              TaskEvidenceOperator           `json:"operator"`
-	AgentFacing           TaskEvidenceAgentFacing        `json:"agent_facing"`
-	Redaction             TaskEvidenceRedaction          `json:"redaction"`
-	StartedSessions       []EvidenceStartedSession       `json:"started_sessions"`
-	ContractLineage       []EvidenceContract             `json:"contract_lineage"`
-	EvidenceRefs          []EvidenceRef                  `json:"evidence_refs,omitempty"`
-	ValidationAssessments []EvidenceValidationAssessment `json:"validation_assessments,omitempty"`
-	CapabilityCallCounts  map[string]int64               `json:"capability_call_counts"`
-	CommunicationCounts   EvidenceCommunicationCounts    `json:"communication_counts"`
-	InspectSummary        map[string]int64               `json:"inspect_summary"`
-	Terminal              EvidenceTerminal               `json:"terminal"`
+	SchemaVersion          string                         `json:"schema_version"`
+	TaskRunID              string                         `json:"task_run_id"`
+	Status                 string                         `json:"status"`
+	FailureSummary         string                         `json:"failure_summary,omitempty"`
+	FailureClass           string                         `json:"failure_class,omitempty"`
+	TerminalReason         string                         `json:"terminal_reason,omitempty"`
+	Audience               string                         `json:"audience"`
+	Operator               TaskEvidenceOperator           `json:"operator"`
+	AgentFacing            TaskEvidenceAgentFacing        `json:"agent_facing"`
+	Redaction              TaskEvidenceRedaction          `json:"redaction"`
+	StartedSessions        []EvidenceStartedSession       `json:"started_sessions"`
+	ContractLineage        []EvidenceContract             `json:"contract_lineage"`
+	EvidenceRefs           []EvidenceRef                  `json:"evidence_refs,omitempty"`
+	ValidationAssessments  []EvidenceValidationAssessment `json:"validation_assessments,omitempty"`
+	CapabilityCallCounts   map[string]int64               `json:"capability_call_counts"`
+	CapabilityCallOutcomes []EvidenceCapabilityOutcome    `json:"capability_call_outcomes"`
+	CommunicationCounts    EvidenceCommunicationCounts    `json:"communication_counts"`
+	InspectSummary         map[string]int64               `json:"inspect_summary"`
+	Terminal               EvidenceTerminal               `json:"terminal"`
 }
 
 type TaskEvidenceOperator struct {
@@ -128,6 +129,9 @@ type EvidenceStartedSession struct {
 	RuntimeID      string `json:"runtime_id,omitempty"`
 	RuntimeState   string `json:"runtime_state,omitempty"`
 	CLIBackend     string `json:"cli_backend,omitempty"`
+	CLIState       string `json:"cli_state,omitempty"`
+	CLIExitCode    *int   `json:"cli_exit_code,omitempty"`
+	TranscriptRef  string `json:"transcript_ref,omitempty"`
 }
 
 type EvidenceSessionRef struct {
@@ -165,6 +169,14 @@ type EvidenceCommunicationCounts struct {
 	DeliveryAttempts int64            `json:"delivery_attempts"`
 	EnvelopesByKind  map[string]int64 `json:"envelopes_by_kind"`
 	MailboxByState   map[string]int64 `json:"mailbox_by_state"`
+}
+
+type EvidenceCapabilityOutcome struct {
+	Capability string `json:"capability"`
+	Status     string `json:"status"`
+	ErrorCode  string `json:"error_code,omitempty"`
+	Retryable  bool   `json:"retryable"`
+	Count      int64  `json:"count"`
 }
 
 type EvidenceTerminal struct {
@@ -399,6 +411,10 @@ func (s *Service) buildTaskEvidence(ctx context.Context, taskRunID string) (Task
 	if err != nil {
 		return TaskEvidence{}, err
 	}
+	capabilityOutcomes, err := s.evidenceCapabilityOutcomes(ctx, taskRunID, run.RootContractID, run.RootAssignmentID, contractIDs)
+	if err != nil {
+		return TaskEvidence{}, err
+	}
 	communicationCounts, err := s.evidenceCommunicationCounts(ctx, contractIDs)
 	if err != nil {
 		return TaskEvidence{}, err
@@ -443,14 +459,15 @@ func (s *Service) buildTaskEvidence(ctx context.Context, taskRunID string) (Task
 				"runtime workspace and home roots",
 			},
 		},
-		StartedSessions:       started,
-		ContractLineage:       lineage,
-		EvidenceRefs:          refs,
-		ValidationAssessments: validations,
-		CapabilityCallCounts:  capabilityCounts,
-		CommunicationCounts:   communicationCounts,
-		InspectSummary:        inspectSummary,
-		Terminal:              terminal,
+		StartedSessions:        started,
+		ContractLineage:        lineage,
+		EvidenceRefs:           refs,
+		ValidationAssessments:  validations,
+		CapabilityCallCounts:   capabilityCounts,
+		CapabilityCallOutcomes: capabilityOutcomes,
+		CommunicationCounts:    communicationCounts,
+		InspectSummary:         inspectSummary,
+		Terminal:               terminal,
 	}
 	return evidence, nil
 }
@@ -555,7 +572,10 @@ func (s *Service) evidenceStartedSessions(ctx context.Context, contractIDs []str
 SELECT a.contract_id, a.id, l.agent_id, l.id, l.state,
        att.id, att.status,
        COALESCE(sr.id, ''), COALESCE(sr.state, ''), COALESCE(sr.runtime_id, ''), COALESCE(sr.cli_backend, ''),
-       COALESCE(ri.state, '')
+       COALESCE(ri.state, ''),
+       COALESCE((SELECT cs.state FROM cli_sessions cs WHERE cs.attempt_id = att.id ORDER BY cs.updated_at DESC, cs.id DESC LIMIT 1), ''),
+       (SELECT cs.exit_code FROM cli_sessions cs WHERE cs.attempt_id = att.id ORDER BY cs.updated_at DESC, cs.id DESC LIMIT 1),
+       COALESCE((SELECT cs.transcript_ref FROM cli_sessions cs WHERE cs.attempt_id = att.id ORDER BY cs.updated_at DESC, cs.id DESC LIMIT 1), att.transcript_ref, '')
 FROM assignments a
 JOIN leases l ON l.assignment_id = a.id
 JOIN attempts att ON att.lease_id = l.id
@@ -571,6 +591,7 @@ ORDER BY att.started_at ASC, att.id ASC`
 	out := []EvidenceStartedSession{}
 	for rows.Next() {
 		var session EvidenceStartedSession
+		var exitCode sql.NullInt64
 		if err := rows.Scan(
 			&session.ContractID,
 			&session.AssignmentID,
@@ -584,8 +605,15 @@ ORDER BY att.started_at ASC, att.id ASC`
 			&session.RuntimeID,
 			&session.CLIBackend,
 			&session.RuntimeState,
+			&session.CLIState,
+			&exitCode,
+			&session.TranscriptRef,
 		); err != nil {
 			return nil, err
+		}
+		if exitCode.Valid {
+			value := int(exitCode.Int64)
+			session.CLIExitCode = &value
 		}
 		out = append(out, session)
 	}
@@ -697,6 +725,51 @@ ORDER BY capability_name`, args...)
 			return nil, err
 		}
 		out[name] = count
+	}
+	return out, rows.Err()
+}
+
+func (s *Service) evidenceCapabilityOutcomes(ctx context.Context, taskRunID, rootContractID, rootAssignmentID string, contractIDs []string) ([]EvidenceCapabilityOutcome, error) {
+	if len(contractIDs) == 0 {
+		return []EvidenceCapabilityOutcome{}, nil
+	}
+	args := []any{rootContractID, rootAssignmentID, taskRunID}
+	args = append(args, stringArgs(contractIDs)...)
+	rows, err := s.db.QueryContext(ctx, `
+SELECT capability_name, status, error_code, retryable, COUNT(*)
+FROM (
+  SELECT capability_name, status, COALESCE(error_code, '') AS error_code,
+         COALESCE(retryable, 0) AS retryable
+  FROM capability_calls
+  WHERE subject_kind IN ('operator', 'debug')
+    AND (
+      json_extract(scope_json, '$.root_contract_id') = ?
+      OR json_extract(scope_json, '$.root_assignment_id') = ?
+      OR (trace_id = ? AND capability_name IN ('operator.task.create', 'operator.task.start', 'operator.task.wait'))
+    )
+  UNION ALL
+  SELECT cc.capability_name, cc.status, COALESCE(cc.error_code, ''), COALESCE(cc.retryable, 0)
+  FROM capability_calls cc
+  JOIN leases l ON l.id = COALESCE(NULLIF(cc.lease_id, ''), json_extract(cc.scope_json, '$.lease_id'))
+  JOIN assignments a ON a.id = l.assignment_id
+  WHERE cc.subject_kind = 'agent'
+    AND a.contract_id IN (`+placeholders(len(contractIDs))+`)
+)
+GROUP BY capability_name, status, error_code, retryable
+ORDER BY capability_name, status, error_code, retryable`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("lookup capability outcomes: %w", err)
+	}
+	defer rows.Close()
+	out := []EvidenceCapabilityOutcome{}
+	for rows.Next() {
+		var item EvidenceCapabilityOutcome
+		var retryable int
+		if err := rows.Scan(&item.Capability, &item.Status, &item.ErrorCode, &retryable, &item.Count); err != nil {
+			return nil, err
+		}
+		item.Retryable = retryable != 0
+		out = append(out, item)
 	}
 	return out, rows.Err()
 }
@@ -982,7 +1055,16 @@ func (s *Service) evidenceRuntimePolicyFailure(ctx context.Context, contractIDs 
 	}
 	args := stringArgs(contractIDs)
 	query := `
-SELECT COALESCE(att.transcript_ref, ''), COALESCE(cs.last_error, ''), COALESCE(ri.last_error, '')
+SELECT COALESCE(att.transcript_ref, ''), COALESCE(cs.last_error, ''), COALESCE(ri.last_error, ''),
+       COALESCE((
+         SELECT json_extract(e.payload_json, '$.reason')
+         FROM events e
+         WHERE e.event_type = 'session.failed'
+           AND e.aggregate_type = 'attempt'
+           AND e.aggregate_id = att.id
+         ORDER BY e.occurred_at DESC, e.id DESC
+         LIMIT 1
+       ), '')
 FROM assignments a
 JOIN leases l ON l.assignment_id = a.id
 JOIN attempts att ON att.lease_id = l.id
@@ -997,11 +1079,11 @@ ORDER BY att.started_at DESC, cs.updated_at DESC`
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var attemptRef, cliError, runtimeError string
-		if err := rows.Scan(&attemptRef, &cliError, &runtimeError); err != nil {
+		var attemptRef, cliError, runtimeError, sessionFailure string
+		if err := rows.Scan(&attemptRef, &cliError, &runtimeError, &sessionFailure); err != nil {
 			return runtimePolicyFailureEvidence{}, false, err
 		}
-		if failure, ok := runtimePolicyFailureFromText(attemptRef + "\n" + cliError + "\n" + runtimeError); ok {
+		if failure, ok := runtimePolicyFailureFromText(attemptRef + "\n" + cliError + "\n" + runtimeError + "\n" + sessionFailure); ok {
 			return failure, true, nil
 		}
 	}
@@ -1033,6 +1115,13 @@ func runtimePolicyFailureFromText(text string) (runtimePolicyFailureEvidence, bo
 			summary:        "runtime command execution timed out before the provider session reached a terminal closeout",
 			failureClass:   cpruntime.FailureClassRuntimeExecTimeout,
 			terminalReason: cpruntime.TerminalReasonRuntimeExecTimeout,
+		}, true
+	case strings.Contains(text, cpruntime.TerminalReasonAgentExitedWithoutAction):
+		return runtimePolicyFailureEvidence{
+			status:         "blocked",
+			summary:        "one-shot agent exited without contract.complete or contract.wait; assignment is available for an explicit retry",
+			failureClass:   cpruntime.FailureClassAgentExited,
+			terminalReason: cpruntime.TerminalReasonAgentExitedWithoutAction,
 		}, true
 	default:
 		return runtimePolicyFailureEvidence{}, false

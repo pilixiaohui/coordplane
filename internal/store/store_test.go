@@ -38,6 +38,7 @@ func TestMigrateCreatesCanonicalTablesAndIsIdempotent(t *testing.T) {
 		"015_controlled_git_operation_evidence",
 		"016_controlled_git_operation_subject_kind",
 		"017_operator_task_runs",
+		"018_capability_audit_outcomes",
 	}; !equalStrings(got, want) {
 		t.Fatalf("applied migrations = %v, want %v", got, want)
 	}
@@ -109,6 +110,11 @@ func TestMigrateCreatesCanonicalTablesAndIsIdempotent(t *testing.T) {
 	}
 	if !columnExists(t, ctx, s.DB(), "git_repositories", "alias") {
 		t.Fatal("git_repositories.alias missing after migration")
+	}
+	for _, column := range []string{"error_code", "retryable", "attempt_id", "lease_id", "runtime_id"} {
+		if !columnExists(t, ctx, s.DB(), "capability_calls", column) {
+			t.Fatalf("capability_calls.%s missing after migration", column)
+		}
 	}
 }
 

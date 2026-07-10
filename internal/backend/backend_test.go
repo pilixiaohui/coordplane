@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -543,6 +544,7 @@ func TestOperatorTaskStartRequiresOperatorAuthAndKnownTaskRun(t *testing.T) {
 	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", payload, http.StatusOK))
 	taskRunID := stringField(t, created, "task_run_id")
 	before := operatorStartCounts(t, ctx, app.DB)
+	delete(before, "events")
 
 	missing := postOperatorTaskStartRaw(t, app.Handler, taskRunID, "", map[string]any{"idempotency_key": "start-auth"}, http.StatusUnauthorized)
 	assertOperatorTaskRejected(t, missing, "OPERATOR_AUTH_REQUIRED")
@@ -705,10 +707,14 @@ func TestOperatorTaskStartRejectsWhenSameAgentHasUnrelatedActiveAssignmentWithou
 	rootAssignmentID := stringField(t, created, "root_assignment_id")
 	rootMailboxID := stringField(t, created, "root_mailbox_id")
 	before := operatorStartCounts(t, ctx, app.DB)
+	delete(before, "events")
 
 	raw := postOperatorTaskStartRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{"idempotency_key": "start-constrained-active"}, http.StatusBadRequest)
 	assertOperatorTaskRejected(t, raw, "TARGET_AGENT_BUSY")
 	assertOperatorStartCountsEqual(t, ctx, app.DB, before, "unrelated active start rejection")
+	if got := countRowsWhere(t, ctx, app.DB, "events", "aggregate_id = '"+taskRunID+"' AND event_type IN ('operator.task.start_requested', 'operator.task.start_finished')"); got != 2 {
+		t.Fatalf("start phase events = %d, want requested and finished", got)
+	}
 	assertAssignmentState(t, ctx, app.DB, rootAssignmentID, "queued", "")
 	assertMailboxState(t, ctx, app.DB, rootMailboxID, "pending", "")
 	assertAssignmentState(t, ctx, app.DB, unrelated.AssignmentID, "claimed", unrelatedSession.Route.ID)
@@ -844,6 +850,76 @@ WHERE c.issuer_contract_id = ? AND c.title = 'policy child' AND c.target_id = 'd
 	}
 }
 
+func TestCapabilityAuditRecordsRejectedOutcomeAndRuntimeScope(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	app, err := backend.Open(ctx, backend.Config{
+		DBPath:            filepath.Join(dir, "coordplane.db"),
+		ListenAddr:        "127.0.0.1:0",
+		TeamConfigPath:    threeAgentFixturePath(t),
+		OperatorToken:     "operator-secret",
+		OperatorSubjectID: "ops-user",
+	})
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	defer app.Close()
+	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest("capability-audit-rejected-outcome", nil), http.StatusOK))
+	taskRunID := stringField(t, created, "task_run_id")
+	session, err := app.Runner.StartAssignment(ctx, "coordinator", stringField(t, created, "root_assignment_id"))
+	if err != nil {
+		t.Fatalf("start root assignment: %v", err)
+	}
+
+	raw := postCapabilityCallRaw(t, app.Handler, session.Env["COORDPLANE_TOKEN"], capability.Call{
+		CapabilityName: "report.submit",
+		TraceID:        taskRunID,
+		Subject: capability.Subject{
+			Kind:      "agent",
+			ID:        "coordinator",
+			AgentID:   "coordinator",
+			RuntimeID: session.Route.RuntimeID,
+		},
+		Scope: mustRawJSON(t, map[string]any{"lease_id": session.LeaseID}),
+		Input: mustRawJSON(t, map[string]any{
+			"summary": "valid summary",
+			"body":    "unknown field",
+		}),
+	}, http.StatusBadRequest)
+	assertCapabilityRejected(t, raw, "INVALID_CAPABILITY_INPUT")
+
+	var errorCode, attemptID, leaseID, runtimeID string
+	var retryable int
+	if err := app.DB.QueryRowContext(ctx, `
+SELECT COALESCE(error_code, ''), COALESCE(retryable, 0), COALESCE(attempt_id, ''),
+       COALESCE(lease_id, ''), COALESCE(runtime_id, '')
+FROM capability_calls
+WHERE trace_id = ? AND capability_name = 'report.submit'
+ORDER BY created_at DESC, id DESC
+LIMIT 1`, taskRunID).Scan(&errorCode, &retryable, &attemptID, &leaseID, &runtimeID); err != nil {
+		t.Fatalf("read rejected capability audit: %v", err)
+	}
+	if errorCode != "INVALID_CAPABILITY_INPUT" || retryable != 0 || attemptID != session.AttemptID || leaseID != session.LeaseID || runtimeID != session.Route.RuntimeID {
+		t.Fatalf("audit = code:%s retryable:%d attempt:%s lease:%s runtime:%s", errorCode, retryable, attemptID, leaseID, runtimeID)
+	}
+
+	evidence := decodeOperatorTaskData(t, getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK))
+	outcomes := arrayField(t, evidence, "capability_call_outcomes")
+	if len(outcomes) == 0 {
+		t.Fatalf("capability outcomes = %#v, want rejected report.submit", outcomes)
+	}
+	found := false
+	for _, rawOutcome := range outcomes {
+		outcome, ok := rawOutcome.(map[string]any)
+		if ok && outcome["capability"] == "report.submit" && outcome["status"] == "rejected" && outcome["error_code"] == "INVALID_CAPABILITY_INPUT" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("capability outcomes = %#v, missing rejected report.submit", outcomes)
+	}
+}
+
 func TestOperatorTaskWaitReturnsRuntimeApprovalBlockedEvidence(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -952,6 +1028,83 @@ func TestOperatorTaskStartReturnsRuntimeTimeoutDiagnosticInsteadOfInternalError(
 		terminal["failure_class"] != cpruntime.FailureClassRuntimeExecTimeout ||
 		terminal["terminal_reason"] != cpruntime.TerminalReasonRuntimeExecTimeout {
 		t.Fatalf("terminal evidence = %#v, want runtime exec timeout blocker", terminal)
+	}
+}
+
+func TestOperatorTaskStartExecutionTimeoutUsesExplicitDeadline(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	app, err := backend.Open(ctx, backend.Config{
+		DBPath:            filepath.Join(dir, "coordplane.db"),
+		ListenAddr:        "127.0.0.1:0",
+		TeamConfigPath:    threeAgentFixturePath(t),
+		OperatorToken:     "operator-secret",
+		OperatorSubjectID: "ops-user",
+	})
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	defer app.Close()
+	app.OperatorTasks, err = operator.NewService(operator.Config{
+		Store:            app.Store,
+		TeamConfig:       app.TeamConfig,
+		TeamConfigLoaded: app.TeamConfigLoaded,
+		Runner:           &deadlineProbeRunner{},
+	})
+	if err != nil {
+		t.Fatalf("replace operator runner: %v", err)
+	}
+
+	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest("operator-explicit-execution-timeout", nil), http.StatusOK))
+	taskRunID := stringField(t, created, "task_run_id")
+	startRaw := postOperatorTaskStartRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{
+		"idempotency_key":          "start-explicit-execution-timeout",
+		"execution_timeout_millis": 5,
+	}, http.StatusBadRequest)
+	assertCapabilityRejected(t, startRaw, cpruntime.TerminalReasonRuntimeExecTimeout)
+	if got := countRowsWhere(t, ctx, app.DB, "events", "aggregate_id = '"+taskRunID+"' AND event_type = 'operator.task.start_requested'"); got != 1 {
+		t.Fatalf("start_requested events = %d, want 1", got)
+	}
+	if got := countRowsWhere(t, ctx, app.DB, "events", "aggregate_id = '"+taskRunID+"' AND event_type = 'operator.task.start_finished'"); got != 1 {
+		t.Fatalf("start_finished events = %d, want 1", got)
+	}
+}
+
+func TestOperatorTaskWaitTimeoutIsObservationOnly(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	app, err := backend.Open(ctx, backend.Config{
+		DBPath:            filepath.Join(dir, "coordplane.db"),
+		ListenAddr:        "127.0.0.1:0",
+		TeamConfigPath:    threeAgentFixturePath(t),
+		OperatorToken:     "operator-secret",
+		OperatorSubjectID: "ops-user",
+	})
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	defer app.Close()
+
+	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest("operator-wait-timeout-observation", nil), http.StatusOK))
+	taskRunID := stringField(t, created, "task_run_id")
+	rootAssignmentID := stringField(t, created, "root_assignment_id")
+	started := decodeOperatorTaskData(t, postOperatorTaskStartRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{"idempotency_key": "start-wait-timeout-observation"}, http.StatusOK))
+	leaseID := stringField(t, started, "lease_id")
+	attemptID := stringField(t, started, "attempt_id")
+
+	wait := decodeOperatorTaskData(t, postOperatorTaskWaitRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{
+		"timeout_millis":       2,
+		"poll_interval_millis": 1,
+	}, http.StatusOK))
+	if wait["status"] != "timeout" || wait["terminal_reason"] != "WAIT_TIMEOUT" {
+		t.Fatalf("wait result = %#v, want observation timeout", wait)
+	}
+	assertAssignmentState(t, ctx, app.DB, rootAssignmentID, "claimed", stringField(t, started, "session_route_id"))
+	if got := countRuntimeTokens(t, ctx, app.DB, leaseID, attemptID, "active"); got != 1 {
+		t.Fatalf("active runtime tokens after wait timeout = %d, want 1", got)
+	}
+	if got := countActiveGuards(t, ctx, app.DB, leaseID, attemptID, "active"); got != 2 {
+		t.Fatalf("active guards after wait timeout = %d, want 2", got)
 	}
 }
 
@@ -2084,14 +2237,12 @@ func TestDockerClaudeFixtureRegistersCommandCLIProfile(t *testing.T) {
 func TestDockerClaudeCommandPolicyUnavailableFailsFastWithEvidence(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "coordplane.db")
 	coordlinkPath := filepath.Join(dir, "coordlink")
 	if err := os.WriteFile(coordlinkPath, []byte("fake coordlink"), 0o755); err != nil {
 		t.Fatalf("write coordlink fixture: %v", err)
 	}
-	dockerLog := installFakeDockerCLI(t, dir)
-	app, err := backend.Open(ctx, backend.Config{
-		DBPath:            dbPath,
+	_, err := backend.Open(ctx, backend.Config{
+		DBPath:            filepath.Join(dir, "coordplane.db"),
 		ListenAddr:        "127.0.0.1:0",
 		TeamConfigPath:    writeDockerClaudePolicyUnavailableTeamConfig(t, dir),
 		CoordlinkPath:     coordlinkPath,
@@ -2099,63 +2250,72 @@ func TestDockerClaudeCommandPolicyUnavailableFailsFastWithEvidence(t *testing.T)
 		OperatorToken:     "operator-secret",
 		OperatorSubjectID: "ops-user",
 	})
+	if err == nil || !strings.Contains(err.Error(), "requires non_interactive_approval") {
+		t.Fatalf("open backend error = %v, want TeamConfig provider policy preflight failure", err)
+	}
+}
+
+func TestDockerClaudeExitWithoutTerminalActionReturnsRetryableRejectionAndEvidence(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "coordplane.db")
+	coordlinkPath := filepath.Join(dir, "coordlink")
+	if err := os.WriteFile(coordlinkPath, []byte("fake coordlink"), 0o755); err != nil {
+		t.Fatalf("write coordlink fixture: %v", err)
+	}
+	t.Setenv("COORDPLANE_FAKE_DOCKER_CLAUDE_MODE", "coordlink-current-only")
+	installFakeDockerCLI(t, dir)
+	server := httptest.NewUnstartedServer(nil)
+	app, err := backend.Open(ctx, backend.Config{
+		DBPath:            dbPath,
+		ListenAddr:        "127.0.0.1:0",
+		BackendURL:        "http://" + server.Listener.Addr().String(),
+		TeamConfigPath:    writeDockerClaudePositiveProviderPolicyTeamConfig(t, dir),
+		CoordlinkPath:     coordlinkPath,
+		ClaudeBinary:      "/usr/local/bin/claude",
+		OperatorToken:     "operator-secret",
+		OperatorSubjectID: "ops-user",
+	})
 	if err != nil {
-		t.Fatalf("open backend with docker claude fixture: %v", err)
+		server.Close()
+		t.Fatalf("open backend with docker claude provider policy fixture: %v", err)
 	}
 	defer app.Close()
+	server.Config.Handler = app.Handler
+	server.Start()
+	defer server.Close()
 
-	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest("operator-claude-policy-unavailable", map[string]any{
-		"team_id":      "docker-claude-policy-unavailable",
+	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest("operator-claude-exit-without-action", map[string]any{
+		"team_id":      "docker-claude-provider-policy-positive",
 		"team_version": 1,
 	}), http.StatusOK))
 	taskRunID := stringField(t, created, "task_run_id")
 	rootAssignmentID := stringField(t, created, "root_assignment_id")
-	rootContractID := stringField(t, created, "root_contract_id")
-	startRaw := postOperatorTaskStartRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{"idempotency_key": "start-claude-policy-unavailable"}, http.StatusInternalServerError)
+	startRaw := postOperatorTaskStartRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{
+		"idempotency_key": "start-claude-exit-without-action",
+	}, http.StatusBadRequest)
 	assertNoOperatorSensitiveLeak(t, startRaw, "operator-secret", dbPath, filepath.Join(dir, "runtime"), "Authorization", "Bearer", "/home/", "/tmp/")
-	if !bytes.Contains(startRaw, []byte(cpruntime.TerminalReasonApprovalPolicyUnavailable)) {
-		t.Fatalf("start failure = %s, want approval policy unavailable", string(startRaw))
+	var start capability.Response[json.RawMessage]
+	if err := json.Unmarshal(startRaw, &start); err != nil {
+		t.Fatalf("decode one-shot rejection: %v", err)
+	}
+	if start.Status != capability.StatusRejected ||
+		start.ErrorCode != cpruntime.TerminalReasonAgentExitedWithoutAction ||
+		start.Retryable == nil || !*start.Retryable {
+		t.Fatalf("one-shot start response = %+v, want retryable terminal-action rejection", start)
 	}
 	assertAssignmentState(t, ctx, app.DB, rootAssignmentID, "queued", "")
-	if got := countRowsWhere(t, ctx, app.DB, "attempts", "status = 'running'"); got != 0 {
-		t.Fatalf("running attempts = %d, want 0", got)
-	}
-	if got := countRowsWhere(t, ctx, app.DB, "session_routes", "1 = 1"); got != 0 {
-		t.Fatalf("session routes = %d, want no ordinary running Claude route", got)
-	}
-	if got := countRowsWhere(t, ctx, app.DB, "cli_sessions", "1 = 1"); got != 0 {
-		t.Fatalf("cli sessions = %d, want no Claude provider session before approval config exists", got)
-	}
-	if got := countRowsWhere(t, ctx, app.DB, "capability_calls", "subject_kind = 'agent' AND status = 'accepted' AND capability_name IN ('contract.current', 'contract.add')"); got != 0 {
-		t.Fatalf("accepted agent coordlink calls = %d, want none from fake Claude exit 0 path", got)
-	}
-	if got := countRowsWhere(t, ctx, app.DB, "work_contracts", "issuer_contract_id = '"+rootContractID+"'"); got != 0 {
-		t.Fatalf("child contracts = %d, want no child side effect from fake Claude exit 0 path", got)
-	}
-	if got := countRowsWhere(t, ctx, app.DB, "capability_calls", "capability_name = 'operator.task.start'"); got != 0 {
-		t.Fatalf("operator task start audits = %d, want no start audit for rejected provider policy", got)
+	if got := countRowsWhere(t, ctx, app.DB, "events", "event_type = 'session.failed' AND json_extract(payload_json, '$.reason') LIKE '%"+cpruntime.TerminalReasonAgentExitedWithoutAction+"%'"); got != 1 {
+		t.Fatalf("one-shot session.failed events = %d, want durable terminal reason", got)
 	}
 
 	evidenceRaw := getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK)
 	assertNoOperatorSensitiveLeak(t, evidenceRaw, "operator-secret", dbPath, filepath.Join(dir, "runtime"), "Authorization", "Bearer", "/home/", "/tmp/")
 	evidence := decodeOperatorTaskData(t, evidenceRaw)
 	if evidence["status"] != "blocked" ||
-		evidence["failure_class"] != cpruntime.FailureClassRuntimeApprovalBlocked ||
-		evidence["terminal_reason"] != cpruntime.TerminalReasonApprovalPolicyUnavailable {
-		t.Fatalf("evidence = %#v, want runtime approval blocked", evidence)
-	}
-	terminal := objectField(t, evidence, "terminal")
-	if terminal["status"] != "blocked" ||
-		terminal["failure_class"] != cpruntime.FailureClassRuntimeApprovalBlocked ||
-		terminal["terminal_reason"] != cpruntime.TerminalReasonApprovalPolicyUnavailable {
-		t.Fatalf("terminal evidence = %#v, want runtime approval blocker", terminal)
-	}
-	rawDockerLog, err := os.ReadFile(dockerLog)
-	if err != nil {
-		t.Fatalf("read fake docker log: %v", err)
-	}
-	if bytes.Contains(rawDockerLog, []byte("--session-id")) {
-		t.Fatalf("fake docker log shows Claude start command executed: %s", string(rawDockerLog))
+		evidence["failure_class"] != cpruntime.FailureClassAgentExited ||
+		evidence["terminal_reason"] != cpruntime.TerminalReasonAgentExitedWithoutAction {
+		t.Fatalf("one-shot evidence = %#v, want retryable agent-exited blocker", evidence)
 	}
 }
 
@@ -2213,16 +2373,16 @@ func TestDockerClaudeProviderPolicyAllowsCoordlinkCallsThroughOperatorPath(t *te
 	}
 	startRaw := startRec.Body.Bytes()
 	assertNoOperatorSensitiveLeak(t, startRaw, "operator-secret", dbPath, filepath.Join(dir, "runtime"), "Authorization", "Bearer", "/home/", "/tmp/")
-	started := decodeOperatorTaskData(t, startRaw)
-	assertAssignmentState(t, ctx, app.DB, rootAssignmentID, "claimed", stringField(t, started, "session_route_id"))
+	decodeOperatorTaskData(t, startRaw)
+	assertAssignmentState(t, ctx, app.DB, rootAssignmentID, "waiting", "")
 
-	if got := countRowsWhere(t, ctx, app.DB, "attempts", "status = 'running'"); got != 1 {
-		t.Fatalf("running attempts = %d, want root provider-policy attempt running", got)
+	if got := countRowsWhere(t, ctx, app.DB, "attempts", "status = 'waiting'"); got != 1 {
+		t.Fatalf("waiting attempts = %d, want provider-policy attempt waiting", got)
 	}
-	if got := countRowsWhere(t, ctx, app.DB, "cli_sessions", "cli_backend = 'claude' AND state = 'exited'"); got != 1 {
-		t.Fatalf("exited Claude cli sessions = %d, want one audited provider-policy invocation", got)
+	if got := countRowsWhere(t, ctx, app.DB, "cli_sessions", "cli_backend = 'claude' AND state = 'finished'"); got != 1 {
+		t.Fatalf("finished Claude cli sessions = %d, want one waiting provider-policy invocation", got)
 	}
-	for _, capabilityName := range []string{"contract.current", "contract.add"} {
+	for _, capabilityName := range []string{"contract.current", "contract.add", "contract.wait"} {
 		if got := countRowsWhere(t, ctx, app.DB, "capability_calls", "subject_kind = 'agent' AND subject_id = 'coordinator' AND status = 'accepted' AND capability_name = '"+capabilityName+"'"); got != 1 {
 			t.Fatalf("accepted %s calls = %d, want one provider-executed coordlink call", capabilityName, got)
 		}
@@ -2251,6 +2411,7 @@ WHERE c.issuer_contract_id = ? AND c.title = 'provider policy child' AND c.targe
 		"--tools Bash",
 		"Bash(/usr/local/bin/coordlink call contract.current *)",
 		"Bash(/usr/local/bin/coordlink call contract.add *)",
+		"Bash(/usr/local/bin/coordlink call contract.wait *)",
 	} {
 		if !strings.Contains(logText, want) {
 			t.Fatalf("fake docker log = %s, missing provider policy marker %q", logText, want)
@@ -2742,6 +2903,7 @@ runtime_profiles:
       allow_coordlink_capabilities:
         - contract.current
         - contract.add
+        - contract.wait
 agents:
   - id: coordinator
     role_prompt: "Coordinate through allowlisted CoordPlane capabilities."
@@ -2753,6 +2915,7 @@ agents:
     capabilities:
       - contract.current
       - contract.add
+      - contract.wait
   - id: developer
     role_prompt: "Handle delegated child work."
     runtime_profile: external-local
@@ -2899,6 +3062,7 @@ runtime_profiles:
       allow_coordlink_capabilities:
         - contract.current
         - contract.add
+        - contract.wait
 agents:
   - id: coordinator
     role_prompt: "Coordinate through provider policy."
@@ -2910,6 +3074,7 @@ agents:
     capabilities:
       - contract.current
       - contract.add
+      - contract.wait
   - id: developer
     role_prompt: "Handle delegated child work."
     runtime_profile: docker-default
@@ -2942,6 +3107,7 @@ runtime_profiles:
         - report.submit
         - validation.assessment
         - contract.complete
+        - contract.wait
 termination:
   terminal_contract_type: root
   accepted_by_capability: validation.assessment
@@ -2957,6 +3123,7 @@ agents:
       - report.submit
       - validation.assessment
       - contract.complete
+      - contract.wait
 `)
 	if err := os.WriteFile(path, raw, 0o644); err != nil {
 		t.Fatalf("write docker claude validation provider TeamConfig: %v", err)
@@ -3168,6 +3335,17 @@ INSERT INTO attempts (
 type timeoutRunner struct {
 	db           *sql.DB
 	coordination *coordination.Service
+}
+
+type deadlineProbeRunner struct{}
+
+func (r *deadlineProbeRunner) StartAssignment(ctx context.Context, agentID, assignmentID string) (cpruntime.AssignmentSession, error) {
+	select {
+	case <-ctx.Done():
+		return cpruntime.AssignmentSession{}, cpruntime.NewRuntimeExecTimeout("explicit operator execution deadline reached", ctx.Err())
+	case <-time.After(25 * time.Millisecond):
+		return cpruntime.AssignmentSession{}, errors.New("operator execution deadline was not applied")
+	}
 }
 
 func (r *timeoutRunner) StartAssignment(ctx context.Context, agentID, assignmentID string) (cpruntime.AssignmentSession, error) {
@@ -4355,6 +4533,10 @@ if mode == "coordlink-validation-scope-reject":
         sys.exit(7)
     label, kwargs, code = wrong_cases[reject_case]
     expect_status(label, "validation.assessment", wrong_validation_input, "rejected", code, **kwargs)
+    expect_status("contract.wait", "contract.wait", {
+        "reason": "scope rejection was verified; wait for operator inspection",
+        "waiting_for_ref": "validation-scope-rejection",
+    }, "accepted")
     sys.exit(0)
 for label, kwargs, code in wrong_cases.values():
     expect_status(label, "validation.assessment", wrong_validation_input, "rejected", code, **kwargs)
@@ -4372,7 +4554,7 @@ expect_status("contract.complete", "contract.complete", {
 PY
         exit 0
       fi
-      if [ "${COORDPLANE_FAKE_DOCKER_CLAUDE_MODE:-}" = "coordlink-calls" ]; then
+      if [ "${COORDPLANE_FAKE_DOCKER_CLAUDE_MODE:-}" = "coordlink-calls" ] || [ "${COORDPLANE_FAKE_DOCKER_CLAUDE_MODE:-}" = "coordlink-current-only" ]; then
         case " $* " in
           *" --session-id "*|*" --resume "*)
             ;;
@@ -4395,6 +4577,7 @@ workspace = os.environ["COORDPLANE_WORKSPACE_ID"]
 trace_id = os.environ["COORDPLANE_TRACE_ID"]
 lease_id = os.environ["COORDPLANE_LEASE_ID"]
 token = os.environ["COORDPLANE_TOKEN"]
+mode = os.environ.get("COORDPLANE_FAKE_DOCKER_CLAUDE_MODE", "")
 
 def call(capability, input_obj):
     body = json.dumps({
@@ -4433,10 +4616,16 @@ def call(capability, input_obj):
     print(raw.decode())
 
 call("contract.current", {})
+if mode == "coordlink-current-only":
+    sys.exit(0)
 call("contract.add", {
     "title": "provider policy child",
     "objective": "child created by provider-policy coordlink call",
     "target_agent_id": "developer",
+})
+call("contract.wait", {
+    "reason": "provider policy calls verified; wait for delegated child",
+    "waiting_for_ref": "provider-policy-child",
 })
 PY
         exit 0

@@ -144,6 +144,31 @@ agents:
 	}
 }
 
+func TestParseYAMLRejectsDockerAgentCapabilityMissingFromProviderPolicy(t *testing.T) {
+	_, err := teamconfig.ParseYAML([]byte(`
+team_id: runtime-policy-team
+version: 1
+runtime_profiles:
+  docker-default:
+    kind: docker
+    image: coordplane/claude-runtime:test
+    command_policy:
+      non_interactive_approval: true
+      allow_coordlink_capabilities:
+        - report.submit
+agents:
+  - id: fpm-agent
+    runtime_profile: docker-default
+    cli_backend: claude
+    capabilities:
+      - contract.context
+      - report.submit
+`))
+	if err == nil || !strings.Contains(err.Error(), "contract.context") {
+		t.Fatalf("ParseYAML missing provider capability error = %v, want contract.context preflight rejection", err)
+	}
+}
+
 func TestParseYAMLRejectsDuplicateRuntimeCommandPolicyCapabilities(t *testing.T) {
 	_, err := teamconfig.ParseYAML([]byte(`
 team_id: runtime-policy-team

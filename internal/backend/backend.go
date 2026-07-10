@@ -150,7 +150,7 @@ func newAuditedDispatcher(db *sql.DB, inner *policy.Dispatcher) *auditedDispatch
 
 func (d *auditedDispatcher) Handle(ctx context.Context, call capability.Call) capability.Response[json.RawMessage] {
 	response := d.inner.Handle(ctx, call)
-	if err := d.record(ctx, call, response.Status); err != nil {
+	if err := d.record(ctx, call, response); err != nil {
 		return capability.Error[json.RawMessage]("CAPABILITY_CALL_AUDIT_FAILED", err.Error(), true)
 	}
 	return response
@@ -163,13 +163,13 @@ func (d *auditedDispatcher) ListForSubject(ctx context.Context, subject capabili
 		Subject:        subject,
 		Scope:          json.RawMessage(`{}`),
 	}
-	if err := d.record(ctx, call, response.Status); err != nil {
+	if err := d.record(ctx, call, response); err != nil {
 		return capability.Error[json.RawMessage]("CAPABILITY_CALL_AUDIT_FAILED", err.Error(), true)
 	}
 	return response
 }
 
-func (d *auditedDispatcher) record(ctx context.Context, call capability.Call, status capability.Status) error {
+func (d *auditedDispatcher) record(ctx context.Context, call capability.Call, response capability.Response[json.RawMessage]) error {
 	if d == nil || d.db == nil {
 		return errors.New("audit dispatcher has no database")
 	}
@@ -190,13 +190,32 @@ func (d *auditedDispatcher) record(ctx context.Context, call capability.Call, st
 	if strings.TrimSpace(scope) == "" {
 		scope = "{}"
 	}
+	var scoped struct {
+		LeaseID string `json:"lease_id"`
+	}
+	_ = json.Unmarshal(call.Scope, &scoped)
+	attemptID := ""
+	if scoped.LeaseID != "" {
+		_ = d.db.QueryRowContext(ctx, `
+SELECT id FROM attempts WHERE lease_id = ? ORDER BY started_at DESC, id DESC LIMIT 1`, scoped.LeaseID).Scan(&attemptID)
+	}
+	var retryable any
+	if response.Retryable != nil {
+		retryable = 0
+		if *response.Retryable {
+			retryable = 1
+		}
+	}
 	_, err = d.db.ExecContext(ctx, `
 INSERT INTO capability_calls (
   id, tenant_id, trace_id, capability_name, subject_kind, subject_id,
-  scope_json, status, idempotency_key, created_at
-) VALUES (?, 'default', ?, ?, ?, ?, ?, ?, ?, ?)`,
+  scope_json, status, error_code, retryable, attempt_id, lease_id, runtime_id,
+  idempotency_key, created_at
+) VALUES (?, 'default', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, traceID, call.CapabilityName, subjectKind, subjectID, scope,
-		string(status), call.IdempotencyKey, time.Now().UTC().Format(time.RFC3339Nano),
+		string(response.Status), response.ErrorCode, retryable, attemptID,
+		scoped.LeaseID, call.Subject.RuntimeID, call.IdempotencyKey,
+		time.Now().UTC().Format(time.RFC3339Nano),
 	)
 	return err
 }
@@ -648,6 +667,7 @@ func (b *Backend) handleOperatorTaskStart(w http.ResponseWriter, r *http.Request
 	}
 	var input operator.StartTaskInput
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&input); err != nil && !errors.Is(err, io.EOF) {
 		writeTypedResponse(w, capability.Error[json.RawMessage]("INVALID_OPERATOR_TASK_START_REQUEST", "request body must be a JSON operator task start payload", false))
 		return
@@ -665,15 +685,27 @@ func (b *Backend) handleOperatorTaskStart(w http.ResponseWriter, r *http.Request
 			))
 			return
 		}
-		if reason, ok := cpruntime.ErrorTerminalReason(err); ok && reason == cpruntime.TerminalReasonRuntimeExecTimeout {
-			writeTypedResponse(w, capability.Rejected[json.RawMessage](
-				reason,
-				err.Error(),
-				capability.WithRepairHint("inspect operator task evidence, then retry start only after the provider timeout cause is resolved"),
-				capability.WithAllowedNextActions("operator.task.evidence", "operator.task.wait", "operator.task.start"),
-				capability.WithRetryable(true),
-			))
-			return
+		if reason, ok := cpruntime.ErrorTerminalReason(err); ok {
+			switch reason {
+			case cpruntime.TerminalReasonRuntimeExecTimeout:
+				writeTypedResponse(w, capability.Rejected[json.RawMessage](
+					reason,
+					err.Error(),
+					capability.WithRepairHint("inspect operator task evidence, then retry start only after the provider timeout cause is resolved"),
+					capability.WithAllowedNextActions("operator.task.evidence", "operator.task.wait", "operator.task.start"),
+					capability.WithRetryable(true),
+				))
+				return
+			case cpruntime.TerminalReasonAgentExitedWithoutAction:
+				writeTypedResponse(w, capability.Rejected[json.RawMessage](
+					reason,
+					err.Error(),
+					capability.WithRepairHint("inspect operator task evidence, then retry with a provider turn that calls contract.complete or contract.wait"),
+					capability.WithAllowedNextActions("operator.task.evidence", "operator.task.wait", "operator.task.start"),
+					capability.WithRetryable(true),
+				))
+				return
+			}
 		}
 		writeTypedResponse(w, capability.Error[json.RawMessage]("OPERATOR_TASK_START_FAILED", err.Error(), false))
 		return
@@ -916,6 +948,7 @@ func buildCLIAdapters(st *store.Store, db *sql.DB, cfg Config, teamCfg teamconfi
 				ResumeArgs:             cfg.ClaudeResumeArgs,
 				Timeout:                cfg.ClaudeTimeout,
 				RuntimeCommandPolicies: runtimeCommandPolicies(teamCfg),
+				AgentCapabilities:      teamConfigAgentCapabilities(teamCfg),
 			},
 		})
 		if err == nil {
@@ -935,6 +968,17 @@ func buildCLIAdapters(st *store.Store, db *sql.DB, cfg Config, teamCfg teamconfi
 		Ready: claudeReady,
 	})
 	return cpruntime.NewCLIAdapterRegistry(db, registrations), entries
+}
+
+func teamConfigAgentCapabilities(teamCfg teamconfig.Config) map[string][]string {
+	if len(teamCfg.Agents) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(teamCfg.Agents))
+	for _, agent := range teamCfg.Agents {
+		out[agent.ID] = append([]string(nil), agent.Capabilities...)
+	}
+	return out
 }
 
 func runtimeCommandPolicies(teamCfg teamconfig.Config) map[string]cpruntime.RuntimeCommandPolicy {
