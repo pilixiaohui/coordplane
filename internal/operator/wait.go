@@ -209,6 +209,8 @@ type EvidenceTerminal struct {
 	ValidationFailureCount                int64  `json:"validation_failure_count"`
 	CompletionBoundValidationFailureCount int64  `json:"completion_bound_validation_failure_count"`
 	ProviderAuditFailureCount             int64  `json:"provider_audit_failure_count"`
+	ManagedRuntimeCleanupPendingCount     int64  `json:"managed_runtime_cleanup_pending_count"`
+	ManagedRuntimeCleanupFailedCount      int64  `json:"managed_runtime_cleanup_failed_count"`
 	QueuedAssignmentCount                 int64  `json:"queued_assignment_count"`
 	ActiveAssignmentCount                 int64  `json:"active_assignment_count"`
 	ActiveLeaseCount                      int64  `json:"active_lease_count"`
@@ -1012,6 +1014,30 @@ WHERE cs.provider_audit_state = 'failed'
   AND a.contract_id IN (`+placeholders(len(contractIDs))+`)`, args...).Scan(&out.ProviderAuditFailureCount); err != nil {
 		return out, fmt.Errorf("count provider audit failures: %w", err)
 	}
+	if err := s.db.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM runtime_instances ri
+JOIN attempts att ON att.id = ri.attempt_id
+JOIN leases l ON l.id = att.lease_id
+JOIN assignments a ON a.id = l.assignment_id
+WHERE ri.runtime_kind = 'docker'
+  AND att.status <> 'waiting'
+  AND ri.cleanup_state IN ('not_requested', 'pending', 'in_progress')
+  AND a.contract_id IN (`+placeholders(len(contractIDs))+`)`, args...).Scan(&out.ManagedRuntimeCleanupPendingCount); err != nil {
+		return out, fmt.Errorf("count pending managed runtime cleanup: %w", err)
+	}
+	if err := s.db.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM runtime_instances ri
+JOIN attempts att ON att.id = ri.attempt_id
+JOIN leases l ON l.id = att.lease_id
+JOIN assignments a ON a.id = l.assignment_id
+WHERE ri.runtime_kind = 'docker'
+  AND att.status <> 'waiting'
+  AND ri.cleanup_state = 'failed'
+  AND a.contract_id IN (`+placeholders(len(contractIDs))+`)`, args...).Scan(&out.ManagedRuntimeCleanupFailedCount); err != nil {
+		return out, fmt.Errorf("count failed managed runtime cleanup: %w", err)
+	}
 	if out.GateMode == teamconfig.GateModeBusiness {
 		business, err := s.businessAcceptance(ctx, contractIDs)
 		if err != nil {
@@ -1024,6 +1050,12 @@ WHERE cs.provider_audit_state = 'failed'
 
 	unfinishedLineage := out.QueuedAssignmentCount > 0 || out.ActiveAssignmentCount > 0 || out.ActiveLeaseCount > 0
 	switch {
+	case out.RootContractStatus == "satisfied" && out.ManagedRuntimeCleanupFailedCount > 0:
+		out.Status = "failed"
+		out.FailureSummary = "managed runtime cleanup failed for a contract lineage session"
+	case out.RootContractStatus == "satisfied" && out.ManagedRuntimeCleanupPendingCount > 0:
+		out.Status = "running"
+		out.FailureSummary = "managed runtime cleanup is still pending for a contract lineage session"
 	case out.RootContractStatus == "satisfied" && out.ProviderAuditFailureCount > 0:
 		out.Status = "failed"
 		out.FailureSummary = "provider tool audit is incomplete for a contract lineage session"
