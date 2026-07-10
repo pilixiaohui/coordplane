@@ -68,7 +68,7 @@ func NewRunner(cfg RunnerConfig) (*Runner, error) {
 	if cfg.WorkspaceName == "" {
 		cfg.WorkspaceName = "default"
 	}
-	return &Runner{
+	runner := &Runner{
 		db:            cfg.Store.DB(),
 		coordination:  cfg.Coordination,
 		cfg:           cfg.TeamConfig,
@@ -79,7 +79,11 @@ func NewRunner(cfg RunnerConfig) (*Runner, error) {
 		objects:       objects.NewStore(cfg.Store),
 		backendURL:    cfg.BackendURL,
 		workspaceName: cfg.WorkspaceName,
-	}, nil
+	}
+	if err := runner.ReconcileRuntimeCleanup(context.Background()); err != nil {
+		return nil, fmt.Errorf("runtime runner: reconcile managed runtime cleanup: %w", err)
+	}
+	return runner, nil
 }
 
 func cloneRuntimeBackends(in map[string]RuntimeBackend) map[string]RuntimeBackend {
@@ -191,6 +195,9 @@ func (r *Runner) startClaimed(ctx context.Context, agent teamconfig.AgentConfig,
 		}
 		if err := r.ReleasePrepareLease(cleanupCtx, prepareLease.ID); err != nil {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("release prepare lease: %w", err))
+		}
+		if err := r.finalizeManagedRuntime(cleanupCtx, attemptID, cause.Error()); err != nil {
+			cleanupErrors = append(cleanupErrors, err)
 		}
 		if len(cleanupErrors) > 0 {
 			return AssignmentSession{}, errors.Join(cause, errors.Join(cleanupErrors...))
@@ -308,8 +315,10 @@ func (r *Runner) startClaimed(ctx context.Context, agent teamconfig.AgentConfig,
 		}
 	}
 	if capabilities, ok := AdapterCapabilitiesForBackend(r.adapter, agent.CLIBackend); ok && capabilities.ReturnsOnProcessExit {
-		if err := r.finalizeOneShotExit(next.Lease.ID, attemptID); err != nil {
-			return AssignmentSession{}, err
+		finalizeErr := r.finalizeOneShotExit(next.Lease.ID, attemptID)
+		cleanupErr := r.finalizeManagedRuntime(ctx, attemptID, "one-shot process exited")
+		if finalizeErr != nil || cleanupErr != nil {
+			return AssignmentSession{}, errors.Join(finalizeErr, cleanupErr)
 		}
 	}
 	if err := r.convergeReleasedLeaseBookkeeping(ctx, next.Lease.ID, attemptID); err != nil {
@@ -634,12 +643,73 @@ UPDATE session_routes SET state = 'waiting', updated_at = ? WHERE id = ?`,
 	if err != nil {
 		return Attempt{}, err
 	}
+	var finalizationErrors []error
 	if !alreadyFinished {
 		if err := r.adapter.Finish(ctx, adapterReport); err != nil {
-			return Attempt{}, err
+			finalizationErrors = append(finalizationErrors, err)
 		}
 	}
-	return attempt, nil
+	if report.Status != "waiting" {
+		if err := r.finalizeManagedRuntime(ctx, report.AttemptID, "session "+report.Status); err != nil {
+			finalizationErrors = append(finalizationErrors, err)
+		}
+	}
+	return attempt, errors.Join(finalizationErrors...)
+}
+
+func (r *Runner) finalizeManagedRuntime(ctx context.Context, attemptID, reason string) error {
+	var profile string
+	err := r.db.QueryRowContext(context.WithoutCancel(ctx), `
+SELECT runtime_profile
+FROM runtime_instances
+WHERE attempt_id = ?
+ORDER BY created_at DESC, id DESC
+LIMIT 1`, attemptID).Scan(&profile)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lookup managed runtime finalizer: %w", err)
+	}
+	var backend RuntimeBackend
+	if r.runtimes != nil {
+		backend = r.runtimes[profile]
+	}
+	if backend == nil && r.runtime != nil && (profile == "" || r.runtime.Name() == profile) {
+		backend = r.runtime
+	}
+	finalizer, ok := backend.(RuntimeFinalizer)
+	if !ok {
+		return nil
+	}
+	if err := finalizer.FinalizeRuntime(ctx, attemptID, reason); err != nil {
+		return fmt.Errorf("finalize managed runtime: %w", err)
+	}
+	return nil
+}
+
+func (r *Runner) ReconcileRuntimeCleanup(ctx context.Context) error {
+	seen := make(map[RuntimeBackend]bool)
+	var reconcileErrors []error
+	for _, backend := range r.runtimes {
+		if backend == nil || seen[backend] {
+			continue
+		}
+		seen[backend] = true
+		if reconciler, ok := backend.(RuntimeFinalizer); ok {
+			if err := reconciler.ReconcileRuntimeCleanup(ctx); err != nil {
+				reconcileErrors = append(reconcileErrors, fmt.Errorf("runtime %s: %w", backend.Name(), err))
+			}
+		}
+	}
+	if r.runtime != nil && !seen[r.runtime] {
+		if reconciler, ok := r.runtime.(RuntimeFinalizer); ok {
+			if err := reconciler.ReconcileRuntimeCleanup(ctx); err != nil {
+				reconcileErrors = append(reconcileErrors, fmt.Errorf("runtime %s: %w", r.runtime.Name(), err))
+			}
+		}
+	}
+	return errors.Join(reconcileErrors...)
 }
 
 func (r *Runner) Attempt(ctx context.Context, attemptID string) (Attempt, error) {

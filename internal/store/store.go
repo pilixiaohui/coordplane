@@ -127,6 +127,11 @@ var migrations = []migration{
 		Name:    "capability audit outcomes and runtime scope",
 		SQL:     capabilityAuditOutcomeSchemaSQL,
 	},
+	{
+		Version: "019_managed_runtime_cleanup",
+		Name:    "managed runtime cleanup ownership and recovery ledger",
+		SQL:     managedRuntimeCleanupSchemaSQL,
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) (MigrationResult, error) {

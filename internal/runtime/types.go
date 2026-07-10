@@ -80,25 +80,31 @@ type EnvironmentInput struct {
 }
 
 type RuntimeInstance struct {
-	ID             string          `json:"id"`
-	RuntimeID      string          `json:"runtime_id"`
-	RuntimeKind    string          `json:"runtime_kind"`
-	RuntimeProfile string          `json:"runtime_profile"`
-	AgentID        string          `json:"agent_id"`
-	AttemptID      string          `json:"attempt_id"`
-	LeaseID        string          `json:"lease_id"`
-	ContainerID    string          `json:"container_id,omitempty"`
-	ContainerName  string          `json:"container_name,omitempty"`
-	Image          string          `json:"image,omitempty"`
-	Network        string          `json:"network,omitempty"`
-	State          string          `json:"state"`
-	WorkspacePath  string          `json:"workspace_path"`
-	HomePath       string          `json:"home_path"`
-	Checks         map[string]bool `json:"checks,omitempty"`
-	EnvKeys        []string        `json:"env_keys,omitempty"`
-	LastError      string          `json:"last_error,omitempty"`
-	CreatedAt      time.Time       `json:"created_at"`
-	UpdatedAt      time.Time       `json:"updated_at"`
+	ID              string          `json:"id"`
+	RuntimeID       string          `json:"runtime_id"`
+	RuntimeKind     string          `json:"runtime_kind"`
+	RuntimeProfile  string          `json:"runtime_profile"`
+	AgentID         string          `json:"agent_id"`
+	AttemptID       string          `json:"attempt_id"`
+	LeaseID         string          `json:"lease_id"`
+	ContainerID     string          `json:"container_id,omitempty"`
+	ContainerName   string          `json:"container_name,omitempty"`
+	Image           string          `json:"image,omitempty"`
+	Network         string          `json:"network,omitempty"`
+	State           string          `json:"state"`
+	WorkspacePath   string          `json:"workspace_path"`
+	HomePath        string          `json:"home_path"`
+	Checks          map[string]bool `json:"checks,omitempty"`
+	EnvKeys         []string        `json:"env_keys,omitempty"`
+	LastError       string          `json:"last_error,omitempty"`
+	CleanupState    string          `json:"cleanup_state"`
+	CleanupReason   string          `json:"cleanup_reason,omitempty"`
+	CleanupError    string          `json:"cleanup_error,omitempty"`
+	CleanupOwner    string          `json:"cleanup_owner,omitempty"`
+	CleanupAttempts int             `json:"cleanup_attempts"`
+	RemovedAt       *time.Time      `json:"removed_at,omitempty"`
+	CreatedAt       time.Time       `json:"created_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
 }
 
 type CLISession struct {

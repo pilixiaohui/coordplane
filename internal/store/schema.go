@@ -806,3 +806,17 @@ ALTER TABLE capability_calls ADD COLUMN runtime_id TEXT;
 CREATE INDEX IF NOT EXISTS capability_calls_runtime_scope_idx
   ON capability_calls(lease_id, attempt_id, runtime_id, created_at);
 `
+
+const managedRuntimeCleanupSchemaSQL = `
+ALTER TABLE runtime_instances ADD COLUMN cleanup_state TEXT NOT NULL DEFAULT 'not_requested'
+  CHECK (cleanup_state IN ('not_requested', 'pending', 'in_progress', 'removed', 'failed'));
+ALTER TABLE runtime_instances ADD COLUMN cleanup_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE runtime_instances ADD COLUMN cleanup_error TEXT NOT NULL DEFAULT '';
+ALTER TABLE runtime_instances ADD COLUMN cleanup_owner TEXT NOT NULL DEFAULT '';
+ALTER TABLE runtime_instances ADD COLUMN cleanup_lease_expires_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE runtime_instances ADD COLUMN cleanup_attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runtime_instances ADD COLUMN removed_at TEXT NOT NULL DEFAULT '';
+
+CREATE INDEX IF NOT EXISTS runtime_instances_cleanup_idx
+  ON runtime_instances(runtime_kind, cleanup_state, cleanup_lease_expires_at);
+`

@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -145,7 +146,7 @@ func (r *DockerRuntime) IsReady() bool {
 	return r != nil && r.ready
 }
 
-func (r *DockerRuntime) Prepare(ctx context.Context, req PrepareRequest) (PreparedRuntime, error) {
+func (r *DockerRuntime) Prepare(ctx context.Context, req PrepareRequest) (prepared PreparedRuntime, retErr error) {
 	if err := r.validate(req); err != nil {
 		return PreparedRuntime{}, err
 	}
@@ -217,6 +218,23 @@ func (r *DockerRuntime) Prepare(ctx context.Context, req PrepareRequest) (Prepar
 	if err != nil {
 		return PreparedRuntime{}, err
 	}
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runtimeCleanupTimeout)
+		defer cancel()
+		var cleanupErrors []error
+		if err := r.markFailed(cleanupCtx, instanceID, runtimeID, retErr, checks); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("mark Docker prepare failed: %w", err))
+		}
+		if err := r.FinalizeRuntime(cleanupCtx, req.AttemptID, "docker prepare failed"); err != nil {
+			cleanupErrors = append(cleanupErrors, err)
+		}
+		if len(cleanupErrors) > 0 {
+			retErr = errors.Join(retErr, errors.Join(cleanupErrors...))
+		}
+	}()
 	if len(authMaterial.Env) > 0 {
 		if err := r.recordAuthMaterialInjected(ctx, runtimeID, req, authMaterial); err != nil {
 			return PreparedRuntime{}, err
@@ -242,15 +260,18 @@ func (r *DockerRuntime) Prepare(ctx context.Context, req PrepareRequest) (Prepar
 		BackendURL: req.BackendURL,
 	}
 	result, err := r.docker.PrepareContainer(ctx, spec)
+	if result.ContainerID != "" {
+		if persistErr := r.recordContainerIdentity(ctx, instanceID, result.ContainerID); persistErr != nil {
+			return PreparedRuntime{}, persistErr
+		}
+	}
 	if err != nil {
-		_ = r.markFailed(ctx, instanceID, runtimeID, err)
 		return PreparedRuntime{}, err
 	}
 	for key, value := range result.Checks {
 		checks[key] = value
 	}
 	if err := validateRuntimeChecks(checks, ""); err != nil {
-		_ = r.markFailed(ctx, instanceID, runtimeID, err, checks)
 		return PreparedRuntime{}, err
 	}
 	if req.CLIBackend == "claude" {
@@ -260,26 +281,22 @@ func (r *DockerRuntime) Prepare(ctx context.Context, req PrepareRequest) (Prepar
 		}
 		if err != nil {
 			_ = r.recordAuthProbeFailed(ctx, runtimeID, req, probe, err)
-			_ = r.markFailed(ctx, instanceID, runtimeID, err, checks)
 			return PreparedRuntime{}, err
 		}
 		if err := r.recordAuthProbePassed(ctx, runtimeID, req, probe, authMaterial); err != nil {
-			_ = r.markFailed(ctx, instanceID, runtimeID, err, checks)
 			return PreparedRuntime{}, err
 		}
 		if err := validateRuntimeChecks(checks, req.CLIBackend); err != nil {
-			_ = r.markFailed(ctx, instanceID, runtimeID, err, checks)
 			return PreparedRuntime{}, err
 		}
 	}
 	if err := validateRuntimeChecks(checks, req.CLIBackend); err != nil {
-		_ = r.markFailed(ctx, instanceID, runtimeID, err, checks)
 		return PreparedRuntime{}, err
 	}
 	if err := r.markReady(ctx, instanceID, runtimeID, result.ContainerID, checks); err != nil {
 		return PreparedRuntime{}, err
 	}
-	return PreparedRuntime{
+	prepared = PreparedRuntime{
 		RuntimeID:         runtimeID,
 		Kind:              "docker",
 		Workspace:         ContainerWorkspacePath,
@@ -290,7 +307,8 @@ func (r *DockerRuntime) Prepare(ctx context.Context, req PrepareRequest) (Prepar
 		ContainerID:       result.ContainerID,
 		ContainerName:     containerName,
 		Checks:            cloneBoolMap(checks),
-	}, nil
+	}
+	return prepared, nil
 }
 
 func (r *DockerRuntime) authMaterial(ctx context.Context, req PrepareRequest, runtimeID string) (secrets.Material, error) {
@@ -453,6 +471,17 @@ WHERE id = ?`,
 		})
 		return err
 	})
+}
+
+func (r *DockerRuntime) recordContainerIdentity(ctx context.Context, instanceID, containerID string) error {
+	_, err := r.db.ExecContext(ctx, `
+UPDATE runtime_instances
+SET container_id = ?, updated_at = ?
+WHERE id = ?`, containerID, formatTime(time.Now()), instanceID)
+	if err != nil {
+		return fmt.Errorf("record runtime container identity: %w", err)
+	}
+	return nil
 }
 
 func (r *DockerRuntime) markFailed(ctx context.Context, instanceID, runtimeID string, cause error, checks ...map[string]bool) error {
@@ -689,7 +718,6 @@ func (c DockerCLIClient) PrepareContainer(ctx context.Context, spec DockerContai
 		return DockerContainerResult{}, err
 	}
 	defer envFile.Cleanup()
-	_ = exec.CommandContext(ctx, binary, "rm", "-f", spec.ContainerName).Run()
 	args := []string{"run", "-d", "--name", spec.ContainerName}
 	if spec.User != "" {
 		args = append(args, "--user", spec.User)
@@ -724,28 +752,76 @@ func (c DockerCLIClient) PrepareContainer(ctx context.Context, spec DockerContai
 		"git_workspace_writable": {"exec", spec.ContainerName, "sh", "-lc", "mkdir -p /workspace/project/.coordplane-git-write-test && touch /workspace/project/.coordplane-git-write-test/file && rm -rf /workspace/project/.coordplane-git-write-test"},
 	} {
 		if raw, err := exec.CommandContext(ctx, binary, args...).CombinedOutput(); err != nil {
-			return DockerContainerResult{}, fmt.Errorf("docker check %s failed: %w: %s", name, err, strings.TrimSpace(string(raw)))
+			return DockerContainerResult{ContainerID: containerID, Checks: checks}, fmt.Errorf("docker check %s failed: %w: %s", name, err, strings.TrimSpace(string(raw)))
 		}
 		checks[name] = true
 	}
 	if spec.User != "" {
 		raw, err := exec.CommandContext(ctx, binary, "exec", spec.ContainerName, "sh", "-lc", "printf '%s:%s' \"$(id -u)\" \"$(id -g)\"").CombinedOutput()
 		if err != nil {
-			return DockerContainerResult{}, fmt.Errorf("docker check cli_user_consistent failed: %w: %s", err, strings.TrimSpace(string(raw)))
+			return DockerContainerResult{ContainerID: containerID, Checks: checks}, fmt.Errorf("docker check cli_user_consistent failed: %w: %s", err, strings.TrimSpace(string(raw)))
 		}
 		checks["cli_user_consistent"] = strings.TrimSpace(string(raw)) == spec.User
 		if !checks["cli_user_consistent"] {
-			return DockerContainerResult{}, fmt.Errorf("docker check cli_user_consistent failed: got %q want %q", strings.TrimSpace(string(raw)), spec.User)
+			return DockerContainerResult{ContainerID: containerID, Checks: checks}, fmt.Errorf("docker check cli_user_consistent failed: got %q want %q", strings.TrimSpace(string(raw)), spec.User)
 		}
 	}
 	envArgs := []string{"exec"}
 	envArgs = envFile.AppendArgs(envArgs)
 	envArgs = append(envArgs, spec.ContainerName, ContainerCoordlinkPath, "capability", "list")
 	if raw, err := exec.CommandContext(ctx, binary, envArgs...).CombinedOutput(); err != nil {
-		return DockerContainerResult{}, fmt.Errorf("docker coordlink backend check failed: %w: %s", err, strings.TrimSpace(string(raw)))
+		return DockerContainerResult{ContainerID: containerID, Checks: checks}, fmt.Errorf("docker coordlink backend check failed: %w: %s", err, strings.TrimSpace(string(raw)))
 	}
 	checks["backend_reachable"] = true
 	return DockerContainerResult{ContainerID: containerID, Checks: checks}, nil
+}
+
+func (c DockerCLIClient) InspectContainer(ctx context.Context, containerName string) (map[string]string, error) {
+	binary := c.Binary
+	if binary == "" {
+		binary = "docker"
+	}
+	if strings.TrimSpace(containerName) == "" {
+		return nil, errors.New("docker inspect: container name is required")
+	}
+	raw, err := exec.CommandContext(ctx, binary, "inspect", "--format", "{{json .Config.Labels}}", containerName).CombinedOutput()
+	if err != nil {
+		if dockerContainerNotFound(raw) {
+			return nil, os.ErrNotExist
+		}
+		return nil, fmt.Errorf("docker inspect failed: %w: %s", err, strings.TrimSpace(string(raw)))
+	}
+	var labels map[string]string
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &labels); err != nil {
+		return nil, fmt.Errorf("decode docker container labels: %w", err)
+	}
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	return labels, nil
+}
+
+func (c DockerCLIClient) RemoveContainer(ctx context.Context, containerName string) error {
+	binary := c.Binary
+	if binary == "" {
+		binary = "docker"
+	}
+	if strings.TrimSpace(containerName) == "" {
+		return errors.New("docker remove: container name is required")
+	}
+	raw, err := exec.CommandContext(ctx, binary, "rm", "-f", containerName).CombinedOutput()
+	if err != nil {
+		if dockerContainerNotFound(raw) {
+			return os.ErrNotExist
+		}
+		return fmt.Errorf("docker remove failed: %w: %s", err, strings.TrimSpace(string(raw)))
+	}
+	return nil
+}
+
+func dockerContainerNotFound(raw []byte) bool {
+	lower := strings.ToLower(string(raw))
+	return strings.Contains(lower, "no such container") || strings.Contains(lower, "no such object")
 }
 
 type dockerEnvFile struct {
@@ -836,7 +912,8 @@ func ListRuntimeInstances(ctx context.Context, db *sql.DB) ([]RuntimeInstance, e
 	rows, err := db.QueryContext(ctx, `
 SELECT id, runtime_id, runtime_kind, runtime_profile, agent_id, attempt_id, lease_id,
   container_id, container_name, image, network, state, workspace_path, home_path,
-  checks_json, env_keys_json, last_error, created_at, updated_at
+  checks_json, env_keys_json, last_error, cleanup_state, cleanup_reason, cleanup_error,
+  cleanup_owner, cleanup_attempts, removed_at, created_at, updated_at
 FROM runtime_instances
 ORDER BY created_at, id`)
 	if err != nil {
@@ -846,7 +923,7 @@ ORDER BY created_at, id`)
 	var out []RuntimeInstance
 	for rows.Next() {
 		var instance RuntimeInstance
-		var checksJSON, envKeysJSON, createdAt, updatedAt string
+		var checksJSON, envKeysJSON, removedAt, createdAt, updatedAt string
 		if err := rows.Scan(
 			&instance.ID,
 			&instance.RuntimeID,
@@ -865,6 +942,12 @@ ORDER BY created_at, id`)
 			&checksJSON,
 			&envKeysJSON,
 			&instance.LastError,
+			&instance.CleanupState,
+			&instance.CleanupReason,
+			&instance.CleanupError,
+			&instance.CleanupOwner,
+			&instance.CleanupAttempts,
+			&removedAt,
 			&createdAt,
 			&updatedAt,
 		); err != nil {
@@ -888,6 +971,13 @@ ORDER BY created_at, id`)
 		instance.UpdatedAt, err = parseTime(updatedAt)
 		if err != nil {
 			return nil, err
+		}
+		if removedAt != "" {
+			value, err := parseTime(removedAt)
+			if err != nil {
+				return nil, err
+			}
+			instance.RemovedAt = &value
 		}
 		out = append(out, instance)
 	}
