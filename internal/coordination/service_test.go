@@ -346,6 +346,64 @@ func TestContractCompleteBindsExistingRequiredEvidenceForCloseout(t *testing.T) 
 	}
 }
 
+func TestContractCompleteRejectsAmbiguousImplicitEvidenceWithoutSideEffects(t *testing.T) {
+	ctx := context.Background()
+	svc, db := newService(t)
+	work := addAndClaim(t, ctx, svc, "builder")
+
+	for _, id := range []string{"ev_report_first", "ev_report_second"} {
+		insertEvidence(t, ctx, db, id, "report", work.Contract.ID, "builder", id)
+	}
+
+	response := svc.CompleteContract(ctx, coordination.CompleteContractInput{
+		LeaseID: work.Lease.ID,
+		AgentID: "builder",
+		Summary: "must bind explicitly",
+	})
+	if response.Status != capability.StatusRejected || response.ErrorCode != "AMBIGUOUS_REQUIRED_EVIDENCE" {
+		t.Fatalf("ambiguous implicit evidence response = %+v, want AMBIGUOUS_REQUIRED_EVIDENCE", response)
+	}
+	if got := contractStatus(t, ctx, db, work.Contract.ID); got != "open" {
+		t.Fatalf("contract status after ambiguous binding = %s, want open", got)
+	}
+	if got := leaseState(t, ctx, db, work.Lease.ID); got != "active" {
+		t.Fatalf("lease state after ambiguous binding = %s, want active", got)
+	}
+}
+
+func TestContractCompleteRejectsExplicitEvidenceOutsideContractWithoutFallback(t *testing.T) {
+	ctx := context.Background()
+	svc, db := newService(t)
+	work := addAndClaim(t, ctx, svc, "builder")
+	local, err := svc.SubmitReport(ctx, coordination.SubmitReportInput{
+		LeaseID: work.Lease.ID,
+		AgentID: "builder",
+		Summary: "local report",
+		Content: "local content",
+	})
+	if err != nil {
+		t.Fatalf("submit local report: %v", err)
+	}
+	foreignContract := addContract(t, ctx, svc, "coordinator")
+	insertEvidence(t, ctx, db, "ev_foreign_report", "report", foreignContract.ContractID, "coordinator", "foreign")
+
+	response := svc.CompleteContract(ctx, coordination.CompleteContractInput{
+		LeaseID:     work.Lease.ID,
+		AgentID:     "builder",
+		EvidenceIDs: []string{"ev_foreign_report"},
+		Summary:     "must not fall back to " + local.ID,
+	})
+	if response.Status != capability.StatusRejected || response.ErrorCode != "EVIDENCE_CONTRACT_MISMATCH" {
+		t.Fatalf("foreign evidence response = %+v, want EVIDENCE_CONTRACT_MISMATCH", response)
+	}
+	if got := contractStatus(t, ctx, db, work.Contract.ID); got != "open" {
+		t.Fatalf("contract status after foreign evidence = %s, want open", got)
+	}
+	if got := leaseState(t, ctx, db, work.Lease.ID); got != "active" {
+		t.Fatalf("lease state after foreign evidence = %s, want active", got)
+	}
+}
+
 func TestContractCompleteMissingRequiredEvidenceReportsActionableRefs(t *testing.T) {
 	ctx := context.Background()
 	svc, db := newService(t)
@@ -768,6 +826,94 @@ func TestCoordinationCapabilitiesPreserveRejectedEvidenceThroughAdapters(t *test
 	}
 	if got := leaseState(t, ctx, db, work.Lease.ID); got != "active" {
 		t.Fatalf("rejected adapter complete changed lease state = %s, want active", got)
+	}
+}
+
+func TestHighRiskCoordinationWritesRejectUnknownFieldsWithoutSideEffects(t *testing.T) {
+	ctx := context.Background()
+	svc, db := newService(t)
+	dispatcher := newCoordinationDispatcher(t, svc)
+	work := addAndClaim(t, ctx, svc, "builder")
+
+	reportResponse := dispatcher.Handle(ctx, capability.Call{
+		CapabilityName: "report.submit",
+		Subject:        agentSubject("builder"),
+		Scope:          mustRaw(t, map[string]any{"lease_id": work.Lease.ID}),
+		Input: mustRaw(t, map[string]any{
+			"summary": "valid summary",
+			"content": "valid content",
+			"body":    "silently ignored before strict decoding",
+		}),
+	})
+	if reportResponse.Status != capability.StatusRejected || reportResponse.ErrorCode != "INVALID_CAPABILITY_INPUT" {
+		t.Fatalf("report.submit unknown-field response = %+v, want INVALID_CAPABILITY_INPUT", reportResponse)
+	}
+	if got := countRowsWhere(t, ctx, db, "evidence", "kind = 'report'"); got != 0 {
+		t.Fatalf("report evidence after rejected unknown field = %d, want 0", got)
+	}
+
+	report, err := svc.SubmitReport(ctx, coordination.SubmitReportInput{
+		LeaseID: work.Lease.ID,
+		AgentID: "builder",
+		Summary: "canonical report",
+		Content: "canonical content",
+	})
+	if err != nil {
+		t.Fatalf("submit canonical report: %v", err)
+	}
+	completeResponse := dispatcher.Handle(ctx, capability.Call{
+		CapabilityName: "contract.complete",
+		Subject:        agentSubject("builder"),
+		Scope:          mustRaw(t, map[string]any{"lease_id": work.Lease.ID}),
+		Input: mustRaw(t, map[string]any{
+			"summary":            "wrong binding field must not be ignored",
+			"report_evidence_id": report.ID,
+		}),
+	})
+	if completeResponse.Status != capability.StatusRejected || completeResponse.ErrorCode != "INVALID_CAPABILITY_INPUT" {
+		t.Fatalf("contract.complete unknown-field response = %+v, want INVALID_CAPABILITY_INPUT", completeResponse)
+	}
+	if got := contractStatus(t, ctx, db, work.Contract.ID); got != "open" {
+		t.Fatalf("contract status after rejected unknown field = %s, want open", got)
+	}
+	if got := leaseState(t, ctx, db, work.Lease.ID); got != "active" {
+		t.Fatalf("lease state after rejected unknown field = %s, want active", got)
+	}
+}
+
+func TestHighRiskCoordinationCapabilitySchemasAreStrict(t *testing.T) {
+	svc, _ := newService(t)
+	registry := capability.NewRegistry()
+	if err := coordination.RegisterCapabilities(registry, svc); err != nil {
+		t.Fatalf("register coordination capabilities: %v", err)
+	}
+	wantRequired := map[string]string{
+		"report.submit":     "summary",
+		"contract.complete": "",
+	}
+	for _, definition := range registry.List() {
+		want, ok := wantRequired[definition.Name]
+		if !ok {
+			continue
+		}
+		var schema map[string]any
+		if err := json.Unmarshal(definition.InputSchema, &schema); err != nil {
+			t.Fatalf("decode %s schema: %v", definition.Name, err)
+		}
+		if schema["additionalProperties"] != false {
+			t.Fatalf("%s additionalProperties = %#v, want false", definition.Name, schema["additionalProperties"])
+		}
+		properties, ok := schema["properties"].(map[string]any)
+		if !ok || len(properties) == 0 {
+			t.Fatalf("%s properties = %#v, want concrete fields", definition.Name, schema["properties"])
+		}
+		if want != "" && !containsAny(schema["required"], want) {
+			t.Fatalf("%s required = %#v, want %s", definition.Name, schema["required"], want)
+		}
+		delete(wantRequired, definition.Name)
+	}
+	if len(wantRequired) != 0 {
+		t.Fatalf("missing high-risk capability schemas: %#v", wantRequired)
 	}
 }
 
@@ -1268,6 +1414,19 @@ INSERT INTO evidence (
 }
 
 func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAny(raw any, want string) bool {
+	values, ok := raw.([]any)
+	if !ok {
+		return false
+	}
 	for _, value := range values {
 		if value == want {
 			return true

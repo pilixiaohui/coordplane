@@ -179,9 +179,10 @@ type CompleteContractInput struct {
 }
 
 type CompleteContractResult struct {
-	ContractID string `json:"contract_id"`
-	Status     string `json:"status"`
-	EnvelopeID string `json:"envelope_id,omitempty"`
+	ContractID  string   `json:"contract_id"`
+	Status      string   `json:"status"`
+	EnvelopeID  string   `json:"envelope_id,omitempty"`
+	EvidenceIDs []string `json:"evidence_ids"`
 }
 
 type SendMessageInput struct {
@@ -513,7 +514,7 @@ func (s *Service) CompleteContract(ctx context.Context, in CompleteContractInput
 		if err != nil {
 			return err
 		}
-		evidenceIDs, requirements, err := bindRequiredEvidence(ctx, tx, scope.Contract.ID, in.EvidenceIDs)
+		evidenceIDs, requirements, err := bindRequiredEvidence(ctx, tx, scope.Contract.ID, in.LeaseID, in.EvidenceIDs)
 		if err != nil {
 			return err
 		}
@@ -564,7 +565,7 @@ func (s *Service) CompleteContract(ctx context.Context, in CompleteContractInput
 		if _, err := appendFact(ctx, tx, "contract.satisfied", "work_contract", scope.Contract.ID, map[string]string{"lease_id": in.LeaseID, "envelope_id": envelopeID}); err != nil {
 			return err
 		}
-		result = CompleteContractResult{ContractID: scope.Contract.ID, Status: "satisfied", EnvelopeID: envelopeID}
+		result = CompleteContractResult{ContractID: scope.Contract.ID, Status: "satisfied", EnvelopeID: envelopeID, EvidenceIDs: evidenceIDs}
 		return nil
 	})
 	if err != nil {
@@ -1074,7 +1075,7 @@ type evidenceRequirementStatus struct {
 	PresentIDs []string
 }
 
-func bindRequiredEvidence(ctx context.Context, tx *sql.Tx, contractID string, evidenceIDs []string) ([]string, []evidenceRequirementStatus, error) {
+func bindRequiredEvidence(ctx context.Context, tx *sql.Tx, contractID, leaseID string, evidenceIDs []string) ([]string, []evidenceRequirementStatus, error) {
 	required, err := requiredEvidence(ctx, tx, contractID)
 	if err != nil {
 		return nil, nil, err
@@ -1082,23 +1083,37 @@ func bindRequiredEvidence(ctx context.Context, tx *sql.Tx, contractID string, ev
 	bound := make([]string, 0, len(evidenceIDs)+len(required))
 	seenEvidence := make(map[string]bool)
 	presentByKind := make(map[string][]string)
+	requiredKinds := make(map[string]bool, len(required))
+	for _, kind := range required {
+		requiredKinds[kind] = true
+	}
 	for _, id := range evidenceIDs {
 		id = strings.TrimSpace(id)
 		if id == "" {
-			continue
+			return nil, nil, rejectedErr{response: invalidEvidenceBindingResponse(contractID, leaseID, "EVIDENCE_NOT_FOUND", "contract.complete evidence_ids contains an empty evidence id", id)}
 		}
-		var kind string
-		err := tx.QueryRowContext(ctx, `SELECT kind FROM evidence WHERE id = ? AND contract_id = ?`, id, contractID).Scan(&kind)
+		if seenEvidence[id] {
+			return nil, nil, rejectedErr{response: invalidEvidenceBindingResponse(contractID, leaseID, "AMBIGUOUS_REQUIRED_EVIDENCE", "contract.complete evidence_ids contains a duplicate evidence id", id)}
+		}
+		var kind, evidenceContractID string
+		err := tx.QueryRowContext(ctx, `SELECT kind, contract_id FROM evidence WHERE id = ?`, id).Scan(&kind, &evidenceContractID)
 		if errors.Is(err, sql.ErrNoRows) {
-			continue
+			return nil, nil, rejectedErr{response: invalidEvidenceBindingResponse(contractID, leaseID, "EVIDENCE_NOT_FOUND", "contract.complete evidence id does not exist", id)}
 		}
 		if err != nil {
 			return nil, nil, err
 		}
-		if !seenEvidence[id] {
-			bound = append(bound, id)
-			seenEvidence[id] = true
+		if evidenceContractID != contractID {
+			return nil, nil, rejectedErr{response: invalidEvidenceBindingResponse(contractID, leaseID, "EVIDENCE_CONTRACT_MISMATCH", "contract.complete evidence belongs to another contract", id)}
 		}
+		if !requiredKinds[kind] {
+			return nil, nil, rejectedErr{response: invalidEvidenceBindingResponse(contractID, leaseID, "EVIDENCE_KIND_MISMATCH", "contract.complete evidence kind is not required by this contract", id)}
+		}
+		if len(presentByKind[kind]) > 0 {
+			return nil, nil, rejectedErr{response: invalidEvidenceBindingResponse(contractID, leaseID, "AMBIGUOUS_REQUIRED_EVIDENCE", "contract.complete requires exactly one evidence id for each required kind", id)}
+		}
+		bound = append(bound, id)
+		seenEvidence[id] = true
 		presentByKind[kind] = append(presentByKind[kind], id)
 	}
 	requirements := make([]evidenceRequirementStatus, 0, len(required))
@@ -1112,7 +1127,10 @@ func bindRequiredEvidence(ctx context.Context, tx *sql.Tx, contractID string, ev
 			if err != nil {
 				return nil, nil, err
 			}
-			if len(available) > 0 {
+			if len(available) > 1 {
+				return nil, nil, rejectedErr{response: ambiguousEvidenceResponse(contractID, leaseID, kind, len(available))}
+			}
+			if len(available) == 1 {
 				chosen := available[0]
 				status.PresentIDs = []string{chosen}
 				if !seenEvidence[chosen] {
@@ -1124,6 +1142,32 @@ func bindRequiredEvidence(ctx context.Context, tx *sql.Tx, contractID string, ev
 		requirements = append(requirements, status)
 	}
 	return bound, requirements, nil
+}
+
+func invalidEvidenceBindingResponse(contractID, leaseID, code, message, evidenceID string) capability.Response[CompleteContractResult] {
+	opts := []capability.RejectedOption{
+		capability.WithCanonicalID("contract_id", contractID),
+		capability.WithCanonicalID("lease_id", leaseID),
+		capability.WithRepairHint("retry contract.complete with exactly one evidence id from this contract for each required evidence kind"),
+		capability.WithAllowedNextActions("contract.context", "contract.complete"),
+		capability.WithRetryable(true),
+	}
+	if evidenceID != "" {
+		opts = append(opts, capability.WithCanonicalID("evidence_id", evidenceID))
+	}
+	return capability.Rejected[CompleteContractResult](code, message, opts...)
+}
+
+func ambiguousEvidenceResponse(contractID, leaseID, kind string, candidateCount int) capability.Response[CompleteContractResult] {
+	return capability.Rejected[CompleteContractResult](
+		"AMBIGUOUS_REQUIRED_EVIDENCE",
+		fmt.Sprintf("contract.complete found %d %s evidence candidates; bind one explicitly", candidateCount, kind),
+		capability.WithCanonicalID("contract_id", contractID),
+		capability.WithCanonicalID("lease_id", leaseID),
+		capability.WithRepairHint("retry contract.complete with evidence_ids containing exactly one evidence id for each required kind"),
+		capability.WithAllowedNextActions("contract.context", "contract.complete"),
+		capability.WithRetryable(true),
+	)
 }
 
 func latestEvidenceIDsForKind(ctx context.Context, tx *sql.Tx, contractID, kind string) ([]string, error) {
@@ -1173,7 +1217,19 @@ func requiredEvidence(ctx context.Context, tx *sql.Tx, contractID string) ([]str
 	if len(decoded.RequiredEvidence) == 0 {
 		return []string{"report"}, nil
 	}
-	return decoded.RequiredEvidence, nil
+	seen := make(map[string]bool, len(decoded.RequiredEvidence))
+	result := make([]string, 0, len(decoded.RequiredEvidence))
+	for _, kind := range decoded.RequiredEvidence {
+		kind = strings.TrimSpace(kind)
+		if kind != "" && !seen[kind] {
+			seen[kind] = true
+			result = append(result, kind)
+		}
+	}
+	if len(result) == 0 {
+		return []string{"report"}, nil
+	}
+	return result, nil
 }
 
 func createChildCompletedMailbox(ctx context.Context, tx *sql.Tx, contract Contract, evidenceIDs []string, envelopeID string, triggerTurn bool) error {

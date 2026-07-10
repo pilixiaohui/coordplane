@@ -144,7 +144,7 @@ func RegisterCapabilities(registry *capability.Registry, service *Service) error
 	}
 	return registry.Register(capability.Definition{
 		Name:           "validation.assessment",
-		InputSchema:    json.RawMessage(`{"type":"object"}`),
+		InputSchema:    json.RawMessage(`{"type":"object","properties":{"lease_id":{"type":"string","minLength":1},"assessed_contract_id":{"type":"string","minLength":1},"verdict":{"type":"string","enum":["pass","fail","blocked"]},"reason":{"type":"string","minLength":1},"summary":{"type":"string","minLength":1},"checked_refs":{"type":"array","minItems":1,"items":{"type":"object","properties":{"kind":{"type":"string","minLength":1},"id":{"type":"string","minLength":1},"ref":{"type":"string","minLength":1}},"required":["kind"],"anyOf":[{"required":["id"]},{"required":["ref"]}],"additionalProperties":false}},"blockers":{"type":"array","items":{"type":"string","minLength":1}}},"required":["verdict","reason","summary","checked_refs"],"additionalProperties":false}`),
 		OutputSchema:   json.RawMessage(`{"type":"object"}`),
 		RejectedSchema: json.RawMessage(`{"type":"object"}`),
 		SideEffect:     capability.SideEffectWrite,
@@ -156,7 +156,7 @@ func RegisterCapabilities(registry *capability.Registry, service *Service) error
 
 func (s *Service) handleAssessment(ctx context.Context, call capability.Call) capability.Response[json.RawMessage] {
 	var input Input
-	if err := decodeInputWithScope(call, &input); err != nil {
+	if err := capability.DecodeWithScopeStrict(call.Scope, call.Input, &input); err != nil {
 		return capability.Rejected[json.RawMessage](
 			"INVALID_CAPABILITY_INPUT",
 			"validation.assessment input is invalid: "+err.Error(),
@@ -805,32 +805,6 @@ func resultFromAssessment(assessment Assessment) Result {
 		CheckedRefCount:    len(assessment.CheckedRefs),
 		Summary:            assessment.Summary,
 	}
-}
-
-func decodeInputWithScope(call capability.Call, target any) error {
-	var merged map[string]any
-	if len(call.Scope) > 0 {
-		if err := json.Unmarshal(call.Scope, &merged); err != nil {
-			return fmt.Errorf("decode scope: %w", err)
-		}
-	}
-	if merged == nil {
-		merged = make(map[string]any)
-	}
-	if len(call.Input) > 0 {
-		var input map[string]any
-		if err := json.Unmarshal(call.Input, &input); err != nil {
-			return err
-		}
-		for key, value := range input {
-			merged[key] = value
-		}
-	}
-	mergedBytes, err := json.Marshal(merged)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(mergedBytes, target)
 }
 
 func reject(code, message, repair string) capability.Response[json.RawMessage] {

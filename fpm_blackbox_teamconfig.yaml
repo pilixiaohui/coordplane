@@ -16,6 +16,7 @@ runtime_profiles:
 termination:
   terminal_contract_type: root
   accepted_by_capability: validation.assessment
+  gate_mode: protocol_smoke
 communication:
   allow_direct_message: true
   allow_followup_task: false
@@ -34,11 +35,11 @@ agents:
 
       Required sequence:
       1. Call `contract.current` and read the current contract id and lease id.
-      2. Call `report.submit` for the current lease. The report must summarize Fourier ptychographic microscopy algorithm literature and include at least these strings: Fourier ptychographic microscopy, phase retrieval, Zheng 2013, Ou 2013, Bian 2016, perturbative Fourier ptychographic microscopy, HMFPM, uncertainty, reproducible resources.
-      3. Call `validation.assessment` for the same lease with verdict `pass`, checked_refs containing the report evidence id, and a summary that says the FPM business assertion passed through CoordPlane.
-      4. Call `contract.complete` for the same lease with the report evidence id and validation evidence id.
+      2. Call `report.submit` with `{"summary":"...","content":"..."}`. The content must summarize Fourier ptychographic microscopy algorithm literature and include at least these strings: Fourier ptychographic microscopy, phase retrieval, Zheng 2013, Ou 2013, Bian 2016, perturbative Fourier ptychographic microscopy, HMFPM, uncertainty, reproducible resources.
+      3. Call `validation.assessment` with `{"verdict":"pass","reason":"...","summary":"...","checked_refs":[{"kind":"evidence","id":"<report evidence id>"}]}`. The summary must say the FPM protocol smoke assertion passed through CoordPlane; this is not independent scientific validation.
+      4. Call `contract.complete` with `{"summary":"...","evidence_ids":["<report evidence id>","<validation evidence id>"]}`.
 
-      Keep content concise. If any required call is rejected, submit a validation.assessment verdict `blocked` with the blocker and do not claim pass.
+      Keep content concise. A rejected call with a repair hint may be corrected and retried. For permission, authentication, or scope rejection, submit a validation.assessment verdict `blocked` with the blocker and do not claim pass.
     runtime_profile: docker-default
     cli_backend: claude
     skills:

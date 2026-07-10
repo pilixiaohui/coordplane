@@ -53,6 +53,7 @@ type RuntimeCommandPolicy struct {
 type TerminationConfig struct {
 	TerminalContractType string `json:"terminal_contract_type,omitempty" yaml:"terminal_contract_type"`
 	AcceptedByCapability string `json:"accepted_by_capability,omitempty" yaml:"accepted_by_capability"`
+	GateMode             string `json:"gate_mode,omitempty" yaml:"gate_mode"`
 }
 
 type CommunicationConfig struct {

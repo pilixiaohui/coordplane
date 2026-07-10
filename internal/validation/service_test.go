@@ -269,6 +269,65 @@ func TestValidationAssessmentRejectsUnauthorizedCapabilityAndOutOfScopeRefs(t *t
 	assertNoValidationSideEffects(t, ctx, h.db)
 }
 
+func TestValidationAssessmentRejectsUnknownFieldsWithoutSideEffects(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, &recordingExecutor{}, true)
+	flow := h.startSiblingSessions(t, ctx)
+	report, err := h.coordination.SubmitReport(ctx, coordination.SubmitReportInput{
+		LeaseID: flow.Developer.LeaseID,
+		AgentID: "developer",
+		Summary: "developer evidence",
+		Content: "developer evidence body",
+	})
+	if err != nil {
+		t.Fatalf("submit developer report: %v", err)
+	}
+
+	call := validationCall("verifier", flow.Verifier.Route.RuntimeID, flow.Verifier.LeaseID, flow.DeveloperContractID, []map[string]string{{"kind": "evidence", "id": report.ID}})
+	var input map[string]any
+	if err := json.Unmarshal(call.Input, &input); err != nil {
+		t.Fatalf("decode validation input fixture: %v", err)
+	}
+	input["checked_ref"] = map[string]string{"kind": "evidence", "id": report.ID}
+	call.Input = raw(t, input)
+	response := coordlink.New(h.dispatcher).Call(ctx, call)
+	if response.Status != capability.StatusRejected || response.ErrorCode != "INVALID_CAPABILITY_INPUT" {
+		t.Fatalf("validation unknown-field response = %+v, want INVALID_CAPABILITY_INPUT", response)
+	}
+	assertNoValidationSideEffects(t, ctx, h.db)
+}
+
+func TestValidationAssessmentPublishesStrictInputSchema(t *testing.T) {
+	h := newHarness(t, &recordingExecutor{}, true)
+	service, err := validation.NewService(validation.Config{Store: h.store})
+	if err != nil {
+		t.Fatalf("new validation service: %v", err)
+	}
+	registry := capability.NewRegistry()
+	if err := validation.RegisterCapabilities(registry, service); err != nil {
+		t.Fatalf("register validation capability: %v", err)
+	}
+	definitions := registry.List()
+	for _, definition := range definitions {
+		if definition.Name != "validation.assessment" {
+			continue
+		}
+		var schema map[string]any
+		if err := json.Unmarshal(definition.InputSchema, &schema); err != nil {
+			t.Fatalf("decode validation schema: %v", err)
+		}
+		if schema["additionalProperties"] != false {
+			t.Fatalf("validation additionalProperties = %#v, want false", schema["additionalProperties"])
+		}
+		properties, ok := schema["properties"].(map[string]any)
+		if !ok || properties["checked_refs"] == nil || properties["verdict"] == nil {
+			t.Fatalf("validation properties = %#v, want checked_refs and verdict", schema["properties"])
+		}
+		return
+	}
+	t.Fatal("validation.assessment definition not found")
+}
+
 func TestValidationAssessmentIdempotencyAndBlockedVerdict(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, &recordingExecutor{}, true)

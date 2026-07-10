@@ -43,13 +43,13 @@ func RegisterCapabilities(registry *capability.Registry, service *Service) error
 		{definition("contract.current", capability.SideEffectRead, "agent_lease", false), service.handleContractCurrent},
 		{definition("contract.context", capability.SideEffectRead, "agent_lease", false), service.handleContractContext},
 		{definition("contract.wait", capability.SideEffectWrite, "agent_lease", true), service.handleContractWait},
-		{definition("contract.complete", capability.SideEffectWrite, "agent_lease", true), service.handleContractComplete},
+		{definitionWithInput("contract.complete", capability.SideEffectWrite, "agent_lease", true, contractCompleteInputSchema), service.handleContractComplete},
 		{definition("message.send", capability.SideEffectWrite, "agent_lease", true), service.handleMessageSend},
 		{definition("communication.read", capability.SideEffectRead, "agent", false), service.handleCommunicationRead},
 		{definition("mailbox.list", capability.SideEffectRead, "agent", false), service.handleMailboxList},
 		{definition("mailbox.get", capability.SideEffectRead, "agent", false), service.handleMailboxGet},
 		{definition("mailbox.resolve", capability.SideEffectWrite, "agent", true), service.handleMailboxResolve},
-		{definition("report.submit", capability.SideEffectWrite, "agent_lease", true), service.handleReportSubmit},
+		{definitionWithInput("report.submit", capability.SideEffectWrite, "agent_lease", true, reportSubmitInputSchema), service.handleReportSubmit},
 	} {
 		if err := registry.Register(spec.def, spec.handler); err != nil {
 			return err
@@ -58,10 +58,18 @@ func RegisterCapabilities(registry *capability.Registry, service *Service) error
 	return nil
 }
 
+var reportSubmitInputSchema = json.RawMessage(`{"type":"object","properties":{"lease_id":{"type":"string","minLength":1},"summary":{"type":"string","minLength":1},"content":{"type":"string"}},"required":["summary"],"additionalProperties":false}`)
+
+var contractCompleteInputSchema = json.RawMessage(`{"type":"object","properties":{"lease_id":{"type":"string","minLength":1},"evidence_ids":{"type":"array","items":{"type":"string","minLength":1},"minItems":1,"uniqueItems":true},"summary":{"type":"string"}},"additionalProperties":false}`)
+
 func definition(name string, sideEffect capability.SideEffect, scope string, idempotency bool) capability.Definition {
+	return definitionWithInput(name, sideEffect, scope, idempotency, json.RawMessage(`{"type":"object"}`))
+}
+
+func definitionWithInput(name string, sideEffect capability.SideEffect, scope string, idempotency bool, inputSchema json.RawMessage) capability.Definition {
 	return capability.Definition{
 		Name:           name,
-		InputSchema:    json.RawMessage(`{"type":"object"}`),
+		InputSchema:    inputSchema,
 		OutputSchema:   json.RawMessage(`{"type":"object"}`),
 		RejectedSchema: json.RawMessage(`{"type":"object"}`),
 		SideEffect:     sideEffect,
@@ -165,7 +173,7 @@ func (s *Service) handleContractWait(ctx context.Context, call capability.Call) 
 
 func (s *Service) handleContractComplete(ctx context.Context, call capability.Call) capability.Response[json.RawMessage] {
 	var input CompleteContractInput
-	if err := decodeInputWithScope(call, &input); err != nil {
+	if err := capability.DecodeWithScopeStrict(call.Scope, call.Input, &input); err != nil {
 		return invalidInput("contract.complete", err)
 	}
 	input.AgentID = agentIDFromCall(call)
@@ -221,7 +229,7 @@ func (s *Service) handleMailboxResolve(ctx context.Context, call capability.Call
 
 func (s *Service) handleReportSubmit(ctx context.Context, call capability.Call) capability.Response[json.RawMessage] {
 	var input SubmitReportInput
-	if err := decodeInputWithScope(call, &input); err != nil {
+	if err := capability.DecodeWithScopeStrict(call.Scope, call.Input, &input); err != nil {
 		return invalidInput("report.submit", err)
 	}
 	input.AgentID = agentIDFromCall(call)
