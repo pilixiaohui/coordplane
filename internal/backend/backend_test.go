@@ -3448,6 +3448,126 @@ UPDATE assignments SET state = 'returned', updated_at = ? WHERE id = ?`, now, ro
 	}
 }
 
+func TestOperatorEvidenceV3ClassifiesPreMigrationValidationAsLegacyUnverifiable(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "coordplane.db")
+	initial, err := backend.Open(ctx, backend.Config{
+		DBPath:            dbPath,
+		ListenAddr:        "127.0.0.1:0",
+		TeamConfigPath:    writeTeamConfig(t, dir),
+		OperatorToken:     "operator-secret",
+		OperatorSubjectID: "ops-user",
+	})
+	if err != nil {
+		t.Fatalf("open pre-migration seed backend: %v", err)
+	}
+	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, initial.Handler, "operator-secret", operatorTaskRequest("operator-legacy-validation", map[string]any{
+		"team_id":         "accept-test",
+		"team_version":    1,
+		"target_agent_id": "builder",
+	}), http.StatusOK))
+	taskRunID := stringField(t, created, "task_run_id")
+	rootContractID := stringField(t, created, "root_contract_id")
+	rootAssignmentID := stringField(t, created, "root_assignment_id")
+	if err := initial.Close(); err != nil {
+		t.Fatalf("close pre-migration seed backend: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open pre-v20 SQLite snapshot: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	legacyTime := "2000-01-01T00:00:00.000000000Z"
+	if _, err := db.ExecContext(ctx, `DROP TABLE contract_completion_evidence`); err != nil {
+		_ = db.Close()
+		t.Fatalf("remove v20 table from legacy snapshot: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version = '020_contract_completion_evidence'`); err != nil {
+		_ = db.Close()
+		t.Fatalf("remove v20 migration marker from legacy snapshot: %v", err)
+	}
+	for _, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{`UPDATE work_contracts SET status = 'satisfied', updated_at = ? WHERE id = ?`, []any{legacyTime, rootContractID}},
+		{`UPDATE assignments SET state = 'returned', session_route_id = 'route_legacy_validation', updated_at = ? WHERE id = ?`, []any{legacyTime, rootAssignmentID}},
+		{`INSERT INTO session_routes (id, agent_id, runtime_id, cli_backend, session_native_id, route_json, state, created_at, updated_at) VALUES ('route_legacy_validation', 'builder', 'rt_legacy_validation', 'fake', 'native_legacy_validation', '{}', 'completed', ?, ?)`, []any{legacyTime, legacyTime}},
+		{`INSERT INTO leases (id, assignment_id, agent_id, runtime_id, session_route_id, state, expires_at, created_at, updated_at) VALUES ('lease_legacy_validation', ?, 'builder', 'rt_legacy_validation', 'route_legacy_validation', 'released', ?, ?, ?)`, []any{rootAssignmentID, legacyTime, legacyTime, legacyTime}},
+		{`INSERT INTO attempts (id, lease_id, cli_backend, runtime_kind, session_native_id, start_reason, status, started_at, ended_at) VALUES ('att_legacy_validation', 'lease_legacy_validation', 'fake', 'external', 'native_legacy_validation', 'legacy seed', 'completed', ?, ?)`, []any{legacyTime, legacyTime}},
+		{`INSERT INTO evidence (id, kind, contract_id, produced_by, content_ref, inline_content, summary, verdict, created_at) VALUES ('ev_legacy_report', 'report', ?, 'builder', 'obj_legacy_report', '', 'legacy report', NULL, ?)`, []any{rootContractID, legacyTime}},
+		{`INSERT INTO evidence (id, kind, contract_id, produced_by, content_ref, inline_content, summary, verdict, created_at) VALUES ('ev_legacy_validation', 'validation_assessment', ?, 'builder', 'validation_assessment:va_legacy', '', 'legacy validation passed', 'pass', ?)`, []any{rootContractID, legacyTime}},
+		{`INSERT INTO validation_assessments (
+  id, verifier_agent_id, lease_id, assignment_id, contract_id, attempt_id,
+  session_route_id, runtime_id, assessed_contract_id, verdict, reason, summary,
+  checked_refs_json, ref_snapshot_json, evidence_id, created_at
+) VALUES (
+  'va_legacy', 'builder', 'lease_legacy_validation', ?, ?, 'att_legacy_validation',
+  'route_legacy_validation', 'rt_legacy_validation', ?, 'pass', 'legacy pass',
+  'legacy validation passed', '["obj_legacy_report"]', '[]',
+  'ev_legacy_validation', ?
+)`, []any{rootAssignmentID, rootContractID, rootContractID, legacyTime}},
+	} {
+		if _, err := db.ExecContext(ctx, statement.query, statement.args...); err != nil {
+			_ = db.Close()
+			t.Fatalf("seed pre-v20 validation snapshot: %v", err)
+		}
+	}
+	var v20Markers, completionTables int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = '020_contract_completion_evidence'`).Scan(&v20Markers); err != nil {
+		_ = db.Close()
+		t.Fatalf("count pre-migration v20 markers: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'contract_completion_evidence'`).Scan(&completionTables); err != nil {
+		_ = db.Close()
+		t.Fatalf("count pre-migration completion tables: %v", err)
+	}
+	if v20Markers != 0 || completionTables != 0 {
+		_ = db.Close()
+		t.Fatalf("pre-migration snapshot still has v20 state: markers=%d tables=%d", v20Markers, completionTables)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close pre-v20 SQLite snapshot: %v", err)
+	}
+
+	app, err := backend.Open(ctx, backend.Config{
+		DBPath:            dbPath,
+		ListenAddr:        "127.0.0.1:0",
+		TeamID:            "accept-test",
+		OperatorToken:     "operator-secret",
+		OperatorSubjectID: "ops-user",
+	})
+	if err != nil {
+		t.Fatalf("open migrated legacy evidence backend: %v", err)
+	}
+	defer app.Close()
+	before := legacyEvidenceReadOnlySnapshot(t, ctx, app.DB, rootContractID)
+	raw := getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK)
+	evidence := decodeOperatorTaskData(t, raw)
+	if evidence["schema_version"] != "operator.task.evidence.v3" || evidence["status"] == "passed" {
+		t.Fatalf("legacy validation evidence = %#v, want v3 non-passed", evidence)
+	}
+	validations := arrayField(t, evidence, "validation_assessments")
+	if len(validations) != 1 || validations[0].(map[string]any)["binding_status"] != "legacy_unverifiable" {
+		t.Fatalf("legacy validation assessments = %#v, want legacy_unverifiable", validations)
+	}
+	terminal := objectField(t, evidence, "terminal")
+	if terminal["total_validation_pass_count"].(float64) != 1 ||
+		terminal["completion_bound_validation_pass_count"].(float64) != 0 ||
+		terminal["status"] == "passed" {
+		t.Fatalf("legacy validation terminal = %#v, want total=1 bound=0 non-passed", terminal)
+	}
+	if got := countRowsWhere(t, ctx, app.DB, "contract_completion_evidence", "1 = 1"); got != 0 {
+		t.Fatalf("migration synthesized completion bindings = %d, want 0", got)
+	}
+	after := legacyEvidenceReadOnlySnapshot(t, ctx, app.DB, rootContractID)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("legacy evidence projection mutated durable state: before=%#v after=%#v", before, after)
+	}
+}
+
 func TestCommunicationReadPublicBoundaryRequiresRuntimeTokenSubjectBinding(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -4496,6 +4616,30 @@ FROM cli_sessions WHERE attempt_id = 'att_provider_audit_failed'`).Scan(
 		var count string
 		if err := db.QueryRowContext(ctx, `SELECT CAST(COUNT(*) AS TEXT) FROM `+table).Scan(&count); err != nil {
 			t.Fatalf("snapshot operator evidence %s: %v", table, err)
+		}
+		out[table] = count
+	}
+	return out
+}
+
+func legacyEvidenceReadOnlySnapshot(t *testing.T, ctx context.Context, db *sql.DB, contractID string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	var contractStatus, contractUpdatedAt, assessmentVerdict, assessmentCreatedAt string
+	if err := db.QueryRowContext(ctx, `SELECT status, updated_at FROM work_contracts WHERE id = ?`, contractID).Scan(&contractStatus, &contractUpdatedAt); err != nil {
+		t.Fatalf("snapshot legacy contract: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT verdict, created_at FROM validation_assessments WHERE id = 'va_legacy'`).Scan(&assessmentVerdict, &assessmentCreatedAt); err != nil {
+		t.Fatalf("snapshot legacy validation: %v", err)
+	}
+	out["contract_status"] = contractStatus
+	out["contract_updated_at"] = contractUpdatedAt
+	out["assessment_verdict"] = assessmentVerdict
+	out["assessment_created_at"] = assessmentCreatedAt
+	for _, table := range []string{"events", "evidence", "validation_assessments", "contract_completion_evidence"} {
+		var count string
+		if err := db.QueryRowContext(ctx, `SELECT CAST(COUNT(*) AS TEXT) FROM `+table).Scan(&count); err != nil {
+			t.Fatalf("snapshot legacy evidence %s: %v", table, err)
 		}
 		out[table] = count
 	}
