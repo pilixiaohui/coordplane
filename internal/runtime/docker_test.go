@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"coordplane/internal/claudeenv"
 	"coordplane/internal/coordination"
@@ -175,6 +176,157 @@ func TestRunnerStartsDockerRuntimeWithDurableEvidenceAndScopedEnv(t *testing.T) 
 	}
 }
 
+func TestManagedDockerRuntimeCleanupConvergesWithDetachedContextAndIsIdempotent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := newDockerRuntimeHarness(t, nil)
+	addContract(t, ctx, h.coordination, "developer")
+	session, err := h.runner.StartNext(ctx, "developer")
+	if err != nil {
+		t.Fatalf("start docker runtime: %v", err)
+	}
+	h.docker.onInspect = func(context.Context) { cancel() }
+
+	if _, err := h.runner.FinishSession(ctx, cpruntime.TerminalReport{
+		AttemptID: session.AttemptID,
+		Status:    "completed",
+		Summary:   "managed runtime completed",
+	}); err != nil {
+		t.Fatalf("finish managed runtime after parent cancellation: %v", err)
+	}
+	assertRuntimeCleanup(t, context.Background(), h.db, session.AttemptID, "stopped", "removed")
+	if h.docker.HasContainer(session.ContainerName) {
+		t.Fatalf("managed container %s still exists after completed cleanup", session.ContainerName)
+	}
+	if got := h.docker.RemovedCount(); got != 1 {
+		t.Fatalf("docker remove calls = %d, want 1", got)
+	}
+
+	if _, err := h.runner.FinishSession(context.Background(), cpruntime.TerminalReport{
+		AttemptID: session.AttemptID,
+		Status:    "completed",
+	}); err != nil {
+		t.Fatalf("repeat finish managed runtime: %v", err)
+	}
+	if got := h.docker.RemovedCount(); got != 1 {
+		t.Fatalf("docker remove calls after repeated finish = %d, want idempotent 1", got)
+	}
+	if got := countRowsWhere(t, context.Background(), h.db, "events", "event_type = 'runtime.cleanup_removed'"); got != 1 {
+		t.Fatalf("runtime.cleanup_removed events = %d, want 1", got)
+	}
+}
+
+func TestManagedDockerRuntimeWaitingSurvivesResumeUntilCompletion(t *testing.T) {
+	ctx := context.Background()
+	h := newDockerRuntimeHarness(t, nil)
+	addContract(t, ctx, h.coordination, "developer")
+	session, err := h.runner.StartNext(ctx, "developer")
+	if err != nil {
+		t.Fatalf("start docker runtime: %v", err)
+	}
+	if _, err := h.coordination.WaitContract(ctx, coordination.WaitContractInput{
+		LeaseID:        session.LeaseID,
+		AgentID:        "developer",
+		Reason:         "waiting for resumable work",
+		WaitingForRef:  "contract:child",
+		SessionRouteID: session.Route.ID,
+	}); err != nil {
+		t.Fatalf("wait contract: %v", err)
+	}
+	if _, err := h.runner.FinishSession(ctx, cpruntime.TerminalReport{
+		AttemptID: session.AttemptID,
+		Status:    "waiting",
+	}); err != nil {
+		t.Fatalf("finish waiting runtime: %v", err)
+	}
+	assertRuntimeCleanup(t, ctx, h.db, session.AttemptID, "ready", "not_requested")
+	if !h.docker.HasContainer(session.ContainerName) {
+		t.Fatalf("waiting managed container %s was removed before resume", session.ContainerName)
+	}
+	if _, err := h.runner.ResumeRoute(ctx, cpruntime.ResumeRouteInput{
+		RouteID: session.Route.ID,
+		Reason:  "resume managed runtime",
+	}); err != nil {
+		t.Fatalf("resume waiting managed runtime: %v", err)
+	}
+	if _, err := h.runner.FinishSession(ctx, cpruntime.TerminalReport{
+		AttemptID: session.AttemptID,
+		Status:    "completed",
+	}); err != nil {
+		t.Fatalf("complete resumed managed runtime: %v", err)
+	}
+	assertRuntimeCleanup(t, ctx, h.db, session.AttemptID, "stopped", "removed")
+	if h.docker.HasContainer(session.ContainerName) {
+		t.Fatalf("resumed managed container %s still exists after completion", session.ContainerName)
+	}
+}
+
+func TestManagedDockerRuntimeCleanupFencesForeignOwnershipLabels(t *testing.T) {
+	ctx := context.Background()
+	h := newDockerRuntimeHarness(t, nil)
+	addContract(t, ctx, h.coordination, "developer")
+	session, err := h.runner.StartNext(ctx, "developer")
+	if err != nil {
+		t.Fatalf("start docker runtime: %v", err)
+	}
+	h.docker.SetContainerLabel(session.ContainerName, "coordplane.runtime_id", "rt_foreign_owner")
+
+	if _, err := h.runner.FinishSession(ctx, cpruntime.TerminalReport{
+		AttemptID: session.AttemptID,
+		Status:    "completed",
+	}); err == nil || !strings.Contains(err.Error(), "ownership") {
+		t.Fatalf("finish with foreign container labels error = %v, want ownership fence", err)
+	}
+	assertRuntimeCleanup(t, ctx, h.db, session.AttemptID, "stopped", "failed")
+	if !h.docker.HasContainer(session.ContainerName) {
+		t.Fatalf("foreign-owned container %s was removed", session.ContainerName)
+	}
+	if got := h.docker.RemovedCount(); got != 0 {
+		t.Fatalf("docker remove calls for foreign-owned container = %d, want 0", got)
+	}
+}
+
+func TestManagedDockerRuntimeReconcilesPendingCleanupAfterCrash(t *testing.T) {
+	ctx := context.Background()
+	h := newDockerRuntimeHarness(t, nil)
+	addContract(t, ctx, h.coordination, "developer")
+	session, err := h.runner.StartNext(ctx, "developer")
+	if err != nil {
+		t.Fatalf("start docker runtime: %v", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := h.db.ExecContext(ctx, `UPDATE attempts SET status = 'failed', ended_at = ? WHERE id = ?`, now, session.AttemptID); err != nil {
+		t.Fatalf("mark crash attempt failed: %v", err)
+	}
+	if _, err := h.db.ExecContext(ctx, `UPDATE leases SET state = 'released', updated_at = ? WHERE id = ?`, now, session.LeaseID); err != nil {
+		t.Fatalf("release crash lease: %v", err)
+	}
+	if _, err := h.db.ExecContext(ctx, `
+UPDATE runtime_instances
+SET cleanup_state = 'pending', cleanup_reason = 'crash recovery', updated_at = ?
+WHERE attempt_id = ?`, now, session.AttemptID); err != nil {
+		t.Fatalf("persist pending cleanup intent: %v", err)
+	}
+	reconciler, ok := any(h.dockerRuntime).(interface {
+		ReconcileRuntimeCleanup(context.Context) error
+	})
+	if !ok {
+		t.Fatal("DockerRuntime does not implement crash cleanup reconciler")
+	}
+	if err := reconciler.ReconcileRuntimeCleanup(ctx); err != nil {
+		t.Fatalf("reconcile pending runtime cleanup: %v", err)
+	}
+	assertRuntimeCleanup(t, ctx, h.db, session.AttemptID, "stopped", "removed")
+	if h.docker.HasContainer(session.ContainerName) {
+		t.Fatalf("crash-reconciled container %s still exists", session.ContainerName)
+	}
+	if err := reconciler.ReconcileRuntimeCleanup(ctx); err != nil {
+		t.Fatalf("repeat cleanup reconciliation: %v", err)
+	}
+	if got := h.docker.RemovedCount(); got != 1 {
+		t.Fatalf("docker remove calls after repeated reconciliation = %d, want 1", got)
+	}
+}
+
 func TestDockerRuntimePrepareFailureFailsClosedWithoutAdapterStart(t *testing.T) {
 	ctx := context.Background()
 	h := newDockerRuntimeHarness(t, errors.New("docker daemon unavailable"))
@@ -235,6 +387,10 @@ func TestDockerRuntimeMissingWritableCheckFailsClosedWithoutAdapterStart(t *test
 	instance := onlyRuntimeInstance(t, ctx, h.db)
 	if instance.State != "failed" || !strings.Contains(instance.LastError, "cli_user_consistent") {
 		t.Fatalf("runtime instance = %+v, want failed missing check evidence", instance)
+	}
+	assertRuntimeCleanup(t, ctx, h.db, instance.AttemptID, "failed", "removed")
+	if h.docker.HasContainer(instance.ContainerName) {
+		t.Fatalf("post-create check failure left managed container %s", instance.ContainerName)
 	}
 }
 
@@ -559,12 +715,13 @@ exit 0
 }
 
 type dockerRuntimeHarness struct {
-	db           *sql.DB
-	store        *store.Store
-	coordination *coordination.Service
-	runner       *cpruntime.Runner
-	fake         *cpruntime.FakeCLIAdapter
-	docker       *recordingDockerClient
+	db            *sql.DB
+	store         *store.Store
+	coordination  *coordination.Service
+	runner        *cpruntime.Runner
+	fake          *cpruntime.FakeCLIAdapter
+	docker        *recordingDockerClient
+	dockerRuntime *cpruntime.DockerRuntime
 }
 
 func newDockerRuntimeHarness(t *testing.T, dockerErr error) dockerRuntimeHarness {
@@ -622,12 +779,13 @@ func newDockerRuntimeHarnessWithClient(t *testing.T, docker *recordingDockerClie
 		t.Fatalf("new docker runner: %v", err)
 	}
 	return dockerRuntimeHarness{
-		db:           db,
-		store:        st,
-		coordination: coordSvc,
-		runner:       runner,
-		fake:         fake,
-		docker:       docker,
+		db:            db,
+		store:         st,
+		coordination:  coordSvc,
+		runner:        runner,
+		fake:          fake,
+		docker:        docker,
+		dockerRuntime: dockerRuntime,
 	}
 }
 
@@ -652,9 +810,13 @@ func dockerRuntimeTeamConfig() teamconfig.Config {
 }
 
 type recordingDockerClient struct {
-	err    error
-	checks map[string]bool
-	specs  []cpruntime.DockerContainerSpec
+	err        error
+	checks     map[string]bool
+	specs      []cpruntime.DockerContainerSpec
+	containers map[string]map[string]string
+	removed    []string
+	removeErr  error
+	onInspect  func(context.Context)
 }
 
 func (c *recordingDockerClient) PrepareContainer(ctx context.Context, spec cpruntime.DockerContainerSpec) (cpruntime.DockerContainerResult, error) {
@@ -677,10 +839,66 @@ func (c *recordingDockerClient) PrepareContainer(ctx context.Context, spec cprun
 	for key, value := range c.checks {
 		checks[key] = value
 	}
+	containerID := "container-" + spec.ContainerName
+	if c.containers == nil {
+		c.containers = make(map[string]map[string]string)
+	}
+	c.containers[spec.ContainerName] = cloneStringMap(spec.Labels)
 	return cpruntime.DockerContainerResult{
-		ContainerID: "container-" + spec.ContainerName,
+		ContainerID: containerID,
 		Checks:      checks,
 	}, nil
+}
+
+func (c *recordingDockerClient) InspectContainer(ctx context.Context, containerName string) (map[string]string, error) {
+	if c.onInspect != nil {
+		onInspect := c.onInspect
+		c.onInspect = nil
+		onInspect(ctx)
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	labels, ok := c.containers[containerName]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return cloneStringMap(labels), nil
+}
+
+func (c *recordingDockerClient) RemoveContainer(ctx context.Context, containerName string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	if c.removeErr != nil {
+		return c.removeErr
+	}
+	if _, ok := c.containers[containerName]; !ok {
+		return os.ErrNotExist
+	}
+	delete(c.containers, containerName)
+	c.removed = append(c.removed, containerName)
+	return nil
+}
+
+func (c *recordingDockerClient) HasContainer(containerName string) bool {
+	_, ok := c.containers[containerName]
+	return ok
+}
+
+func (c *recordingDockerClient) SetContainerLabel(containerName, key, value string) {
+	if c.containers[containerName] == nil {
+		c.containers[containerName] = make(map[string]string)
+	}
+	c.containers[containerName][key] = value
+}
+
+func (c *recordingDockerClient) RemovedCount() int {
+	return len(c.removed)
 }
 
 func (c *recordingDockerClient) Specs() []cpruntime.DockerContainerSpec {
@@ -731,6 +949,20 @@ func cloneDockerSpec(spec cpruntime.DockerContainerSpec) cpruntime.DockerContain
 	cloned.Env = cloneStringMap(spec.Env)
 	cloned.Mounts = append([]cpruntime.DockerMount(nil), spec.Mounts...)
 	return cloned
+}
+
+func assertRuntimeCleanup(t *testing.T, ctx context.Context, db *sql.DB, attemptID, wantState, wantCleanupState string) {
+	t.Helper()
+	var state, cleanupState string
+	if err := db.QueryRowContext(ctx, `
+SELECT state, cleanup_state
+FROM runtime_instances
+WHERE attempt_id = ?`, attemptID).Scan(&state, &cleanupState); err != nil {
+		t.Fatalf("read runtime cleanup for attempt %s: %v", attemptID, err)
+	}
+	if state != wantState || cleanupState != wantCleanupState {
+		t.Fatalf("runtime state/cleanup for attempt %s = %s/%s, want %s/%s", attemptID, state, cleanupState, wantState, wantCleanupState)
+	}
 }
 
 func onlyRuntimeInstance(t *testing.T, ctx context.Context, db *sql.DB) cpruntime.RuntimeInstance {

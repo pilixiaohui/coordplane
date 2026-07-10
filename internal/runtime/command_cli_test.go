@@ -102,6 +102,7 @@ LIMIT 1`).Scan(&attemptID, &leaseID, &assignmentID, &attemptStatus, &leaseStatus
 	if got := countRowsWhere(t, ctx, h.db, "events", "event_type IN ('cli.start_requested', 'cli.process_started', 'cli.session_id_captured', 'cli.exited')"); got != 4 {
 		t.Fatalf("cli events = %d, want start/process/session/exited", got)
 	}
+	assertRuntimeCleanup(t, ctx, h.db, attemptID, "stopped", "removed")
 }
 
 func TestCommandCLIAdapterResumeUsesLightweightMailboxSignal(t *testing.T) {
@@ -1091,6 +1092,7 @@ func TestCommandCLIAdapterCancelledDeadlinePersistsDiagnosticsAndConvergesRunner
 			t.Fatalf("%s where %s = %d, want %d", check.table, check.where, got, check.want)
 		}
 	}
+	assertRuntimeCleanup(t, ctx, h.db, cliSessions[0].AttemptID, "stopped", "removed")
 }
 
 func TestCommandCLIAdapterExecErrorIncludesDiagnosticPersistenceFailure(t *testing.T) {
