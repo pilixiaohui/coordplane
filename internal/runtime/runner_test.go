@@ -233,6 +233,85 @@ func TestRunnerDoesNotMarkRunningWhenExternalRuntimeIsNotReady(t *testing.T) {
 	}
 }
 
+func TestRunnerReadinessAdmissionRejectsBeforeClaimOrPrepare(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		newRunner func(t *testing.T, h runtimeHarness) *cpruntime.Runner
+		wantCode  string
+	}{
+		{
+			name: "runtime profile not ready",
+			newRunner: func(t *testing.T, h runtimeHarness) *cpruntime.Runner {
+				t.Helper()
+				runner, err := cpruntime.NewRunner(cpruntime.RunnerConfig{
+					Store:         h.store,
+					Coordination:  h.coordination,
+					TeamConfig:    runtimeTeamConfig(),
+					Runtime:       cpruntime.ExternalRuntime{ID: "external_test", WorkspaceRoot: t.TempDir(), HomeRoot: t.TempDir(), Ready: false},
+					Adapter:       h.fake,
+					BackendURL:    "http://coordplane.test",
+					WorkspaceName: "test-workspace",
+				})
+				if err != nil {
+					t.Fatalf("new not-ready runtime runner: %v", err)
+				}
+				return runner
+			},
+			wantCode: "RUNTIME_PROFILE_NOT_READY",
+		},
+		{
+			name: "CLI backend not ready",
+			newRunner: func(t *testing.T, h runtimeHarness) *cpruntime.Runner {
+				t.Helper()
+				registry := cpruntime.NewCLIAdapterRegistry(h.db, nil)
+				runner, err := cpruntime.NewRunner(cpruntime.RunnerConfig{
+					Store:         h.store,
+					Coordination:  h.coordination,
+					TeamConfig:    runtimeTeamConfig(),
+					Runtime:       cpruntime.ExternalRuntime{ID: "external_test", WorkspaceRoot: t.TempDir(), HomeRoot: t.TempDir(), Ready: true},
+					Adapter:       registry,
+					BackendURL:    "http://coordplane.test",
+					WorkspaceName: "test-workspace",
+				})
+				if err != nil {
+					t.Fatalf("new not-ready CLI runner: %v", err)
+				}
+				return runner
+			},
+			wantCode: "CLI_BACKEND_NOT_READY",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			h := newRuntimeHarness(t, true)
+			runner := tc.newRunner(t, h)
+			add := addContract(t, ctx, h.coordination, "builder")
+
+			if _, err := runner.StartNext(ctx, "builder"); err == nil || !strings.Contains(err.Error(), tc.wantCode) {
+				t.Fatalf("StartNext error = %v, want %s", err, tc.wantCode)
+			}
+			if got := assignmentState(t, ctx, h.db, add.AssignmentID); got != "queued" {
+				t.Fatalf("assignment state = %s, want queued", got)
+			}
+			for table, where := range map[string]string{
+				"leases":            "1 = 1",
+				"attempts":          "1 = 1",
+				"prepare_leases":    "1 = 1",
+				"runtime_instances": "1 = 1",
+				"runtime_tokens":    "1 = 1",
+				"session_routes":    "1 = 1",
+			} {
+				if got := countRowsWhere(t, ctx, h.db, table, where); got != 0 {
+					t.Fatalf("%s rows after readiness rejection = %d, want 0", table, got)
+				}
+			}
+			if starts := h.fake.Starts(); len(starts) != 0 {
+				t.Fatalf("CLI starts after readiness rejection = %d, want 0", len(starts))
+			}
+		})
+	}
+}
+
 func TestRunnerCancellationUsesIndependentCleanupContext(t *testing.T) {
 	ctx := context.Background()
 	h := newRuntimeHarness(t, true)

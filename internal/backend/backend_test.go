@@ -629,6 +629,79 @@ func TestOperatorTaskStartUsesRunnerLifecycleAndIsIdempotent(t *testing.T) {
 	assertOperatorStartCountsEqual(t, ctx, app.DB, afterFirst, "duplicate start")
 }
 
+func TestOperatorTaskReadinessAdmissionProtectsCreateAndStart(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		coordlink    bool
+		claudeBinary string
+		wantCode     string
+	}{
+		{name: "CLI backend not ready", coordlink: true, wantCode: "CLI_BACKEND_NOT_READY"},
+		{name: "runtime profile not ready", claudeBinary: "/usr/local/bin/claude", wantCode: "RUNTIME_PROFILE_NOT_READY"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			coordlinkPath := ""
+			if tc.coordlink {
+				coordlinkPath = filepath.Join(dir, "coordlink")
+				if err := os.WriteFile(coordlinkPath, []byte("fake coordlink"), 0o755); err != nil {
+					t.Fatalf("write coordlink fixture: %v", err)
+				}
+			}
+			app, err := backend.Open(ctx, backend.Config{
+				DBPath:            filepath.Join(dir, "coordplane.db"),
+				ListenAddr:        "127.0.0.1:0",
+				TeamConfigPath:    dockerClaudeThreeAgentFixturePath(t),
+				CoordlinkPath:     coordlinkPath,
+				ClaudeBinary:      tc.claudeBinary,
+				OperatorToken:     "operator-secret",
+				OperatorSubjectID: "ops-user",
+			})
+			if err != nil {
+				t.Fatalf("open backend: %v", err)
+			}
+			defer app.Close()
+
+			request := map[string]any{
+				"run_label":               "readiness admission",
+				"idempotency_key":         "readiness-required-" + tc.wantCode,
+				"team_id":                 "cp-accept-001-three-agent-docker-claude",
+				"team_version":            1,
+				"title":                   "Readiness-gated root task",
+				"objective":               "Reject before durable task creation when execution cannot start.",
+				"target_agent_id":         "coordinator",
+				"completion_requirements": []string{"report"},
+				"require_startable":       true,
+			}
+			beforeCreate := operatorStartCounts(t, ctx, app.DB)
+			rejected := postOperatorTaskRaw(t, app.Handler, "operator-secret", request, http.StatusBadRequest)
+			assertOperatorTaskRejected(t, rejected, tc.wantCode)
+			assertOperatorStartCountsEqual(t, ctx, app.DB, beforeCreate, "require_startable create rejection")
+
+			delete(request, "require_startable")
+			request["idempotency_key"] = "readiness-parked-" + tc.wantCode
+			created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", request, http.StatusOK))
+			taskRunID := stringField(t, created, "task_run_id")
+			assignmentID := stringField(t, created, "root_assignment_id")
+			beforeStart := operatorStartCounts(t, ctx, app.DB)
+			delete(beforeStart, "events")
+
+			startRejected := postOperatorTaskStartRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{
+				"idempotency_key": "readiness-start-" + tc.wantCode,
+			}, http.StatusBadRequest)
+			assertOperatorTaskRejected(t, startRejected, tc.wantCode)
+			assertOperatorStartCountsEqual(t, ctx, app.DB, beforeStart, "parked start readiness rejection")
+			assertAssignmentState(t, ctx, app.DB, assignmentID, "queued", "")
+			for _, table := range []string{"leases", "attempts", "prepare_leases", "runtime_instances", "runtime_tokens", "session_routes"} {
+				if got := countRows(t, ctx, app.DB, table); got != 0 {
+					t.Fatalf("%s after parked start readiness rejection = %d, want 0", table, got)
+				}
+			}
+		})
+	}
+}
+
 func TestOperatorTaskStartClaimsRootAssignmentWhenSameAgentHasUnrelatedQueuedAssignment(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
