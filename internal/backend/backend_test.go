@@ -1647,6 +1647,113 @@ func TestOperatorBusinessGatePassesLinkedIndependentValidation(t *testing.T) {
 	}
 }
 
+func TestOperatorCompletionGateUsesOnlyBoundValidationAssessments(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	app, err := backend.Open(ctx, backend.Config{
+		DBPath:            filepath.Join(dir, "coordplane.db"),
+		ListenAddr:        "127.0.0.1:0",
+		TeamConfigPath:    writeBusinessThreeAgentFixture(t, dir),
+		OperatorToken:     "operator-secret",
+		OperatorSubjectID: "ops-user",
+	})
+	if err != nil {
+		t.Fatalf("open business-gate backend: %v", err)
+	}
+	defer app.Close()
+
+	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest("operator-completion-bound-validation", nil), http.StatusOK))
+	taskRunID := stringField(t, created, "task_run_id")
+	rootContractID := stringField(t, created, "root_contract_id")
+	started := decodeOperatorTaskData(t, postOperatorTaskStartRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{"idempotency_key": "start-completion-bound-validation"}, http.StatusOK))
+	rootLeaseID := stringField(t, started, "lease_id")
+	rootReport, err := app.Coordination.SubmitReport(ctx, coordination.SubmitReportInput{
+		LeaseID: rootLeaseID,
+		AgentID: "coordinator",
+		Summary: "completion-bound root report",
+		Content: "readable completion-bound report content",
+	})
+	if err != nil {
+		t.Fatalf("submit root report: %v", err)
+	}
+	verifierTask, err := app.Coordination.AddContract(ctx, coordination.AddContractInput{
+		IssuerLeaseID:          rootLeaseID,
+		IssuerAgentID:          "coordinator",
+		Title:                  "completion-bound verifier",
+		Objective:              "bind exactly one of two passing validation assessments",
+		TargetAgentID:          "verifier",
+		CompletionRequirements: []string{"validation_assessment"},
+	})
+	if err != nil {
+		t.Fatalf("add verifier task: %v", err)
+	}
+	verifierSession, err := app.Runner.StartAssignment(ctx, "verifier", verifierTask.AssignmentID)
+	if err != nil {
+		t.Fatalf("start verifier task: %v", err)
+	}
+	subject := capability.Subject{
+		Kind:      "agent",
+		ID:        "verifier",
+		AgentID:   "verifier",
+		RuntimeID: verifierSession.Route.RuntimeID,
+	}
+	boundAssessment, response := app.Validation.Assess(ctx, subject, validation.Input{
+		LeaseID:            verifierSession.LeaseID,
+		AssessedContractID: rootContractID,
+		Verdict:            "pass",
+		Reason:             "the report object is readable but the evidence relation was not checked",
+		Summary:            "bound object-only validation",
+		CheckedRefs:        []validation.CheckedRef{{Kind: "object", Ref: rootReport.ContentRef}},
+	}, "completion-bound-pass")
+	if response.Status != "" {
+		t.Fatalf("bound validation response = %+v, want accepted result", response)
+	}
+	unboundAssessment, response := app.Validation.Assess(ctx, subject, validation.Input{
+		LeaseID:            verifierSession.LeaseID,
+		AssessedContractID: rootContractID,
+		Verdict:            "pass",
+		Reason:             "the root report evidence is explicitly linked",
+		Summary:            "unbound linked validation",
+		CheckedRefs:        []validation.CheckedRef{{Kind: "evidence", ID: rootReport.ID}},
+	}, "unbound-linked-pass")
+	if response.Status != "" {
+		t.Fatalf("unbound validation response = %+v, want accepted result", response)
+	}
+	if unboundAssessment.EvidenceID == boundAssessment.EvidenceID {
+		t.Fatalf("validation evidence ids unexpectedly match: %s", boundAssessment.EvidenceID)
+	}
+	verifierComplete := app.Coordination.CompleteContract(ctx, coordination.CompleteContractInput{
+		LeaseID:     verifierSession.LeaseID,
+		AgentID:     "verifier",
+		EvidenceIDs: []string{boundAssessment.EvidenceID},
+		Summary:     "complete with only the object-checked validation",
+	})
+	if verifierComplete.Status != capability.StatusAccepted {
+		t.Fatalf("complete verifier = %+v, want accepted", verifierComplete)
+	}
+	rootComplete := app.Coordination.CompleteContract(ctx, coordination.CompleteContractInput{
+		LeaseID:     rootLeaseID,
+		AgentID:     "coordinator",
+		EvidenceIDs: []string{rootReport.ID},
+		Summary:     "root complete",
+	})
+	if rootComplete.Status != capability.StatusAccepted {
+		t.Fatalf("complete root = %+v, want accepted", rootComplete)
+	}
+
+	before := operatorStartCounts(t, ctx, app.DB)
+	evidence := decodeOperatorTaskData(t, getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK))
+	terminal := objectField(t, evidence, "terminal")
+	if evidence["status"] != "failed" ||
+		terminal["validation_pass_count"] != float64(2) ||
+		terminal["total_validation_pass_count"] != float64(2) ||
+		terminal["completion_bound_validation_pass_count"] != float64(1) ||
+		terminal["linked_validation_pass_count"] != float64(0) {
+		t.Fatalf("completion-bound terminal = %#v, want failed with total=2 bound=1 linked=0", terminal)
+	}
+	assertOperatorStartCountsEqual(t, ctx, app.DB, before, "read-only completion-bound evidence projection")
+}
+
 func TestOperatorTaskWaitDispatchesQueuedLineageAndBuildsEvidence(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

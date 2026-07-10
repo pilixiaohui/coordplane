@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -343,6 +344,63 @@ func TestContractCompleteBindsExistingRequiredEvidenceForCloseout(t *testing.T) 
 	}
 	if !strings.Contains(body, report.ID) || !strings.Contains(body, validationID) {
 		t.Fatalf("result body = %q, want auto-bound report and validation evidence ids", body)
+	}
+}
+
+func TestContractCompletePersistsFinalEvidenceBindingAndSatisfiedEvent(t *testing.T) {
+	ctx := context.Background()
+	svc, db := newService(t)
+	work := addAndClaim(t, ctx, svc, "builder")
+	setCompletionRequirements(t, ctx, db, work.Contract.ID, []string{"report", "validation_assessment"})
+
+	report, err := svc.SubmitReport(ctx, coordination.SubmitReportInput{
+		LeaseID: work.Lease.ID,
+		AgentID: "builder",
+		Summary: "completion-bound report",
+		Content: "durable completion-bound report content",
+	})
+	if err != nil {
+		t.Fatalf("report.submit: %v", err)
+	}
+	validationID := "ev_completion_bound_validation"
+	insertEvidence(t, ctx, db, validationID, "validation_assessment", work.Contract.ID, "builder", "completion-bound validation")
+
+	done := svc.CompleteContract(ctx, coordination.CompleteContractInput{
+		LeaseID:     work.Lease.ID,
+		AgentID:     "builder",
+		EvidenceIDs: []string{report.ID, validationID},
+		Summary:     "complete with explicit final bindings",
+	})
+	if done.Status != capability.StatusAccepted {
+		t.Fatalf("complete with explicit bindings = %+v, want accepted", done)
+	}
+	rows, err := db.QueryContext(ctx, `
+SELECT evidence_id
+FROM contract_completion_evidence
+WHERE contract_id = ?
+ORDER BY ordinal`, work.Contract.ID)
+	if err != nil {
+		t.Fatalf("query completion evidence bindings: %v", err)
+	}
+	defer rows.Close()
+	var bound []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan completion evidence binding: %v", err)
+		}
+		bound = append(bound, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate completion evidence bindings: %v", err)
+	}
+	if !reflect.DeepEqual(bound, []string{report.ID, validationID}) {
+		t.Fatalf("completion evidence bindings = %#v, want report and validation in final order", bound)
+	}
+	payload := eventPayload(t, ctx, db, "contract.satisfied", work.Contract.ID)
+	gotIDs, ok := payload["evidence_ids"].([]any)
+	if !ok || len(gotIDs) != 2 || gotIDs[0] != report.ID || gotIDs[1] != validationID {
+		t.Fatalf("contract.satisfied payload = %#v, want final evidence_ids", payload)
 	}
 }
 
