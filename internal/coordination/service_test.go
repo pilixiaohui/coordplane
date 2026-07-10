@@ -371,36 +371,82 @@ func TestContractCompleteRejectsAmbiguousImplicitEvidenceWithoutSideEffects(t *t
 	}
 }
 
-func TestContractCompleteRejectsExplicitEvidenceOutsideContractWithoutFallback(t *testing.T) {
-	ctx := context.Background()
-	svc, db := newService(t)
-	work := addAndClaim(t, ctx, svc, "builder")
-	local, err := svc.SubmitReport(ctx, coordination.SubmitReportInput{
-		LeaseID: work.Lease.ID,
-		AgentID: "builder",
-		Summary: "local report",
-		Content: "local content",
-	})
-	if err != nil {
-		t.Fatalf("submit local report: %v", err)
+func TestContractCompleteRejectsInvalidExplicitEvidenceBindingMatrixWithoutSideEffects(t *testing.T) {
+	type seedFunc func(t *testing.T, ctx context.Context, svc *coordination.Service, db *sql.DB, work claimedWork) []string
+	cases := []struct {
+		name     string
+		wantCode string
+		seed     seedFunc
+	}{
+		{name: "empty id", wantCode: "EVIDENCE_NOT_FOUND", seed: func(t *testing.T, ctx context.Context, svc *coordination.Service, db *sql.DB, work claimedWork) []string {
+			return []string{""}
+		}},
+		{name: "missing id", wantCode: "EVIDENCE_NOT_FOUND", seed: func(t *testing.T, ctx context.Context, svc *coordination.Service, db *sql.DB, work claimedWork) []string {
+			return []string{"ev_missing"}
+		}},
+		{name: "foreign contract", wantCode: "EVIDENCE_CONTRACT_MISMATCH", seed: func(t *testing.T, ctx context.Context, svc *coordination.Service, db *sql.DB, work claimedWork) []string {
+			_, err := svc.SubmitReport(ctx, coordination.SubmitReportInput{LeaseID: work.Lease.ID, AgentID: "builder", Summary: "local", Content: "local"})
+			if err != nil {
+				t.Fatalf("submit local report: %v", err)
+			}
+			foreign := addContract(t, ctx, svc, "coordinator")
+			insertEvidence(t, ctx, db, "ev_foreign_report", "report", foreign.ContractID, "coordinator", "foreign")
+			return []string{"ev_foreign_report"}
+		}},
+		{name: "wrong kind", wantCode: "EVIDENCE_KIND_MISMATCH", seed: func(t *testing.T, ctx context.Context, svc *coordination.Service, db *sql.DB, work claimedWork) []string {
+			insertEvidence(t, ctx, db, "ev_wrong_kind", "validation_assessment", work.Contract.ID, "builder", "wrong kind")
+			return []string{"ev_wrong_kind"}
+		}},
+		{name: "duplicate id", wantCode: "AMBIGUOUS_REQUIRED_EVIDENCE", seed: func(t *testing.T, ctx context.Context, svc *coordination.Service, db *sql.DB, work claimedWork) []string {
+			insertEvidence(t, ctx, db, "ev_duplicate", "report", work.Contract.ID, "builder", "duplicate")
+			return []string{"ev_duplicate", "ev_duplicate"}
+		}},
+		{name: "two ids for same required kind", wantCode: "AMBIGUOUS_REQUIRED_EVIDENCE", seed: func(t *testing.T, ctx context.Context, svc *coordination.Service, db *sql.DB, work claimedWork) []string {
+			insertEvidence(t, ctx, db, "ev_report_a", "report", work.Contract.ID, "builder", "a")
+			insertEvidence(t, ctx, db, "ev_report_b", "report", work.Contract.ID, "builder", "b")
+			return []string{"ev_report_a", "ev_report_b"}
+		}},
 	}
-	foreignContract := addContract(t, ctx, svc, "coordinator")
-	insertEvidence(t, ctx, db, "ev_foreign_report", "report", foreignContract.ContractID, "coordinator", "foreign")
 
-	response := svc.CompleteContract(ctx, coordination.CompleteContractInput{
-		LeaseID:     work.Lease.ID,
-		AgentID:     "builder",
-		EvidenceIDs: []string{"ev_foreign_report"},
-		Summary:     "must not fall back to " + local.ID,
-	})
-	if response.Status != capability.StatusRejected || response.ErrorCode != "EVIDENCE_CONTRACT_MISMATCH" {
-		t.Fatalf("foreign evidence response = %+v, want EVIDENCE_CONTRACT_MISMATCH", response)
-	}
-	if got := contractStatus(t, ctx, db, work.Contract.ID); got != "open" {
-		t.Fatalf("contract status after foreign evidence = %s, want open", got)
-	}
-	if got := leaseState(t, ctx, db, work.Lease.ID); got != "active" {
-		t.Fatalf("lease state after foreign evidence = %s, want active", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			svc, db := newService(t)
+			dispatcher := newCoordinationDispatcher(t, svc)
+			work := addAndClaim(t, ctx, svc, "builder")
+			evidenceIDs := tc.seed(t, ctx, svc, db, work)
+			before := map[string]int{}
+			for _, table := range []string{"work_contracts", "assignments", "leases", "evidence", "agent_communication_envelopes", "mailbox_items", "events"} {
+				before[table] = countRows(t, ctx, db, table)
+			}
+
+			response := dispatcher.Handle(ctx, capability.Call{
+				CapabilityName: "contract.complete",
+				Subject:        agentSubject("builder"),
+				Scope:          mustRaw(t, map[string]any{"lease_id": work.Lease.ID}),
+				Input:          mustRaw(t, map[string]any{"summary": "invalid explicit binding", "evidence_ids": evidenceIDs}),
+			})
+			if response.Status != capability.StatusRejected || response.ErrorCode != tc.wantCode || response.Data != nil {
+				t.Fatalf("explicit evidence response = %+v, want rejected %s without data", response, tc.wantCode)
+			}
+			if got := contractStatus(t, ctx, db, work.Contract.ID); got != "open" {
+				t.Fatalf("contract status after rejected binding = %s, want open", got)
+			}
+			if got := leaseState(t, ctx, db, work.Lease.ID); got != "active" {
+				t.Fatalf("lease state after rejected binding = %s, want active", got)
+			}
+			if got := assignmentState(t, ctx, db, work.Add.AssignmentID); got != "claimed" {
+				t.Fatalf("assignment state after rejected binding = %s, want claimed", got)
+			}
+			for table, want := range before {
+				if got := countRows(t, ctx, db, table); got != want {
+					t.Fatalf("%s rows after rejected binding = %d, want %d", table, got, want)
+				}
+			}
+			if got := countRowsWhere(t, ctx, db, "events", "event_type = 'contract.satisfied' AND aggregate_id = '"+work.Contract.ID+"'"); got != 0 {
+				t.Fatalf("contract.satisfied events after rejected binding = %d, want 0", got)
+			}
+		})
 	}
 }
 

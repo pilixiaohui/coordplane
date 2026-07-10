@@ -5,7 +5,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -1074,11 +1073,25 @@ func TestOperatorTaskStartExecutionTimeoutUsesExplicitDeadline(t *testing.T) {
 		t.Fatalf("open backend: %v", err)
 	}
 	defer app.Close()
+	blockingAdapter := &deadlineBlockingCLIAdapter{started: make(chan struct{})}
+	realRunner, err := cpruntime.NewRunner(cpruntime.RunnerConfig{
+		Store:         app.Store,
+		Coordination:  app.Coordination,
+		TeamConfig:    app.TeamConfig,
+		Skills:        app.Skills,
+		Runtime:       cpruntime.ExternalRuntime{ID: "external_deadline", WorkspaceRoot: t.TempDir(), HomeRoot: t.TempDir(), Ready: true},
+		Adapter:       blockingAdapter,
+		BackendURL:    "http://coordplane.test",
+		WorkspaceName: "operator-deadline-test",
+	})
+	if err != nil {
+		t.Fatalf("new real deadline runner: %v", err)
+	}
 	app.OperatorTasks, err = operator.NewService(operator.Config{
 		Store:            app.Store,
 		TeamConfig:       app.TeamConfig,
 		TeamConfigLoaded: app.TeamConfigLoaded,
-		Runner:           &deadlineProbeRunner{},
+		Runner:           realRunner,
 	})
 	if err != nil {
 		t.Fatalf("replace operator runner: %v", err)
@@ -1086,16 +1099,50 @@ func TestOperatorTaskStartExecutionTimeoutUsesExplicitDeadline(t *testing.T) {
 
 	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest("operator-explicit-execution-timeout", nil), http.StatusOK))
 	taskRunID := stringField(t, created, "task_run_id")
+	rootAssignmentID := stringField(t, created, "root_assignment_id")
 	startRaw := postOperatorTaskStartRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{
 		"idempotency_key":          "start-explicit-execution-timeout",
-		"execution_timeout_millis": 5,
+		"execution_timeout_millis": 250,
 	}, http.StatusBadRequest)
 	assertCapabilityRejected(t, startRaw, cpruntime.TerminalReasonRuntimeExecTimeout)
+	select {
+	case <-blockingAdapter.started:
+	default:
+		t.Fatal("execution deadline expired before real CLI adapter Start boundary")
+	}
+	assertAssignmentState(t, ctx, app.DB, rootAssignmentID, "queued", "")
+	for _, check := range []struct {
+		table string
+		where string
+		want  int64
+	}{
+		{table: "attempts", where: "status = 'failed'", want: 1},
+		{table: "leases", where: "state = 'released'", want: 1},
+		{table: "session_routes", where: "state = 'failed'", want: 1},
+		{table: "runtime_tokens", where: "state = 'revoked'", want: 1},
+		{table: "runtime_tokens", where: "state = 'active'", want: 0},
+		{table: "active_guards", where: "state = 'released'", want: 2},
+		{table: "active_guards", where: "state = 'active'", want: 0},
+		{table: "prepare_leases", where: "state = 'released'", want: 1},
+	} {
+		if got := countRowsWhere(t, ctx, app.DB, check.table, check.where); got != check.want {
+			t.Fatalf("%s where %s = %d, want %d", check.table, check.where, got, check.want)
+		}
+	}
 	if got := countRowsWhere(t, ctx, app.DB, "events", "aggregate_id = '"+taskRunID+"' AND event_type = 'operator.task.start_requested'"); got != 1 {
 		t.Fatalf("start_requested events = %d, want 1", got)
 	}
-	if got := countRowsWhere(t, ctx, app.DB, "events", "aggregate_id = '"+taskRunID+"' AND event_type = 'operator.task.start_finished'"); got != 1 {
-		t.Fatalf("start_finished events = %d, want 1", got)
+	if got := countRowsWhere(t, ctx, app.DB, "events", "aggregate_id = '"+taskRunID+"' AND event_type = 'operator.task.start_finished' AND json_extract(payload_json, '$.error_code') = '"+cpruntime.TerminalReasonRuntimeExecTimeout+"'"); got != 1 {
+		t.Fatalf("typed start_finished timeout events = %d, want 1", got)
+	}
+	if got := countRowsWhere(t, ctx, app.DB, "events", "event_type IN ('contract.satisfied', 'session.finished')"); got != 0 {
+		t.Fatalf("terminal success events after execution deadline = %d, want 0", got)
+	}
+	if got := countRowsWhere(t, ctx, app.DB, "events", "event_type = 'session.failed'"); got != 1 {
+		t.Fatalf("session.failed events after execution deadline = %d, want 1", got)
+	}
+	if got := countRowsWhere(t, ctx, app.DB, "capability_calls", "status = 'accepted' AND capability_name IN ('contract.complete', 'contract.wait')"); got != 0 {
+		t.Fatalf("accepted terminal capability calls after execution deadline = %d, want 0", got)
 	}
 }
 
@@ -1120,6 +1167,7 @@ func TestOperatorTaskWaitTimeoutIsObservationOnly(t *testing.T) {
 	started := decodeOperatorTaskData(t, postOperatorTaskStartRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{"idempotency_key": "start-wait-timeout-observation"}, http.StatusOK))
 	leaseID := stringField(t, started, "lease_id")
 	attemptID := stringField(t, started, "attempt_id")
+	routeID := stringField(t, started, "session_route_id")
 
 	wait := decodeOperatorTaskData(t, postOperatorTaskWaitRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{
 		"timeout_millis":       2,
@@ -1134,6 +1182,21 @@ func TestOperatorTaskWaitTimeoutIsObservationOnly(t *testing.T) {
 	}
 	if got := countActiveGuards(t, ctx, app.DB, leaseID, attemptID, "active"); got != 2 {
 		t.Fatalf("active guards after wait timeout = %d, want 2", got)
+	}
+	for _, check := range []struct {
+		table string
+		where string
+	}{
+		{table: "attempts", where: "id = '" + attemptID + "' AND status = 'running'"},
+		{table: "leases", where: "id = '" + leaseID + "' AND state = 'active'"},
+		{table: "session_routes", where: "id = '" + routeID + "' AND state = 'active'"},
+	} {
+		if got := countRowsWhere(t, ctx, app.DB, check.table, check.where); got != 1 {
+			t.Fatalf("%s where %s = %d, want 1 after observation timeout", check.table, check.where, got)
+		}
+	}
+	if got := countRowsWhere(t, ctx, app.DB, "events", "aggregate_id = '"+attemptID+"' AND event_type IN ('session.failed', 'session.finished')"); got != 0 {
+		t.Fatalf("terminal session events after wait timeout = %d, want 0", got)
 	}
 }
 
@@ -1246,43 +1309,108 @@ func TestOperatorTaskCloseoutConvergesReleasedLeaseBookkeeping(t *testing.T) {
 	}
 }
 
-func TestOperatorBusinessGateRejectsEmptyOrSelfValidatedReport(t *testing.T) {
-	ctx := context.Background()
-	dir := t.TempDir()
-	app, err := backend.Open(ctx, backend.Config{
-		DBPath:            filepath.Join(dir, "coordplane.db"),
-		ListenAddr:        "127.0.0.1:0",
-		TeamConfigPath:    writeBusinessThreeAgentFixture(t, dir),
-		OperatorToken:     "operator-secret",
-		OperatorSubjectID: "ops-user",
-	})
-	if err != nil {
-		t.Fatalf("open business-gate backend: %v", err)
+func TestOperatorBusinessGateRejectsEachMissingCondition(t *testing.T) {
+	cases := []struct {
+		name            string
+		mutate          func(t *testing.T, ctx context.Context, db *sql.DB, rootContractID string)
+		wantReports     float64
+		wantLinked      float64
+		wantIndependent float64
+		failureContains string
+	}{
+		{
+			name: "unreadable report",
+			mutate: func(t *testing.T, ctx context.Context, db *sql.DB, rootContractID string) {
+				t.Helper()
+				if _, err := db.ExecContext(ctx, `UPDATE evidence SET content_ref = NULL WHERE contract_id = ? AND kind = 'report'`, rootContractID); err != nil {
+					t.Fatalf("remove report content ref: %v", err)
+				}
+			},
+			wantReports:     0,
+			wantLinked:      0,
+			wantIndependent: 0,
+			failureContains: "non-empty readable report",
+		},
+		{
+			name: "passing assessment does not reference report",
+			mutate: func(t *testing.T, ctx context.Context, db *sql.DB, rootContractID string) {
+				t.Helper()
+				if _, err := db.ExecContext(ctx, `UPDATE validation_assessments SET checked_refs_json = '[]' WHERE assessed_contract_id = ?`, rootContractID); err != nil {
+					t.Fatalf("remove validation checked refs: %v", err)
+				}
+			},
+			wantReports:     1,
+			wantLinked:      0,
+			wantIndependent: 0,
+			failureContains: "explicitly references",
+		},
+		{
+			name: "independent policy rejects producer self validation",
+			mutate: func(t *testing.T, ctx context.Context, db *sql.DB, rootContractID string) {
+				t.Helper()
+				if _, err := db.ExecContext(ctx, `UPDATE validation_assessments SET verifier_agent_id = 'coordinator' WHERE assessed_contract_id = ?`, rootContractID); err != nil {
+					t.Fatalf("make validation self-authored: %v", err)
+				}
+			},
+			wantReports:     1,
+			wantLinked:      1,
+			wantIndependent: 0,
+			failureContains: "independent",
+		},
 	}
-	defer app.Close()
 
-	created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest("operator-business-empty-report", nil), http.StatusOK))
-	taskRunID := stringField(t, created, "task_run_id")
-	rootContractID := stringField(t, created, "root_contract_id")
-	started := decodeOperatorTaskData(t, postOperatorTaskStartRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{"idempotency_key": "start-business-empty-report"}, http.StatusOK))
-	completeRootWithPassingValidation(t, ctx, app, rootContractID, stringField(t, started, "lease_id"))
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			app, err := backend.Open(ctx, backend.Config{
+				DBPath:            filepath.Join(dir, "coordplane.db"),
+				ListenAddr:        "127.0.0.1:0",
+				TeamConfigPath:    writeBusinessThreeAgentFixture(t, dir),
+				OperatorToken:     "operator-secret",
+				OperatorSubjectID: "ops-user",
+			})
+			if err != nil {
+				t.Fatalf("open business-gate backend: %v", err)
+			}
+			defer app.Close()
 
-	if _, err := app.DB.ExecContext(ctx, `
-UPDATE evidence SET content_ref = NULL WHERE contract_id = ? AND kind = 'report'`, rootContractID); err != nil {
-		t.Fatalf("remove report content ref: %v", err)
-	}
-	if _, err := app.DB.ExecContext(ctx, `
-UPDATE validation_assessments SET verifier_agent_id = 'coordinator' WHERE assessed_contract_id = ?`, rootContractID); err != nil {
-		t.Fatalf("make validation self-authored: %v", err)
-	}
+			key := "operator-business-negative-" + strings.ReplaceAll(tc.name, " ", "-")
+			created := decodeOperatorTaskData(t, postOperatorTaskRaw(t, app.Handler, "operator-secret", operatorTaskRequest(key, nil), http.StatusOK))
+			taskRunID := stringField(t, created, "task_run_id")
+			rootContractID := stringField(t, created, "root_contract_id")
+			rootAssignmentID := stringField(t, created, "root_assignment_id")
+			started := decodeOperatorTaskData(t, postOperatorTaskStartRaw(t, app.Handler, taskRunID, "operator-secret", map[string]any{"idempotency_key": "start-" + key}, http.StatusOK))
+			rootLeaseID := stringField(t, started, "lease_id")
+			completeRootWithPassingValidation(t, ctx, app, rootContractID, rootLeaseID)
+			tc.mutate(t, ctx, app.DB, rootContractID)
 
-	evidence := decodeOperatorTaskData(t, getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK))
-	if evidence["status"] != "failed" {
-		t.Fatalf("business evidence status = %#v, want failed: %#v", evidence["status"], evidence)
-	}
-	terminal := objectField(t, evidence, "terminal")
-	if terminal["gate_mode"] != "business" || terminal["business_report_count"].(float64) != 0 {
-		t.Fatalf("business terminal = %#v, want business mode with zero readable reports", terminal)
+			beforeEvents := countRows(t, ctx, app.DB, "events")
+			beforeEvidence := countRows(t, ctx, app.DB, "evidence")
+			beforeValidations := countRows(t, ctx, app.DB, "validation_assessments")
+			evidence := decodeOperatorTaskData(t, getOperatorTaskEvidenceRaw(t, app.Handler, taskRunID, "operator-secret", http.StatusOK))
+			if evidence["status"] != "failed" {
+				t.Fatalf("business evidence status = %#v, want failed: %#v", evidence["status"], evidence)
+			}
+			terminal := objectField(t, evidence, "terminal")
+			if terminal["gate_mode"] != "business" ||
+				terminal["business_report_count"].(float64) != tc.wantReports ||
+				terminal["linked_validation_pass_count"].(float64) != tc.wantLinked ||
+				terminal["independent_validation_pass_count"].(float64) != tc.wantIndependent ||
+				!strings.Contains(terminal["failure_summary"].(string), tc.failureContains) {
+				t.Fatalf("business terminal = %#v, want counts %v/%v/%v and failure containing %q", terminal, tc.wantReports, tc.wantLinked, tc.wantIndependent, tc.failureContains)
+			}
+			if got := countRowsWhere(t, ctx, app.DB, "work_contracts", "id = '"+rootContractID+"' AND status = 'satisfied'"); got != 1 {
+				t.Fatalf("satisfied root contracts after evidence projection = %d, want 1", got)
+			}
+			assertAssignmentState(t, ctx, app.DB, rootAssignmentID, "returned", stringField(t, started, "session_route_id"))
+			if got := countRowsWhere(t, ctx, app.DB, "leases", "state = 'active'"); got != 0 {
+				t.Fatalf("active leases after completed business run = %d, want 0", got)
+			}
+			if countRows(t, ctx, app.DB, "events") != beforeEvents || countRows(t, ctx, app.DB, "evidence") != beforeEvidence || countRows(t, ctx, app.DB, "validation_assessments") != beforeValidations {
+				t.Fatal("read-only business evidence projection mutated durable state")
+			}
+		})
 	}
 }
 
@@ -3366,15 +3494,23 @@ type timeoutRunner struct {
 	coordination *coordination.Service
 }
 
-type deadlineProbeRunner struct{}
+type deadlineBlockingCLIAdapter struct {
+	started chan struct{}
+	once    sync.Once
+}
 
-func (r *deadlineProbeRunner) StartAssignment(ctx context.Context, agentID, assignmentID string) (cpruntime.AssignmentSession, error) {
-	select {
-	case <-ctx.Done():
-		return cpruntime.AssignmentSession{}, cpruntime.NewRuntimeExecTimeout("explicit operator execution deadline reached", ctx.Err())
-	case <-time.After(25 * time.Millisecond):
-		return cpruntime.AssignmentSession{}, errors.New("operator execution deadline was not applied")
-	}
+func (a *deadlineBlockingCLIAdapter) Start(ctx context.Context, req cpruntime.StartRequest) (cpruntime.StartResult, error) {
+	a.once.Do(func() { close(a.started) })
+	<-ctx.Done()
+	return cpruntime.StartResult{}, ctx.Err()
+}
+
+func (a *deadlineBlockingCLIAdapter) Steer(context.Context, cpruntime.SteerRequest) error {
+	return nil
+}
+
+func (a *deadlineBlockingCLIAdapter) Finish(context.Context, cpruntime.TerminalReport) error {
+	return nil
 }
 
 func (r *timeoutRunner) StartAssignment(ctx context.Context, agentID, assignmentID string) (cpruntime.AssignmentSession, error) {
