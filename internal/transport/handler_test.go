@@ -40,10 +40,19 @@ func TestOperatorHandlerHasOnlyTheFixedRouteSurface(t *testing.T) {
 		{name: "list tasks", method: http.MethodGet, path: "/v1/tasks", call: "list_tasks"},
 		{name: "show task", method: http.MethodGet, path: "/v1/tasks/tsk-1", call: "task"},
 		{name: "close task", method: http.MethodPost, path: "/v1/tasks/tsk-1/close", call: "close_conversation"},
+		{name: "wake task", method: http.MethodPost, path: "/v1/tasks/tsk-1/wake", body: `{}`, call: "wake_task"},
+		{name: "retry task", method: http.MethodPost, path: "/v1/tasks/tsk-1/retry", body: `{}`, call: "retry_task"},
+		{name: "cancel task", method: http.MethodPost, path: "/v1/tasks/tsk-1/cancel", body: `{}`, call: "cancel_task"},
+		{name: "accept task", method: http.MethodPost, path: "/v1/tasks/tsk-1/accept", body: `{}`, call: "accept_task"},
+		{name: "rework task", method: http.MethodPost, path: "/v1/tasks/tsk-1/rework", body: `{}`, call: "rework_task"},
 		{name: "list runs", method: http.MethodGet, path: "/v1/runs", call: "list_runs"},
 		{name: "show run", method: http.MethodGet, path: "/v1/runs/run-1", call: "run"},
+		{name: "stop run", method: http.MethodPost, path: "/v1/runs/run-1/stop", body: `{}`, call: "stop_run"},
 		{name: "messages", method: http.MethodGet, path: "/v1/messages", call: "list_messages"},
+		{name: "send message", method: http.MethodPost, path: "/v1/messages", body: `{}`, call: "send_boss_message"},
+		{name: "read message", method: http.MethodPost, path: "/v1/messages/msg-1/read", call: "read_message"},
 		{name: "ack message", method: http.MethodPost, path: "/v1/messages/msg-1/ack", call: "ack_message"},
+		{name: "retry message", method: http.MethodPost, path: "/v1/messages/msg-1/retry", call: "retry_message"},
 		{name: "events", method: http.MethodGet, path: "/v1/events", call: "list_events"},
 	}
 	for _, test := range tests {
@@ -91,10 +100,52 @@ func TestOperatorHandlerMapsBodiesPathsAndQueriesWithoutGenericDispatch(t *testi
 		t.Fatalf("project input = %+v", projectInput)
 	}
 
+	chatBody := `{"project_id":"prj-1","agent_id":"agt-1","body":"reply","ack_message_ids":["msg-1"],"request_id":"req-chat"}`
+	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/chat", chatBody, ""))
+	chat := operations.calls[len(operations.calls)-1].value.(core.ChatInput)
+	if chat.ProjectID != "prj-1" || chat.RequestID != "req-chat" || !reflect.DeepEqual(chat.AckMessageIDs, []string{"msg-1"}) {
+		t.Fatalf("chat input = %+v", chat)
+	}
+
+	createBody := `{"project_id":"prj-1","assignee_agent_id":"agt-1","title":"follow-up","ack_message_ids":["msg-2"],"request_id":"req-create"}`
+	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/tasks", createBody, ""))
+	create := operations.calls[len(operations.calls)-1].value.(core.CreateTaskInput)
+	if create.ProjectID != "prj-1" || create.RequestID != "req-create" || !reflect.DeepEqual(create.AckMessageIDs, []string{"msg-2"}) {
+		t.Fatalf("create task input = %+v", create)
+	}
+
 	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/agents/agt-7/pause", `{"request_id":"req-pause"}`, ""))
 	action := operations.calls[len(operations.calls)-1].value.(agentStatusCall)
 	if action.id != "agt-7" || action.status != core.AgentPaused || action.requestID != "req-pause" {
 		t.Fatalf("pause action = %+v", action)
+	}
+
+	taskActionBody := `{"reason":"try again","ack_message_ids":["msg-1"],"request_id":"req-rework"}`
+	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/tasks/tsk-7/rework", taskActionBody, ""))
+	taskAction := operations.calls[len(operations.calls)-1].value.(core.TaskActionInput)
+	if taskAction.TaskID != "tsk-7" || taskAction.Reason != "try again" || taskAction.RequestID != "req-rework" || !reflect.DeepEqual(taskAction.AckMessageIDs, []string{"msg-1"}) {
+		t.Fatalf("task action = %+v", taskAction)
+	}
+
+	acceptBody := `{"integration_agent_id":"agt-integrator","ack_message_ids":["msg-2"],"request_id":"req-accept"}`
+	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/tasks/tsk-8/accept", acceptBody, ""))
+	accept := operations.calls[len(operations.calls)-1].value.(core.AcceptInput)
+	if accept.TaskID != "tsk-8" || accept.IntegrationAgentID != "agt-integrator" || accept.RequestID != "req-accept" || !reflect.DeepEqual(accept.AckMessageIDs, []string{"msg-2"}) {
+		t.Fatalf("accept input = %+v", accept)
+	}
+
+	stopBody := `{"reason":"operator requested","request_id":"req-stop"}`
+	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/runs/run-7/stop", stopBody, ""))
+	stop := operations.calls[len(operations.calls)-1].value.(core.RunStopInput)
+	if stop.RunID != "run-7" || stop.Reason != "operator requested" || stop.RequestID != "req-stop" {
+		t.Fatalf("run stop input = %+v", stop)
+	}
+
+	messageBody := `{"project_id":"prj-1","agent_id":"agt-1","task_id":"tsk-1","body":"direct","wake":true,"ack_message_ids":["msg-3"],"request_id":"req-message"}`
+	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/messages", messageBody, ""))
+	message := operations.calls[len(operations.calls)-1].value.(core.BossMessageInput)
+	if message.ProjectID != "prj-1" || message.TaskID != "tsk-1" || !message.Wake || !reflect.DeepEqual(message.AckMessageIDs, []string{"msg-3"}) {
+		t.Fatalf("Boss message input = %+v", message)
 	}
 
 	assertOK(t, invoke(t, handler, http.MethodGet, "/v1/tasks?project_id=prj-1&cursor=opaque-task&limit=25", "", ""))
@@ -143,8 +194,16 @@ func TestRunHandlerForwardsOnlyBearerTokenToCore(t *testing.T) {
 		call   string
 	}{
 		{name: "current", method: http.MethodGet, path: "/v1/task/current", call: "current_task"},
+		{name: "show task", method: http.MethodGet, path: "/v1/task/task-child", call: "task_for_run"},
+		{name: "create child", method: http.MethodPost, path: "/v1/task/create", body: `{}`, call: "create_child_task"},
+		{name: "outcome", method: http.MethodPost, path: "/v1/task/outcome", body: `{"outcome":"wait"}`, call: "request_outcome"},
+		{name: "accept child", method: http.MethodPost, path: "/v1/task/task-child/accept", body: `{}`, call: "accept_task"},
+		{name: "rework child", method: http.MethodPost, path: "/v1/task/task-child/rework", body: `{}`, call: "rework_task"},
+		{name: "inbox", method: http.MethodGet, path: "/v1/inbox", call: "inbox"},
+		{name: "read inbox", method: http.MethodGet, path: "/v1/inbox/msg-1", call: "inbox_message"},
+		{name: "ack inbox", method: http.MethodPost, path: "/v1/inbox/ack", body: `{}`, call: "ack_agent_messages"},
 		{name: "progress", method: http.MethodPost, path: "/v1/progress", body: `{"summary":"working","request_id":"req-progress"}`, call: "progress"},
-		{name: "message", method: http.MethodPost, path: "/v1/message", body: `{"body":"result","request_id":"req-message"}`, call: "message"},
+		{name: "message", method: http.MethodPost, path: "/v1/message", body: `{"recipient_kind":"boss","body":"result","request_id":"req-message"}`, call: "send_agent_message"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -158,15 +217,68 @@ func TestRunHandlerForwardsOnlyBearerTokenToCore(t *testing.T) {
 	}
 }
 
-func TestRunHandlerDoesNotExposeDeferredOutcomeRoute(t *testing.T) {
+func TestRunHandlerMapsP2BodiesWithoutAllowingBodyScopeOverride(t *testing.T) {
 	operations := &runFake{}
-	recorder := invoke(t, transport.NewRunHandler(operations), http.MethodPost, "/v1/task/outcome", `{"outcome":"submit"}`, "run-secret")
-	envelope := decodeEnvelope(t, recorder)
-	if recorder.Code != http.StatusNotFound || envelope.OK || envelope.Error == nil || envelope.Error.Code != core.CodeNotFound {
-		t.Fatalf("deferred outcome response = status:%d envelope:%+v", recorder.Code, envelope)
+	handler := transport.NewRunHandler(operations)
+
+	createBody := `{"assignee_agent_id":"agent-b","title":"child","description":"work","priority":7,"max_retries":2,"ack_message_ids":["msg-1"],"request_id":"req-create"}`
+	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/task/create", createBody, "run-secret"))
+	create := operations.calls[len(operations.calls)-1].value.(core.CreateChildTaskInput)
+	if create.Token != "run-secret" || create.AssigneeAgentID != "agent-b" || create.Title != "child" || create.Priority != 7 || !reflect.DeepEqual(create.AckMessageIDs, []string{"msg-1"}) {
+		t.Fatalf("create input = %+v", create)
 	}
-	if len(operations.calls) != 0 {
-		t.Fatalf("deferred outcome route invoked operations: %+v", operations.calls)
+
+	outcomeBody := `{"outcome":"submit","summary":"ready","expected_head":"abc123","ack_message_ids":["msg-2"],"request_id":"req-submit"}`
+	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/task/outcome", outcomeBody, "run-secret"))
+	outcome := operations.calls[len(operations.calls)-1].value.(core.OutcomeInput)
+	if outcome.Token != "run-secret" || outcome.Outcome != core.OutcomeSubmit || outcome.Summary != "ready" || outcome.ExpectedHead != "abc123" || !reflect.DeepEqual(outcome.AckMessageIDs, []string{"msg-2"}) {
+		t.Fatalf("outcome input = %+v", outcome)
+	}
+
+	ackBody := `{"message_ids":["msg-3","msg-4"],"request_id":"req-ack"}`
+	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/inbox/ack", ackBody, "run-secret"))
+	ack := operations.calls[len(operations.calls)-1].value.(core.AcknowledgeMessagesInput)
+	if ack.Token != "run-secret" || ack.RequestID != "req-ack" || !reflect.DeepEqual(ack.MessageIDs, []string{"msg-3", "msg-4"}) {
+		t.Fatalf("ack input = %+v", ack)
+	}
+
+	messageBody := `{"recipient_kind":"agent","recipient_id":"agent-c","task_id":"task-c","related_task_id":"task-source","body":"question","wake":true,"reply_to_message_id":"msg-5","ack_message_ids":["msg-5"],"request_id":"req-message"}`
+	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/message", messageBody, "run-secret"))
+	message := operations.calls[len(operations.calls)-1].value.(core.SendMessageInput)
+	if message.Token != "run-secret" || message.RecipientKind != "agent" || message.RecipientID != "agent-c" || message.TaskID != "task-c" || message.RelatedTaskID != "task-source" || !message.Wake || !reflect.DeepEqual(message.AckMessageIDs, []string{"msg-5"}) {
+		t.Fatalf("message input = %+v", message)
+	}
+
+	acceptBody := `{"task_id":"forged","integration_agent_id":"agent-i","ack_message_ids":["msg-6"],"request_id":"req-accept"}`
+	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/task/task-child/accept", acceptBody, "run-secret"))
+	accept := operations.calls[len(operations.calls)-1].value.(core.AcceptInput)
+	if accept.Token != "run-secret" || accept.TaskID != "task-child" || accept.IntegrationAgentID != "agent-i" || !reflect.DeepEqual(accept.AckMessageIDs, []string{"msg-6"}) {
+		t.Fatalf("accept input = %+v", accept)
+	}
+
+	reworkBody := `{"task_id":"forged","reason":"needs changes","ack_message_ids":["msg-7"],"request_id":"req-rework"}`
+	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/task/task-child/rework", reworkBody, "run-secret"))
+	rework := operations.calls[len(operations.calls)-1].value.(core.TaskActionInput)
+	if rework.Token != "run-secret" || rework.TaskID != "task-child" || rework.Reason != "needs changes" || !reflect.DeepEqual(rework.AckMessageIDs, []string{"msg-7"}) {
+		t.Fatalf("rework input = %+v", rework)
+	}
+
+	assertOK(t, invoke(t, handler, http.MethodGet, "/v1/task/task-child", "", "run-secret"))
+	show := operations.calls[len(operations.calls)-1]
+	if show.token != "run-secret" || show.value != "task-child" {
+		t.Fatalf("task show call = %+v", show)
+	}
+
+	before := len(operations.calls)
+	for _, path := range []string{"/call", "/capabilities", "/skills", "/v1/raw"} {
+		recorder := invoke(t, handler, http.MethodPost, path, `{}`, "run-secret")
+		envelope := decodeEnvelope(t, recorder)
+		if recorder.Code != http.StatusNotFound || envelope.Error == nil || envelope.Error.Code != core.CodeNotFound {
+			t.Fatalf("generic path %s response = status:%d envelope:%+v", path, recorder.Code, envelope)
+		}
+	}
+	if len(operations.calls) != before {
+		t.Fatalf("generic paths reached Core: %+v", operations.calls[before:])
 	}
 }
 
@@ -344,6 +456,26 @@ func (f *operatorFake) CloseConversation(_ context.Context, id, requestID string
 	return core.Task{}, f.record("close_conversation", actionCall{id: id, requestID: requestID})
 }
 
+func (f *operatorFake) WakeTask(_ context.Context, input core.TaskActionInput) (core.Task, error) {
+	return core.Task{}, f.record("wake_task", input)
+}
+
+func (f *operatorFake) RetryTask(_ context.Context, input core.TaskActionInput) (core.Task, error) {
+	return core.Task{}, f.record("retry_task", input)
+}
+
+func (f *operatorFake) CancelTask(_ context.Context, input core.TaskActionInput) (core.Task, error) {
+	return core.Task{}, f.record("cancel_task", input)
+}
+
+func (f *operatorFake) RequestAccept(_ context.Context, input core.AcceptInput) (core.Task, error) {
+	return core.Task{}, f.record("accept_task", input)
+}
+
+func (f *operatorFake) ReworkTask(_ context.Context, input core.TaskActionInput) (core.Task, error) {
+	return core.Task{}, f.record("rework_task", input)
+}
+
 func (f *operatorFake) ListTasks(_ context.Context, filter core.TaskFilter) (core.TaskPage, error) {
 	return core.TaskPage{}, f.record("list_tasks", filter)
 }
@@ -356,8 +488,24 @@ func (f *operatorFake) ListMessages(_ context.Context, filter core.MessageFilter
 	return core.MessagePage{}, f.record("list_messages", filter)
 }
 
+func (f *operatorFake) SendBossMessage(_ context.Context, input core.BossMessageInput) (core.Message, error) {
+	return core.Message{}, f.record("send_boss_message", input)
+}
+
+func (f *operatorFake) ReadBossMessage(_ context.Context, id, requestID string) (core.Message, error) {
+	return core.Message{}, f.record("read_message", actionCall{id: id, requestID: requestID})
+}
+
 func (f *operatorFake) AcknowledgeBossMessage(_ context.Context, id, requestID string) (core.Message, error) {
 	return core.Message{}, f.record("ack_message", actionCall{id: id, requestID: requestID})
+}
+
+func (f *operatorFake) RetryMessage(_ context.Context, id, requestID string) (core.Message, error) {
+	return core.Message{}, f.record("retry_message", actionCall{id: id, requestID: requestID})
+}
+
+func (f *operatorFake) RequestRunStop(_ context.Context, input core.RunStopInput) (core.Run, error) {
+	return core.Run{}, f.record("stop_run", input)
 }
 
 func (f *operatorFake) ListEvents(_ context.Context, filter core.EventFilter) (core.EventPage, error) {
@@ -369,19 +517,59 @@ type runFake struct {
 	err   error
 }
 
-func (f *runFake) CurrentTask(_ context.Context, token string) (core.Task, error) {
+func (f *runFake) CurrentTask(_ context.Context, token string) (core.CurrentTaskResult, error) {
 	f.calls = append(f.calls, recordedCall{name: "current_task", token: token})
+	return core.CurrentTaskResult{}, f.err
+}
+
+func (f *runFake) TaskForRun(_ context.Context, token, taskID string) (core.Task, error) {
+	f.calls = append(f.calls, recordedCall{name: "task_for_run", value: taskID, token: token})
 	return core.Task{}, f.err
+}
+
+func (f *runFake) CreateChildTask(_ context.Context, input core.CreateChildTaskInput) (core.Task, error) {
+	f.calls = append(f.calls, recordedCall{name: "create_child_task", value: input, token: input.Token})
+	return core.Task{}, f.err
+}
+
+func (f *runFake) RequestOutcome(_ context.Context, input core.OutcomeInput) (core.OutcomeResult, error) {
+	f.calls = append(f.calls, recordedCall{name: "request_outcome", value: input, token: input.Token})
+	return core.OutcomeResult{}, f.err
+}
+
+func (f *runFake) RequestAccept(_ context.Context, input core.AcceptInput) (core.Task, error) {
+	f.calls = append(f.calls, recordedCall{name: "accept_task", value: input, token: input.Token})
+	return core.Task{}, f.err
+}
+
+func (f *runFake) ReworkTask(_ context.Context, input core.TaskActionInput) (core.Task, error) {
+	f.calls = append(f.calls, recordedCall{name: "rework_task", value: input, token: input.Token})
+	return core.Task{}, f.err
+}
+
+func (f *runFake) Inbox(_ context.Context, token string) ([]core.Message, error) {
+	f.calls = append(f.calls, recordedCall{name: "inbox", token: token})
+	return nil, f.err
+}
+
+func (f *runFake) InboxMessage(_ context.Context, token, messageID string) (core.Message, error) {
+	f.calls = append(f.calls, recordedCall{name: "inbox_message", value: messageID, token: token})
+	return core.Message{}, f.err
+}
+
+func (f *runFake) AcknowledgeAgentMessages(_ context.Context, input core.AcknowledgeMessagesInput) ([]core.Message, error) {
+	f.calls = append(f.calls, recordedCall{name: "ack_agent_messages", value: input, token: input.Token})
+	return nil, f.err
+}
+
+func (f *runFake) SendAgentMessage(_ context.Context, input core.SendMessageInput) (core.Message, error) {
+	f.calls = append(f.calls, recordedCall{name: "send_agent_message", value: input, token: input.Token})
+	return core.Message{}, f.err
 }
 
 func (f *runFake) Progress(_ context.Context, input core.ProgressInput) (core.Event, error) {
 	f.calls = append(f.calls, recordedCall{name: "progress", value: input, token: input.Token})
 	return core.Event{}, f.err
-}
-
-func (f *runFake) AgentMessageToBoss(_ context.Context, input core.AgentMessageInput) (core.Message, error) {
-	f.calls = append(f.calls, recordedCall{name: "message", value: input, token: input.Token})
-	return core.Message{}, f.err
 }
 
 func invoke(t *testing.T, handler http.Handler, method, path, body, token string) *httptest.ResponseRecorder {

@@ -240,6 +240,35 @@ func (u *unitOfWork) MessagesForTask(taskID string) ([]core.Message, error) {
 	return collectMessages(rows)
 }
 
+func (u *unitOfWork) MessagesForRun(runID string) ([]core.Message, error) {
+	rows, err := u.tx.QueryContext(u.ctx, messageSelect+` WHERE delivered_run_id=? ORDER BY created_at,id`, runID)
+	if err != nil {
+		return nil, err
+	}
+	return collectMessages(rows)
+}
+
+func (u *unitOfWork) MessagesForRecipient(kind, id string) ([]core.Message, error) {
+	rows, err := u.tx.QueryContext(u.ctx, messageSelect+` WHERE recipient_kind=? AND recipient_id=? ORDER BY created_at,id`, kind, id)
+	if err != nil {
+		return nil, err
+	}
+	return collectMessages(rows)
+}
+
+func (u *unitOfWork) PendingWakeAt(taskID string) (string, bool, error) {
+	var next string
+	err := u.tx.QueryRowContext(u.ctx, `
+		SELECT next_delivery_at FROM messages
+		WHERE task_id=? AND recipient_kind='agent' AND wake=1 AND state='pending'
+		  AND next_delivery_at<>'' AND (max_deliveries=0 OR delivery_count<max_deliveries)
+		ORDER BY next_delivery_at,id LIMIT 1`, taskID).Scan(&next)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	return next, err == nil, err
+}
+
 func (u *unitOfWork) InsertMessage(message core.Message) error {
 	_, err := u.tx.ExecContext(u.ctx, `
 INSERT INTO messages(id,project_id,task_id,related_task_id,sender_kind,sender_id,recipient_kind,recipient_id,reply_to_message_id,system_code,body,wake,state,delivered_run_id,delivery_count,max_deliveries,next_delivery_at,last_delivery_error,idempotency_key,version,created_at,delivered_at,acknowledged_at)
@@ -256,11 +285,13 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 
 func (u *unitOfWork) UpdateMessage(message core.Message, expectedVersion int64, expectedState core.MessageState) error {
 	result, err := u.tx.ExecContext(u.ctx, `
-UPDATE messages SET state=?,delivered_run_id=?,delivery_count=?,max_deliveries=?,next_delivery_at=?,last_delivery_error=?,version=?,delivered_at=?,acknowledged_at=?
-WHERE id=? AND version=? AND state=?`,
-		message.State, message.DeliveredRunID, message.DeliveryCount, message.MaxDeliveries,
-		message.NextDeliveryAt, message.LastDeliveryError, message.Version,
-		message.DeliveredAt, message.AcknowledgedAt, message.ID, expectedVersion, expectedState,
+	UPDATE messages SET task_id=?,related_task_id=?,recipient_kind=?,recipient_id=?,system_code=?,body=?,wake=?,state=?,delivered_run_id=?,delivery_count=?,max_deliveries=?,next_delivery_at=?,last_delivery_error=?,version=?,delivered_at=?,acknowledged_at=?
+	WHERE id=? AND version=? AND state=?`,
+		message.TaskID, message.RelatedTaskID, message.RecipientKind, message.RecipientID,
+		message.SystemCode, message.Body, message.Wake, message.State, message.DeliveredRunID,
+		message.DeliveryCount, message.MaxDeliveries, message.NextDeliveryAt,
+		message.LastDeliveryError, message.Version, message.DeliveredAt,
+		message.AcknowledgedAt, message.ID, expectedVersion, expectedState,
 	)
 	return u.casResult(result, err, "message", message.ID)
 }

@@ -99,9 +99,9 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 		},
 		{
 			name:   "chat",
-			args:   []string{"chat", "--project", "project-1", "--agent", "agent-1", "--body", "hello", "--related-task", "task-1", "--reply-to", "message-0", "--wake=false", "--request-id", "req-chat", "--output", "json"},
+			args:   []string{"chat", "--project", "project-1", "--agent", "agent-1", "--body", "hello", "--related-task", "task-1", "--reply-to", "message-0", "--wake=false", "--ack-message", "message-0", "--request-id", "req-chat", "--output", "json"},
 			method: http.MethodPost, path: "/v1/chat",
-			input:     core.ChatInput{ProjectID: "project-1", AgentID: "agent-1", Body: "hello", RelatedTask: "task-1", ReplyTo: "message-0", Wake: false, RequestID: "req-chat"},
+			input:     core.ChatInput{ProjectID: "project-1", AgentID: "agent-1", Body: "hello", RelatedTask: "task-1", ReplyTo: "message-0", Wake: false, AckMessageIDs: []string{"message-0"}, RequestID: "req-chat"},
 			outputHas: `"message"`,
 		},
 		{
@@ -111,16 +111,42 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 			outputHas: `"id":"message-1"`,
 		},
 		{
+			name: "message send",
+			args: []string{
+				"message", "send", "--project", "project-1", "--agent", "agent-1", "--task", "task-1",
+				"--related-task", "task-source", "--body", "direct", "--wake=false", "--reply-to", "message-0",
+				"--ack-message", "message-0", "--request-id", "req-message-send", "--output", "json",
+			},
+			method: http.MethodPost, path: "/v1/messages",
+			input: core.BossMessageInput{
+				ProjectID: "project-1", AgentID: "agent-1", TaskID: "task-1", RelatedTaskID: "task-source",
+				Body: "direct", Wake: false, ReplyTo: "message-0", AckMessageIDs: []string{"message-0"}, RequestID: "req-message-send",
+			},
+			outputHas: `"id":"message-1"`,
+		},
+		{
+			name:   "message read",
+			args:   []string{"message", "read", "message-1", "--request-id", "req-message-read", "--output", "json"},
+			method: http.MethodPost, path: "/v1/messages/message-1/read",
+			input: actionRequest{RequestID: "req-message-read"}, outputHas: `"id":"message-1"`,
+		},
+		{
 			name:   "message ack",
 			args:   []string{"message", "ack", "message-1", "--request-id", "req-message-ack", "--output", "json"},
 			method: http.MethodPost, path: "/v1/messages/message-1/ack",
 			input: actionRequest{RequestID: "req-message-ack"}, outputHas: `"id":"message-1"`,
 		},
 		{
+			name:   "message retry",
+			args:   []string{"message", "retry", "message-1", "--request-id", "req-message-retry", "--output", "json"},
+			method: http.MethodPost, path: "/v1/messages/message-1/retry",
+			input: actionRequest{RequestID: "req-message-retry"}, outputHas: `"id":"message-1"`,
+		},
+		{
 			name:   "task create",
-			args:   []string{"task", "create", "--project", "project-1", "--kind", "work", "--agent", "agent-1", "--title", "Implement", "--description", "Do the work", "--priority", "7", "--max-retries", "3", "--request-id", "req-task-create", "--output", "json"},
+			args:   []string{"task", "create", "--project", "project-1", "--kind", "work", "--agent", "agent-1", "--title", "Implement", "--description", "Do the work", "--priority", "7", "--max-retries", "3", "--ack-message", "message-1", "--request-id", "req-task-create", "--output", "json"},
 			method: http.MethodPost, path: "/v1/tasks",
-			input:     core.CreateTaskInput{ProjectID: "project-1", Kind: core.TaskWork, AssigneeAgentID: "agent-1", Title: "Implement", Description: "Do the work", Priority: 7, MaxRetries: 3, RequestID: "req-task-create"},
+			input:     core.CreateTaskInput{ProjectID: "project-1", Kind: core.TaskWork, AssigneeAgentID: "agent-1", Title: "Implement", Description: "Do the work", Priority: 7, MaxRetries: 3, AckMessageIDs: []string{"message-1"}, RequestID: "req-task-create"},
 			outputHas: `"id":"task-1"`,
 		},
 		{
@@ -142,6 +168,51 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 			input: actionRequest{RequestID: "req-task-close"}, outputHas: `"id":"task-1"`,
 		},
 		{
+			name: "task wake",
+			args: []string{
+				"task", "wake", "task-1", "--reason", "new input", "--ack-message", "message-1",
+				"--ack-message", "message-2", "--request-id", "req-task-wake", "--output", "json",
+			},
+			method: http.MethodPost, path: "/v1/tasks/task-1/wake",
+			input: core.TaskActionInput{
+				Reason: "new input", AckMessageIDs: []string{"message-1", "message-2"}, RequestID: "req-task-wake",
+			},
+			outputHas: `"id":"task-1"`,
+		},
+		{
+			name:   "task retry",
+			args:   []string{"task", "retry", "task-1", "--reason", "retry runtime", "--request-id", "req-task-retry", "--output", "json"},
+			method: http.MethodPost, path: "/v1/tasks/task-1/retry",
+			input:     core.TaskActionInput{Reason: "retry runtime", RequestID: "req-task-retry"},
+			outputHas: `"id":"task-1"`,
+		},
+		{
+			name:   "task cancel",
+			args:   []string{"task", "cancel", "task-1", "--reason", "superseded", "--request-id", "req-task-cancel", "--output", "json"},
+			method: http.MethodPost, path: "/v1/tasks/task-1/cancel",
+			input:     core.TaskActionInput{Reason: "superseded", RequestID: "req-task-cancel"},
+			outputHas: `"id":"task-1"`,
+		},
+		{
+			name:   "task rework",
+			args:   []string{"task", "rework", "task-1", "--reason", "address review", "--request-id", "req-task-rework", "--output", "json"},
+			method: http.MethodPost, path: "/v1/tasks/task-1/rework",
+			input:     core.TaskActionInput{Reason: "address review", RequestID: "req-task-rework"},
+			outputHas: `"id":"task-1"`,
+		},
+		{
+			name: "task accept",
+			args: []string{
+				"task", "accept", "task-1", "--integration-agent", "agent-2", "--ack-message", "message-1",
+				"--request-id", "req-task-accept", "--output", "json",
+			},
+			method: http.MethodPost, path: "/v1/tasks/task-1/accept",
+			input: core.AcceptInput{
+				IntegrationAgentID: "agent-2", AckMessageIDs: []string{"message-1"}, RequestID: "req-task-accept",
+			},
+			outputHas: `"id":"task-1"`,
+		},
+		{
 			name:   "run list",
 			args:   []string{"run", "list", "--project", "project-1", "--task", "task-1", "--agent", "agent-1", "--cursor", "next-run", "--limit", "25", "--output", "json"},
 			method: http.MethodGet, path: "/v1/runs?agent_id=agent-1&cursor=next-run&limit=25&project_id=project-1&task_id=task-1",
@@ -151,6 +222,13 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 			name:   "run show",
 			args:   []string{"run", "show", "run-1", "--output", "json"},
 			method: http.MethodGet, path: "/v1/runs/run-1",
+			outputHas: `"id":"run-1"`,
+		},
+		{
+			name:   "run stop",
+			args:   []string{"run", "stop", "run-1", "--reason", "operator request", "--request-id", "req-run-stop", "--output", "json"},
+			method: http.MethodPost, path: "/v1/runs/run-1/stop",
+			input:     core.RunStopInput{Reason: "operator request", RequestID: "req-run-stop"},
 			outputHas: `"id":"run-1"`,
 		},
 		{
@@ -233,7 +311,6 @@ func TestLegacyAndFutureCommandsFailBeforeClientSetup(t *testing.T) {
 		{name: "teamconfig client", args: []string{"status", "--teamconfig", "old.yaml", "--socket", "/tmp/operator.sock"}},
 		{name: "teamconfig serve", args: []string{"serve", "--config", "new.yaml", "--teamconfig", "old.yaml"}},
 		{name: "future project update", args: []string{"project", "update", "project-1", "--socket", "/tmp/operator.sock"}},
-		{name: "future message send", args: []string{"message", "send", "--socket", "/tmp/operator.sock"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -264,6 +341,20 @@ func TestBlankIDFailsBeforeClientSetup(t *testing.T) {
 		return &recordingClient{}, nil
 	}, nil)
 	if code == 0 || factoryCalls != 0 || !strings.Contains(stderr.String(), "ID is required") {
+		t.Fatalf("code=%d factory=%d stderr=%s", code, factoryCalls, stderr.String())
+	}
+}
+
+func TestBlankAtomicAckIDFailsBeforeClientSetup(t *testing.T) {
+	factoryCalls := 0
+	var stderr bytes.Buffer
+	code := run(context.Background(), []string{
+		"task", "rework", "task-1", "--ack-message", "   ", "--socket", "/tmp/operator.sock",
+	}, nil, ioDiscard{}, &stderr, func(string) (jsonClient, error) {
+		factoryCalls++
+		return &recordingClient{}, nil
+	}, nil)
+	if code == 0 || factoryCalls != 0 || !strings.Contains(stderr.String(), "message ID must not be blank") {
 		t.Fatalf("code=%d factory=%d stderr=%s", code, factoryCalls, stderr.String())
 	}
 }

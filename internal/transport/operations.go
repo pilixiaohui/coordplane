@@ -24,19 +24,36 @@ type OperatorOperations interface {
 	Task(context.Context, string) (core.TaskDetail, error)
 	Run(context.Context, string) (core.Run, error)
 	CloseConversation(context.Context, string, string) (core.Task, error)
+	WakeTask(context.Context, core.TaskActionInput) (core.Task, error)
+	RetryTask(context.Context, core.TaskActionInput) (core.Task, error)
+	CancelTask(context.Context, core.TaskActionInput) (core.Task, error)
+	RequestAccept(context.Context, core.AcceptInput) (core.Task, error)
+	ReworkTask(context.Context, core.TaskActionInput) (core.Task, error)
+	RequestRunStop(context.Context, core.RunStopInput) (core.Run, error)
 	ListTasks(context.Context, core.TaskFilter) (core.TaskPage, error)
 	ListRuns(context.Context, core.RunFilter) (core.RunPage, error)
 	ListMessages(context.Context, core.MessageFilter) (core.MessagePage, error)
+	SendBossMessage(context.Context, core.BossMessageInput) (core.Message, error)
+	ReadBossMessage(context.Context, string, string) (core.Message, error)
 	AcknowledgeBossMessage(context.Context, string, string) (core.Message, error)
+	RetryMessage(context.Context, string, string) (core.Message, error)
 	ListEvents(context.Context, core.EventFilter) (core.EventPage, error)
 }
 
 // RunOperations is the fixed Agent-facing operation surface. The transport
 // forwards the bearer token; scope and generation checks remain in core.
 type RunOperations interface {
-	CurrentTask(context.Context, string) (core.Task, error)
+	CurrentTask(context.Context, string) (core.CurrentTaskResult, error)
+	TaskForRun(context.Context, string, string) (core.Task, error)
+	CreateChildTask(context.Context, core.CreateChildTaskInput) (core.Task, error)
+	RequestOutcome(context.Context, core.OutcomeInput) (core.OutcomeResult, error)
+	RequestAccept(context.Context, core.AcceptInput) (core.Task, error)
+	ReworkTask(context.Context, core.TaskActionInput) (core.Task, error)
+	Inbox(context.Context, string) ([]core.Message, error)
+	InboxMessage(context.Context, string, string) (core.Message, error)
+	AcknowledgeAgentMessages(context.Context, core.AcknowledgeMessagesInput) ([]core.Message, error)
+	SendAgentMessage(context.Context, core.SendMessageInput) (core.Message, error)
 	Progress(context.Context, core.ProgressInput) (core.Event, error)
-	AgentMessageToBoss(context.Context, core.AgentMessageInput) (core.Message, error)
 }
 
 var _ OperatorOperations = (*core.Service)(nil)

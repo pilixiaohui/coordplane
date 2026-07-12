@@ -1,6 +1,8 @@
 package core
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -41,4 +43,61 @@ func TestRunnableTasksUseCanonicalPriorityCreatedAndIDOrder(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("runnable order = %v, want %v", got, want)
 	}
+}
+
+func TestClaimNextReturnsCandidateLookupErrors(t *testing.T) {
+	lookupError := errors.New("candidate lookup failed")
+	for _, failure := range []string{"project", "task", "agent"} {
+		t.Run(failure, func(t *testing.T) {
+			tx := &claimLookupErrorTransaction{failure: failure, err: lookupError}
+			service := &Service{
+				repository: claimLookupErrorRepository{tx: tx},
+				now:        func() time.Time { return time.Date(2026, 7, 12, 1, 2, 3, 0, time.UTC) },
+				maxRuns:    1,
+			}
+			if _, claimed, err := service.ClaimNext(context.Background(), "prj-1"); !errors.Is(err, lookupError) || claimed {
+				t.Fatalf("ClaimNext() claimed=%t err=%v, want lookup error", claimed, err)
+			}
+		})
+	}
+}
+
+type claimLookupErrorRepository struct {
+	Repository
+	tx Transaction
+}
+
+func (r claimLookupErrorRepository) Transact(ctx context.Context, fn func(Transaction) error) error {
+	return fn(r.tx)
+}
+
+type claimLookupErrorTransaction struct {
+	Transaction
+	failure string
+	err     error
+}
+
+func (tx *claimLookupErrorTransaction) RunnableTasks(string) ([]Task, error) {
+	return []Task{{ID: "tsk-1", ProjectID: "prj-1", AssigneeAgentID: "agt-1", Status: TaskQueued}}, nil
+}
+
+func (tx *claimLookupErrorTransaction) Project(string) (Project, error) {
+	if tx.failure == "project" {
+		return Project{}, tx.err
+	}
+	return Project{ID: "prj-1", Status: ProjectActive}, nil
+}
+
+func (tx *claimLookupErrorTransaction) Task(string) (Task, error) {
+	if tx.failure == "task" {
+		return Task{}, tx.err
+	}
+	return Task{ID: "tsk-1", ProjectID: "prj-1", AssigneeAgentID: "agt-1", Status: TaskQueued}, nil
+}
+
+func (tx *claimLookupErrorTransaction) Agent(string) (Agent, error) {
+	if tx.failure == "agent" {
+		return Agent{}, tx.err
+	}
+	return Agent{ID: "agt-1", Status: AgentActive}, nil
 }

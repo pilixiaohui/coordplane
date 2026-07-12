@@ -161,7 +161,7 @@ func TestCT03StaleRunCannotWriteThroughAgentEntry(t *testing.T) {
 			return err
 		}},
 		{"message", func() error {
-			_, err := h.service.AgentMessageToBoss(context.Background(), core.AgentMessageInput{Token: run1.Token, Body: "stale", RequestID: "stale-message"})
+			_, err := h.service.SendAgentMessage(context.Background(), core.SendMessageInput{Token: run1.Token, RecipientKind: "boss", Body: "stale", RequestID: "stale-message"})
 			return err
 		}},
 	}
@@ -208,8 +208,8 @@ func TestAgentMessageReplyCannotCrossProject(t *testing.T) {
 	}
 	beforeFirst := h.durableSignature(t, firstProject.ID)
 	beforeSecond := h.durableSignature(t, secondProject.ID)
-	_, err = h.service.AgentMessageToBoss(context.Background(), core.AgentMessageInput{
-		Token: claim.Token, Body: "invalid reply", ReplyTo: foreign.Message.ID,
+	_, err = h.service.SendAgentMessage(context.Background(), core.SendMessageInput{
+		Token: claim.Token, RecipientKind: "boss", Body: "invalid reply", ReplyTo: foreign.Message.ID,
 		RequestID: "cross-project-reply",
 	})
 	if !core.IsCode(err, core.CodeScopeDenied) {
@@ -220,6 +220,79 @@ func TestAgentMessageReplyCannotCrossProject(t *testing.T) {
 	}
 	if after := h.durableSignature(t, secondProject.ID); after != beforeSecond {
 		t.Fatal("cross-project reply changed the referenced project")
+	}
+}
+
+func TestAgentMessageRelatedTaskCannotEscapeRunScope(t *testing.T) {
+	h := newHarness(t)
+	sender := h.addAgent(t, "related-sender")
+	other := h.addAgent(t, "related-other")
+	project := h.addProject(t, "related-project", "")
+	foreignProject := h.addProject(t, "related-foreign-project", "")
+	current, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+		ProjectID: project.ID, AssigneeAgentID: sender.ID, Kind: core.TaskWork,
+		Title: "current", Priority: 100, RequestID: "related-current",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelated, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+		ProjectID: project.ID, AssigneeAgentID: other.ID, Kind: core.TaskWork,
+		Title: "unrelated", RequestID: "related-unrelated",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+		ProjectID: foreignProject.ID, AssigneeAgentID: other.ID, Kind: core.TaskWork,
+		Title: "foreign", RequestID: "related-foreign",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
+	if err != nil || !ok || claim.Task.ID != current.ID {
+		t.Fatalf("claim = %#v ok=%t err=%v", claim, ok, err)
+	}
+	if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, "related-active"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, candidate := range []core.Task{unrelated, foreign} {
+		beforeProject := h.durableSignature(t, project.ID)
+		beforeForeign := h.durableSignature(t, foreignProject.ID)
+		_, err := h.service.SendAgentMessage(context.Background(), core.SendMessageInput{
+			Token: claim.Token, RecipientKind: "boss", RelatedTaskID: candidate.ID,
+			Body: "out-of-scope association", RequestID: "related-denied-" + candidate.ID,
+		})
+		if !core.IsCode(err, core.CodeScopeDenied) {
+			t.Fatalf("related task %s error = %v, want SCOPE_DENIED", candidate.ID, err)
+		}
+		if after := h.durableSignature(t, project.ID); after != beforeProject {
+			t.Fatal("rejected related task changed the sender project")
+		}
+		if after := h.durableSignature(t, foreignProject.ID); after != beforeForeign {
+			t.Fatal("rejected related task changed the foreign project")
+		}
+	}
+
+	privateMessage, err := h.service.SendBossMessage(context.Background(), core.BossMessageInput{
+		ProjectID: project.ID, AgentID: other.ID, TaskID: unrelated.ID,
+		Body: "private context", RequestID: "related-private-message",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeProject := h.durableSignature(t, project.ID)
+	_, err = h.service.SendAgentMessage(context.Background(), core.SendMessageInput{
+		Token: claim.Token, RecipientKind: "boss", ReplyTo: privateMessage.ID,
+		Body: "out-of-scope reply", RequestID: "related-private-reply-denied",
+	})
+	if !core.IsCode(err, core.CodeScopeDenied) {
+		t.Fatalf("private reply error = %v, want SCOPE_DENIED", err)
+	}
+	if after := h.durableSignature(t, project.ID); after != beforeProject {
+		t.Fatal("rejected private reply changed durable state")
 	}
 }
 
@@ -301,6 +374,75 @@ func TestCT07ConversationIsDurableReusedAndKindSafe(t *testing.T) {
 	if len(messages.Items) != 2 || messages.Items[0].Body != "first" || messages.Items[1].Body != "second" {
 		t.Fatalf("messages after restart = %#v", messages)
 	}
+}
+
+func TestCT07KindErrorsRemainStableWhileTaskIsFinishing(t *testing.T) {
+	t.Run("work close", func(t *testing.T) {
+		h := newHarness(t)
+		agent := h.addAgent(t, "finishing-work-kind-agent")
+		project := h.addProject(t, "finishing-work-kind-project", "")
+		claim := createActiveWorkClaim(t, h, project, agent, "finishing-work-kind")
+		if _, err := h.service.RequestOutcome(context.Background(), core.OutcomeInput{
+			Token: claim.Token, Outcome: core.OutcomeWait, Reason: "finishing",
+			RequestID: "finishing-work-kind-wait",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		before := h.durableSignature(t, project.ID)
+		if _, err := h.service.CloseConversation(context.Background(), claim.Task.ID, "finishing-work-kind-close"); !core.IsCode(err, core.CodeInvalidState) {
+			t.Fatalf("finishing work close error = %v, want INVALID_STATE", err)
+		}
+		if after := h.durableSignature(t, project.ID); after != before {
+			t.Fatal("invalid finishing work close changed durable state")
+		}
+	})
+
+	t.Run("conversation accept and rework", func(t *testing.T) {
+		h := newHarness(t)
+		agent := h.addAgent(t, "finishing-conversation-kind-agent")
+		project := h.addProject(t, "finishing-conversation-kind-project", "")
+		chat, err := h.service.Chat(context.Background(), core.ChatInput{
+			ProjectID: project.ID, AgentID: agent.ID, Body: "start", Wake: true,
+			RequestID: "finishing-conversation-kind-chat",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
+		if err != nil || !ok || claim.Task.ID != chat.Task.ID {
+			t.Fatalf("conversation claim = %#v ok=%t err=%v", claim, ok, err)
+		}
+		if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, "finishing-conversation-kind-active"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.service.RequestOutcome(context.Background(), core.OutcomeInput{
+			Token: claim.Token, Outcome: core.OutcomeWait, Reason: "finishing",
+			RequestID: "finishing-conversation-kind-wait",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		for _, action := range []struct {
+			name string
+			call func() error
+		}{
+			{name: "accept", call: func() error {
+				_, err := h.service.RequestAccept(context.Background(), core.AcceptInput{TaskID: chat.Task.ID, RequestID: "finishing-conversation-kind-accept"})
+				return err
+			}},
+			{name: "rework", call: func() error {
+				_, err := h.service.ReworkTask(context.Background(), core.TaskActionInput{TaskID: chat.Task.ID, RequestID: "finishing-conversation-kind-rework"})
+				return err
+			}},
+		} {
+			before := h.durableSignature(t, project.ID)
+			if err := action.call(); !core.IsCode(err, core.CodeInvalidState) {
+				t.Fatalf("finishing conversation %s error = %v, want INVALID_STATE", action.name, err)
+			}
+			if after := h.durableSignature(t, project.ID); after != before {
+				t.Fatalf("invalid finishing conversation %s changed durable state", action.name)
+			}
+		}
+	})
 }
 
 func TestCT09ConversationCloseDisposesMessagesBeforeArchive(t *testing.T) {
@@ -716,10 +858,11 @@ func (i *testIDs) New(prefix string) (string, error) {
 }
 
 type fakeGit struct {
-	mu            sync.Mutex
-	sha           string
-	initializeErr error
-	exists        bool
+	mu              sync.Mutex
+	sha             string
+	initializeErr   error
+	initializeCalls int
+	exists          bool
 }
 
 func (g *fakeGit) Preflight(context.Context, string, string) (core.ProjectGitFact, error) {
@@ -731,11 +874,18 @@ func (g *fakeGit) ControlPath(projectID string) string { return "/control/" + pr
 func (g *fakeGit) Initialize(context.Context, core.ProjectGitIntent) (core.ProjectGitFact, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.initializeCalls++
 	if g.initializeErr != nil {
 		return core.ProjectGitFact{}, g.initializeErr
 	}
 	g.exists = true
 	return core.ProjectGitFact{CanonicalSHA: g.sha}, nil
+}
+
+func (g *fakeGit) initializeCallCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.initializeCalls
 }
 
 func (g *fakeGit) Verify(context.Context, core.ProjectGitIntent) (core.ProjectGitFact, error) {

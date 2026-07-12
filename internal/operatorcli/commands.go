@@ -15,16 +15,19 @@ import (
 func runChat(ctx context.Context, args []string, getenv environment, stdout, stderr io.Writer, clients clientFactory) error {
 	flags, cfg := clientFlags("chat", getenv, stderr)
 	input := core.ChatInput{Wake: true}
+	var acknowledged stringListFlag
 	flags.StringVar(&input.ProjectID, "project", "", "project ID")
 	flags.StringVar(&input.AgentID, "agent", "", "recipient agent ID")
 	flags.StringVar(&input.Body, "body", "", "message body")
 	flags.StringVar(&input.RelatedTask, "related-task", "", "related task ID")
 	flags.StringVar(&input.ReplyTo, "reply-to", "", "message being replied to")
 	flags.BoolVar(&input.Wake, "wake", true, "ensure the conversation is queued")
+	flags.Var(&acknowledged, "ack-message", "message ID to acknowledge atomically; repeat for multiple messages")
 	flags.StringVar(&input.RequestID, "request-id", "", "idempotency key")
 	if err := parseNoPositionals(flags, args); err != nil {
 		return err
 	}
+	input.AckMessageIDs = append([]string(nil), acknowledged...)
 	var result core.ChatResult
 	if err := request(ctx, *cfg, clients, http.MethodPost, "/v1/chat", input, &result); err != nil {
 		return err
@@ -37,6 +40,28 @@ func runMessage(ctx context.Context, args []string, getenv environment, stdout, 
 		return errors.New("message subcommand is required")
 	}
 	switch args[0] {
+	case "send":
+		flags, cfg := clientFlags("message send", getenv, stderr)
+		var input core.BossMessageInput
+		var acknowledged stringListFlag
+		flags.StringVar(&input.ProjectID, "project", "", "project ID")
+		flags.StringVar(&input.AgentID, "agent", "", "recipient Agent ID")
+		flags.StringVar(&input.TaskID, "task", "", "delivery Task ID")
+		flags.StringVar(&input.RelatedTaskID, "related-task", "", "related Task ID")
+		flags.StringVar(&input.Body, "body", "", "message body")
+		flags.BoolVar(&input.Wake, "wake", false, "ensure the recipient obtains a Run")
+		flags.StringVar(&input.ReplyTo, "reply-to", "", "message being replied to")
+		flags.Var(&acknowledged, "ack-message", "message ID to acknowledge atomically; repeat for multiple messages")
+		flags.StringVar(&input.RequestID, "request-id", "", "idempotency key")
+		if err := parseNoPositionals(flags, args[1:]); err != nil {
+			return err
+		}
+		input.AckMessageIDs = append([]string(nil), acknowledged...)
+		var message core.Message
+		if err := request(ctx, *cfg, clients, http.MethodPost, "/v1/messages", input, &message); err != nil {
+			return err
+		}
+		return render(stdout, cfg.output, message)
 	case "list":
 		flags, cfg := clientFlags("message list", getenv, stderr)
 		var filter core.MessageFilter
@@ -66,6 +91,19 @@ func runMessage(ctx context.Context, args []string, getenv environment, stdout, 
 			return err
 		}
 		return render(stdout, cfg.output, messages)
+	case "read":
+		flags, cfg := clientFlags("message read", getenv, stderr)
+		requestID := flags.String("request-id", "", "idempotency key")
+		id, err := parseID(flags, args[1:])
+		if err != nil {
+			return err
+		}
+		var message core.Message
+		path := "/v1/messages/" + url.PathEscape(id) + "/read"
+		if err := request(ctx, *cfg, clients, http.MethodPost, path, actionRequest{RequestID: *requestID}, &message); err != nil {
+			return err
+		}
+		return render(stdout, cfg.output, message)
 	case "ack":
 		flags, cfg := clientFlags("message ack", getenv, stderr)
 		requestID := flags.String("request-id", "", "idempotency key")
@@ -75,6 +113,19 @@ func runMessage(ctx context.Context, args []string, getenv environment, stdout, 
 		}
 		var message core.Message
 		path := "/v1/messages/" + url.PathEscape(id) + "/ack"
+		if err := request(ctx, *cfg, clients, http.MethodPost, path, actionRequest{RequestID: *requestID}, &message); err != nil {
+			return err
+		}
+		return render(stdout, cfg.output, message)
+	case "retry":
+		flags, cfg := clientFlags("message retry", getenv, stderr)
+		requestID := flags.String("request-id", "", "idempotency key")
+		id, err := parseID(flags, args[1:])
+		if err != nil {
+			return err
+		}
+		var message core.Message
+		path := "/v1/messages/" + url.PathEscape(id) + "/retry"
 		if err := request(ctx, *cfg, clients, http.MethodPost, path, actionRequest{RequestID: *requestID}, &message); err != nil {
 			return err
 		}
@@ -93,17 +144,20 @@ func runTask(ctx context.Context, args []string, getenv environment, stdout, std
 		flags, cfg := clientFlags("task create", getenv, stderr)
 		var input core.CreateTaskInput
 		kind := flags.String("kind", string(core.TaskWork), "task kind")
+		var acknowledged stringListFlag
 		flags.StringVar(&input.ProjectID, "project", "", "project ID")
 		flags.StringVar(&input.AssigneeAgentID, "agent", "", "assignee agent ID")
 		flags.StringVar(&input.Title, "title", "", "task title")
 		flags.StringVar(&input.Description, "description", "", "task description")
 		flags.IntVar(&input.Priority, "priority", 0, "task priority")
 		flags.IntVar(&input.MaxRetries, "max-retries", 0, "runtime retry limit")
+		flags.Var(&acknowledged, "ack-message", "message ID to acknowledge atomically; repeat for multiple messages")
 		flags.StringVar(&input.RequestID, "request-id", "", "idempotency key")
 		if err := parseNoPositionals(flags, args[1:]); err != nil {
 			return err
 		}
 		input.Kind = core.TaskKind(strings.TrimSpace(*kind))
+		input.AckMessageIDs = append([]string(nil), acknowledged...)
 		var task core.Task
 		if err := request(ctx, *cfg, clients, http.MethodPost, "/v1/tasks", input, &task); err != nil {
 			return err
@@ -156,9 +210,53 @@ func runTask(ctx context.Context, args []string, getenv environment, stdout, std
 			return err
 		}
 		return render(stdout, cfg.output, task)
+	case "wake", "retry", "cancel", "rework":
+		return runTaskAction(ctx, args[0], args[1:], getenv, stdout, stderr, clients)
+	case "accept":
+		return runTaskAccept(ctx, args[1:], getenv, stdout, stderr, clients)
 	default:
 		return fmt.Errorf("unknown task subcommand %q", args[0])
 	}
+}
+
+func runTaskAccept(ctx context.Context, args []string, getenv environment, stdout, stderr io.Writer, clients clientFactory) error {
+	flags, cfg := clientFlags("task accept", getenv, stderr)
+	var input core.AcceptInput
+	var acknowledged stringListFlag
+	flags.StringVar(&input.IntegrationAgentID, "integration-agent", "", "integration agent ID")
+	flags.Var(&acknowledged, "ack-message", "message ID to acknowledge atomically; repeat for multiple messages")
+	flags.StringVar(&input.RequestID, "request-id", "", "idempotency key")
+	id, err := parseID(flags, args)
+	if err != nil {
+		return err
+	}
+	input.AckMessageIDs = append([]string(nil), acknowledged...)
+	var task core.Task
+	path := "/v1/tasks/" + url.PathEscape(id) + "/accept"
+	if err := request(ctx, *cfg, clients, http.MethodPost, path, input, &task); err != nil {
+		return err
+	}
+	return render(stdout, cfg.output, task)
+}
+
+func runTaskAction(ctx context.Context, action string, args []string, getenv environment, stdout, stderr io.Writer, clients clientFactory) error {
+	flags, cfg := clientFlags("task "+action, getenv, stderr)
+	var input core.TaskActionInput
+	var acknowledged stringListFlag
+	flags.StringVar(&input.Reason, "reason", "", "action reason")
+	flags.Var(&acknowledged, "ack-message", "message ID to acknowledge atomically; repeat for multiple messages")
+	flags.StringVar(&input.RequestID, "request-id", "", "idempotency key")
+	id, err := parseID(flags, args)
+	if err != nil {
+		return err
+	}
+	input.AckMessageIDs = append([]string(nil), acknowledged...)
+	var task core.Task
+	path := "/v1/tasks/" + url.PathEscape(id) + "/" + action
+	if err := request(ctx, *cfg, clients, http.MethodPost, path, input, &task); err != nil {
+		return err
+	}
+	return render(stdout, cfg.output, task)
 }
 
 func runRun(ctx context.Context, args []string, getenv environment, stdout, stderr io.Writer, clients clientFactory) error {
@@ -204,9 +302,39 @@ func runRun(ctx context.Context, args []string, getenv environment, stdout, stde
 			return err
 		}
 		return render(stdout, cfg.output, run)
+	case "stop":
+		flags, cfg := clientFlags("run stop", getenv, stderr)
+		var input core.RunStopInput
+		flags.StringVar(&input.Reason, "reason", "", "stop reason")
+		flags.StringVar(&input.RequestID, "request-id", "", "idempotency key")
+		id, err := parseID(flags, args[1:])
+		if err != nil {
+			return err
+		}
+		var run core.Run
+		path := "/v1/runs/" + url.PathEscape(id) + "/stop"
+		if err := request(ctx, *cfg, clients, http.MethodPost, path, input, &run); err != nil {
+			return err
+		}
+		return render(stdout, cfg.output, run)
 	default:
 		return fmt.Errorf("unknown run subcommand %q", args[0])
 	}
+}
+
+type stringListFlag []string
+
+func (values *stringListFlag) String() string {
+	return strings.Join(*values, ",")
+}
+
+func (values *stringListFlag) Set(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return errors.New("message ID must not be blank")
+	}
+	*values = append(*values, value)
+	return nil
 }
 
 func runEvents(ctx context.Context, args []string, getenv environment, stdout, stderr io.Writer, clients clientFactory) error {

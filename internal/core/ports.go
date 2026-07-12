@@ -51,6 +51,9 @@ type Transaction interface {
 
 	Message(string) (Message, error)
 	MessagesForTask(string) ([]Message, error)
+	MessagesForRun(string) ([]Message, error)
+	MessagesForRecipient(string, string) ([]Message, error)
+	PendingWakeAt(string) (string, bool, error)
 	InsertMessage(Message) error
 	UpdateMessage(Message, int64, MessageState) error
 

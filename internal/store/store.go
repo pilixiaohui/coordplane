@@ -51,6 +51,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	}
 	u := &url.URL{Scheme: "file", Path: filepath.ToSlash(absolute)}
 	query := u.Query()
+	query.Set("_txlock", "immediate")
 	query.Add("_pragma", "foreign_keys(1)")
 	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeoutMillis))
 	query.Add("_pragma", "journal_mode(WAL)")

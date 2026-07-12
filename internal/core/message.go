@@ -18,6 +18,10 @@ func (s *Service) Chat(ctx context.Context, input ChatInput) (ChatResult, error)
 	if err != nil {
 		return ChatResult{}, err
 	}
+	ackIDs, err := canonicalMessageIDs(input.AckMessageIDs)
+	if err != nil {
+		return ChatResult{}, err
+	}
 	requestID, err := s.requestID(input.RequestID)
 	if err != nil {
 		return ChatResult{}, err
@@ -25,9 +29,9 @@ func (s *Service) Chat(ctx context.Context, input ChatInput) (ChatResult, error)
 	relatedTaskID := strings.TrimSpace(input.RelatedTask)
 	replyToID := strings.TrimSpace(input.ReplyTo)
 	inputHash, err := inputFingerprint(struct {
-		ProjectID, AgentID, Body, RelatedTaskID, ReplyToID string
-		Wake                                               bool
-	}{projectID, agentID, body, relatedTaskID, replyToID, input.Wake})
+		ProjectID, AgentID, Body, RelatedTaskID, ReplyToID, AckIDs string
+		Wake                                                       bool
+	}{projectID, agentID, body, relatedTaskID, replyToID, strings.Join(ackIDs, "\x00"), input.Wake})
 	if err != nil {
 		return ChatResult{}, err
 	}
@@ -80,6 +84,9 @@ func (s *Service) Chat(ctx context.Context, input ChatInput) (ChatResult, error)
 			}
 		}
 		now := s.nowText()
+		if err := s.acknowledgeForActor(tx, ackIDs, projectID, taskMutationActor{kind: "boss"}, requestID, now); err != nil {
+			return err
+		}
 		conversation, err := tx.Conversation(projectID, agentID)
 		if IsCode(err, CodeNotFound) {
 			taskID, idErr := s.requiredID("tsk")

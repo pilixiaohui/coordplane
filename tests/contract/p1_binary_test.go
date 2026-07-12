@@ -685,7 +685,8 @@ func TestCT03CoordlinkBinaryRejectsStaleRunWithoutSideEffects(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.Chat(ctx, core.ChatInput{ProjectID: project.ID, AgentID: agent.ID, Body: "work", Wake: true, RequestID: "chat"}); err != nil {
+	chat, err := service.Chat(ctx, core.ChatInput{ProjectID: project.ID, AgentID: agent.ID, Body: "work", Wake: true, RequestID: "chat"})
+	if err != nil {
 		t.Fatal(err)
 	}
 	run1, ok, err := service.ClaimNext(ctx, project.ID)
@@ -724,6 +725,17 @@ func TestCT03CoordlinkBinaryRejectsStaleRunWithoutSideEffects(t *testing.T) {
 	}()
 	before := durableSignature(t, database, project.ID)
 	staleCalls := [][]string{
+		{"task", "current", "--output", "json"},
+		{"task", "show", run1.Task.ID, "--output", "json"},
+		{"task", "create", "--agent", agent.ID, "--title", "stale child", "--request-id", "stale-create", "--output", "json"},
+		{"task", "wait", "--reason", "stale wait", "--request-id", "stale-wait", "--output", "json"},
+		{"task", "submit", "--summary", "stale submit", "--expected-head", gitFacts.sha, "--request-id", "stale-submit", "--output", "json"},
+		{"task", "fail", "--reason", "stale fail", "--request-id", "stale-fail", "--output", "json"},
+		{"task", "accept", run1.Task.ID, "--request-id", "stale-accept", "--output", "json"},
+		{"task", "rework", run1.Task.ID, "--request-id", "stale-rework", "--output", "json"},
+		{"inbox", "list", "--output", "json"},
+		{"inbox", "read", chat.Message.ID, "--output", "json"},
+		{"inbox", "ack", "--ack-message", chat.Message.ID, "--request-id", "stale-ack", "--output", "json"},
 		{"progress", "--summary", "stale", "--request-id", "stale-progress", "--output", "json"},
 		{"message", "send", "--to-boss", "--body", "stale", "--request-id", "stale-message", "--output", "json"},
 	}
@@ -742,80 +754,152 @@ func TestCT03CoordlinkBinaryRejectsStaleRunWithoutSideEffects(t *testing.T) {
 	}
 }
 
-func TestP1CoordlinkBinaryRejectsUnownedOutcomeCommandsWithoutSideEffects(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	database, err := store.Open(ctx, filepath.Join(root, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
-	gitFacts := &contractGit{sha: strings.Repeat("a", 40), root: filepath.Join(root, "repos")}
-	service, err := core.NewService(database, gitFacts, core.ServiceOptions{MaxParallelRuns: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	agent, err := service.AddAgent(ctx, core.AddAgentInput{DisplayName: "Agent", AdapterID: "one-shot", Image: "agent:latest", InstructionsFile: "/instructions", RequestID: "agent"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	project, err := service.AddProject(ctx, core.AddProjectInput{Name: "Project", Source: "/source", SourceRef: "refs/heads/main", RequestID: "project"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := service.Chat(ctx, core.ChatInput{ProjectID: project.ID, AgentID: agent.ID, Body: "work", Wake: true, RequestID: "chat"}); err != nil {
-		t.Fatal(err)
-	}
-	claim, ok, err := service.ClaimNext(ctx, project.ID)
-	if err != nil || !ok {
-		t.Fatalf("claim ok=%v err=%v", ok, err)
-	}
-	if _, err := service.ActivateRun(ctx, claim.Run.ID, "activate"); err != nil {
-		t.Fatal(err)
-	}
-
-	controlRoot, err := os.MkdirTemp("/tmp", "coordplane-run-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(controlRoot) })
-	socket := filepath.Join(controlRoot, "api.sock")
-	server, err := transport.NewUnixServer(controlRoot, socket, transport.NewRunHandler(service))
-	if err != nil {
-		t.Fatal(err)
-	}
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve() }()
-	defer func() {
-		_ = server.Close()
-		<-serveDone
-	}()
-
-	progressRaw, err := runCoordlink(socket, claim.Token, "progress", "--summary", "socket ready", "--request-id", "binary-progress", "--output", "json")
-	if err != nil || !bytes.Contains(progressRaw, []byte(`"kind":"task.progress"`)) {
-		t.Fatalf("coordlink progress err=%v output=%s", err, progressRaw)
-	}
+func TestP2CoordlinkBinaryPersistsOutcomeIntentBeforeTerminalFact(t *testing.T) {
 	tests := []struct {
-		name string
-		args []string
+		name        string
+		args        func(string) []string
+		wantSummary string
+		wantCapture bool
 	}{
-		{name: "wait", args: []string{"task", "wait", "--reason", "awaiting review", "--request-id", "binary-wait", "--output", "json"}},
-		{name: "submit", args: []string{"task", "submit", "--summary", "ready", "--expected-head", gitFacts.sha, "--request-id", "binary-submit", "--output", "json"}},
-		{name: "fail", args: []string{"task", "fail", "--reason", "tests failed", "--request-id", "binary-fail", "--output", "json"}},
+		{
+			name: "wait",
+			args: func(string) []string {
+				return []string{"task", "wait", "--reason", "awaiting review", "--request-id", "binary-wait", "--output", "json"}
+			},
+			wantSummary: "awaiting review",
+		},
+		{
+			name: "submit",
+			args: func(head string) []string {
+				return []string{"task", "submit", "--summary", "ready", "--expected-head", head, "--request-id", "binary-submit", "--output", "json"}
+			},
+			wantSummary: "ready",
+			wantCapture: true,
+		},
+		{
+			name: "fail",
+			args: func(string) []string {
+				return []string{"task", "fail", "--reason", "tests failed", "--request-id", "binary-fail", "--output", "json"}
+			},
+			wantSummary: "tests failed",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			before := durableSignature(t, database, project.ID)
-			raw, err := runCoordlink(socket, claim.Token, test.args...)
-			wantError := fmt.Sprintf("unknown task subcommand %q", test.name)
-			if err == nil || !bytes.Contains(raw, []byte(wantError)) {
-				t.Fatalf("coordlink %v err=%v output=%s", test.args, err, raw)
+			ctx := context.Background()
+			root := t.TempDir()
+			database, err := store.Open(ctx, filepath.Join(root, "coordplane.db"))
+			if err != nil {
+				t.Fatal(err)
 			}
-			if after := durableSignature(t, database, project.ID); after != before {
-				t.Fatalf("rejected coordlink %s changed durable state\nbefore=%s\nafter=%s", test.name, before, after)
+			defer database.Close()
+			gitFacts := &contractGit{sha: strings.Repeat("a", 40), root: filepath.Join(root, "repos")}
+			service, err := core.NewService(database, gitFacts, core.ServiceOptions{MaxParallelRuns: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			agent, err := service.AddAgent(ctx, core.AddAgentInput{
+				DisplayName: "Agent", AdapterID: "one-shot", Image: "agent:latest",
+				InstructionsFile: "/instructions", RequestID: "agent-" + test.name,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			project, err := service.AddProject(ctx, core.AddProjectInput{
+				Name: "Project " + test.name, Source: "/source", SourceRef: "refs/heads/main",
+				RequestID: "project-" + test.name,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			task, err := service.CreateTask(ctx, core.CreateTaskInput{
+				ProjectID: project.ID, Kind: core.TaskWork, AssigneeAgentID: agent.ID,
+				Title: "work " + test.name, RequestID: "task-" + test.name,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim, ok, err := service.ClaimNext(ctx, project.ID)
+			if err != nil || !ok || claim.Task.ID != task.ID {
+				t.Fatalf("claim=%#v ok=%v err=%v", claim, ok, err)
+			}
+			if _, err := service.ActivateRun(ctx, claim.Run.ID, "activate-"+test.name); err != nil {
+				t.Fatal(err)
+			}
+
+			controlRoot, err := os.MkdirTemp("/tmp", "coordplane-run-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(controlRoot) })
+			socket := filepath.Join(controlRoot, "api.sock")
+			server, err := transport.NewUnixServer(controlRoot, socket, transport.NewRunHandler(service))
+			if err != nil {
+				t.Fatal(err)
+			}
+			serveDone := make(chan error, 1)
+			go func() { serveDone <- server.Serve() }()
+			defer func() {
+				_ = server.Close()
+				<-serveDone
+			}()
+
+			args := test.args(gitFacts.sha)
+			raw, err := runCoordlink(socket, claim.Token, args...)
+			if err != nil {
+				t.Fatalf("coordlink %v err=%v output=%s", args, err, raw)
+			}
+			snapshot, err := database.Snapshot(ctx, project.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotTask := contractTaskWithID(t, snapshot, task.ID)
+			gotRun := contractRunWithID(t, snapshot, claim.Run.ID)
+			if gotTask.Status != core.TaskFinishing || gotTask.CurrentRunID != gotRun.ID ||
+				gotRun.State != core.RunActive || gotRun.RequestedOutcome != test.name ||
+				gotRun.RequestedSummary != test.wantSummary || gotRun.TokenRevokedAt == "" {
+				t.Fatalf("durable outcome intent task=%#v run=%#v", gotTask, gotRun)
+			}
+			if (gotTask.PendingAction == "capture") != test.wantCapture || gotTask.Status == core.TaskSubmitted ||
+				gotTask.Status == core.TaskWaiting || gotTask.Status == core.TaskFailed {
+				t.Fatalf("outcome committed a premature terminal Task state: %#v", gotTask)
+			}
+			if test.wantCapture && (gotTask.PendingActionID == "" || gotTask.PendingActionRunID != gotRun.ID ||
+				gotTask.PendingExpectedSHA != gitFacts.sha || gotTask.PendingActionVersion != gotTask.Version) {
+				t.Fatalf("submit capture intent = %#v", gotTask)
+			}
+			beforeReplay := durableSignature(t, database, project.ID)
+			replayed, err := runCoordlink(socket, claim.Token, args...)
+			if err != nil {
+				t.Fatalf("idempotent outcome replay err=%v output=%s", err, replayed)
+			}
+			if afterReplay := durableSignature(t, database, project.ID); afterReplay != beforeReplay {
+				t.Fatalf("outcome replay changed durable state\nbefore=%s\nafter=%s", beforeReplay, afterReplay)
 			}
 		})
 	}
+}
+
+func contractTaskWithID(t *testing.T, snapshot core.Snapshot, id string) core.Task {
+	t.Helper()
+	for _, task := range snapshot.Tasks {
+		if task.ID == id {
+			return task
+		}
+	}
+	t.Fatalf("Task %q not found in snapshot", id)
+	return core.Task{}
+}
+
+func contractRunWithID(t *testing.T, snapshot core.Snapshot, id string) core.Run {
+	t.Helper()
+	for _, run := range snapshot.Runs {
+		if run.ID == id {
+			return run
+		}
+	}
+	t.Fatalf("Run %q not found in snapshot", id)
+	return core.Run{}
 }
 
 type daemonProcess struct {

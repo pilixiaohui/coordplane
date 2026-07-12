@@ -236,8 +236,8 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "  coordplane project add|list|show|repair|archive ...")
 	fmt.Fprintln(writer, "  coordplane agent add|list|show|pause|resume|archive ...")
 	fmt.Fprintln(writer, "  coordplane chat --project ID --agent ID --body TEXT [--request-id ID]")
-	fmt.Fprintln(writer, "  coordplane message list|ack ...")
-	fmt.Fprintln(writer, "  coordplane task create|list|show|close ...")
-	fmt.Fprintln(writer, "  coordplane run list|show ...")
+	fmt.Fprintln(writer, "  coordplane message send|list|read|ack|retry ...")
+	fmt.Fprintln(writer, "  coordplane task create|list|show|wake|retry|cancel|accept|rework|close ...")
+	fmt.Fprintln(writer, "  coordplane run list|show|stop ...")
 	fmt.Fprintln(writer, "  coordplane events tail ...")
 }

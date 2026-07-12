@@ -78,16 +78,16 @@ func TestMessageAndProgressLimitPlusOneHaveNoDurableSideEffects(t *testing.T) {
 
 	before = h.durableSignature(t, project.ID)
 	agentMessageRequestID := "bounded-agent-message"
-	if _, err := h.service.AgentMessageToBoss(context.Background(), core.AgentMessageInput{
-		Token: claim.Token, Body: strings.Repeat("a", core.MaximumMessageBodyBytes+1), RequestID: agentMessageRequestID,
+	if _, err := h.service.SendAgentMessage(context.Background(), core.SendMessageInput{
+		Token: claim.Token, RecipientKind: "boss", Body: strings.Repeat("a", core.MaximumMessageBodyBytes+1), RequestID: agentMessageRequestID,
 	}); !core.IsCode(err, core.CodeInvalidArgument) {
 		t.Fatalf("oversized Agent message error = %v, want INVALID_ARGUMENT", err)
 	}
 	if after := h.durableSignature(t, project.ID); after != before {
 		t.Fatalf("oversized Agent message wrote a row, Event, or dedupe\nbefore=%s\nafter=%s", before, after)
 	}
-	if _, err := h.service.AgentMessageToBoss(context.Background(), core.AgentMessageInput{
-		Token: claim.Token, Body: strings.Repeat("a", core.MaximumMessageBodyBytes), RequestID: agentMessageRequestID,
+	if _, err := h.service.SendAgentMessage(context.Background(), core.SendMessageInput{
+		Token: claim.Token, RecipientKind: "boss", Body: strings.Repeat("a", core.MaximumMessageBodyBytes), RequestID: agentMessageRequestID,
 	}); err != nil {
 		t.Fatalf("exact-limit Agent message failed with the rejected request ID: %v", err)
 	}

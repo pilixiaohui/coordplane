@@ -122,6 +122,26 @@ func NewOperatorHandler(operations OperatorOperations) http.Handler {
 	mux.HandleFunc("/v1/tasks/{id}/close", requireMethod(http.MethodPost, actionCall(func(ctx requestContext, id, requestID string) (any, error) {
 		return operations.CloseConversation(ctx.Context, id, requestID)
 	})))
+	mux.HandleFunc("/v1/tasks/{id}/wake", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.TaskActionInput) (any, error) {
+		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
+		return operations.WakeTask(ctx.Context, input)
+	})))
+	mux.HandleFunc("/v1/tasks/{id}/retry", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.TaskActionInput) (any, error) {
+		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
+		return operations.RetryTask(ctx.Context, input)
+	})))
+	mux.HandleFunc("/v1/tasks/{id}/cancel", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.TaskActionInput) (any, error) {
+		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
+		return operations.CancelTask(ctx.Context, input)
+	})))
+	mux.HandleFunc("/v1/tasks/{id}/accept", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.AcceptInput) (any, error) {
+		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
+		return operations.RequestAccept(ctx.Context, input)
+	})))
+	mux.HandleFunc("/v1/tasks/{id}/rework", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.TaskActionInput) (any, error) {
+		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
+		return operations.ReworkTask(ctx.Context, input)
+	})))
 	mux.HandleFunc("/v1/runs", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
 		limit, err := queryInt(query.Get("limit"), "limit")
@@ -139,25 +159,45 @@ func NewOperatorHandler(operations OperatorOperations) http.Handler {
 		result, err := operations.Run(r.Context(), strings.TrimSpace(r.PathValue("id")))
 		writeResult(w, result, err)
 	}))
-	mux.HandleFunc("/v1/messages", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
-		query := r.URL.Query()
-		limit, err := queryInt(query.Get("limit"), "limit")
-		if err != nil {
-			writeError(w, err)
-			return
+	mux.HandleFunc("/v1/runs/{id}/stop", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.RunStopInput) (any, error) {
+		input.RunID = strings.TrimSpace(ctx.PathValue("id"))
+		return operations.RequestRunStop(ctx.Context, input)
+	})))
+	sendBossMessage := decodeCall(func(ctx requestContext, input core.BossMessageInput) (any, error) {
+		return operations.SendBossMessage(ctx.Context, input)
+	})
+	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			sendBossMessage(w, r)
+		case http.MethodGet:
+			query := r.URL.Query()
+			limit, err := queryInt(query.Get("limit"), "limit")
+			if err != nil {
+				writeError(w, err)
+				return
+			}
+			result, err := operations.ListMessages(r.Context(), core.MessageFilter{
+				ProjectID:     strings.TrimSpace(query.Get("project_id")),
+				TaskID:        strings.TrimSpace(query.Get("task_id")),
+				RecipientKind: strings.TrimSpace(query.Get("recipient_kind")),
+				RecipientID:   strings.TrimSpace(query.Get("recipient_id")),
+				Cursor:        strings.TrimSpace(query.Get("cursor")),
+				Limit:         limit,
+			})
+			writeResult(w, result, err)
+		default:
+			methodNotAllowed(w, "GET, POST")
 		}
-		result, err := operations.ListMessages(r.Context(), core.MessageFilter{
-			ProjectID:     strings.TrimSpace(query.Get("project_id")),
-			TaskID:        strings.TrimSpace(query.Get("task_id")),
-			RecipientKind: strings.TrimSpace(query.Get("recipient_kind")),
-			RecipientID:   strings.TrimSpace(query.Get("recipient_id")),
-			Cursor:        strings.TrimSpace(query.Get("cursor")),
-			Limit:         limit,
-		})
-		writeResult(w, result, err)
-	}))
+	})
+	mux.HandleFunc("/v1/messages/{id}/read", requireMethod(http.MethodPost, actionCall(func(ctx requestContext, id, requestID string) (any, error) {
+		return operations.ReadBossMessage(ctx.Context, id, requestID)
+	})))
 	mux.HandleFunc("/v1/messages/{id}/ack", requireMethod(http.MethodPost, actionCall(func(ctx requestContext, id, requestID string) (any, error) {
 		return operations.AcknowledgeBossMessage(ctx.Context, id, requestID)
+	})))
+	mux.HandleFunc("/v1/messages/{id}/retry", requireMethod(http.MethodPost, actionCall(func(ctx requestContext, id, requestID string) (any, error) {
+		return operations.RetryMessage(ctx.Context, id, requestID)
 	})))
 	mux.HandleFunc("/v1/events", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
@@ -190,21 +230,56 @@ func NewRunHandler(operations RunOperations) http.Handler {
 		result, err := operations.CurrentTask(r.Context(), bearerToken(r))
 		writeResult(w, result, err)
 	}))
+	mux.HandleFunc("/v1/task/create", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.CreateChildTaskInput) (any, error) {
+		input.Token = ctx.Token
+		return operations.CreateChildTask(ctx.Context, input)
+	})))
+	mux.HandleFunc("/v1/task/outcome", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.OutcomeInput) (any, error) {
+		input.Token = ctx.Token
+		return operations.RequestOutcome(ctx.Context, input)
+	})))
+	mux.HandleFunc("/v1/task/{id}/accept", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.AcceptInput) (any, error) {
+		input.Token = ctx.Token
+		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
+		return operations.RequestAccept(ctx.Context, input)
+	})))
+	mux.HandleFunc("/v1/task/{id}/rework", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.TaskActionInput) (any, error) {
+		input.Token = ctx.Token
+		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
+		return operations.ReworkTask(ctx.Context, input)
+	})))
+	mux.HandleFunc("/v1/task/{id}", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		result, err := operations.TaskForRun(r.Context(), bearerToken(r), strings.TrimSpace(r.PathValue("id")))
+		writeResult(w, result, err)
+	}))
+	mux.HandleFunc("/v1/inbox", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		result, err := operations.Inbox(r.Context(), bearerToken(r))
+		writeResult(w, result, err)
+	}))
+	mux.HandleFunc("/v1/inbox/{id}", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		result, err := operations.InboxMessage(r.Context(), bearerToken(r), strings.TrimSpace(r.PathValue("id")))
+		writeResult(w, result, err)
+	}))
+	mux.HandleFunc("/v1/inbox/ack", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.AcknowledgeMessagesInput) (any, error) {
+		input.Token = ctx.Token
+		return operations.AcknowledgeAgentMessages(ctx.Context, input)
+	})))
 	mux.HandleFunc("/v1/progress", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.ProgressInput) (any, error) {
 		input.Token = ctx.Token
 		return operations.Progress(ctx.Context, input)
 	})))
-	mux.HandleFunc("/v1/message", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.AgentMessageInput) (any, error) {
+	mux.HandleFunc("/v1/message", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.SendMessageInput) (any, error) {
 		input.Token = ctx.Token
-		return operations.AgentMessageToBoss(ctx.Context, input)
+		return operations.SendAgentMessage(ctx.Context, input)
 	})))
 	mux.HandleFunc("/", notFound)
 	return mux
 }
 
 type requestContext struct {
-	Context context.Context
-	Token   string
+	Context   context.Context
+	Token     string
+	PathValue func(string) string
 }
 
 func decodeCall[T any](call func(requestContext, T) (any, error)) http.HandlerFunc {
@@ -232,7 +307,7 @@ func actionCall(call func(requestContext, string, string) (any, error)) http.Han
 }
 
 func newRequestContext(r *http.Request) requestContext {
-	return requestContext{Context: r.Context(), Token: bearerToken(r)}
+	return requestContext{Context: r.Context(), Token: bearerToken(r), PathValue: r.PathValue}
 }
 
 func requireMethod(method string, next http.HandlerFunc) http.HandlerFunc {

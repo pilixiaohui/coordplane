@@ -21,15 +21,24 @@ func (s *Service) ClaimNext(ctx context.Context, projectID string) (Claim, bool,
 				continue
 			}
 			project, err := tx.Project(candidate.ProjectID)
-			if err != nil || project.Status != ProjectActive {
+			if err != nil {
+				return err
+			}
+			if project.Status != ProjectActive {
 				continue
 			}
 			task, err := tx.Task(candidate.ID)
-			if err != nil || task.Status != TaskQueued || task.CurrentRunID != "" {
+			if err != nil {
+				return err
+			}
+			if task.Status != TaskQueued || task.CurrentRunID != "" {
 				continue
 			}
 			agent, err := tx.Agent(task.AssigneeAgentID)
-			if err != nil || agent.Status != AgentActive {
+			if err != nil {
+				return err
+			}
+			if agent.Status != AgentActive {
 				continue
 			}
 			agentRuns, err := tx.LiveRunCount("", agent.ID)
@@ -137,62 +146,10 @@ func (s *Service) ActivateRun(ctx context.Context, runID, requestID string) (Run
 }
 
 func (s *Service) InterruptRun(ctx context.Context, runID, reason, requestID string) (Run, error) {
-	runID, err := requireText("run_id", runID)
-	if err != nil {
-		return Run{}, err
-	}
-	requestID, err = s.requestID(requestID)
-	if err != nil {
-		return Run{}, err
-	}
-	reason = boundedDurableText(reason, MaximumTerminalTextBytes)
-
-	var run Run
-	err = s.repository.Transact(ctx, func(tx Transaction) error {
-		var err error
-		run, err = tx.Run(runID)
-		if err != nil {
-			return err
-		}
-		if IsRunTerminal(run.State) {
-			if run.State == RunInterrupted && run.TerminalReason == reason {
-				return nil
-			}
-			return Conflict(CodeInvalidState, "terminal run fact cannot change", string(run.State), run.Version)
-		}
-		if err := ValidateRunTransition(run.State, RunInterrupted); err != nil {
-			return Conflict(CodeInvalidState, "run cannot be interrupted", string(run.State), run.Version)
-		}
-		task, err := tx.Task(run.TaskID)
-		if err != nil {
-			return err
-		}
-
-		now := s.nowText()
-		runVersion, runState := run.Version, run.State
-		run.State = RunInterrupted
-		run.TerminalReason = reason
-		if run.TokenRevokedAt == "" {
-			run.TokenRevokedAt = now
-		}
-		run.EndedAt = now
-		run.Version++
-		if err := tx.UpdateRun(run, runVersion, runState); err != nil {
-			return err
-		}
-		if task.CurrentRunID == run.ID && task.Generation == run.Generation &&
-			(task.Status == TaskQueued || task.Status == TaskRunning) {
-			if err := s.projectRuntimeFailure(tx, &task, run, requestID, now); err != nil {
-				return err
-			}
-		}
-		_, err = tx.AppendEvent(event(
-			run.ProjectID, "run", run.ID, "run.interrupted", "daemon", "", run.ID,
-			requestID, "", eventPayload(map[string]any{"reason": run.TerminalReason}), now,
-		))
-		return err
+	result, err := s.RecordRunTerminal(ctx, RunTerminalInput{
+		RunID: runID, State: RunInterrupted, TerminalReason: reason, RequestID: requestID,
 	})
-	return run, err
+	return result.Run, err
 }
 
 func (s *Service) projectRuntimeFailure(tx Transaction, task *Task, run Run, requestID, now string) error {
@@ -259,17 +216,27 @@ func runtimeRetryAt(now string, retryCount int) string {
 	return instant.Add(delay).UTC().Format("2006-01-02T15:04:05.000000000Z")
 }
 
-func (s *Service) CurrentTask(ctx context.Context, token string) (Task, error) {
-	var task Task
+func (s *Service) CurrentTask(ctx context.Context, token string) (CurrentTaskResult, error) {
+	var result CurrentTaskResult
 	err := s.repository.Transact(ctx, func(tx Transaction) error {
-		_, current, err := s.authenticateRun(tx, token)
+		run, current, err := s.authenticateRun(tx, token)
 		if err != nil {
 			return err
 		}
-		task = current
+		messages, err := tx.MessagesForRecipient("agent", run.AgentID)
+		if err != nil {
+			return err
+		}
+		unread := 0
+		for _, message := range messages {
+			if message.ProjectID == current.ProjectID && (message.State == MessagePending || message.State == MessageDelivered) {
+				unread++
+			}
+		}
+		result = CurrentTaskResult{Task: current, Run: run, UnreadMessageCount: unread}
 		return nil
 	})
-	return task, err
+	return result, err
 }
 
 func (s *Service) Progress(ctx context.Context, input ProgressInput) (Event, error) {
@@ -293,92 +260,9 @@ func (s *Service) Progress(ctx context.Context, input ProgressInput) (Event, err
 	return progress, err
 }
 
-func (s *Service) AgentMessageToBoss(ctx context.Context, input AgentMessageInput) (Message, error) {
-	body, err := requireText("body", input.Body)
-	if err != nil {
-		return Message{}, err
-	}
-	requestID, err := s.requestID(input.RequestID)
-	if err != nil {
-		return Message{}, err
-	}
-	replyToID := strings.TrimSpace(input.ReplyTo)
-	inputHash, err := inputFingerprint(struct{ Body, ReplyToID string }{body, replyToID})
-	if err != nil {
-		return Message{}, err
-	}
-	var message Message
-	err = s.repository.Transact(ctx, func(tx Transaction) error {
-		scopedRun, err := tx.RunByTokenHash(hashToken(input.Token))
-		if err != nil {
-			if IsCode(err, CodeNotFound) {
-				return NewError(CodeScopeDenied, "run scope is not valid", false)
-			}
-			return err
-		}
-		actorScope := "run:" + scopedRun.ID
-		if raw, ok, err := tx.Dedupe(actorScope, "message.send", requestID); err != nil {
-			return err
-		} else if ok {
-			result, err := decodeDedupe(raw, inputHash)
-			if err != nil {
-				return err
-			}
-			message, err = tx.Message(result.ID)
-			return err
-		}
-		run, task, err := s.authenticateRun(tx, input.Token)
-		if err != nil {
-			return err
-		}
-		if err := ValidateTaskOperation(task.Kind, "message"); err != nil {
-			return err
-		}
-		if replyToID != "" {
-			repliedTo, err := tx.Message(replyToID)
-			if err != nil {
-				return err
-			}
-			if repliedTo.ProjectID != task.ProjectID {
-				return NewError(CodeScopeDenied, "reply message belongs to another project", false)
-			}
-		}
-		messageID, err := s.requiredID("msg")
-		if err != nil {
-			return err
-		}
-		now := s.nowText()
-		message = Message{
-			ID: messageID, ProjectID: task.ProjectID, TaskID: task.ID,
-			SenderKind: "agent", SenderID: run.AgentID, RecipientKind: "boss",
-			ReplyToMessageID: replyToID, Body: body,
-			State: MessagePending, MaxDeliveries: 1, NextDeliveryAt: now,
-			IdempotencyKey: requestID, Version: 1, CreatedAt: now,
-		}
-		if err := tx.InsertMessage(message); err != nil {
-			return err
-		}
-		if _, err = tx.AppendEvent(event(task.ProjectID, "message", message.ID, "message.created", "agent", run.AgentID, run.ID, requestID, "", "{}", now)); err != nil {
-			return err
-		}
-		raw, err := encodeDedupe(message.ID, "", inputHash)
-		if err != nil {
-			return err
-		}
-		return tx.PutDedupe(actorScope, "message.send", requestID, raw, now)
-	})
-	return message, err
-}
-
 func (s *Service) authenticateRun(tx Transaction, token string) (Run, Task, error) {
-	if strings.TrimSpace(token) == "" {
-		return Run{}, Task{}, NewError(CodeScopeDenied, "run token is required", false)
-	}
-	run, err := tx.RunByTokenHash(hashToken(token))
+	run, err := scopedRun(tx, token)
 	if err != nil {
-		if IsCode(err, CodeNotFound) {
-			return Run{}, Task{}, NewError(CodeScopeDenied, "run scope is not valid", false)
-		}
 		return Run{}, Task{}, err
 	}
 	task, err := tx.Task(run.TaskID)

@@ -35,10 +35,14 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (Task, 
 	if input.MaxRetries < 0 {
 		return Task{}, NewError(CodeInvalidArgument, "max_retries cannot be negative", false)
 	}
+	ackIDs, err := canonicalMessageIDs(input.AckMessageIDs)
+	if err != nil {
+		return Task{}, err
+	}
 	inputHash, err := inputFingerprint(struct {
-		ProjectID, AgentID, Kind, Title, Description string
-		Priority, MaxRetries                         int
-	}{projectID, agentID, string(input.Kind), title, description, input.Priority, input.MaxRetries})
+		ProjectID, AgentID, Kind, Title, Description, AckIDs string
+		Priority, MaxRetries                                 int
+	}{projectID, agentID, string(input.Kind), title, description, strings.Join(ackIDs, "\x00"), input.Priority, input.MaxRetries})
 	if err != nil {
 		return Task{}, err
 	}
@@ -80,11 +84,14 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (Task, 
 		if agent.Status == AgentArchived {
 			return Conflict(CodeInvalidState, "archived agent cannot receive a task", string(agent.Status), agent.Version)
 		}
+		now := s.nowText()
+		if err := s.acknowledgeForActor(tx, ackIDs, projectID, taskMutationActor{kind: "boss"}, requestID, now); err != nil {
+			return err
+		}
 		taskID, err := s.requiredID("tsk")
 		if err != nil {
 			return err
 		}
-		now := s.nowText()
 		task = Task{
 			ID: taskID, ProjectID: projectID, Kind: TaskWork, CreatedByKind: "boss",
 			AssigneeAgentID: agentID, Title: title, Description: description,
@@ -122,6 +129,9 @@ func (s *Service) CloseConversation(ctx context.Context, taskID, requestID strin
 		}
 		if err := ValidateTaskOperation(task.Kind, "close"); err != nil {
 			return Conflict(CodeInvalidState, "task kind cannot be closed", string(task.Status), task.Version)
+		}
+		if err := taskActionAvailable(task); err != nil {
+			return err
 		}
 		if err := ValidateTaskTransition(task.Kind, task.Status, TaskCompleted); err != nil {
 			return Conflict(CodeInvalidState, "conversation is not waiting", string(task.Status), task.Version)
