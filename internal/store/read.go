@@ -418,14 +418,15 @@ func taskSummary(task core.Task) core.TaskSummary {
 func runSummary(run core.Run) core.RunSummary {
 	terminalReason, terminalTruncated := boundedUTF8(run.TerminalReason, 512)
 	lastError, errorTruncated := boundedUTF8(run.LastError, 512)
+	runtimeErrorCode, codeTruncated := boundedUTF8(run.RuntimeErrorCode, 256)
 	return core.RunSummary{
 		ID: run.ID, ProjectID: run.ProjectID, TaskID: run.TaskID, AgentID: run.AgentID,
 		Generation: run.Generation, State: run.State, ContainerIDPresent: run.ContainerID != "",
 		NativeSessionPresent: run.NativeSessionID != "", HeartbeatAt: run.HeartbeatAt,
 		DeadlineAt: run.DeadlineAt, LastObservedAt: run.LastObservedAt,
 		LaunchPhase: run.LaunchPhase, CleanupState: run.CleanupState,
-		TerminalReason: terminalReason, LastError: lastError, RuntimeErrorCode: run.RuntimeErrorCode,
-		TextTruncated: terminalTruncated || errorTruncated, Version: run.Version,
+		TerminalReason: terminalReason, LastError: lastError, RuntimeErrorCode: runtimeErrorCode,
+		TextTruncated: terminalTruncated || errorTruncated || codeTruncated, Version: run.Version,
 		CreatedAt: run.CreatedAt, StartedAt: run.StartedAt, EndedAt: run.EndedAt,
 	}
 }

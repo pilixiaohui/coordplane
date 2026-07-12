@@ -12,8 +12,8 @@ const taskSelect = `SELECT id,project_id,kind,parent_task_id,retry_of_task_id,cr
 const runSelect = `SELECT id,project_id,task_id,agent_id,generation,resumed_from_run_id,adapter_id,image,instructions_hash,state,workspace_path,container_id,native_session_id,log_path,token_hash,token_revoked_at,requested_outcome,requested_summary,expected_head,requested_at,stop_requested_at,stop_reason,stop_operation_id,heartbeat_at,exit_code,terminal_reason,last_error,cleanup_state,launch_nonce,launch_operation_id,launch_phase,home_path,container_name,deadline_at,last_observed_at,launch_mode,resume_native_session_id,runtime_error_code,cleanup_operation_id,version,created_at,started_at,ended_at FROM runs`
 const messageSelect = `SELECT id,project_id,task_id,related_task_id,sender_kind,sender_id,recipient_kind,recipient_id,reply_to_message_id,system_code,body,wake,state,delivered_run_id,delivery_count,max_deliveries,next_delivery_at,last_delivery_error,idempotency_key,version,created_at,delivered_at,acknowledged_at FROM messages`
 const eventSelect = `SELECT id,project_id,entity_type,entity_id,kind,actor_kind,actor_id,run_id,request_id,operation_id,payload_json,created_at FROM events`
-const taskSummarySelect = `SELECT id,project_id,kind,parent_task_id,assignee_agent_id,substr(title,1,256),length(CAST(title AS BLOB))>256,priority,status,current_run_id,generation,next_run_at,retry_count,max_retries,substr(wait_reason,1,512),substr(result_summary,1,512),substr(failure_reason,1,512),(length(CAST(wait_reason AS BLOB))>512 OR length(CAST(result_summary AS BLOB))>512 OR length(CAST(failure_reason AS BLOB))>512),base_sha,head_sha,task_ref,accepted_by_kind,accepted_by_id,accepted_integration_agent_id,final_canonical_sha,integration_task_id,source_task_id,source_run_id,source_task_ref,source_head_sha,pending_action,pending_action_id,version,created_at,updated_at,submitted_at,completed_at,closed_at FROM tasks`
-const runSummarySelect = `SELECT id,project_id,task_id,agent_id,generation,state,container_id<>'',native_session_id<>'',heartbeat_at,deadline_at,last_observed_at,launch_phase,cleanup_state,substr(terminal_reason,1,512),substr(last_error,1,512),substr(runtime_error_code,1,256),(length(CAST(terminal_reason AS BLOB))>512 OR length(CAST(last_error AS BLOB))>512 OR length(CAST(runtime_error_code AS BLOB))>256),version,created_at,started_at,ended_at FROM runs`
+const taskSummarySelect = `SELECT id,project_id,kind,parent_task_id,assignee_agent_id,title,priority,status,current_run_id,generation,next_run_at,retry_count,max_retries,wait_reason,result_summary,failure_reason,base_sha,head_sha,task_ref,accepted_by_kind,accepted_by_id,accepted_integration_agent_id,final_canonical_sha,integration_task_id,source_task_id,source_run_id,source_task_ref,source_head_sha,pending_action,pending_action_id,version,created_at,updated_at,submitted_at,completed_at,closed_at FROM tasks`
+const runSummarySelect = `SELECT id,project_id,task_id,agent_id,generation,state,container_id,native_session_id,heartbeat_at,deadline_at,last_observed_at,launch_phase,cleanup_state,terminal_reason,last_error,runtime_error_code,version,created_at,started_at,ended_at FROM runs`
 const projectSummarySelect = `SELECT id,substr(name,1,256),substr(canonical_ref,1,256),canonical_sha,integration_agent_id,status,pending_action,substr(last_error,1,256),version,created_at,updated_at FROM projects`
 const agentSummarySelect = `SELECT id,substr(display_name,1,256),substr(adapter_id,1,256),substr(image,1,256),status,version,created_at,updated_at FROM agents`
 
@@ -114,42 +114,32 @@ func scanEvent(row scanner) (core.Event, error) {
 }
 
 func scanTaskSummary(row scanner) (core.TaskSummary, error) {
-	var summary core.TaskSummary
-	var titleTruncated, textTruncated int
+	var task core.Task
 	err := row.Scan(
-		&summary.ID, &summary.ProjectID, &summary.Kind, &summary.ParentTaskID,
-		&summary.AssigneeAgentID, &summary.Title, &titleTruncated, &summary.Priority,
-		&summary.Status, &summary.CurrentRunID, &summary.Generation, &summary.NextRunAt,
-		&summary.RetryCount, &summary.MaxRetries, &summary.WaitReason, &summary.ResultSummary,
-		&summary.FailureReason, &textTruncated, &summary.BaseSHA, &summary.HeadSHA,
-		&summary.TaskRef, &summary.AcceptedByKind, &summary.AcceptedByID,
-		&summary.AcceptedIntegrationAgentID, &summary.FinalCanonicalSHA,
-		&summary.IntegrationTaskID, &summary.SourceTaskID, &summary.SourceRunID,
-		&summary.SourceTaskRef, &summary.SourceHeadSHA, &summary.PendingAction,
-		&summary.PendingActionID, &summary.Version, &summary.CreatedAt, &summary.UpdatedAt,
-		&summary.SubmittedAt, &summary.CompletedAt, &summary.ClosedAt,
+		&task.ID, &task.ProjectID, &task.Kind, &task.ParentTaskID,
+		&task.AssigneeAgentID, &task.Title, &task.Priority, &task.Status,
+		&task.CurrentRunID, &task.Generation, &task.NextRunAt, &task.RetryCount,
+		&task.MaxRetries, &task.WaitReason, &task.ResultSummary, &task.FailureReason,
+		&task.BaseSHA, &task.HeadSHA, &task.TaskRef, &task.AcceptedByKind,
+		&task.AcceptedByID, &task.AcceptedIntegrationAgentID, &task.FinalCanonicalSHA,
+		&task.IntegrationTaskID, &task.SourceTaskID, &task.SourceRunID,
+		&task.SourceTaskRef, &task.SourceHeadSHA, &task.PendingAction,
+		&task.PendingActionID, &task.Version, &task.CreatedAt, &task.UpdatedAt,
+		&task.SubmittedAt, &task.CompletedAt, &task.ClosedAt,
 	)
-	summary.TitleTruncated = titleTruncated == 1
-	summary.TextTruncated = textTruncated == 1
-	return summary, err
+	return taskSummary(task), err
 }
 
 func scanRunSummary(row scanner) (core.RunSummary, error) {
-	var summary core.RunSummary
-	var containerPresent, nativeSessionPresent, textTruncated int
+	var run core.Run
 	err := row.Scan(
-		&summary.ID, &summary.ProjectID, &summary.TaskID, &summary.AgentID,
-		&summary.Generation, &summary.State, &containerPresent,
-		&nativeSessionPresent, &summary.HeartbeatAt, &summary.DeadlineAt,
-		&summary.LastObservedAt, &summary.LaunchPhase, &summary.CleanupState,
-		&summary.TerminalReason, &summary.LastError, &summary.RuntimeErrorCode,
-		&textTruncated, &summary.Version, &summary.CreatedAt, &summary.StartedAt,
-		&summary.EndedAt,
+		&run.ID, &run.ProjectID, &run.TaskID, &run.AgentID, &run.Generation,
+		&run.State, &run.ContainerID, &run.NativeSessionID, &run.HeartbeatAt,
+		&run.DeadlineAt, &run.LastObservedAt, &run.LaunchPhase, &run.CleanupState,
+		&run.TerminalReason, &run.LastError, &run.RuntimeErrorCode, &run.Version,
+		&run.CreatedAt, &run.StartedAt, &run.EndedAt,
 	)
-	summary.ContainerIDPresent = containerPresent == 1
-	summary.NativeSessionPresent = nativeSessionPresent == 1
-	summary.TextTruncated = textTruncated == 1
-	return summary, err
+	return runSummary(run), err
 }
 
 func scanProjectSummary(row scanner) (core.ProjectSummary, error) {

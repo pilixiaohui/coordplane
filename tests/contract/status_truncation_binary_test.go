@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"coordplane/internal/core"
 	"coordplane/internal/store"
@@ -109,10 +110,13 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 	var project core.Project
 	decodeJSON(t, projectRaw, &project)
 
-	longTitle := "field-truncation-" + strings.Repeat("T", 300)
-	longReason := "runtime interrupted: " + strings.Repeat("R", 700)
+	longTitle := "标题: " + strings.Repeat("中文任务", 40)
+	longReason := "终止: " + strings.Repeat("运行失败原因", 50)
 	if len(longTitle) <= 256 || len(longTitle) > 512 || len(longReason) <= 512 || len(longReason) > core.MaximumTerminalTextBytes {
 		t.Fatalf("fixture is outside legal field bounds: title=%d reason=%d", len(longTitle), len(longReason))
+	}
+	if !utf8.ValidString(longTitle) || !utf8.ValidString(longReason) {
+		t.Fatal("fixture must contain valid UTF-8")
 	}
 	taskRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"task", "create", "--socket", socket, "--project", project.ID,
@@ -171,7 +175,13 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 	if taskSummary.ID != task.ID || !taskSummary.TitleTruncated || !taskSummary.TextTruncated {
 		t.Fatalf("status task does not disclose field truncation: %#v", taskSummary)
 	}
-	if taskSummary.Title != longTitle[:256] || taskSummary.FailureReason != ("RUN_INTERRUPTED: " + longReason)[:512] {
+	wantFailure := "RUN_INTERRUPTED: " + longReason
+	wantTitleSummary := byteSafeSummary(t, longTitle, 256)
+	wantFailureSummary := byteSafeSummary(t, wantFailure, 512)
+	wantTerminalSummary := byteSafeSummary(t, longReason, 512)
+	assertUTF8ByteBound(t, "status task title", taskSummary.Title, 256)
+	assertUTF8ByteBound(t, "status task failure reason", taskSummary.FailureReason, 512)
+	if taskSummary.Title != wantTitleSummary || taskSummary.FailureReason != wantFailureSummary {
 		t.Fatalf("status task summaries are not deterministically clipped: %#v", taskSummary)
 	}
 
@@ -201,8 +211,12 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 		!tasks.Items[0].TitleTruncated || !tasks.Items[0].TextTruncated {
 		t.Fatalf("task list does not disclose field truncation: %#v", tasks)
 	}
-	if tasks.Items[0].Title != longTitle[:256] || tasks.Items[0].FailureReason != ("RUN_INTERRUPTED: " + longReason)[:512] {
-		t.Fatalf("task list summaries are not deterministically clipped: %#v", tasks.Items[0])
+	listedTask := tasks.Items[0]
+	assertUTF8ByteBound(t, "task list title", listedTask.Title, 256)
+	assertUTF8ByteBound(t, "task list failure reason", listedTask.FailureReason, 512)
+	if listedTask.Title != taskSummary.Title || listedTask.FailureReason != taskSummary.FailureReason ||
+		listedTask.TitleTruncated != taskSummary.TitleTruncated || listedTask.TextTruncated != taskSummary.TextTruncated {
+		t.Fatalf("status and task list summaries disagree: status=%#v list=%#v", taskSummary, listedTask)
 	}
 	taskListCommand := exec.Command(testBinaries.coordplane,
 		"task", "list", "--socket", socket, "--project", project.ID)
@@ -227,7 +241,8 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 	if len(runs.Items) != 1 || runs.Items[0].ID != claim.Run.ID || !runs.Items[0].TextTruncated {
 		t.Fatalf("run list does not disclose terminal text truncation: %#v", runs)
 	}
-	if runs.Items[0].TerminalReason != longReason[:512] {
+	assertUTF8ByteBound(t, "run list terminal reason", runs.Items[0].TerminalReason, 512)
+	if runs.Items[0].TerminalReason != wantTerminalSummary {
 		t.Fatalf("run terminal summary is not deterministically clipped: %#v", runs.Items[0])
 	}
 	runCommand := exec.Command(testBinaries.coordplane,
@@ -249,7 +264,6 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 		"task", "show", task.ID, "--socket", socket, "--output", "json")
 	var taskDetail core.TaskDetail
 	decodeJSON(t, taskDetailRaw, &taskDetail)
-	wantFailure := "RUN_INTERRUPTED: " + longReason
 	if taskDetail.Task.Status != core.TaskFailed || taskDetail.Task.Title != longTitle || taskDetail.Task.FailureReason != wantFailure {
 		t.Fatalf("task show did not recover full fields: title=%d/%d failure=%d/%d",
 			len(taskDetail.Task.Title), len(longTitle), len(taskDetail.Task.FailureReason), len(wantFailure))
@@ -260,5 +274,29 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 	decodeJSON(t, runDetailRaw, &runDetail)
 	if runDetail.State != core.RunInterrupted || runDetail.TerminalReason != longReason {
 		t.Fatalf("run show did not recover full terminal reason: got %d bytes, want %d", len(runDetail.TerminalReason), len(longReason))
+	}
+}
+
+func byteSafeSummary(t *testing.T, value string, limit int) string {
+	t.Helper()
+	var summary strings.Builder
+	for _, current := range value {
+		if summary.Len()+utf8.RuneLen(current) > limit {
+			break
+		}
+		if _, err := summary.WriteRune(current); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return summary.String()
+}
+
+func assertUTF8ByteBound(t *testing.T, name, value string, limit int) {
+	t.Helper()
+	if !utf8.ValidString(value) {
+		t.Fatalf("%s is not valid UTF-8: %q", name, value)
+	}
+	if len(value) > limit {
+		t.Fatalf("%s is %d bytes, exceeds %d-byte summary budget", name, len(value), limit)
 	}
 }

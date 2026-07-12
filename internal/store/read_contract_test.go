@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"coordplane/internal/core"
 )
@@ -290,6 +291,91 @@ func TestStatusProjectionIsBoundedAndOmitsHistoricalPayloads(t *testing.T) {
 	}
 	if !current.Task.TitleTruncated || len(current.Task.Title) != 256 {
 		t.Fatalf("task title summary was not explicitly bounded: %#v", current.Task)
+	}
+}
+
+func TestTaskAndRunSummariesUseConsistentUTF8ByteBudgets(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, filepath.Join(t.TempDir(), "utf8-summaries.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := insertReadFixture(ctx, database, "utf8", core.TaskRunning, core.RunActive, core.MessagePending, false); err != nil {
+		t.Fatal(err)
+	}
+
+	title := strings.Repeat("题", 100)
+	waitReason := strings.Repeat("等", 200)
+	resultSummary := strings.Repeat("果", 200)
+	failure := strings.Repeat("败", 200)
+	terminal := strings.Repeat("终", 200)
+	lastError := strings.Repeat("错", 200)
+	runtimeErrorCode := strings.Repeat("码", 100)
+	if _, err := database.db.ExecContext(ctx, `UPDATE tasks SET title=?,wait_reason=?,result_summary=?,failure_reason=? WHERE id='tsk_utf8'`, title, waitReason, resultSummary, failure); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.db.ExecContext(ctx, `UPDATE runs SET terminal_reason=?,last_error=?,runtime_error_code=? WHERE id='run_utf8'`, terminal, lastError, runtimeErrorCode); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := database.StatusProjection(ctx, "prj_utf8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Truncated || len(status.Tasks) != 1 || status.Tasks[0].CurrentRun == nil {
+		t.Fatalf("status object bound/current run = truncated:%t tasks:%d view:%#v", status.Truncated, len(status.Tasks), status.Tasks)
+	}
+	tasks, err := database.Tasks(ctx, core.TaskFilter{ProjectID: "prj_utf8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs, err := database.Runs(ctx, core.RunFilter{ProjectID: "prj_utf8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks.Items) != 1 || len(runs.Items) != 1 {
+		t.Fatalf("list object counts = tasks:%d runs:%d", len(tasks.Items), len(runs.Items))
+	}
+
+	statusTask, listTask := status.Tasks[0].Task, tasks.Items[0]
+	statusRun, listRun := *status.Tasks[0].CurrentRun, runs.Items[0]
+	if statusTask != listTask {
+		t.Fatalf("status/list task summaries disagree: status=%#v list=%#v", statusTask, listTask)
+	}
+	if statusRun != listRun {
+		t.Fatalf("status/list run summaries disagree: status=%#v list=%#v", statusRun, listRun)
+	}
+	assertUTF8Budget(t, "task title", listTask.Title, 256, 255)
+	assertUTF8Budget(t, "task wait reason", listTask.WaitReason, 512, 510)
+	assertUTF8Budget(t, "task result summary", listTask.ResultSummary, 512, 510)
+	assertUTF8Budget(t, "task failure", listTask.FailureReason, 512, 510)
+	assertUTF8Budget(t, "run terminal", listRun.TerminalReason, 512, 510)
+	assertUTF8Budget(t, "run last error", listRun.LastError, 512, 510)
+	assertUTF8Budget(t, "run runtime error code", listRun.RuntimeErrorCode, 256, 255)
+	if !listTask.TitleTruncated || !listTask.TextTruncated || !listRun.TextTruncated {
+		t.Fatalf("truncation flags = title:%t task_text:%t run_text:%t", listTask.TitleTruncated, listTask.TextTruncated, listRun.TextTruncated)
+	}
+	fullTask, err := database.Task(ctx, "tsk_utf8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fullRun, err := database.Run(ctx, "run_utf8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fullTask.Title != title || fullTask.WaitReason != waitReason || fullTask.ResultSummary != resultSummary || fullTask.FailureReason != failure {
+		t.Fatalf("full task read did not preserve UTF-8 text: %#v", fullTask)
+	}
+	if fullRun.TerminalReason != terminal || fullRun.LastError != lastError || fullRun.RuntimeErrorCode != runtimeErrorCode {
+		t.Fatalf("full run read did not preserve UTF-8 text: %#v", fullRun)
+	}
+}
+
+func assertUTF8Budget(t *testing.T, field, value string, limit, wantBytes int) {
+	t.Helper()
+	if !utf8.ValidString(value) || len(value) != wantBytes || len(value) > limit {
+		t.Fatalf("%s summary = %d bytes valid_utf8:%t, want %d valid bytes within %d-byte budget", field, len(value), utf8.ValidString(value), wantBytes, limit)
 	}
 }
 
