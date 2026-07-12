@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"coordplane/internal/ids"
 )
@@ -65,85 +66,127 @@ func (s *Service) SetReady(ready bool, reason string) {
 }
 
 func (s *Service) Status(ctx context.Context, projectID string) (Status, error) {
-	snapshot, err := s.repository.Snapshot(ctx, strings.TrimSpace(projectID))
+	projection, err := s.repository.StatusProjection(ctx, strings.TrimSpace(projectID))
 	if err != nil {
 		return Status{}, err
 	}
-	status := Status{Snapshot: snapshot}
+	status := Status{Snapshot: projection.Snapshot, Tasks: projection.Tasks, SummaryTruncated: projection.Truncated}
 	s.readyMu.RLock()
 	status.DaemonReady = s.ready
-	status.Reason = s.readyReason
+	var truncated bool
+	status.Reason, truncated = boundedStatusText(s.readyReason, 1024)
+	status.SummaryTruncated = status.SummaryTruncated || truncated
 	s.readyMu.RUnlock()
-	actualByProject := make(map[string]GitState, len(snapshot.Projects))
-	for _, project := range snapshot.Projects {
+	actualByProject := make(map[string]GitState, len(status.Snapshot.Projects))
+	for index := range status.Snapshot.Projects {
+		project := &status.Snapshot.Projects[index]
 		gitState := GitState{ProjectID: project.ID, CanonicalRef: project.CanonicalRef}
 		gitState.ActualSHA, err = s.projectGit.Resolve(ctx, project.ControlRepoPath, project.CanonicalRef)
 		if err != nil {
 			gitState.Error = err.Error()
 		}
+		gitState.ActualSHA, _ = boundedStatusText(gitState.ActualSHA, 256)
+		gitState.Error, truncated = boundedStatusText(gitState.Error, 1024)
+		status.SummaryTruncated = status.SummaryTruncated || truncated
 		status.ActualRefs = append(status.ActualRefs, gitState)
 		actualByProject[project.ID] = gitState
+		for value, limit := range map[*string]int{
+			&project.Name: 256, &project.Source: 2048, &project.SourceRef: 1024,
+			&project.ControlRepoPath: 2048, &project.CanonicalRef: 1024, &project.LastError: 1024,
+		} {
+			*value, truncated = boundedStatusText(*value, limit)
+			status.SummaryTruncated = status.SummaryTruncated || truncated
+		}
 	}
-	runsByID := make(map[string]Run, len(snapshot.Runs))
-	for _, run := range snapshot.Runs {
-		runsByID[run.ID] = run
+	for index := range status.Snapshot.Agents {
+		agent := &status.Snapshot.Agents[index]
+		for value, limit := range map[*string]int{
+			&agent.DisplayName: 256, &agent.AdapterID: 256, &agent.Image: 1024, &agent.InstructionsFile: 2048,
+		} {
+			bounded, truncated := boundedStatusText(*value, limit)
+			*value = bounded
+			status.SummaryTruncated = status.SummaryTruncated || truncated
+		}
 	}
-	messageCounts := make(map[string][2]int, len(snapshot.Tasks))
-	for _, message := range snapshot.Messages {
-		counts := messageCounts[message.TaskID]
-		switch message.State {
-		case MessagePending:
-			counts[0]++
-		case MessageDelivered:
-			counts[1]++
-		}
-		messageCounts[message.TaskID] = counts
-	}
-	for _, task := range snapshot.Tasks {
-		counts := messageCounts[task.ID]
-		gitState := actualByProject[task.ProjectID]
-		view := TaskView{
-			Task: task, PendingMessageCount: counts[0], DeliveredMessageCount: counts[1],
-			ActualCanonicalSHA: gitState.ActualSHA, ActualCanonicalError: gitState.Error,
-			Stale:   task.BaseSHA != "" && gitState.ActualSHA != "" && task.BaseSHA != gitState.ActualSHA,
-			Derived: true,
-		}
-		if current, ok := runsByID[task.CurrentRunID]; ok {
-			currentCopy := current
-			view.CurrentRun = &currentCopy
-		}
-		progress, progressErr := s.repository.Events(ctx, EventFilter{
-			ProjectID: task.ProjectID, EntityType: "task", EntityID: task.ID, Kind: "task.progress", Limit: 1,
-		})
-		if progressErr != nil {
-			return Status{}, progressErr
-		}
-		if len(progress) == 1 {
-			progressCopy := progress[0]
-			view.LatestProgress = &progressCopy
-		}
-		status.Tasks = append(status.Tasks, view)
+	for index := range status.Tasks {
+		task := &status.Tasks[index]
+		gitState := actualByProject[task.Task.ProjectID]
+		task.ActualCanonicalSHA = gitState.ActualSHA
+		task.ActualCanonicalError = gitState.Error
+		task.Stale = task.Task.BaseSHA != "" && gitState.ActualSHA != "" && task.Task.BaseSHA != gitState.ActualSHA
 	}
 	return status, nil
 }
 
-func (s *Service) Project(ctx context.Context, id string) (Project, error) {
-	return s.repository.Project(ctx, strings.TrimSpace(id))
+func (s *Service) Project(ctx context.Context, id string) (ProjectDetail, error) {
+	project, err := s.repository.Project(ctx, strings.TrimSpace(id))
+	if err != nil {
+		return ProjectDetail{}, err
+	}
+	detail := ProjectDetail{Project: project}
+	detail.ActualCanonicalSHA, err = s.projectGit.Resolve(ctx, project.ControlRepoPath, project.CanonicalRef)
+	if err != nil {
+		detail.ActualCanonicalSHA = ""
+		detail.ActualCanonicalError, _ = boundedStatusText(err.Error(), 1024)
+	} else {
+		detail.ActualCanonicalSHA, _ = boundedStatusText(detail.ActualCanonicalSHA, 256)
+	}
+	return detail, nil
 }
 
 func (s *Service) Agent(ctx context.Context, id string) (Agent, error) {
 	return s.repository.Agent(ctx, strings.TrimSpace(id))
 }
 
+func (s *Service) ListProjects(ctx context.Context, filter ProjectFilter) (ProjectPage, error) {
+	return s.repository.Projects(ctx, filter)
+}
+
+func (s *Service) ListAgents(ctx context.Context, filter AgentFilter) (AgentPage, error) {
+	return s.repository.Agents(ctx, filter)
+}
+
+func (s *Service) Task(ctx context.Context, id string) (TaskDetail, error) {
+	projection, err := s.repository.TaskProjection(ctx, strings.TrimSpace(id))
+	if err != nil {
+		return TaskDetail{}, err
+	}
+	actual, resolveErr := s.projectGit.Resolve(ctx, projection.Project.ControlRepoPath, projection.Project.CanonicalRef)
+	if resolveErr != nil {
+		projection.Task.ActualCanonicalError, _ = boundedStatusText(resolveErr.Error(), 1024)
+	} else {
+		projection.Task.ActualCanonicalSHA, _ = boundedStatusText(actual, 256)
+	}
+	projection.Task.Stale = projection.Task.Task.BaseSHA != "" && projection.Task.ActualCanonicalSHA != "" && projection.Task.Task.BaseSHA != projection.Task.ActualCanonicalSHA
+	return projection.Task, nil
+}
+
+func (s *Service) Run(ctx context.Context, id string) (Run, error) {
+	return s.repository.Run(ctx, strings.TrimSpace(id))
+}
+
 func (s *Service) Snapshot(ctx context.Context, projectID string) (Snapshot, error) {
 	return s.repository.Snapshot(ctx, strings.TrimSpace(projectID))
 }
 
-func (s *Service) ListMessages(ctx context.Context, filter MessageFilter) ([]Message, error) {
+func (s *Service) ListTasks(ctx context.Context, filter TaskFilter) (TaskPage, error) {
+	return s.repository.Tasks(ctx, filter)
+}
+
+func (s *Service) ListRuns(ctx context.Context, filter RunFilter) (RunPage, error) {
+	return s.repository.Runs(ctx, filter)
+}
+
+func (s *Service) ListMessages(ctx context.Context, filter MessageFilter) (MessagePage, error) {
 	return s.repository.Messages(ctx, filter)
 }
 
 func (s *Service) ListEvents(ctx context.Context, filter EventFilter) ([]Event, error) {
+	limit, err := NormalizeEventPageLimit(filter.Limit)
+	if err != nil {
+		return nil, err
+	}
+	filter.Limit = limit
 	return s.repository.Events(ctx, filter)
 }
 
@@ -164,6 +207,9 @@ func (s *Service) requiredID(prefix string) (string, error) {
 
 func (s *Service) requestID(value string) (string, error) {
 	if value = strings.TrimSpace(value); value != "" {
+		if len(value) > 256 {
+			return "", NewError(CodeInvalidArgument, "request_id must not exceed 256 bytes", false)
+		}
 		return value, nil
 	}
 	return s.requiredID("req")
@@ -239,6 +285,58 @@ func requireText(name, value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return "", NewError(CodeInvalidArgument, fmt.Sprintf("%s is required", name), false)
+	}
+	maximum := 0
+	switch name {
+	case "body":
+		maximum = MaximumMessageBodyBytes
+	case "summary":
+		maximum = MaximumProgressSummaryBytes
+	case "name", "display_name":
+		maximum = 256
+	case "title":
+		maximum = 512
+	case "adapter_id":
+		maximum = 256
+	case "image", "source_ref":
+		maximum = 1024
+	case "source", "instructions_file":
+		maximum = 2048
+	}
+	if maximum > 0 && len(value) > maximum {
+		return "", NewError(CodeInvalidArgument, fmt.Sprintf("%s must not exceed %d bytes", name, maximum), false)
+	}
+	return value, nil
+}
+
+func boundedStatusText(value string, limit int) (string, bool) {
+	if len(value) <= limit {
+		return value, false
+	}
+	value = value[:limit]
+	for !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value, true
+}
+
+func boundedDurableText(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= limit {
+		return value
+	}
+	const suffix = "...[truncated]"
+	value = value[:limit-len(suffix)]
+	for !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value + suffix
+}
+
+func optionalTextWithin(name, value string, maximum int) (string, error) {
+	value = strings.TrimSpace(value)
+	if len(value) > maximum {
+		return "", NewError(CodeInvalidArgument, fmt.Sprintf("%s must not exceed %d bytes", name, maximum), false)
 	}
 	return value, nil
 }

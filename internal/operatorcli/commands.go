@@ -44,7 +44,12 @@ func runMessage(ctx context.Context, args []string, getenv environment, stdout, 
 		flags.StringVar(&filter.TaskID, "task", "", "task ID")
 		flags.StringVar(&filter.RecipientKind, "recipient-kind", "", "recipient kind")
 		flags.StringVar(&filter.RecipientID, "recipient-id", "", "recipient ID")
+		flags.StringVar(&filter.Cursor, "cursor", "", "opaque next-page cursor")
+		flags.IntVar(&filter.Limit, "limit", 0, "maximum messages (default and maximum 20)")
 		if err := parseNoPositionals(flags, args[1:]); err != nil {
+			return err
+		}
+		if _, err := core.NormalizeMessagePageLimit(filter.Limit); err != nil {
 			return err
 		}
 		query := url.Values{}
@@ -52,7 +57,11 @@ func runMessage(ctx context.Context, args []string, getenv environment, stdout, 
 		addQuery(query, "task_id", filter.TaskID)
 		addQuery(query, "recipient_kind", filter.RecipientKind)
 		addQuery(query, "recipient_id", filter.RecipientID)
-		var messages []core.Message
+		addQuery(query, "cursor", filter.Cursor)
+		if filter.Limit > 0 {
+			query.Set("limit", fmt.Sprint(filter.Limit))
+		}
+		var messages core.MessagePage
 		if err := request(ctx, *cfg, clients, http.MethodGet, withQuery("/v1/messages", query), nil, &messages); err != nil {
 			return err
 		}
@@ -102,28 +111,36 @@ func runTask(ctx context.Context, args []string, getenv environment, stdout, std
 		return render(stdout, cfg.output, task)
 	case "list":
 		flags, cfg := clientFlags("task list", getenv, stderr)
-		projectID := flags.String("project", "", "filter by project ID")
+		var filter core.TaskFilter
+		flags.StringVar(&filter.ProjectID, "project", "", "filter by project ID")
+		flags.StringVar(&filter.Cursor, "cursor", "", "opaque next-page cursor")
+		flags.IntVar(&filter.Limit, "limit", 0, "maximum tasks (default 100, maximum 500)")
 		if err := parseNoPositionals(flags, args[1:]); err != nil {
 			return err
 		}
-		status, err := fetchStatus(ctx, *cfg, clients, strings.TrimSpace(*projectID))
-		if err != nil {
+		if _, err := core.NormalizePageLimit(filter.Limit); err != nil {
 			return err
 		}
-		return render(stdout, cfg.output, status.Snapshot.Tasks)
+		query := url.Values{}
+		addQuery(query, "project_id", filter.ProjectID)
+		addQuery(query, "cursor", filter.Cursor)
+		if filter.Limit > 0 {
+			query.Set("limit", fmt.Sprint(filter.Limit))
+		}
+		var page core.TaskPage
+		if err := request(ctx, *cfg, clients, http.MethodGet, withQuery("/v1/tasks", query), nil, &page); err != nil {
+			return err
+		}
+		return render(stdout, cfg.output, page)
 	case "show":
 		flags, cfg := clientFlags("task show", getenv, stderr)
 		id, err := parseID(flags, args[1:])
 		if err != nil {
 			return err
 		}
-		status, err := fetchStatus(ctx, *cfg, clients, "")
-		if err != nil {
+		var task core.TaskDetail
+		if err := request(ctx, *cfg, clients, http.MethodGet, "/v1/tasks/"+url.PathEscape(id), nil, &task); err != nil {
 			return err
-		}
-		task, ok := findTaskView(status.Tasks, id)
-		if !ok {
-			return core.NewError(core.CodeNotFound, "task not found", false)
 		}
 		return render(stdout, cfg.output, task)
 	case "close":
@@ -141,6 +158,54 @@ func runTask(ctx context.Context, args []string, getenv environment, stdout, std
 		return render(stdout, cfg.output, task)
 	default:
 		return fmt.Errorf("unknown task subcommand %q", args[0])
+	}
+}
+
+func runRun(ctx context.Context, args []string, getenv environment, stdout, stderr io.Writer, clients clientFactory) error {
+	if len(args) == 0 {
+		return errors.New("run subcommand is required")
+	}
+	switch args[0] {
+	case "list":
+		flags, cfg := clientFlags("run list", getenv, stderr)
+		var filter core.RunFilter
+		flags.StringVar(&filter.ProjectID, "project", "", "filter by project ID")
+		flags.StringVar(&filter.TaskID, "task", "", "filter by task ID")
+		flags.StringVar(&filter.AgentID, "agent", "", "filter by agent ID")
+		flags.StringVar(&filter.Cursor, "cursor", "", "opaque next-page cursor")
+		flags.IntVar(&filter.Limit, "limit", 0, "maximum runs (default 100, maximum 500)")
+		if err := parseNoPositionals(flags, args[1:]); err != nil {
+			return err
+		}
+		if _, err := core.NormalizePageLimit(filter.Limit); err != nil {
+			return err
+		}
+		query := url.Values{}
+		addQuery(query, "project_id", filter.ProjectID)
+		addQuery(query, "task_id", filter.TaskID)
+		addQuery(query, "agent_id", filter.AgentID)
+		addQuery(query, "cursor", filter.Cursor)
+		if filter.Limit > 0 {
+			query.Set("limit", fmt.Sprint(filter.Limit))
+		}
+		var page core.RunPage
+		if err := request(ctx, *cfg, clients, http.MethodGet, withQuery("/v1/runs", query), nil, &page); err != nil {
+			return err
+		}
+		return render(stdout, cfg.output, page)
+	case "show":
+		flags, cfg := clientFlags("run show", getenv, stderr)
+		id, err := parseID(flags, args[1:])
+		if err != nil {
+			return err
+		}
+		var run core.Run
+		if err := request(ctx, *cfg, clients, http.MethodGet, "/v1/runs/"+url.PathEscape(id), nil, &run); err != nil {
+			return err
+		}
+		return render(stdout, cfg.output, run)
+	default:
+		return fmt.Errorf("unknown run subcommand %q", args[0])
 	}
 }
 

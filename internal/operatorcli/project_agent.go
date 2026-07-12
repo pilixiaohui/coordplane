@@ -34,27 +34,33 @@ func runProject(ctx context.Context, args []string, getenv environment, stdout, 
 		return render(stdout, cfg.output, project)
 	case "list":
 		flags, cfg := clientFlags("project list", getenv, stderr)
+		cursor := flags.String("cursor", "", "opaque next-page cursor")
+		limit := flags.Int("limit", 0, "maximum projects (default and maximum 100)")
 		if err := parseNoPositionals(flags, args[1:]); err != nil {
 			return err
 		}
-		status, err := fetchStatus(ctx, *cfg, clients, "")
-		if err != nil {
+		if _, err := core.NormalizeCompactPageLimit(*limit); err != nil {
 			return err
 		}
-		return render(stdout, cfg.output, projectViews(status))
+		query := url.Values{}
+		addQuery(query, "cursor", *cursor)
+		if *limit > 0 {
+			query.Set("limit", fmt.Sprint(*limit))
+		}
+		var page core.ProjectPage
+		if err := request(ctx, *cfg, clients, http.MethodGet, withQuery("/v1/projects", query), nil, &page); err != nil {
+			return err
+		}
+		return render(stdout, cfg.output, page)
 	case "show":
 		flags, cfg := clientFlags("project show", getenv, stderr)
 		id, err := parseID(flags, args[1:])
 		if err != nil {
 			return err
 		}
-		status, err := fetchStatus(ctx, *cfg, clients, id)
-		if err != nil {
+		var project core.ProjectDetail
+		if err := request(ctx, *cfg, clients, http.MethodGet, "/v1/projects/"+url.PathEscape(id), nil, &project); err != nil {
 			return err
-		}
-		project, ok := findProjectView(status, id)
-		if !ok {
-			return core.NewError(core.CodeNotFound, "project not found", false)
 		}
 		return render(stdout, cfg.output, project)
 	case "repair", "archive":
@@ -103,27 +109,33 @@ func runAgent(ctx context.Context, args []string, getenv environment, stdout, st
 		return render(stdout, cfg.output, agent)
 	case "list":
 		flags, cfg := clientFlags("agent list", getenv, stderr)
+		cursor := flags.String("cursor", "", "opaque next-page cursor")
+		limit := flags.Int("limit", 0, "maximum agents (default and maximum 100)")
 		if err := parseNoPositionals(flags, args[1:]); err != nil {
 			return err
 		}
-		status, err := fetchStatus(ctx, *cfg, clients, "")
-		if err != nil {
+		if _, err := core.NormalizeCompactPageLimit(*limit); err != nil {
 			return err
 		}
-		return render(stdout, cfg.output, status.Snapshot.Agents)
+		query := url.Values{}
+		addQuery(query, "cursor", *cursor)
+		if *limit > 0 {
+			query.Set("limit", fmt.Sprint(*limit))
+		}
+		var page core.AgentPage
+		if err := request(ctx, *cfg, clients, http.MethodGet, withQuery("/v1/agents", query), nil, &page); err != nil {
+			return err
+		}
+		return render(stdout, cfg.output, page)
 	case "show":
 		flags, cfg := clientFlags("agent show", getenv, stderr)
 		id, err := parseID(flags, args[1:])
 		if err != nil {
 			return err
 		}
-		status, err := fetchStatus(ctx, *cfg, clients, "")
-		if err != nil {
+		var agent core.Agent
+		if err := request(ctx, *cfg, clients, http.MethodGet, "/v1/agents/"+url.PathEscape(id), nil, &agent); err != nil {
 			return err
-		}
-		agent, ok := findAgent(status.Snapshot.Agents, id)
-		if !ok {
-			return core.NewError(core.CodeNotFound, "agent not found", false)
 		}
 		return render(stdout, cfg.output, agent)
 	case "pause", "resume", "archive":

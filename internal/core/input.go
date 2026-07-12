@@ -78,3 +78,14 @@ type OutcomeInput struct {
 	Reason       string `json:"reason,omitempty"`
 	RequestID    string `json:"request_id"`
 }
+
+// TerminalRunInput is daemon/runtime-owned evidence. It is intentionally not
+// part of the Agent-facing transport, so a Run cannot report its own exit.
+type TerminalRunInput struct {
+	RunID     string   `json:"run_id"`
+	State     RunState `json:"state"`
+	ExitCode  *int     `json:"exit_code,omitempty"`
+	Reason    string   `json:"reason,omitempty"`
+	LastError string   `json:"last_error,omitempty"`
+	RequestID string   `json:"request_id"`
+}

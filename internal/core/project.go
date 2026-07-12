@@ -52,7 +52,7 @@ func (s *Service) AddProject(ctx context.Context, input AddProjectInput) (Projec
 	project := Project{
 		ID: projectID, Name: name, Source: fact.Source, SourceRef: fact.SourceRef,
 		InitialSHA: fact.InitialSHA, ControlRepoPath: s.projectGit.ControlPath(projectID),
-		CanonicalRef: fact.CanonicalRef, CanonicalSHA: fact.InitialSHA,
+		CanonicalRef:       fact.CanonicalRef,
 		IntegrationAgentID: strings.TrimSpace(input.IntegrationAgentID), Status: ProjectCreating,
 		PendingAction: "initialize", PendingActionID: operationID, PendingStartedAt: now,
 		Version: 1, CreatedAt: now, UpdatedAt: now,
@@ -137,9 +137,11 @@ func (s *Service) RepairProject(ctx context.Context, projectID, requestID string
 	if err != nil {
 		return Project{}, err
 	}
-	action := "initialize"
-	if s.projectGit.Exists(project.ControlRepoPath) {
-		action = "verify"
+	// A non-empty cache proves this project was active before. Never rebuild its
+	// missing code truth from the registration SHA.
+	action := "verify"
+	if project.CanonicalSHA == "" && !s.projectGit.Exists(project.ControlRepoPath) {
+		action = "initialize"
 	}
 	now := s.nowText()
 	expectedVersion := project.Version
@@ -353,6 +355,7 @@ func newProjectGitFailure(cause error) *Error {
 	if cause != nil && strings.TrimSpace(cause.Error()) != "" {
 		message += ": " + strings.TrimSpace(cause.Error())
 	}
+	message = boundedDurableText(message, MaximumOutcomeTextBytes)
 	return NewError(CodeGitInvariantViolation, message, false)
 }
 

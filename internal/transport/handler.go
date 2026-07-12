@@ -29,18 +29,58 @@ func NewOperatorHandler(operations OperatorOperations) http.Handler {
 		result, err := operations.Status(r.Context(), strings.TrimSpace(r.URL.Query().Get("project_id")))
 		writeResult(w, result, err)
 	}))
-	mux.HandleFunc("/v1/projects", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.AddProjectInput) (any, error) {
+	addProject := decodeCall(func(ctx requestContext, input core.AddProjectInput) (any, error) {
 		return operations.AddProject(ctx.Context, input)
-	})))
+	})
+	mux.HandleFunc("/v1/projects", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			addProject(w, r)
+		case http.MethodGet:
+			limit, err := queryInt(r.URL.Query().Get("limit"), "limit")
+			if err != nil {
+				writeError(w, err)
+				return
+			}
+			result, err := operations.ListProjects(r.Context(), core.ProjectFilter{Cursor: strings.TrimSpace(r.URL.Query().Get("cursor")), Limit: limit})
+			writeResult(w, result, err)
+		default:
+			methodNotAllowed(w, "GET, POST")
+		}
+	})
+	mux.HandleFunc("/v1/projects/{id}", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		result, err := operations.Project(r.Context(), strings.TrimSpace(r.PathValue("id")))
+		writeResult(w, result, err)
+	}))
 	mux.HandleFunc("/v1/projects/{id}/repair", requireMethod(http.MethodPost, actionCall(func(ctx requestContext, id, requestID string) (any, error) {
 		return operations.RepairProject(ctx.Context, id, requestID)
 	})))
 	mux.HandleFunc("/v1/projects/{id}/archive", requireMethod(http.MethodPost, actionCall(func(ctx requestContext, id, requestID string) (any, error) {
 		return operations.ArchiveProject(ctx.Context, id, requestID)
 	})))
-	mux.HandleFunc("/v1/agents", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.AddAgentInput) (any, error) {
+	addAgent := decodeCall(func(ctx requestContext, input core.AddAgentInput) (any, error) {
 		return operations.AddAgent(ctx.Context, input)
-	})))
+	})
+	mux.HandleFunc("/v1/agents", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			addAgent(w, r)
+		case http.MethodGet:
+			limit, err := queryInt(r.URL.Query().Get("limit"), "limit")
+			if err != nil {
+				writeError(w, err)
+				return
+			}
+			result, err := operations.ListAgents(r.Context(), core.AgentFilter{Cursor: strings.TrimSpace(r.URL.Query().Get("cursor")), Limit: limit})
+			writeResult(w, result, err)
+		default:
+			methodNotAllowed(w, "GET, POST")
+		}
+	})
+	mux.HandleFunc("/v1/agents/{id}", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		result, err := operations.Agent(r.Context(), strings.TrimSpace(r.PathValue("id")))
+		writeResult(w, result, err)
+	}))
 	mux.HandleFunc("/v1/agents/{id}/pause", requireMethod(http.MethodPost, actionCall(func(ctx requestContext, id, requestID string) (any, error) {
 		return operations.SetAgentStatus(ctx.Context, id, core.AgentPaused, requestID)
 	})))
@@ -53,19 +93,66 @@ func NewOperatorHandler(operations OperatorOperations) http.Handler {
 	mux.HandleFunc("/v1/chat", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.ChatInput) (any, error) {
 		return operations.Chat(ctx.Context, input)
 	})))
-	mux.HandleFunc("/v1/tasks", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.CreateTaskInput) (any, error) {
+	createTask := decodeCall(func(ctx requestContext, input core.CreateTaskInput) (any, error) {
 		return operations.CreateTask(ctx.Context, input)
-	})))
+	})
+	mux.HandleFunc("/v1/tasks", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			createTask(w, r)
+		case http.MethodGet:
+			limit, err := queryInt(r.URL.Query().Get("limit"), "limit")
+			if err != nil {
+				writeError(w, err)
+				return
+			}
+			result, err := operations.ListTasks(r.Context(), core.TaskFilter{
+				ProjectID: strings.TrimSpace(r.URL.Query().Get("project_id")),
+				Cursor:    strings.TrimSpace(r.URL.Query().Get("cursor")), Limit: limit,
+			})
+			writeResult(w, result, err)
+		default:
+			methodNotAllowed(w, "GET, POST")
+		}
+	})
+	mux.HandleFunc("/v1/tasks/{id}", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		result, err := operations.Task(r.Context(), strings.TrimSpace(r.PathValue("id")))
+		writeResult(w, result, err)
+	}))
 	mux.HandleFunc("/v1/tasks/{id}/close", requireMethod(http.MethodPost, actionCall(func(ctx requestContext, id, requestID string) (any, error) {
 		return operations.CloseConversation(ctx.Context, id, requestID)
 	})))
+	mux.HandleFunc("/v1/runs", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		limit, err := queryInt(query.Get("limit"), "limit")
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		result, err := operations.ListRuns(r.Context(), core.RunFilter{
+			ProjectID: strings.TrimSpace(query.Get("project_id")), TaskID: strings.TrimSpace(query.Get("task_id")),
+			AgentID: strings.TrimSpace(query.Get("agent_id")), Cursor: strings.TrimSpace(query.Get("cursor")), Limit: limit,
+		})
+		writeResult(w, result, err)
+	}))
+	mux.HandleFunc("/v1/runs/{id}", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		result, err := operations.Run(r.Context(), strings.TrimSpace(r.PathValue("id")))
+		writeResult(w, result, err)
+	}))
 	mux.HandleFunc("/v1/messages", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
+		limit, err := queryInt(query.Get("limit"), "limit")
+		if err != nil {
+			writeError(w, err)
+			return
+		}
 		result, err := operations.ListMessages(r.Context(), core.MessageFilter{
 			ProjectID:     strings.TrimSpace(query.Get("project_id")),
 			TaskID:        strings.TrimSpace(query.Get("task_id")),
 			RecipientKind: strings.TrimSpace(query.Get("recipient_kind")),
 			RecipientID:   strings.TrimSpace(query.Get("recipient_id")),
+			Cursor:        strings.TrimSpace(query.Get("cursor")),
+			Limit:         limit,
 		})
 		writeResult(w, result, err)
 	}))
@@ -154,12 +241,16 @@ func newRequestContext(r *http.Request) requestContext {
 func requireMethod(method string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != method {
-			w.Header().Set("Allow", method)
-			writeErrorStatus(w, http.StatusMethodNotAllowed, core.NewError(core.CodeInvalidArgument, "method not allowed", false))
+			methodNotAllowed(w, method)
 			return
 		}
 		next(w, r)
 	}
+}
+
+func methodNotAllowed(w http.ResponseWriter, allow string) {
+	w.Header().Set("Allow", allow)
+	writeErrorStatus(w, http.StatusMethodNotAllowed, core.NewError(core.CodeInvalidArgument, "method not allowed", false))
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any, optional bool) error {

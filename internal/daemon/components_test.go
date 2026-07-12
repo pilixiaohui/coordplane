@@ -96,6 +96,16 @@ func TestGT00CompositionRegistersAndReconcilesRealProject(t *testing.T) {
 		t.Fatalf("control canonical = %s, initial = %s", actual, project.InitialSHA)
 	}
 	gitOutput(t, "--git-dir", project.ControlRepoPath, "fsck", "--connectivity-only")
+	if err := os.WriteFile(filepath.Join(source, "advanced.txt"), []byte("advanced\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, source, "add", "advanced.txt")
+	gitIn(t, source, "commit", "-m", "advance canonical")
+	advanced := strings.TrimSpace(gitIn(t, source, "rev-parse", "HEAD"))
+	gitOutput(t, "--git-dir="+project.ControlRepoPath,
+		"-c", "protocol.file.allow=always", "fetch", "--no-tags", "--no-write-fetch-head", source, advanced)
+	gitOutput(t, "--git-dir="+project.ControlRepoPath,
+		"update-ref", project.CanonicalRef, advanced, project.InitialSHA)
 	if err := components.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +115,7 @@ func TestGT00CompositionRegistersAndReconcilesRealProject(t *testing.T) {
 		t.Fatal(err)
 	}
 	persisted, err := reopened.store.Project(ctx, project.ID)
-	if err != nil || persisted.Status != core.ProjectActive || persisted.InitialSHA != project.InitialSHA {
+	if err != nil || persisted.Status != core.ProjectActive || persisted.InitialSHA != project.InitialSHA || persisted.CanonicalSHA != advanced {
 		t.Fatalf("persisted project = %#v err=%v", persisted, err)
 	}
 	if err := reopened.Close(); err != nil {
@@ -126,6 +136,43 @@ func TestGT00CompositionRegistersAndReconcilesRealProject(t *testing.T) {
 	}
 	if persisted.Status != core.ProjectError || persisted.LastError == "" {
 		t.Fatalf("missing active repo did not fail closed: %#v", persisted)
+	}
+	if persisted.CanonicalSHA != advanced {
+		t.Fatalf("missing active repo rewrote cached canonical: got %q want %q", persisted.CanonicalSHA, advanced)
+	}
+	if _, err := degraded.service.RepairProject(ctx, project.ID, "repair-missing-active-repo"); !core.IsCode(err, core.CodeGitInvariantViolation) {
+		t.Fatalf("repair missing formerly-active repo error = %v, want %s", err, core.CodeGitInvariantViolation)
+	}
+	if _, err := os.Stat(project.ControlRepoPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("repair recreated missing formerly-active repo: %v", err)
+	}
+	persisted, err = degraded.store.Project(ctx, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != core.ProjectError || persisted.CanonicalSHA != advanced {
+		t.Fatalf("failed repair changed formerly-active project: %#v", persisted)
+	}
+	if err := degraded.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(missingRepo, project.ControlRepoPath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := buildComponents(ctx, configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	repaired, err := restored.service.RepairProject(ctx, project.ID, "repair-restored-active-repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repaired.Status != core.ProjectActive || repaired.CanonicalSHA != advanced || repaired.InitialSHA != project.InitialSHA {
+		t.Fatalf("verified restored project = %#v, want actual canonical %s", repaired, advanced)
+	}
+	if got := gitOutput(t, "--git-dir="+project.ControlRepoPath, "rev-parse", project.CanonicalRef+"^{commit}"); got != advanced {
+		t.Fatalf("restored canonical = %s, want %s", got, advanced)
 	}
 }
 

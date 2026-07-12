@@ -17,14 +17,16 @@ import (
 	"time"
 
 	"coordplane/internal/core"
+	coorddaemon "coordplane/internal/daemon"
 	"coordplane/internal/store"
 	"coordplane/internal/transport"
 )
 
 var testBinaries struct {
-	directory  string
-	coordplane string
-	coordlink  string
+	directory          string
+	coordplane         string
+	coordplaneContract string
+	coordlink          string
 }
 
 func TestMain(m *testing.M) {
@@ -33,20 +35,187 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	defer os.RemoveAll(directory)
 	root := repositoryRoot()
 	testBinaries.directory = directory
 	testBinaries.coordplane = filepath.Join(directory, "coordplane")
+	testBinaries.coordplaneContract = filepath.Join(directory, "coordplane-contract")
 	testBinaries.coordlink = filepath.Join(directory, "coordlink")
-	for command, output := range map[string]string{"./cmd/coordplane": testBinaries.coordplane, "./cmd/coordlink": testBinaries.coordlink} {
-		build := exec.Command("go", "build", "-buildvcs=false", "-o", output, command)
+	builds := []struct {
+		command string
+		output  string
+		tags    string
+	}{
+		{command: "./cmd/coordplane", output: testBinaries.coordplane},
+		{command: "./cmd/coordplane", output: testBinaries.coordplaneContract, tags: "contract"},
+		{command: "./cmd/coordlink", output: testBinaries.coordlink, tags: "contract"},
+	}
+	code := 0
+	for _, target := range builds {
+		args := []string{"build", "-buildvcs=false"}
+		if target.tags != "" {
+			args = append(args, "-tags="+target.tags)
+		}
+		args = append(args, "-o", target.output, target.command)
+		build := exec.Command("go", args...)
 		build.Dir = root
 		if raw, err := build.CombinedOutput(); err != nil {
-			fmt.Fprintf(os.Stderr, "build %s: %v\n%s", command, err, raw)
-			os.Exit(1)
+			fmt.Fprintf(os.Stderr, "build %s: %v\n%s", target.command, err, raw)
+			code = 1
+			break
 		}
 	}
-	os.Exit(m.Run())
+	if code == 0 {
+		code = m.Run()
+	}
+	if err := os.RemoveAll(directory); err != nil {
+		fmt.Fprintf(os.Stderr, "remove contract binaries: %v\n", err)
+		if code == 0 {
+			code = 1
+		}
+	}
+	os.Exit(code)
+}
+
+func TestGT00DaemonBinaryRecoversEveryInitializationPhase(t *testing.T) {
+	phases := []string{
+		"intent_committed",
+		"partial_prepared",
+		"bare_initialized",
+		"objects_imported",
+		"canonical_written",
+		"integrity_verified",
+		"promoted",
+	}
+	for _, phase := range phases {
+		t.Run(phase, func(t *testing.T) {
+			root, err := os.MkdirTemp("/tmp", "cp-gt00-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(root) })
+			dataDir := filepath.Join(root, "data")
+			socket := filepath.Join(dataDir, "operator.sock")
+			configPath := writeConfig(t, root, dataDir, socket, "")
+			source := createRepository(t, root)
+			initial := strings.TrimSpace(git(t, source, "rev-parse", "refs/heads/main"))
+			readyPath := filepath.Join(root, "git-phase-ready")
+			daemon := startDaemonBinaryWithEnv(t, testBinaries.coordplaneContract, configPath, socket, []string{
+				"COORDPLANE_CONTRACT_GIT_PHASE=" + phase,
+				"COORDPLANE_CONTRACT_GIT_PHASE_READY=" + readyPath,
+			})
+
+			var addOutput lockedBuffer
+			add := exec.Command(testBinaries.coordplaneContract,
+				"project", "add", "--socket", socket, "--name", "phase-"+phase,
+				"--repo", source, "--ref", "refs/heads/main",
+				"--request-id", "phase-"+phase, "--output", "json")
+			add.Stdout = &addOutput
+			add.Stderr = &addOutput
+			if err := add.Start(); err != nil {
+				t.Fatal(err)
+			}
+			waitForFile(t, readyPath)
+			killDaemon(t, daemon)
+			if err := add.Wait(); err == nil {
+				t.Fatalf("project add survived daemon kill: %s", addOutput.String())
+			}
+
+			if err := os.WriteFile(filepath.Join(source, "advanced.txt"), []byte(phase+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			git(t, source, "add", "advanced.txt")
+			git(t, source, "commit", "-m", "advance source after "+phase)
+			advanced := strings.TrimSpace(git(t, source, "rev-parse", "refs/heads/main"))
+			if advanced == initial {
+				t.Fatal("source ref did not advance after initialization intent")
+			}
+			sourceStatus := git(t, source, "status", "--porcelain=v1", "--untracked-files=all")
+			sourceConfig, err := os.ReadFile(filepath.Join(source, ".git", "config"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			daemon = startDaemon(t, configPath, socket)
+			t.Cleanup(func() { stopDaemon(t, daemon, socket) })
+			projectsRaw := runBinaryJSON(t, testBinaries.coordplane,
+				"project", "list", "--socket", socket, "--output", "json")
+			var projects core.ProjectPage
+			decodeJSON(t, projectsRaw, &projects)
+			if len(projects.Items) != 1 {
+				t.Fatalf("recovered projects = %#v", projects.Items)
+			}
+			projectRaw := runBinaryJSON(t, testBinaries.coordplane,
+				"project", "show", projects.Items[0].ID, "--socket", socket, "--output", "json")
+			var project core.ProjectDetail
+			decodeJSON(t, projectRaw, &project)
+			if project.Status != core.ProjectActive || project.PendingAction != "" ||
+				project.InitialSHA != initial || project.CanonicalSHA != initial ||
+				project.ActualCanonicalSHA != initial {
+				t.Fatalf("recovered project = %#v, want immutable initial %s", project, initial)
+			}
+			controlRepo := filepath.Join(dataDir, "repos", project.ID+".git")
+			if got := strings.TrimSpace(git(t, controlRepo, "rev-parse", "refs/heads/main^{commit}")); got != initial {
+				t.Fatalf("recovered canonical = %s, want %s", got, initial)
+			}
+			git(t, controlRepo, "fsck", "--full", "--strict")
+			if got := strings.TrimSpace(git(t, source, "rev-parse", "refs/heads/main")); got != advanced {
+				t.Fatalf("recovery rewrote source ref: got %s want %s", got, advanced)
+			}
+			if got := git(t, source, "status", "--porcelain=v1", "--untracked-files=all"); got != sourceStatus {
+				t.Fatalf("recovery changed source worktree: before=%q after=%q", sourceStatus, got)
+			}
+			afterConfig, err := os.ReadFile(filepath.Join(source, ".git", "config"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(afterConfig, sourceConfig) {
+				t.Fatal("recovery changed source Git config")
+			}
+
+			eventsRaw := runBinaryJSON(t, testBinaries.coordplane,
+				"events", "tail", "--socket", socket, "--project", project.ID, "--output", "json")
+			var events []core.Event
+			decodeJSON(t, eventsRaw, &events)
+			if len(events) != 2 || events[0].Kind != "project.creating" || events[1].Kind != "project.active" ||
+				events[0].OperationID == "" || events[0].OperationID != events[1].OperationID ||
+				events[0].ID >= events[1].ID {
+				t.Fatalf("recovered project events = %#v", events)
+			}
+		})
+	}
+}
+
+func TestGT00ProductionBinaryHasNoContractFaultControl(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "data")
+	socket := filepath.Join(dataDir, "operator.sock")
+	configPath := writeConfig(t, root, dataDir, socket, "")
+	source := createRepository(t, root)
+	readyPath := filepath.Join(root, "must-not-exist")
+	daemon := startDaemonBinaryWithEnv(t, testBinaries.coordplane, configPath, socket, []string{
+		"COORDPLANE_CONTRACT_GIT_PHASE=partial_prepared",
+		"COORDPLANE_CONTRACT_GIT_PHASE_READY=" + readyPath,
+	})
+	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, testBinaries.coordplane,
+		"project", "add", "--socket", socket, "--name", "production-project",
+		"--repo", source, "--ref", "refs/heads/main",
+		"--request-id", "production-project", "--output", "json")
+	raw, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("production project add used contract fault control: %v\n%s", err, raw)
+	}
+	var project core.Project
+	decodeJSON(t, raw, &project)
+	if project.Status != core.ProjectActive {
+		t.Fatalf("production project = %#v", project)
+	}
+	if _, err := os.Stat(readyPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("production binary published contract phase marker: %v", err)
+	}
 }
 
 func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
@@ -94,7 +263,8 @@ func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 	statusRaw := runBinaryJSON(t, testBinaries.coordplane, "status", "--socket", socket, "--project", project.ID, "--output", "json")
 	var status core.Status
 	decodeJSON(t, statusRaw, &status)
-	if !status.DaemonReady || len(status.Snapshot.Projects) != 1 || len(status.Snapshot.Messages) != 2 {
+	if !status.DaemonReady || len(status.Snapshot.Projects) != 1 || len(status.Snapshot.Agents) != 1 ||
+		len(status.Snapshot.Tasks) != 0 || len(status.Snapshot.Runs) != 0 || len(status.Snapshot.Messages) != 0 {
 		t.Fatalf("status = %#v", status)
 	}
 	if len(status.ActualRefs) != 1 || strings.TrimSpace(status.ActualRefs[0].ActualSHA) != strings.TrimSpace(sourceRefBefore) {
@@ -105,10 +275,27 @@ func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 	}
 	taskRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"task", "show", first.Task.ID, "--socket", socket, "--output", "json")
-	var taskView core.TaskView
-	decodeJSON(t, taskRaw, &taskView)
-	if taskView.Task.ID != first.Task.ID || taskView.PendingMessageCount != 2 || strings.TrimSpace(taskView.ActualCanonicalSHA) != strings.TrimSpace(sourceRefBefore) {
-		t.Fatalf("task show projection = %#v", taskView)
+	var taskDetail core.TaskDetail
+	decodeJSON(t, taskRaw, &taskDetail)
+	if taskDetail.Task.ID != first.Task.ID || taskDetail.PendingMessageCount != 2 || strings.TrimSpace(taskDetail.ActualCanonicalSHA) != strings.TrimSpace(sourceRefBefore) {
+		t.Fatalf("task show projection = %#v", taskDetail)
+	}
+	messagesBeforeRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"message", "list", "--socket", socket, "--task", first.Task.ID, "--output", "json")
+	var messagesBefore core.MessagePage
+	decodeJSON(t, messagesBeforeRaw, &messagesBefore)
+	eventsBeforeRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"events", "tail", "--socket", socket, "--output", "json")
+	var eventsBefore []core.Event
+	decodeJSON(t, eventsBeforeRaw, &eventsBefore)
+	beforeRestart, err := json.Marshal(struct {
+		Status   core.Status      `json:"status"`
+		Task     core.TaskDetail  `json:"task"`
+		Messages core.MessagePage `json:"messages"`
+		Events   []core.Event     `json:"events"`
+	}{status, taskDetail, messagesBefore, eventsBefore})
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	secondDaemon := exec.Command(testBinaries.coordplane, "serve", "--config", configPath)
@@ -123,12 +310,35 @@ func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 	stopDaemon(t, daemon, socket)
 	daemon = startDaemon(t, configPath, socket)
 	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
+	statusAfterRaw := runBinaryJSON(t, testBinaries.coordplane, "status", "--socket", socket, "--project", project.ID, "--output", "json")
+	var statusAfter core.Status
+	decodeJSON(t, statusAfterRaw, &statusAfter)
+	taskAfterRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"task", "show", first.Task.ID, "--socket", socket, "--output", "json")
+	var taskAfter core.TaskDetail
+	decodeJSON(t, taskAfterRaw, &taskAfter)
 	messagesRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"message", "list", "--socket", socket, "--task", first.Task.ID, "--output", "json")
-	var messages []core.Message
+	var messages core.MessagePage
 	decodeJSON(t, messagesRaw, &messages)
-	if len(messages) != 2 || messages[0].Body != "first" || messages[1].Body != "second" {
+	if len(messages.Items) != 2 || messages.Items[0].Body != "first" || messages.Items[1].Body != "second" {
 		t.Fatalf("messages after restart = %#v", messages)
+	}
+	eventsAfterRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"events", "tail", "--socket", socket, "--output", "json")
+	var eventsAfter []core.Event
+	decodeJSON(t, eventsAfterRaw, &eventsAfter)
+	afterRestart, err := json.Marshal(struct {
+		Status   core.Status      `json:"status"`
+		Task     core.TaskDetail  `json:"task"`
+		Messages core.MessagePage `json:"messages"`
+		Events   []core.Event     `json:"events"`
+	}{statusAfter, taskAfter, messages, eventsAfter})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterRestart, beforeRestart) {
+		t.Fatalf("restart changed row versions or Event IDs/order\nbefore=%s\nafter=%s", beforeRestart, afterRestart)
 	}
 	if got := git(t, source, "rev-parse", "refs/heads/main"); got != sourceRefBefore {
 		t.Fatalf("source ref changed: before=%s after=%s", sourceRefBefore, got)
@@ -146,6 +356,14 @@ func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 
 	stopDaemon(t, daemon, socket)
 	controlRepo := filepath.Join(dataDir, "repos", project.ID+".git")
+	if err := os.WriteFile(filepath.Join(source, "canonical-advanced.txt"), []byte("advanced\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, source, "add", "canonical-advanced.txt")
+	git(t, source, "commit", "-m", "advance canonical before loss")
+	advancedSHA := strings.TrimSpace(git(t, source, "rev-parse", "refs/heads/main"))
+	git(t, controlRepo, "fetch", "--no-tags", source, advancedSHA)
+	git(t, controlRepo, "update-ref", "refs/heads/main", advancedSHA, strings.TrimSpace(sourceRefBefore))
 	missingRepo := filepath.Join(root, "missing-control.git")
 	if err := os.Rename(controlRepo, missingRepo); err != nil {
 		t.Fatal(err)
@@ -161,16 +379,36 @@ func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 	if failedView.Status != core.ProjectError || failedView.LastError == "" || failedView.ActualCanonicalError == "" {
 		t.Fatalf("project did not fail closed after control repo loss: %#v", failedView)
 	}
+	repair := exec.Command(testBinaries.coordplane,
+		"project", "repair", project.ID, "--socket", socket,
+		"--request-id", "binary-project-repair-missing", "--output", "json")
+	repairRaw, repairErr := repair.CombinedOutput()
+	if repairErr == nil || !bytes.Contains(repairRaw, []byte(core.CodeGitInvariantViolation)) {
+		t.Fatalf("missing active repo repair err=%v output=%s", repairErr, repairRaw)
+	}
+	if _, err := os.Stat(controlRepo); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("repair recreated a formerly active control repo: %v", err)
+	}
+	stillFailedRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"project", "show", project.ID, "--socket", socket, "--output", "json")
+	decodeJSON(t, stillFailedRaw, &failedView)
+	if failedView.Status != core.ProjectError || failedView.CanonicalSHA != strings.TrimSpace(sourceRefBefore) {
+		t.Fatalf("failed repair changed project truth: %#v", failedView)
+	}
+
+	if err := os.Rename(missingRepo, controlRepo); err != nil {
+		t.Fatal(err)
+	}
 	repairedRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"project", "repair", project.ID, "--socket", socket,
-		"--request-id", "binary-project-repair", "--output", "json")
+		"--request-id", "binary-project-repair-restored", "--output", "json")
 	var repaired core.Project
 	decodeJSON(t, repairedRaw, &repaired)
-	if repaired.Status != core.ProjectActive || repaired.InitialSHA != strings.TrimSpace(sourceRefBefore) {
+	if repaired.Status != core.ProjectActive || repaired.InitialSHA != strings.TrimSpace(sourceRefBefore) || repaired.CanonicalSHA != advancedSHA {
 		t.Fatalf("repaired project = %#v", repaired)
 	}
-	if got := strings.TrimSpace(git(t, controlRepo, "rev-parse", "refs/heads/main^{commit}")); got != strings.TrimSpace(sourceRefBefore) {
-		t.Fatalf("repaired canonical = %s, want immutable initial %s", got, sourceRefBefore)
+	if got := strings.TrimSpace(git(t, controlRepo, "rev-parse", "refs/heads/main^{commit}")); got != advancedSHA {
+		t.Fatalf("repaired canonical = %s, want restored actual %s", got, advancedSHA)
 	}
 }
 
@@ -189,6 +427,186 @@ func TestP1ServeRejectsUnknownConfigBeforeCreatingDatabase(t *testing.T) {
 	}
 }
 
+func TestP1BinaryReadSurfacesStayBoundedPastTwoMiBLedger(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "cp-bounded-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	dataDir := filepath.Join(root, "data")
+	socket := filepath.Join(dataDir, "operator.sock")
+	configPath := writeConfig(t, root, dataDir, socket, "")
+	source := createRepository(t, root)
+	daemon := startDaemon(t, configPath, socket)
+	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
+
+	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"agent", "add", "--socket", socket, "--display-name", "Bounded Agent",
+		"--adapter", "one-shot", "--image", "agent:latest", "--instructions-file", filepath.Join(root, "agent.md"),
+		"--request-id", "bounded-agent", "--output", "json")
+	var agent core.Agent
+	decodeJSON(t, agentRaw, &agent)
+	projectRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"project", "add", "--socket", socket, "--name", "bounded-project",
+		"--repo", source, "--ref", "refs/heads/main", "--request-id", "bounded-project", "--output", "json")
+	var project core.Project
+	decodeJSON(t, projectRaw, &project)
+
+	body := strings.Repeat("x", core.MaximumMessageBodyBytes)
+	messageCount := 34
+	var taskID string
+	for index := 0; index < messageCount; index++ {
+		raw := runBinaryJSON(t, testBinaries.coordplane,
+			"chat", "--socket", socket, "--project", project.ID, "--agent", agent.ID,
+			"--body", body, "--request-id", fmt.Sprintf("bounded-chat-%02d", index), "--output", "json")
+		if len(raw) >= 2<<20 {
+			t.Fatalf("chat response %d is unbounded: %d bytes", index, len(raw))
+		}
+		var result core.ChatResult
+		decodeJSON(t, raw, &result)
+		taskID = result.Task.ID
+	}
+	controlBody := strings.Repeat("\x01", core.MaximumMessageBodyBytes)
+	controlRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"chat", "--socket", socket, "--project", project.ID, "--agent", agent.ID,
+		"--body", controlBody, "--request-id", "bounded-chat-control", "--output", "json")
+	if len(controlRaw) >= 2<<20 {
+		t.Fatalf("control-character chat response is unbounded: %d bytes", len(controlRaw))
+	}
+	messageCount++
+	if messageCount*core.MaximumMessageBodyBytes <= 2<<20 {
+		t.Fatal("test fixture did not exceed the old 2 MiB ledger threshold")
+	}
+
+	stopDaemon(t, daemon, socket)
+	database, err := store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := core.NewService(database, &contractGit{sha: project.InitialSHA, root: filepath.Join(dataDir, "repos")}, core.ServiceOptions{MaxParallelRuns: 1})
+	if err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	claim, ok, err := service.ClaimNext(context.Background(), project.ID)
+	if err != nil || !ok || claim.Task.ID != taskID {
+		_ = database.Close()
+		t.Fatalf("seed bounded run: claim=%#v ok=%t err=%v", claim, ok, err)
+	}
+	if _, err := service.ActivateRun(context.Background(), claim.Run.ID, "bounded-run-active"); err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	daemon = startDaemon(t, configPath, socket)
+
+	statusRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"status", "--socket", socket, "--project", project.ID, "--output", "json")
+	if len(statusRaw) >= 2<<20 {
+		t.Fatalf("status response is unbounded: %d bytes", len(statusRaw))
+	}
+	var status core.Status
+	decodeJSON(t, statusRaw, &status)
+	if len(status.Tasks) != 1 || status.Tasks[0].Task.ID != taskID || status.Tasks[0].PendingMessageCount != messageCount {
+		t.Fatalf("bounded status lost current ledger counts: %#v", status.Tasks)
+	}
+	if status.Tasks[0].CurrentRun == nil || status.Tasks[0].CurrentRun.ID != claim.Run.ID {
+		t.Fatalf("bounded status lost current Run: %#v", status.Tasks[0])
+	}
+
+	projectListRaw := runBinaryJSON(t, testBinaries.coordplane, "project", "list", "--socket", socket, "--output", "json")
+	var projects core.ProjectPage
+	decodeJSON(t, projectListRaw, &projects)
+	if len(projectListRaw) >= 2<<20 || len(projects.Items) != 1 || projects.Items[0].ID != project.ID {
+		t.Fatalf("project list response=%d page=%#v", len(projectListRaw), projects)
+	}
+	projectShowRaw := runBinaryJSON(t, testBinaries.coordplane, "project", "show", project.ID, "--socket", socket, "--output", "json")
+	var projectDetail core.ProjectDetail
+	decodeJSON(t, projectShowRaw, &projectDetail)
+	if len(projectShowRaw) >= 2<<20 || projectDetail.ID != project.ID || projectDetail.ActualCanonicalSHA == "" {
+		t.Fatalf("project show response=%d detail=%#v", len(projectShowRaw), projectDetail)
+	}
+
+	agentListRaw := runBinaryJSON(t, testBinaries.coordplane, "agent", "list", "--socket", socket, "--output", "json")
+	var agents core.AgentPage
+	decodeJSON(t, agentListRaw, &agents)
+	if len(agentListRaw) >= 2<<20 || len(agents.Items) != 1 || agents.Items[0].ID != agent.ID {
+		t.Fatalf("agent list response=%d page=%#v", len(agentListRaw), agents)
+	}
+	agentShowRaw := runBinaryJSON(t, testBinaries.coordplane, "agent", "show", agent.ID, "--socket", socket, "--output", "json")
+	var shownAgent core.Agent
+	decodeJSON(t, agentShowRaw, &shownAgent)
+	if len(agentShowRaw) >= 2<<20 || shownAgent.ID != agent.ID {
+		t.Fatalf("agent show response=%d agent=%#v", len(agentShowRaw), shownAgent)
+	}
+
+	taskListRaw := runBinaryJSON(t, testBinaries.coordplane, "task", "list", "--project", project.ID, "--socket", socket, "--output", "json")
+	var tasks core.TaskPage
+	decodeJSON(t, taskListRaw, &tasks)
+	if len(taskListRaw) >= 2<<20 || len(tasks.Items) != 1 || tasks.Items[0].ID != taskID {
+		t.Fatalf("task list response=%d page=%#v", len(taskListRaw), tasks)
+	}
+	taskShowRaw := runBinaryJSON(t, testBinaries.coordplane, "task", "show", taskID, "--socket", socket, "--output", "json")
+	var taskDetail core.TaskDetail
+	decodeJSON(t, taskShowRaw, &taskDetail)
+	if len(taskShowRaw) >= 2<<20 || taskDetail.Task.ID != taskID || taskDetail.PendingMessageCount != messageCount {
+		t.Fatalf("task show response=%d detail=%#v", len(taskShowRaw), taskDetail)
+	}
+
+	runListRaw := runBinaryJSON(t, testBinaries.coordplane, "run", "list", "--project", project.ID, "--socket", socket, "--output", "json")
+	var runs core.RunPage
+	decodeJSON(t, runListRaw, &runs)
+	if len(runListRaw) >= 2<<20 || len(runs.Items) != 1 || runs.Items[0].ID != claim.Run.ID {
+		t.Fatalf("run list response=%d page=%#v", len(runListRaw), runs)
+	}
+	runShowRaw := runBinaryJSON(t, testBinaries.coordplane, "run", "show", claim.Run.ID, "--socket", socket, "--output", "json")
+	var shownRun core.Run
+	decodeJSON(t, runShowRaw, &shownRun)
+	if len(runShowRaw) >= 2<<20 || shownRun.ID != claim.Run.ID || shownRun.State != core.RunActive {
+		t.Fatalf("run show response=%d run=%#v", len(runShowRaw), shownRun)
+	}
+
+	cursor := ""
+	seenMessages := 0
+	seenBytes := 0
+	for pageNumber := 0; pageNumber < 10; pageNumber++ {
+		args := []string{"message", "list", "--socket", socket, "--task", taskID, "--output", "json"}
+		if cursor != "" {
+			args = append(args, "--cursor", cursor)
+		}
+		raw := runBinaryJSON(t, testBinaries.coordplane, args...)
+		if len(raw) >= 2<<20 {
+			t.Fatalf("message page %d is unbounded: %d bytes", pageNumber, len(raw))
+		}
+		var page core.MessagePage
+		decodeJSON(t, raw, &page)
+		if len(page.Items) == 0 {
+			t.Fatalf("message page %d made no cursor progress", pageNumber)
+		}
+		for _, message := range page.Items {
+			seenMessages++
+			seenBytes += len(message.Body)
+		}
+		cursor = page.NextCursor
+		if cursor == "" {
+			break
+		}
+	}
+	if cursor != "" || seenMessages != messageCount || seenBytes <= 2<<20 {
+		t.Fatalf("message pagination cursor=%q count=%d bytes=%d", cursor, seenMessages, seenBytes)
+	}
+
+	eventsRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"events", "tail", "--socket", socket, "--project", project.ID, "--output", "json")
+	var events []core.Event
+	decodeJSON(t, eventsRaw, &events)
+	if len(eventsRaw) >= 2<<20 || len(events) > core.EventPageLimit {
+		t.Fatalf("events response=%d count=%d", len(eventsRaw), len(events))
+	}
+}
+
 func TestCT03CoordlinkBinaryRejectsStaleRunWithoutSideEffects(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -198,7 +616,11 @@ func TestCT03CoordlinkBinaryRejectsStaleRunWithoutSideEffects(t *testing.T) {
 	}
 	defer database.Close()
 	gitFacts := &contractGit{sha: strings.Repeat("a", 40), root: filepath.Join(root, "repos")}
-	service, err := core.NewService(database, gitFacts, core.ServiceOptions{MaxParallelRuns: 2})
+	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
+	service, err := core.NewService(database, gitFacts, core.ServiceOptions{
+		MaxParallelRuns: 2,
+		Now:             func() time.Time { return now },
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,6 +645,7 @@ func TestCT03CoordlinkBinaryRejectsStaleRunWithoutSideEffects(t *testing.T) {
 	if _, err := service.InterruptRun(ctx, run1.Run.ID, "rotate", "interrupt"); err != nil {
 		t.Fatal(err)
 	}
+	now = now.Add(time.Second)
 	run2, ok, err := service.ClaimNext(ctx, project.ID)
 	if err != nil || !ok {
 		t.Fatalf("run2 claim ok=%v err=%v", ok, err)
@@ -267,15 +690,182 @@ func TestCT03CoordlinkBinaryRejectsStaleRunWithoutSideEffects(t *testing.T) {
 	}
 }
 
+func TestCT04CoordlinkBinaryConvergesThroughDaemonRunComposition(t *testing.T) {
+	tests := []struct {
+		name           string
+		args           []string
+		wantStatus     core.TaskStatus
+		wantCurrentRun bool
+		wantTaskEvent  string
+	}{
+		{
+			name:       "wait",
+			args:       []string{"task", "wait", "--reason", "awaiting review", "--request-id", "binary-wait", "--output", "json"},
+			wantStatus: core.TaskWaiting, wantTaskEvent: "task.waiting",
+		},
+		{
+			name:       "fail",
+			args:       []string{"task", "fail", "--reason", "tests failed", "--request-id", "binary-fail", "--output", "json"},
+			wantStatus: core.TaskFailed, wantTaskEvent: "task.failed",
+		},
+		{
+			name:       "submit",
+			args:       []string{"task", "submit", "--summary", "ready", "--expected-head", strings.Repeat("a", 40), "--request-id", "binary-submit", "--output", "json"},
+			wantStatus: core.TaskFinishing, wantCurrentRun: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root, err := os.MkdirTemp("/tmp", "cp-ct04-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(root) })
+			dataDir := filepath.Join(root, "data")
+			operatorSocket := filepath.Join(dataDir, "operator.sock")
+			configPath := writeConfig(t, root, dataDir, operatorSocket, "")
+			source := createRepository(t, root)
+			daemonProcess := startDaemon(t, configPath, operatorSocket)
+
+			agentRaw := runBinaryJSON(t, testBinaries.coordplane,
+				"agent", "add", "--socket", operatorSocket, "--display-name", "Outcome Agent",
+				"--adapter", "one-shot", "--image", "agent:latest", "--instructions-file", filepath.Join(root, "agent.md"),
+				"--request-id", "outcome-agent", "--output", "json")
+			var agent core.Agent
+			decodeJSON(t, agentRaw, &agent)
+			projectRaw := runBinaryJSON(t, testBinaries.coordplane,
+				"project", "add", "--socket", operatorSocket, "--name", "outcome-project",
+				"--repo", source, "--ref", "refs/heads/main", "--request-id", "outcome-project", "--output", "json")
+			var project core.Project
+			decodeJSON(t, projectRaw, &project)
+			taskRaw := runBinaryJSON(t, testBinaries.coordplane,
+				"task", "create", "--socket", operatorSocket, "--project", project.ID, "--agent", agent.ID,
+				"--kind", "work", "--title", "Outcome "+test.name, "--max-retries", "0",
+				"--request-id", "outcome-task", "--output", "json")
+			var task core.Task
+			decodeJSON(t, taskRaw, &task)
+			stopDaemon(t, daemonProcess, operatorSocket)
+
+			database, err := store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			service, err := core.NewService(database, &contractGit{sha: project.InitialSHA, root: filepath.Join(dataDir, "repos")}, core.ServiceOptions{MaxParallelRuns: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim, ok, err := service.ClaimNext(context.Background(), project.ID)
+			if err != nil || !ok || claim.Task.ID != task.ID {
+				t.Fatalf("claim=%#v ok=%v err=%v", claim, ok, err)
+			}
+			if _, err := service.ActivateRun(context.Background(), claim.Run.ID, "binary-activate"); err != nil {
+				t.Fatal(err)
+			}
+			if err := database.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			composed, err := coorddaemon.Open(context.Background(), configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runControl := filepath.Join(dataDir, "run-control", claim.Run.ID)
+			if err := os.MkdirAll(runControl, 0o700); err != nil {
+				_ = composed.Close()
+				t.Fatal(err)
+			}
+			runSocket := filepath.Join(runControl, "api.sock")
+			runServer, err := composed.NewRunServer(dataDir, runSocket)
+			if err != nil {
+				_ = composed.Close()
+				t.Fatal(err)
+			}
+			serveDone := make(chan error, 1)
+			go func() { serveDone <- runServer.Serve() }()
+
+			outcomeRaw, outcomeErr := runCoordlink(runSocket, claim.Token, test.args...)
+			if outcomeErr != nil {
+				_ = runServer.Close()
+				<-serveDone
+				_ = composed.Close()
+				t.Fatalf("coordlink outcome: %v\n%s", outcomeErr, outcomeRaw)
+			}
+			var finishing core.Task
+			decodeJSON(t, outcomeRaw, &finishing)
+			if finishing.Status != core.TaskFinishing || finishing.CurrentRunID != claim.Run.ID {
+				t.Fatalf("outcome response = %#v", finishing)
+			}
+			exitCode := 0
+			terminalInput := core.TerminalRunInput{
+				RunID: claim.Run.ID, State: core.RunExited, ExitCode: &exitCode,
+				Reason: "trusted process exit", RequestID: "binary-terminal-" + test.name,
+			}
+			if _, err := composed.RecordRunTerminal(context.Background(), terminalInput); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := composed.RecordRunTerminal(context.Background(), terminalInput); err != nil {
+				t.Fatalf("terminal fact replay: %v", err)
+			}
+			if err := runServer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-serveDone; err != nil {
+				t.Fatal(err)
+			}
+			if err := composed.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			reopened, err := store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			snapshot, err := reopened.Snapshot(context.Background(), project.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			persistedTask := snapshotTask(t, snapshot, task.ID)
+			persistedRun := snapshotRun(t, snapshot, claim.Run.ID)
+			if persistedTask.Status != test.wantStatus || (persistedTask.CurrentRunID != "") != test.wantCurrentRun {
+				t.Fatalf("persisted task = %#v", persistedTask)
+			}
+			if persistedRun.State != core.RunExited || persistedRun.EndedAt == "" || persistedRun.TokenRevokedAt == "" {
+				t.Fatalf("persisted run = %#v", persistedRun)
+			}
+			if test.name == "submit" {
+				if persistedTask.PendingAction != "capture" || persistedTask.PendingActionID == "" ||
+					persistedTask.PendingActionRunID != persistedRun.ID || persistedTask.PendingActionVersion != persistedTask.Version ||
+					persistedTask.HeadSHA != "" || persistedTask.TaskRef != "" || persistedTask.SubmittedAt != "" {
+					t.Fatalf("submit capture fence = task:%#v run:%#v", persistedTask, persistedRun)
+				}
+			}
+			events, err := reopened.Events(context.Background(), core.EventFilter{ProjectID: project.ID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if countEvents(events, "run.exited") != 1 || (test.wantTaskEvent != "" && countEvents(events, test.wantTaskEvent) != 1) {
+				t.Fatalf("terminal events = %#v", events)
+			}
+		})
+	}
+}
+
 type daemonProcess struct {
 	command *exec.Cmd
 	output  *lockedBuffer
 }
 
 func startDaemon(t *testing.T, configPath, socket string) *daemonProcess {
+	return startDaemonBinaryWithEnv(t, testBinaries.coordplane, configPath, socket, nil)
+}
+
+func startDaemonBinaryWithEnv(t *testing.T, binary, configPath, socket string, extraEnv []string) *daemonProcess {
 	t.Helper()
 	output := &lockedBuffer{}
-	command := exec.Command(testBinaries.coordplane, "serve", "--config", configPath)
+	command := exec.Command(binary, "serve", "--config", configPath)
+	command.Env = append(os.Environ(), extraEnv...)
 	command.Stdout = output
 	command.Stderr = output
 	if err := command.Start(); err != nil {
@@ -284,7 +874,7 @@ func startDaemon(t *testing.T, configPath, socket string) *daemonProcess {
 	process := &daemonProcess{command: command, output: output}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		status := exec.Command(testBinaries.coordplane, "status", "--socket", socket, "--output", "json")
+		status := exec.Command(binary, "status", "--socket", socket, "--output", "json")
 		if raw, err := status.Output(); err == nil && bytes.Contains(raw, []byte(`"daemon_ready":true`)) {
 			return process
 		}
@@ -298,6 +888,34 @@ func startDaemon(t *testing.T, configPath, socket string) *daemonProcess {
 			t.Fatalf("daemon readiness timeout: %s", output.String())
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func killDaemon(t *testing.T, process *daemonProcess) {
+	t.Helper()
+	if process == nil || process.command == nil || process.command.Process == nil {
+		t.Fatal("daemon process is not running")
+	}
+	if err := process.command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		t.Fatal(err)
+	}
+	if err := process.command.Wait(); err == nil {
+		t.Fatal("SIGKILLed daemon exited successfully")
+	}
+	process.command = nil
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", path)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -360,6 +978,38 @@ func durableSignature(t *testing.T, database *store.Store, projectID string) str
 		t.Fatal(err)
 	}
 	return string(raw)
+}
+
+func snapshotTask(t *testing.T, snapshot core.Snapshot, id string) core.Task {
+	t.Helper()
+	for _, task := range snapshot.Tasks {
+		if task.ID == id {
+			return task
+		}
+	}
+	t.Fatalf("task %s not found in snapshot", id)
+	return core.Task{}
+}
+
+func snapshotRun(t *testing.T, snapshot core.Snapshot, id string) core.Run {
+	t.Helper()
+	for _, run := range snapshot.Runs {
+		if run.ID == id {
+			return run
+		}
+	}
+	t.Fatalf("run %s not found in snapshot", id)
+	return core.Run{}
+}
+
+func countEvents(events []core.Event, kind string) int {
+	count := 0
+	for _, event := range events {
+		if event.Kind == kind {
+			count++
+		}
+	}
+	return count
 }
 
 func writeConfig(t *testing.T, root, dataDir, socket, suffix string) string {

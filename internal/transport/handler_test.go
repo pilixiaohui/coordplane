@@ -25,15 +25,23 @@ func TestOperatorHandlerHasOnlyTheFixedRouteSurface(t *testing.T) {
 	}{
 		{name: "status", method: http.MethodGet, path: "/v1/status?project_id=prj-1", call: "status"},
 		{name: "add project", method: http.MethodPost, path: "/v1/projects", body: `{}`, call: "add_project"},
+		{name: "list projects", method: http.MethodGet, path: "/v1/projects", call: "list_projects"},
+		{name: "show project", method: http.MethodGet, path: "/v1/projects/prj-1", call: "project"},
 		{name: "repair project", method: http.MethodPost, path: "/v1/projects/prj-1/repair", call: "repair_project"},
 		{name: "archive project", method: http.MethodPost, path: "/v1/projects/prj-1/archive", body: `{}`, call: "archive_project"},
 		{name: "add agent", method: http.MethodPost, path: "/v1/agents", body: `{}`, call: "add_agent"},
+		{name: "list agents", method: http.MethodGet, path: "/v1/agents", call: "list_agents"},
+		{name: "show agent", method: http.MethodGet, path: "/v1/agents/agt-1", call: "agent"},
 		{name: "pause agent", method: http.MethodPost, path: "/v1/agents/agt-1/pause", call: "set_agent_status"},
 		{name: "resume agent", method: http.MethodPost, path: "/v1/agents/agt-1/resume", body: `{}`, call: "set_agent_status"},
 		{name: "archive agent", method: http.MethodPost, path: "/v1/agents/agt-1/archive", call: "archive_agent"},
 		{name: "chat", method: http.MethodPost, path: "/v1/chat", body: `{}`, call: "chat"},
 		{name: "create task", method: http.MethodPost, path: "/v1/tasks", body: `{}`, call: "create_task"},
+		{name: "list tasks", method: http.MethodGet, path: "/v1/tasks", call: "list_tasks"},
+		{name: "show task", method: http.MethodGet, path: "/v1/tasks/tsk-1", call: "task"},
 		{name: "close task", method: http.MethodPost, path: "/v1/tasks/tsk-1/close", call: "close_conversation"},
+		{name: "list runs", method: http.MethodGet, path: "/v1/runs", call: "list_runs"},
+		{name: "show run", method: http.MethodGet, path: "/v1/runs/run-1", call: "run"},
 		{name: "messages", method: http.MethodGet, path: "/v1/messages", call: "list_messages"},
 		{name: "ack message", method: http.MethodPost, path: "/v1/messages/msg-1/ack", call: "ack_message"},
 		{name: "events", method: http.MethodGet, path: "/v1/events", call: "list_events"},
@@ -65,7 +73,7 @@ func TestOperatorHandlerHasOnlyTheFixedRouteSurface(t *testing.T) {
 		t.Fatalf("unknown routes invoked operations: %+v", operations.calls)
 	}
 
-	recorder := invoke(t, handler, http.MethodGet, "/v1/projects", "", "")
+	recorder := invoke(t, handler, http.MethodPut, "/v1/projects", "", "")
 	envelope := decodeEnvelope(t, recorder)
 	if recorder.Code != http.StatusMethodNotAllowed || envelope.Error == nil || envelope.Error.Code != core.CodeInvalidArgument {
 		t.Fatalf("method mismatch response = status:%d envelope:%+v", recorder.Code, envelope)
@@ -89,9 +97,21 @@ func TestOperatorHandlerMapsBodiesPathsAndQueriesWithoutGenericDispatch(t *testi
 		t.Fatalf("pause action = %+v", action)
 	}
 
-	assertOK(t, invoke(t, handler, http.MethodGet, "/v1/messages?project_id=prj-1&task_id=tsk-1&recipient_kind=boss&recipient_id=owner", "", ""))
+	assertOK(t, invoke(t, handler, http.MethodGet, "/v1/tasks?project_id=prj-1&cursor=opaque-task&limit=25", "", ""))
+	taskFilter := operations.calls[len(operations.calls)-1].value.(core.TaskFilter)
+	if want := (core.TaskFilter{ProjectID: "prj-1", Cursor: "opaque-task", Limit: 25}); taskFilter != want {
+		t.Fatalf("task filter = %+v, want %+v", taskFilter, want)
+	}
+
+	assertOK(t, invoke(t, handler, http.MethodGet, "/v1/runs?project_id=prj-1&task_id=tsk-1&agent_id=agt-1&cursor=opaque-run&limit=30", "", ""))
+	runFilter := operations.calls[len(operations.calls)-1].value.(core.RunFilter)
+	if want := (core.RunFilter{ProjectID: "prj-1", TaskID: "tsk-1", AgentID: "agt-1", Cursor: "opaque-run", Limit: 30}); runFilter != want {
+		t.Fatalf("run filter = %+v, want %+v", runFilter, want)
+	}
+
+	assertOK(t, invoke(t, handler, http.MethodGet, "/v1/messages?project_id=prj-1&task_id=tsk-1&recipient_kind=boss&recipient_id=owner&cursor=opaque-message&limit=20", "", ""))
 	messageFilter := operations.calls[len(operations.calls)-1].value.(core.MessageFilter)
-	wantMessages := core.MessageFilter{ProjectID: "prj-1", TaskID: "tsk-1", RecipientKind: "boss", RecipientID: "owner"}
+	wantMessages := core.MessageFilter{ProjectID: "prj-1", TaskID: "tsk-1", RecipientKind: "boss", RecipientID: "owner", Cursor: "opaque-message", Limit: 20}
 	if messageFilter != wantMessages {
 		t.Fatalf("message filter = %+v, want %+v", messageFilter, wantMessages)
 	}
@@ -116,16 +136,19 @@ func TestOperatorHandlerMapsBodiesPathsAndQueriesWithoutGenericDispatch(t *testi
 
 func TestRunHandlerForwardsOnlyBearerTokenToCore(t *testing.T) {
 	tests := []struct {
-		name   string
-		method string
-		path   string
-		body   string
-		call   string
+		name        string
+		method      string
+		path        string
+		body        string
+		call        string
+		wantOutcome string
 	}{
 		{name: "current", method: http.MethodGet, path: "/v1/task/current", call: "current_task"},
 		{name: "progress", method: http.MethodPost, path: "/v1/progress", body: `{"summary":"working","request_id":"req-progress"}`, call: "progress"},
 		{name: "message", method: http.MethodPost, path: "/v1/message", body: `{"body":"result","request_id":"req-message"}`, call: "message"},
-		{name: "outcome", method: http.MethodPost, path: "/v1/task/outcome", body: `{"outcome":"wait","reason":"review","request_id":"req-outcome"}`, call: "outcome"},
+		{name: "wait outcome", method: http.MethodPost, path: "/v1/task/outcome", body: `{"outcome":"wait","reason":"review","request_id":"req-wait"}`, call: "outcome", wantOutcome: "wait"},
+		{name: "fail outcome", method: http.MethodPost, path: "/v1/task/outcome", body: `{"outcome":"fail","reason":"tests failed","request_id":"req-fail"}`, call: "outcome", wantOutcome: "fail"},
+		{name: "submit outcome", method: http.MethodPost, path: "/v1/task/outcome", body: `{"outcome":"submit","summary":"ready","expected_head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","request_id":"req-submit"}`, call: "outcome", wantOutcome: "submit"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -134,6 +157,12 @@ func TestRunHandlerForwardsOnlyBearerTokenToCore(t *testing.T) {
 			assertOK(t, recorder)
 			if len(operations.calls) != 1 || operations.calls[0].name != test.call || operations.calls[0].token != "run-secret" {
 				t.Fatalf("run calls = %+v, want %s with bearer token", operations.calls, test.call)
+			}
+			if test.wantOutcome != "" {
+				input := operations.calls[0].value.(core.OutcomeInput)
+				if input.Outcome != test.wantOutcome {
+					t.Fatalf("outcome = %q, want %q", input.Outcome, test.wantOutcome)
+				}
 			}
 		})
 	}
@@ -253,6 +282,22 @@ func (f *operatorFake) Status(_ context.Context, projectID string) (core.Status,
 	return core.Status{}, f.record("status", projectID)
 }
 
+func (f *operatorFake) Project(_ context.Context, id string) (core.ProjectDetail, error) {
+	return core.ProjectDetail{}, f.record("project", id)
+}
+
+func (f *operatorFake) Agent(_ context.Context, id string) (core.Agent, error) {
+	return core.Agent{}, f.record("agent", id)
+}
+
+func (f *operatorFake) ListProjects(_ context.Context, filter core.ProjectFilter) (core.ProjectPage, error) {
+	return core.ProjectPage{}, f.record("list_projects", filter)
+}
+
+func (f *operatorFake) ListAgents(_ context.Context, filter core.AgentFilter) (core.AgentPage, error) {
+	return core.AgentPage{}, f.record("list_agents", filter)
+}
+
 func (f *operatorFake) AddProject(_ context.Context, input core.AddProjectInput) (core.Project, error) {
 	return core.Project{}, f.record("add_project", input)
 }
@@ -285,12 +330,28 @@ func (f *operatorFake) CreateTask(_ context.Context, input core.CreateTaskInput)
 	return core.Task{}, f.record("create_task", input)
 }
 
+func (f *operatorFake) Task(_ context.Context, id string) (core.TaskDetail, error) {
+	return core.TaskDetail{}, f.record("task", id)
+}
+
+func (f *operatorFake) Run(_ context.Context, id string) (core.Run, error) {
+	return core.Run{}, f.record("run", id)
+}
+
 func (f *operatorFake) CloseConversation(_ context.Context, id, requestID string) (core.Task, error) {
 	return core.Task{}, f.record("close_conversation", actionCall{id: id, requestID: requestID})
 }
 
-func (f *operatorFake) ListMessages(_ context.Context, filter core.MessageFilter) ([]core.Message, error) {
-	return []core.Message{}, f.record("list_messages", filter)
+func (f *operatorFake) ListTasks(_ context.Context, filter core.TaskFilter) (core.TaskPage, error) {
+	return core.TaskPage{}, f.record("list_tasks", filter)
+}
+
+func (f *operatorFake) ListRuns(_ context.Context, filter core.RunFilter) (core.RunPage, error) {
+	return core.RunPage{}, f.record("list_runs", filter)
+}
+
+func (f *operatorFake) ListMessages(_ context.Context, filter core.MessageFilter) (core.MessagePage, error) {
+	return core.MessagePage{}, f.record("list_messages", filter)
 }
 
 func (f *operatorFake) AcknowledgeBossMessage(_ context.Context, id, requestID string) (core.Message, error) {

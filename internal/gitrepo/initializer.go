@@ -94,6 +94,9 @@ func (i *Initializer) Initialize(ctx context.Context, project Project) (Fact, er
 	if err != nil {
 		return Fact{}, err
 	}
+	if err := i.afterPhase(ctx, PhaseIntentCommitted, project, paths); err != nil {
+		return Fact{}, err
+	}
 
 	finalExists, err := pathExists(paths.Final)
 	if err != nil {
@@ -488,10 +491,16 @@ func (i *Initializer) resolveRef(ctx context.Context, repoPath, ref string) (str
 }
 
 func (i *Initializer) afterPhase(ctx context.Context, phase Phase, project Project, paths Paths) error {
+	fact := phaseFact{Project: project, Paths: paths}
+	if contractPhaseHook != nil {
+		if err := contractPhaseHook(ctx, phase, fact); err != nil {
+			return fmt.Errorf("gitrepo: contract phase %s: %w", phase, err)
+		}
+	}
 	if i.phaseHook == nil {
 		return nil
 	}
-	if err := i.phaseHook(ctx, phase, phaseFact{Project: project, Paths: paths}); err != nil {
+	if err := i.phaseHook(ctx, phase, fact); err != nil {
 		return fmt.Errorf("gitrepo: phase %s: %w", phase, err)
 	}
 	return nil

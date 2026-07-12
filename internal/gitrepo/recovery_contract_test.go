@@ -67,6 +67,9 @@ func TestGT00ProjectIntentAndRealGitPhasesReconcileAfterRestart(t *testing.T) {
 			if persisted.Status != core.ProjectCreating || persisted.PendingAction != "initialize" || persisted.InitialSHA != initial {
 				t.Fatalf("pending project = %#v", persisted)
 			}
+			if persisted.CanonicalSHA != "" {
+				t.Fatalf("unverified project cached canonical SHA %q before first active transition", persisted.CanonicalSHA)
+			}
 			advanced := commitFile(t, source, "advanced.txt", test.name+"\n", "move source after intent")
 			if advanced == initial {
 				t.Fatal("source branch did not advance")
@@ -117,6 +120,65 @@ func TestGT00ProjectIntentAndRealGitPhasesReconcileAfterRestart(t *testing.T) {
 				t.Fatalf("project event operation pair = creating %q active %q", creatingOperation, activeOperation)
 			}
 		})
+	}
+}
+
+func TestGT00RepairRetriesOnlyNeverActiveInitializationAtSavedSHA(t *testing.T) {
+	ctx := context.Background()
+	source, initial := newSourceRepository(t)
+	root := t.TempDir()
+	initializer, err := New(filepath.Join(root, "repos"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("injected initialization failure")
+	fired := false
+	initializer.phaseHook = func(_ context.Context, phase Phase, _ phaseFact) error {
+		if phase == PhaseObjectsImported && !fired {
+			fired = true
+			return injected
+		}
+		return nil
+	}
+	adapter := &recoveryProjectGit{initializer: initializer}
+	database, err := store.Open(ctx, filepath.Join(root, "coordplane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	service, err := core.NewService(database, adapter, core.ServiceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := service.AddProject(ctx, core.AddProjectInput{
+		Name: "repair-never-active", Source: source, SourceRef: "refs/heads/main", RequestID: "add-never-active",
+	})
+	if !core.IsCode(err, core.CodeGitInvariantViolation) {
+		t.Fatalf("project add error = %v, want %s", err, core.CodeGitInvariantViolation)
+	}
+	persisted, err := database.Project(ctx, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != core.ProjectError || persisted.CanonicalSHA != "" || persisted.InitialSHA != initial {
+		t.Fatalf("failed never-active project = %#v", persisted)
+	}
+	advanced := commitFile(t, source, "advanced.txt", "advanced\n", "move source after failed initialization")
+	if advanced == initial {
+		t.Fatal("source branch did not advance")
+	}
+
+	initializer.phaseHook = nil
+	repaired, err := service.RepairProject(ctx, project.ID, "repair-never-active")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repaired.Status != core.ProjectActive || repaired.InitialSHA != initial || repaired.CanonicalSHA != initial {
+		t.Fatalf("repaired project = %#v, want saved initial SHA %s", repaired, initial)
+	}
+	actual, err := initializer.Resolve(ctx, repaired.ControlRepoPath, repaired.CanonicalRef)
+	if err != nil || actual != initial {
+		t.Fatalf("actual canonical = %q err=%v, want saved initial SHA %s", actual, err, initial)
 	}
 }
 

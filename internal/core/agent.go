@@ -6,6 +6,10 @@ import (
 )
 
 func (s *Service) AddAgent(ctx context.Context, input AddAgentInput) (Agent, error) {
+	requestedID, err := optionalTextWithin("id", input.ID, 256)
+	if err != nil {
+		return Agent{}, err
+	}
 	displayName, err := requireText("display_name", input.DisplayName)
 	if err != nil {
 		return Agent{}, err
@@ -28,7 +32,7 @@ func (s *Service) AddAgent(ctx context.Context, input AddAgentInput) (Agent, err
 	}
 	inputHash, err := inputFingerprint(struct {
 		ID, DisplayName, AdapterID, Image, InstructionsFile string
-	}{strings.TrimSpace(input.ID), displayName, adapterID, image, instructions})
+	}{requestedID, displayName, adapterID, image, instructions})
 	if err != nil {
 		return Agent{}, err
 	}
@@ -44,7 +48,7 @@ func (s *Service) AddAgent(ctx context.Context, input AddAgentInput) (Agent, err
 			agent, err = tx.Agent(result.ID)
 			return err
 		}
-		agentID := strings.TrimSpace(input.ID)
+		agentID := requestedID
 		if agentID == "" {
 			var err error
 			agentID, err = s.requiredID("agt")

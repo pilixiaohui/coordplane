@@ -39,13 +39,13 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 		{
 			name:   "project list",
 			args:   []string{"project", "list", "--output", "json"},
-			method: http.MethodGet, path: "/v1/status",
+			method: http.MethodGet, path: "/v1/projects",
 			outputHas: `"id":"project-2"`,
 		},
 		{
 			name:   "project show",
 			args:   []string{"project", "show", "project-1", "--output", "json"},
-			method: http.MethodGet, path: "/v1/status?project_id=project-1",
+			method: http.MethodGet, path: "/v1/projects/project-1",
 			outputHas: `"id":"project-1"`, outputLacks: `"id":"project-2"`,
 		},
 		{
@@ -70,13 +70,13 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 		{
 			name:   "agent list",
 			args:   []string{"agent", "list", "--output", "json"},
-			method: http.MethodGet, path: "/v1/status",
+			method: http.MethodGet, path: "/v1/agents",
 			outputHas: `"id":"agent-2"`,
 		},
 		{
 			name:   "agent show",
 			args:   []string{"agent", "show", "agent-1", "--output", "json"},
-			method: http.MethodGet, path: "/v1/status",
+			method: http.MethodGet, path: "/v1/agents/agent-1",
 			outputHas: `"id":"agent-1"`, outputLacks: `"id":"agent-2"`,
 		},
 		{
@@ -126,13 +126,13 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 		{
 			name:   "task list",
 			args:   []string{"task", "list", "--project", "project-1", "--output", "json"},
-			method: http.MethodGet, path: "/v1/status?project_id=project-1",
+			method: http.MethodGet, path: "/v1/tasks?project_id=project-1",
 			outputHas: `"id":"task-2"`,
 		},
 		{
 			name:   "task show",
 			args:   []string{"task", "show", "task-1", "--output", "json"},
-			method: http.MethodGet, path: "/v1/status",
+			method: http.MethodGet, path: "/v1/tasks/task-1",
 			outputHas: `"id":"task-1"`, outputLacks: `"id":"task-2"`,
 		},
 		{
@@ -140,6 +140,18 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 			args:   []string{"task", "close", "task-1", "--request-id", "req-task-close", "--output", "json"},
 			method: http.MethodPost, path: "/v1/tasks/task-1/close",
 			input: actionRequest{RequestID: "req-task-close"}, outputHas: `"id":"task-1"`,
+		},
+		{
+			name:   "run list",
+			args:   []string{"run", "list", "--project", "project-1", "--task", "task-1", "--agent", "agent-1", "--cursor", "next-run", "--limit", "25", "--output", "json"},
+			method: http.MethodGet, path: "/v1/runs?agent_id=agent-1&cursor=next-run&limit=25&project_id=project-1&task_id=task-1",
+			outputHas: `"id":"run-1"`,
+		},
+		{
+			name:   "run show",
+			args:   []string{"run", "show", "run-1", "--output", "json"},
+			method: http.MethodGet, path: "/v1/runs/run-1",
+			outputHas: `"id":"run-1"`,
 		},
 		{
 			name:   "events tail",
@@ -222,7 +234,6 @@ func TestLegacyAndFutureCommandsFailBeforeClientSetup(t *testing.T) {
 		{name: "teamconfig serve", args: []string{"serve", "--config", "new.yaml", "--teamconfig", "old.yaml"}},
 		{name: "future project update", args: []string{"project", "update", "project-1", "--socket", "/tmp/operator.sock"}},
 		{name: "future message send", args: []string{"message", "send", "--socket", "/tmp/operator.sock"}},
-		{name: "future run list", args: []string{"run", "list", "--socket", "/tmp/operator.sock"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -312,8 +323,15 @@ func TestStatusAndShowCommandsKeepActualTruthProjection(t *testing.T) {
 	status.ActualRefs[0].ActualSHA = "actual-one"
 	status.Tasks[0].ActualCanonicalSHA = "actual-one"
 	status.Tasks[0].PendingMessageCount = 3
-	status.Tasks[0].CurrentRun = &core.Run{ID: "run-1", State: core.RunActive}
+	status.Tasks[0].CurrentRun = &core.RunSummary{ID: "run-1", State: core.RunActive}
 	status.Tasks[0].LatestProgress = &core.Event{ID: 9, Kind: "task.progress"}
+	status.Snapshot.Tasks[0].ParentTaskID = "task-parent"
+	status.Snapshot.Tasks[0].ResultSummary = "complete result"
+	status.Snapshot.Tasks[0].FailureReason = "prior failure"
+	status.Snapshot.Tasks[0].BaseSHA = "base-sha"
+	status.Snapshot.Tasks[0].HeadSHA = "head-sha"
+	status.Snapshot.Tasks[0].TaskRef = "refs/coordplane/tasks/task-1"
+	status.Snapshot.Tasks[0].Version = 7
 
 	for _, test := range []struct {
 		name string
@@ -321,7 +339,7 @@ func TestStatusAndShowCommandsKeepActualTruthProjection(t *testing.T) {
 		want []string
 	}{
 		{name: "project show", args: []string{"project", "show", "project-1", "--output", "json"}, want: []string{`"actual_canonical_sha":"actual-one"`}},
-		{name: "task show", args: []string{"task", "show", "task-1", "--output", "json"}, want: []string{`"current_run":{"id":"run-1"`, `"pending_message_count":3`, `"actual_canonical_sha":"actual-one"`, `"latest_progress":{"id":9`}},
+		{name: "task show", args: []string{"task", "show", "task-1", "--output", "json"}, want: []string{`"current_run":{"id":"run-1"`, `"pending_message_count":3`, `"actual_canonical_sha":"actual-one"`, `"latest_progress":{"id":9`, `"parent_task_id":"task-parent"`, `"result_summary":"complete result"`, `"failure_reason":"prior failure"`, `"base_sha":"base-sha"`, `"head_sha":"head-sha"`, `"task_ref":"refs/coordplane/tasks/task-1"`, `"version":7`}},
 		{name: "human status", args: []string{"status"}, want: []string{"project-1\tactive\tOne\tactual-one", "task-1\tqueued\tagent-1\tImplement\trun=run-1\tpending=3"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -373,16 +391,46 @@ func (c *recordingClient) JSON(_ context.Context, method, path string, input, ou
 		*target = c.status
 	case *core.Project:
 		*target = c.status.Snapshot.Projects[0]
+	case *core.ProjectDetail:
+		*target = core.ProjectDetail{Project: c.status.Snapshot.Projects[0], ActualCanonicalSHA: c.status.ActualRefs[0].ActualSHA, ActualCanonicalError: c.status.ActualRefs[0].Error}
+	case *core.ProjectPage:
+		for _, project := range c.status.Snapshot.Projects {
+			target.Items = append(target.Items, core.ProjectSummary{ID: project.ID, Name: project.Name, CanonicalSHA: project.CanonicalSHA, Status: project.Status})
+		}
 	case *core.Agent:
 		*target = c.status.Snapshot.Agents[0]
+	case *core.AgentPage:
+		for _, agent := range c.status.Snapshot.Agents {
+			target.Items = append(target.Items, core.AgentSummary{ID: agent.ID, DisplayName: agent.DisplayName, AdapterID: agent.AdapterID, Status: agent.Status})
+		}
 	case *core.ChatResult:
 		*target = core.ChatResult{Task: c.status.Snapshot.Tasks[0], Message: c.status.Snapshot.Messages[0]}
-	case *[]core.Message:
-		*target = c.status.Snapshot.Messages
+	case *core.MessagePage:
+		*target = core.MessagePage{Items: c.status.Snapshot.Messages}
 	case *core.Message:
 		*target = c.status.Snapshot.Messages[0]
 	case *core.Task:
 		*target = c.status.Snapshot.Tasks[0]
+	case *core.TaskPage:
+		for _, task := range c.status.Snapshot.Tasks {
+			target.Items = append(target.Items, core.TaskSummary{ID: task.ID, ProjectID: task.ProjectID, Kind: task.Kind, AssigneeAgentID: task.AssigneeAgentID, Title: task.Title, Status: task.Status})
+		}
+	case *core.TaskDetail:
+		view := c.status.Tasks[0]
+		detail := core.TaskDetail{
+			Task: c.status.Snapshot.Tasks[0], LatestProgress: view.LatestProgress,
+			PendingMessageCount: view.PendingMessageCount, DeliveredMessageCount: view.DeliveredMessageCount,
+			ActualCanonicalSHA: view.ActualCanonicalSHA, ActualCanonicalError: view.ActualCanonicalError,
+			Stale: view.Stale, Derived: true,
+		}
+		if view.CurrentRun != nil {
+			detail.CurrentRun = &core.Run{ID: view.CurrentRun.ID, State: view.CurrentRun.State}
+		}
+		*target = detail
+	case *core.RunPage:
+		*target = core.RunPage{Items: []core.RunSummary{{ID: "run-1", ProjectID: "project-1", TaskID: "task-1", AgentID: "agent-1", State: core.RunExited}}}
+	case *core.Run:
+		*target = core.Run{ID: "run-1", ProjectID: "project-1", TaskID: "task-1", AgentID: "agent-1", State: core.RunExited}
 	case *[]core.Event:
 		*target = c.status.Snapshot.Events
 	}
@@ -418,8 +466,8 @@ func testStatus() core.Status {
 		{ProjectID: "project-2", CanonicalRef: "refs/heads/main", Error: "missing"},
 	}
 	status.Tasks = []core.TaskView{
-		{Task: status.Snapshot.Tasks[0], ActualCanonicalSHA: "sha-one", Derived: true},
-		{Task: status.Snapshot.Tasks[1], ActualCanonicalError: "missing", Derived: true},
+		{Task: core.TaskSummary{ID: "task-1", ProjectID: "project-1", Kind: core.TaskWork, Status: core.TaskQueued, AssigneeAgentID: "agent-1", Title: "Implement"}, ActualCanonicalSHA: "sha-one", Derived: true},
+		{Task: core.TaskSummary{ID: "task-2", ProjectID: "project-2", Kind: core.TaskConversation, Status: core.TaskWaiting, AssigneeAgentID: "agent-2", Title: "Chat"}, ActualCanonicalError: "missing", Derived: true},
 	}
 	return status
 }

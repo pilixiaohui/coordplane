@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"strings"
+	"time"
 )
 
 func (s *Service) ClaimNext(ctx context.Context, projectID string) (Claim, bool, error) {
@@ -136,56 +137,316 @@ func (s *Service) ActivateRun(ctx context.Context, runID, requestID string) (Run
 }
 
 func (s *Service) InterruptRun(ctx context.Context, runID, reason, requestID string) (Run, error) {
-	requestID, err := s.requestID(requestID)
+	return s.RecordRunTerminal(ctx, TerminalRunInput{
+		RunID: runID, State: RunInterrupted, Reason: reason, RequestID: requestID,
+	})
+}
+
+// RecordRunTerminal accepts only daemon/runtime-owned process evidence. The
+// Run fact, Task projection, current_run_id fence, and Events commit together.
+func (s *Service) RecordRunTerminal(ctx context.Context, input TerminalRunInput) (Run, error) {
+	runID, err := requireText("run_id", input.RunID)
 	if err != nil {
 		return Run{}, err
 	}
+	requestID, err := s.requestID(input.RequestID)
+	if err != nil {
+		return Run{}, err
+	}
+	if !IsRunTerminal(input.State) {
+		return Run{}, NewError(CodeInvalidArgument, "state must be a terminal Run state", false)
+	}
+	input.Reason = boundedDurableText(input.Reason, MaximumTerminalTextBytes)
+	input.LastError = boundedDurableText(input.LastError, MaximumTerminalTextBytes)
+
 	var run Run
 	err = s.repository.Transact(ctx, func(tx Transaction) error {
 		var err error
-		run, err = tx.Run(strings.TrimSpace(runID))
+		run, err = tx.Run(runID)
 		if err != nil {
 			return err
 		}
-		if !IsRunLive(run.State) {
-			return runTerminalIdempotent(run)
+		if IsRunTerminal(run.State) {
+			if sameTerminalFact(run, input) {
+				return nil
+			}
+			return Conflict(CodeInvalidState, "terminal run fact cannot change", string(run.State), run.Version)
 		}
-		if err := ValidateRunTransition(run.State, RunInterrupted); err != nil {
-			return err
+		if err := ValidateRunTransition(run.State, input.State); err != nil {
+			return Conflict(CodeInvalidState, "run cannot enter requested terminal state", string(run.State), run.Version)
 		}
 		task, err := tx.Task(run.TaskID)
 		if err != nil {
 			return err
 		}
+
 		now := s.nowText()
 		runVersion, runState := run.Version, run.State
-		run.State = RunInterrupted
-		run.TokenRevokedAt = now
+		run.State = input.State
+		run.ExitCode = input.ExitCode
+		run.TerminalReason = input.Reason
+		run.LastError = input.LastError
+		if run.TokenRevokedAt == "" {
+			run.TokenRevokedAt = now
+		}
 		run.EndedAt = now
-		run.TerminalReason = strings.TrimSpace(reason)
 		run.Version++
 		if err := tx.UpdateRun(run, runVersion, runState); err != nil {
 			return err
 		}
-		if task.CurrentRunID == run.ID && (task.Status == TaskRunning || task.Status == TaskQueued) {
-			taskVersion, taskStatus := task.Version, task.Status
-			task.Status = TaskQueued
-			task.CurrentRunID = ""
-			task.RetryCount++
-			task.NextRunAt = now
-			task.Version++
-			task.UpdatedAt = now
-			if err := tx.UpdateTask(task, taskVersion, taskStatus); err != nil {
-				return err
-			}
-			if _, err := tx.AppendEvent(event(task.ProjectID, "task", task.ID, "task.requeued", "daemon", "", run.ID, requestID, "", `{"reason":"run_interrupted"}`, now)); err != nil {
-				return err
-			}
+		if err := s.projectTerminalRunToTask(tx, &task, run, requestID, now); err != nil {
+			return err
 		}
-		_, err = tx.AppendEvent(event(run.ProjectID, "run", run.ID, "run.interrupted", "daemon", "", run.ID, requestID, "", eventPayload(map[string]any{"reason": reason}), now))
+		_, err = tx.AppendEvent(event(
+			run.ProjectID, "run", run.ID, "run."+string(run.State), "daemon", "", run.ID,
+			requestID, "", eventPayload(map[string]any{
+				"exit_code": input.ExitCode, "reason": run.TerminalReason, "last_error": run.LastError,
+			}), now,
+		))
 		return err
 	})
 	return run, err
+}
+
+func sameTerminalFact(run Run, input TerminalRunInput) bool {
+	if run.State != input.State || run.TerminalReason != strings.TrimSpace(input.Reason) || run.LastError != strings.TrimSpace(input.LastError) {
+		return false
+	}
+	if run.ExitCode == nil || input.ExitCode == nil {
+		return run.ExitCode == nil && input.ExitCode == nil
+	}
+	return *run.ExitCode == *input.ExitCode
+}
+
+func (s *Service) projectTerminalRunToTask(tx Transaction, task *Task, run Run, requestID, now string) error {
+	if task.CurrentRunID != run.ID || task.Generation != run.Generation {
+		return nil
+	}
+	messageTarget := MessagePending
+	if run.RequestedOutcome == "fail" || (run.RequestedOutcome == "" && runtimeRetryDecision(task.RetryCount, task.MaxRetries).status == TaskFailed) {
+		messageTarget = MessageCancelled
+	}
+	if err := settleRunMessages(tx, *task, run, messageTarget, requestID, now); err != nil {
+		return err
+	}
+	if task.Status == TaskFinishing && run.RequestedOutcome != "" {
+		return s.projectRequestedOutcome(tx, task, run, requestID, now)
+	}
+	if task.Status != TaskQueued && task.Status != TaskRunning {
+		return nil
+	}
+	return s.projectRuntimeFailure(tx, task, run, requestID, now)
+}
+
+func settleRunMessages(tx Transaction, task Task, run Run, target MessageState, requestID, now string) error {
+	messages, err := tx.MessagesForTask(task.ID)
+	if err != nil {
+		return err
+	}
+	for _, message := range messages {
+		switch target {
+		case MessagePending:
+			if message.State != MessageDelivered || message.DeliveredRunID != run.ID {
+				continue
+			}
+		case MessageCancelled:
+			if message.RecipientKind != "agent" ||
+				(message.State != MessagePending && message.State != MessageDelivered) {
+				continue
+			}
+		default:
+			return NewError(CodeInternal, "unsupported terminal message projection", false)
+		}
+		if err := ValidateMessageTransition(message.State, target); err != nil {
+			return err
+		}
+		expectedVersion, expectedState := message.Version, message.State
+		message.State = target
+		message.Version++
+		message.LastDeliveryError = "TASK_FAILED"
+		kind := "message.cancelled"
+		payload := eventPayload(map[string]any{"terminal_run_id": run.ID, "reason": "task_failed"})
+		if target == MessagePending {
+			message.DeliveredRunID = ""
+			message.DeliveredAt = ""
+			message.NextDeliveryAt = now
+			message.LastDeliveryError = "RUN_TERMINATED_BEFORE_ACK"
+			kind = "message.redelivered"
+			payload = eventPayload(map[string]any{"terminal_run_id": run.ID})
+		}
+		if err := tx.UpdateMessage(message, expectedVersion, expectedState); err != nil {
+			return err
+		}
+		if _, err := tx.AppendEvent(event(
+			message.ProjectID, "message", message.ID, kind, "daemon", "", run.ID,
+			requestID, "", payload, now,
+		)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) projectRequestedOutcome(tx Transaction, task *Task, run Run, requestID, now string) error {
+	switch run.RequestedOutcome {
+	case "wait":
+		target := TaskWaiting
+		messages, err := tx.MessagesForTask(task.ID)
+		if err != nil {
+			return err
+		}
+		for _, message := range messages {
+			if message.Wake && (message.State == MessagePending || message.State == MessageDelivered) {
+				target = TaskQueued
+				break
+			}
+		}
+		if err := ValidateTaskTransition(task.Kind, task.Status, target); err != nil {
+			return err
+		}
+		expectedVersion, expectedStatus := task.Version, task.Status
+		task.Status = target
+		task.CurrentRunID = ""
+		if target == TaskQueued {
+			task.NextRunAt = now
+			task.WaitReason = ""
+		}
+		task.Version++
+		task.UpdatedAt = now
+		if err := tx.UpdateTask(*task, expectedVersion, expectedStatus); err != nil {
+			return err
+		}
+		eventKind := "task.waiting"
+		payload := eventPayload(map[string]any{"reason": task.WaitReason})
+		if target == TaskQueued {
+			eventKind = "task.requeued"
+			payload = `{"reason":"pending_wake"}`
+		}
+		_, err = tx.AppendEvent(event(task.ProjectID, "task", task.ID, eventKind, "daemon", "", run.ID, requestID, "", payload, now))
+		return err
+	case "fail":
+		if err := ValidateTaskTransition(task.Kind, task.Status, TaskFailed); err != nil {
+			return err
+		}
+		expectedVersion, expectedStatus := task.Version, task.Status
+		task.Status = TaskFailed
+		task.CurrentRunID = ""
+		if task.FailureReason == "" {
+			task.FailureReason = run.TerminalReason
+		}
+		task.Version++
+		task.UpdatedAt = now
+		if err := tx.UpdateTask(*task, expectedVersion, expectedStatus); err != nil {
+			return err
+		}
+		_, err := tx.AppendEvent(event(task.ProjectID, "task", task.ID, "task.failed", "daemon", "", run.ID, requestID, "", eventPayload(map[string]any{"reason": task.FailureReason}), now))
+		return err
+	case "submit":
+		if validCaptureIntent(*task, run) {
+			return nil
+		}
+		return s.failInvalidOutcomeIntent(tx, task, run, requestID, now)
+	default:
+		return s.failInvalidOutcomeIntent(tx, task, run, requestID, now)
+	}
+}
+
+func validCaptureIntent(task Task, run Run) bool {
+	return task.PendingAction == "capture" && task.PendingActionID != "" &&
+		task.PendingActionVersion == task.Version && task.PendingActionRunID == run.ID &&
+		task.PendingExpectedSHA != "" && task.PendingExpectedSHA == run.ExpectedHead
+}
+
+func (s *Service) failInvalidOutcomeIntent(tx Transaction, task *Task, run Run, requestID, now string) error {
+	if err := ValidateTaskTransition(task.Kind, task.Status, TaskFailed); err != nil {
+		return err
+	}
+	expectedVersion, expectedStatus := task.Version, task.Status
+	task.Status = TaskFailed
+	task.CurrentRunID = ""
+	task.FailureReason = string(CodeGitInvariantViolation) + ": invalid or missing capture intent"
+	clearTaskPendingAction(task)
+	task.Version++
+	task.UpdatedAt = now
+	if err := tx.UpdateTask(*task, expectedVersion, expectedStatus); err != nil {
+		return err
+	}
+	_, err := tx.AppendEvent(event(task.ProjectID, "task", task.ID, "task.failed", "daemon", "", run.ID, requestID, "", eventPayload(map[string]any{"reason": task.FailureReason}), now))
+	return err
+}
+
+func (s *Service) projectRuntimeFailure(tx Transaction, task *Task, run Run, requestID, now string) error {
+	decision := runtimeRetryDecision(task.RetryCount, task.MaxRetries)
+	if decision.status != task.Status {
+		if err := ValidateTaskTransition(task.Kind, task.Status, decision.status); err != nil {
+			return err
+		}
+	}
+	expectedVersion, expectedStatus := task.Version, task.Status
+	task.Status = decision.status
+	task.CurrentRunID = ""
+	task.RetryCount = decision.retryCount
+	task.FailureReason = runtimeFailureReason(run)
+	if decision.status == TaskQueued {
+		task.NextRunAt = runtimeRetryAt(now, task.RetryCount)
+	}
+	task.Version++
+	task.UpdatedAt = now
+	if err := tx.UpdateTask(*task, expectedVersion, expectedStatus); err != nil {
+		return err
+	}
+	eventKind := "task.failed"
+	if decision.status == TaskQueued {
+		eventKind = "task.requeued"
+	}
+	_, err := tx.AppendEvent(event(task.ProjectID, "task", task.ID, eventKind, "daemon", "", run.ID, requestID, "", eventPayload(map[string]any{
+		"reason": task.FailureReason, "retry_count": task.RetryCount, "max_retries": task.MaxRetries,
+	}), now))
+	return err
+}
+
+func runtimeFailureReason(run Run) string {
+	code := "RUN_" + strings.ToUpper(string(run.State))
+	if run.State == RunExited {
+		code = "NO_TASK_OUTCOME"
+	} else if run.State == RunFailed {
+		code = "RUN_START_FAILED"
+	}
+	detail := strings.TrimSpace(run.TerminalReason)
+	if detail == "" {
+		detail = strings.TrimSpace(run.LastError)
+	}
+	if detail == "" {
+		return code
+	}
+	return code + ": " + detail
+
+}
+
+func runtimeRetryAt(now string, retryCount int) string {
+	instant, err := time.Parse(time.RFC3339Nano, now)
+	if err != nil {
+		return now
+	}
+	shift := retryCount - 1
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > 5 {
+		shift = 5
+	}
+	delay := time.Second * time.Duration(1<<shift)
+	return instant.Add(delay).UTC().Format("2006-01-02T15:04:05.000000000Z")
+}
+
+func clearTaskPendingAction(task *Task) {
+	task.PendingAction = ""
+	task.PendingActionID = ""
+	task.PendingActionVersion = 0
+	task.PendingActionRunID = ""
+	task.PendingExpectedSHA = ""
+	task.PendingTargetSHA = ""
+	task.PendingStartedAt = ""
 }
 
 func (s *Service) CurrentTask(ctx context.Context, token string) (Task, error) {
@@ -300,6 +561,18 @@ func (s *Service) AgentMessageToBoss(ctx context.Context, input AgentMessageInpu
 }
 
 func (s *Service) RequestOutcome(ctx context.Context, input OutcomeInput) (Task, error) {
+	reason, err := optionalTextWithin("reason", input.Reason, MaximumOutcomeTextBytes)
+	if err != nil {
+		return Task{}, err
+	}
+	summary, err := optionalTextWithin("summary", input.Summary, MaximumOutcomeTextBytes)
+	if err != nil {
+		return Task{}, err
+	}
+	expectedHead, err := optionalTextWithin("expected_head", input.ExpectedHead, 256)
+	if err != nil {
+		return Task{}, err
+	}
 	requestID, err := s.requestID(input.RequestID)
 	if err != nil {
 		return Task{}, err
@@ -307,7 +580,7 @@ func (s *Service) RequestOutcome(ctx context.Context, input OutcomeInput) (Task,
 	operation := strings.TrimSpace(input.Outcome)
 	inputHash, err := inputFingerprint(struct {
 		Outcome, Reason, Summary, ExpectedHead string
-	}{operation, strings.TrimSpace(input.Reason), strings.TrimSpace(input.Summary), strings.TrimSpace(input.ExpectedHead)})
+	}{operation, reason, summary, expectedHead})
 	if err != nil {
 		return Task{}, err
 	}
@@ -345,17 +618,27 @@ func (s *Service) RequestOutcome(ctx context.Context, input OutcomeInput) (Task,
 		if current.Status != TaskRunning {
 			return Conflict(CodeInvalidState, "task is not running", string(current.Status), current.Version)
 		}
-		if operation == "submit" && strings.TrimSpace(input.ExpectedHead) == "" {
+		if operation == "submit" && expectedHead == "" {
 			return NewError(CodeInvalidArgument, "expected_head is required for submit", false)
 		}
-		if (operation == "wait" || operation == "fail") && strings.TrimSpace(input.Reason) == "" {
+		if (operation == "wait" || operation == "fail") && reason == "" {
 			return NewError(CodeInvalidArgument, "reason is required", false)
+		}
+		if err := ValidateTaskTransition(current.Kind, current.Status, TaskFinishing); err != nil {
+			return Conflict(CodeInvalidState, "task cannot enter finishing", string(current.Status), current.Version)
+		}
+		operationID := ""
+		if operation == "submit" {
+			operationID, err = s.requiredID("op")
+			if err != nil {
+				return err
+			}
 		}
 		now := s.nowText()
 		runVersion := run.Version
 		run.RequestedOutcome = operation
-		run.RequestedSummary = strings.TrimSpace(input.Summary)
-		run.ExpectedHead = strings.TrimSpace(input.ExpectedHead)
+		run.RequestedSummary = summary
+		run.ExpectedHead = expectedHead
 		run.RequestedAt = now
 		run.TokenRevokedAt = now
 		run.Version++
@@ -364,18 +647,37 @@ func (s *Service) RequestOutcome(ctx context.Context, input OutcomeInput) (Task,
 		}
 		taskVersion := current.Version
 		current.Status = TaskFinishing
-		current.WaitReason = strings.TrimSpace(input.Reason)
-		current.ResultSummary = strings.TrimSpace(input.Summary)
+		switch operation {
+		case "wait":
+			current.WaitReason = reason
+		case "fail":
+			current.FailureReason = reason
+		case "submit":
+			current.ResultSummary = summary
+			current.PendingAction = "capture"
+			current.PendingActionID = operationID
+			current.PendingActionRunID = run.ID
+			current.PendingExpectedSHA = expectedHead
+			current.PendingStartedAt = now
+		}
 		current.Version++
+		if operation == "submit" {
+			current.PendingActionVersion = current.Version
+		}
 		current.UpdatedAt = now
 		if err := tx.UpdateTask(current, taskVersion, TaskRunning); err != nil {
 			return err
 		}
-		if _, err := tx.AppendEvent(event(current.ProjectID, "run", run.ID, "run.outcome_requested", "agent", run.AgentID, run.ID, requestID, "", eventPayload(map[string]any{"outcome": operation}), now)); err != nil {
+		if _, err := tx.AppendEvent(event(current.ProjectID, "run", run.ID, "run.outcome_requested", "agent", run.AgentID, run.ID, requestID, operationID, eventPayload(map[string]any{"outcome": operation}), now)); err != nil {
 			return err
 		}
-		if _, err := tx.AppendEvent(event(current.ProjectID, "task", current.ID, "task.finishing", "agent", run.AgentID, run.ID, requestID, "", eventPayload(map[string]any{"outcome": operation}), now)); err != nil {
+		if _, err := tx.AppendEvent(event(current.ProjectID, "task", current.ID, "task.finishing", "agent", run.AgentID, run.ID, requestID, operationID, eventPayload(map[string]any{"outcome": operation}), now)); err != nil {
 			return err
+		}
+		if operation == "submit" {
+			if _, err := tx.AppendEvent(event(current.ProjectID, "task", current.ID, "git.task_ref_capture_requested", "agent", run.AgentID, run.ID, requestID, operationID, eventPayload(map[string]any{"expected_head": current.PendingExpectedSHA}), now)); err != nil {
+				return err
+			}
 		}
 		raw, err := encodeDedupe(current.ID, "", inputHash)
 		if err != nil {
@@ -415,11 +717,4 @@ func (s *Service) authenticateRun(tx Transaction, token string) (Run, Task, erro
 		return Run{}, Task{}, Conflict(CodeStaleRun, "run scope no longer owns a running task", string(run.State), run.Version)
 	}
 	return run, task, nil
-}
-
-func runTerminalIdempotent(run Run) error {
-	if IsRunTerminal(run.State) {
-		return nil
-	}
-	return NewError(CodeInvalidState, "run is not terminal", false)
 }

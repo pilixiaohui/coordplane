@@ -8,6 +8,7 @@ import "context"
 type Phase string
 
 const (
+	PhaseIntentCommitted   Phase = "intent_committed"
 	PhasePartialPrepared   Phase = "partial_prepared"
 	PhaseBareInitialized   Phase = "bare_initialized"
 	PhaseObjectsImported   Phase = "objects_imported"
@@ -59,6 +60,11 @@ type phaseFact struct {
 }
 
 type phaseHook func(context.Context, Phase, phaseFact) error
+
+// contractPhaseHook is nil in production builds. A contract-tagged file may
+// install a process-level fault observer without exposing test controls in a
+// production binary.
+var contractPhaseHook phaseHook
 
 // Initializer owns the trusted Git process boundary for project repository
 // initialization and verification.

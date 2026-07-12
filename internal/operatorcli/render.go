@@ -63,8 +63,15 @@ func render(writer io.Writer, mode string, value any) error {
 	}
 	switch typed := value.(type) {
 	case core.Status:
+		runs, messages := 0, 0
+		for _, task := range typed.Tasks {
+			if task.CurrentRun != nil {
+				runs++
+			}
+			messages += task.PendingMessageCount + task.DeliveredMessageCount
+		}
 		if _, err := fmt.Fprintf(writer, "ready=%t\tprojects=%d\tagents=%d\ttasks=%d\truns=%d\tmessages=%d\n",
-			typed.DaemonReady, len(typed.Snapshot.Projects), len(typed.Snapshot.Agents), len(typed.Snapshot.Tasks), len(typed.Snapshot.Runs), len(typed.Snapshot.Messages)); err != nil {
+			typed.DaemonReady, len(typed.Snapshot.Projects), len(typed.Snapshot.Agents), len(typed.Tasks), runs, messages); err != nil {
 			return err
 		}
 		for _, project := range projectViews(typed) {
@@ -80,6 +87,15 @@ func render(writer io.Writer, mode string, value any) error {
 		return nil
 	case core.Project:
 		return renderProject(writer, typed)
+	case core.ProjectDetail:
+		return renderProjectStatus(writer, projectStatusView{Project: typed.Project, ActualCanonicalSHA: typed.ActualCanonicalSHA, ActualCanonicalError: typed.ActualCanonicalError})
+	case core.ProjectPage:
+		for _, project := range typed.Items {
+			if err := renderProjectSummary(writer, project); err != nil {
+				return err
+			}
+		}
+		return renderNextCursor(writer, typed.NextCursor)
 	case projectStatusView:
 		return renderProjectStatus(writer, typed)
 	case []core.Project:
@@ -105,10 +121,19 @@ func render(writer io.Writer, mode string, value any) error {
 			}
 		}
 		return nil
+	case core.AgentPage:
+		for _, agent := range typed.Items {
+			if err := renderAgentSummary(writer, agent); err != nil {
+				return err
+			}
+		}
+		return renderNextCursor(writer, typed.NextCursor)
 	case core.Task:
 		return renderTask(writer, typed)
 	case core.TaskView:
 		return renderTaskView(writer, typed)
+	case core.TaskDetail:
+		return renderTaskDetail(writer, typed)
 	case []core.Task:
 		for _, task := range typed {
 			if err := renderTask(writer, task); err != nil {
@@ -116,6 +141,22 @@ func render(writer io.Writer, mode string, value any) error {
 			}
 		}
 		return nil
+	case core.TaskPage:
+		for _, task := range typed.Items {
+			if err := renderTaskSummary(writer, task); err != nil {
+				return err
+			}
+		}
+		return renderNextCursor(writer, typed.NextCursor)
+	case core.Run:
+		return renderRun(writer, typed)
+	case core.RunPage:
+		for _, run := range typed.Items {
+			if err := renderRunSummary(writer, run); err != nil {
+				return err
+			}
+		}
+		return renderNextCursor(writer, typed.NextCursor)
 	case core.ChatResult:
 		return renderMessage(writer, typed.Message)
 	case core.Message:
@@ -127,6 +168,13 @@ func render(writer io.Writer, mode string, value any) error {
 			}
 		}
 		return nil
+	case core.MessagePage:
+		for _, message := range typed.Items {
+			if err := renderMessage(writer, message); err != nil {
+				return err
+			}
+		}
+		return renderNextCursor(writer, typed.NextCursor)
 	case core.Event:
 		return renderEvent(writer, typed)
 	case []core.Event:
@@ -155,12 +203,27 @@ func renderProjectStatus(writer io.Writer, project projectStatusView) error {
 	return err
 }
 
+func renderProjectSummary(writer io.Writer, project core.ProjectSummary) error {
+	_, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\n", project.ID, project.Status, project.Name, project.CanonicalSHA)
+	return err
+}
+
 func renderAgent(writer io.Writer, agent core.Agent) error {
 	_, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\n", agent.ID, agent.Status, agent.DisplayName, agent.AdapterID)
 	return err
 }
 
+func renderAgentSummary(writer io.Writer, agent core.AgentSummary) error {
+	_, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\n", agent.ID, agent.Status, agent.DisplayName, agent.AdapterID)
+	return err
+}
+
 func renderTask(writer io.Writer, task core.Task) error {
+	_, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", task.ID, task.Kind, task.Status, task.AssigneeAgentID, task.Title)
+	return err
+}
+
+func renderTaskSummary(writer io.Writer, task core.TaskSummary) error {
 	_, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", task.ID, task.Kind, task.Status, task.AssigneeAgentID, task.Title)
 	return err
 }
@@ -176,8 +239,37 @@ func renderTaskView(writer io.Writer, view core.TaskView) error {
 	return err
 }
 
+func renderTaskDetail(writer io.Writer, detail core.TaskDetail) error {
+	runID := ""
+	if detail.CurrentRun != nil {
+		runID = detail.CurrentRun.ID
+	}
+	_, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\trun=%s\tpending=%d\tdelivered=%d\tcanonical=%s\tstale=%t\n",
+		detail.Task.ID, detail.Task.Status, detail.Task.AssigneeAgentID, detail.Task.Title, runID,
+		detail.PendingMessageCount, detail.DeliveredMessageCount, detail.ActualCanonicalSHA, detail.Stale)
+	return err
+}
+
 func renderMessage(writer io.Writer, message core.Message) error {
 	_, err := fmt.Fprintf(writer, "%s\t%s\t%s:%s\t%s\n", message.ID, message.State, message.SenderKind, message.SenderID, message.Body)
+	return err
+}
+
+func renderRun(writer io.Writer, run core.Run) error {
+	_, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\tgeneration=%d\n", run.ID, run.State, run.TaskID, run.AgentID, run.Generation)
+	return err
+}
+
+func renderRunSummary(writer io.Writer, run core.RunSummary) error {
+	_, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\tgeneration=%d\n", run.ID, run.State, run.TaskID, run.AgentID, run.Generation)
+	return err
+}
+
+func renderNextCursor(writer io.Writer, cursor string) error {
+	if cursor == "" {
+		return nil
+	}
+	_, err := fmt.Fprintf(writer, "next_cursor=%s\n", cursor)
 	return err
 }
 

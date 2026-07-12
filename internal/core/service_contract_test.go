@@ -139,6 +139,7 @@ func TestCT03StaleRunCannotWriteThroughAgentEntry(t *testing.T) {
 	if _, err := h.service.InterruptRun(context.Background(), run1.Run.ID, "test rollover", "interrupt-1"); err != nil {
 		t.Fatal(err)
 	}
+	h.clock.Advance(time.Second)
 	run2, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 	if err != nil || !ok {
 		t.Fatalf("claim run2: ok=%v err=%v", ok, err)
@@ -356,7 +357,7 @@ func TestCT07ConversationIsDurableReusedAndKindSafe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(messages) != 2 || messages[0].Body != "first" || messages[1].Body != "second" {
+	if len(messages.Items) != 2 || messages.Items[0].Body != "first" || messages.Items[1].Body != "second" {
 		t.Fatalf("messages after restart = %#v", messages)
 	}
 }
@@ -378,7 +379,7 @@ func TestCT09ConversationCloseDisposesMessagesBeforeArchive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(messages) != 1 || messages[0].State != core.MessageCancelled {
+	if len(messages.Items) != 1 || messages.Items[0].State != core.MessageCancelled {
 		t.Fatalf("messages after close = %#v, want one cancelled message", messages)
 	}
 	if _, err := h.service.ArchiveAgent(context.Background(), agent.ID, "archive-closing-agent"); err != nil {
@@ -640,6 +641,12 @@ func (c *testClock) Now() time.Time {
 	defer c.mu.Unlock()
 	c.value = c.value.Add(time.Microsecond)
 	return c.value
+}
+
+func (c *testClock) Advance(duration time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.value = c.value.Add(duration)
 }
 
 type testIDs struct {

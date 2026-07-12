@@ -84,6 +84,8 @@ func run(ctx context.Context, args []string, getenv environment, stdout, stderr 
 		err = runMessage(ctx, args[1:], getenv, stdout, stderr, clients)
 	case "task":
 		err = runTask(ctx, args[1:], getenv, stdout, stderr, clients)
+	case "run":
+		err = runRun(ctx, args[1:], getenv, stdout, stderr, clients)
 	case "events":
 		err = runEvents(ctx, args[1:], getenv, stdout, stderr, clients)
 	default:
@@ -236,5 +238,6 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "  coordplane chat --project ID --agent ID --body TEXT [--request-id ID]")
 	fmt.Fprintln(writer, "  coordplane message list|ack ...")
 	fmt.Fprintln(writer, "  coordplane task create|list|show|close ...")
+	fmt.Fprintln(writer, "  coordplane run list|show ...")
 	fmt.Fprintln(writer, "  coordplane events tail ...")
 }

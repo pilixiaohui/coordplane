@@ -60,7 +60,7 @@ WHERE id=? AND version=? AND status=?`,
 		project.PendingAction, project.PendingActionID, project.PendingStartedAt, project.LastError,
 		project.Version, project.UpdatedAt, project.ID, expectedVersion, expectedStatus,
 	)
-	return casResult(result, err, "project", project.ID, string(expectedStatus), expectedVersion)
+	return u.casResult(result, err, "project", project.ID)
 }
 
 func (u *unitOfWork) ProjectsByIntegrationAgent(agentID string) ([]core.Project, error) {
@@ -106,7 +106,7 @@ func (u *unitOfWork) UpdateAgent(agent core.Agent, expectedVersion int64, expect
 		agent.DisplayName, agent.AdapterID, agent.Image, agent.InstructionsFile, agent.Status,
 		agent.Version, agent.UpdatedAt, agent.ID, expectedVersion, expectedStatus,
 	)
-	return casResult(result, err, "agent", agent.ID, string(expectedStatus), expectedVersion)
+	return u.casResult(result, err, "agent", agent.ID)
 }
 
 func (u *unitOfWork) AgentBlockers(agentID string) (core.LifecycleBlockers, error) {
@@ -174,7 +174,7 @@ WHERE id=? AND version=? AND status=?`,
 		task.PendingStartedAt, task.Version, task.UpdatedAt, task.SubmittedAt,
 		task.CompletedAt, task.ClosedAt, task.ID, expectedVersion, expectedStatus,
 	)
-	return casResult(result, err, "task", task.ID, string(expectedStatus), expectedVersion)
+	return u.casResult(result, err, "task", task.ID)
 }
 
 func (u *unitOfWork) Run(id string) (core.Run, error) {
@@ -208,7 +208,7 @@ WHERE id=? AND version=? AND state=?`,
 		run.CleanupOperationID, run.Version, run.StartedAt, run.EndedAt,
 		run.ID, expectedVersion, expectedState,
 	)
-	return casResult(result, err, "run", run.ID, string(expectedState), expectedVersion)
+	return u.casResult(result, err, "run", run.ID)
 }
 
 func (u *unitOfWork) LiveRunCount(projectID, agentID string) (int, error) {
@@ -262,10 +262,13 @@ WHERE id=? AND version=? AND state=?`,
 		message.NextDeliveryAt, message.LastDeliveryError, message.Version,
 		message.DeliveredAt, message.AcknowledgedAt, message.ID, expectedVersion, expectedState,
 	)
-	return casResult(result, err, "message", message.ID, string(expectedState), expectedVersion)
+	return u.casResult(result, err, "message", message.ID)
 }
 
 func (u *unitOfWork) AppendEvent(event core.Event) (core.Event, error) {
+	if len(event.PayloadJSON) > core.MaximumEventPayloadBytes {
+		return core.Event{}, core.NewError(core.CodeInternal, "event payload exceeds 32768 bytes", false)
+	}
 	result, err := u.tx.ExecContext(u.ctx, `
 INSERT INTO events(project_id,entity_type,entity_id,kind,actor_kind,actor_id,run_id,request_id,operation_id,payload_json,created_at)
 VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
@@ -280,7 +283,7 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
 	return event, err
 }
 
-func casResult(result sql.Result, err error, entity, id, state string, version int64) error {
+func (u *unitOfWork) casResult(result sql.Result, err error, entity, id string) error {
 	if err != nil {
 		return err
 	}
@@ -289,6 +292,21 @@ func casResult(result sql.Result, err error, entity, id, state string, version i
 		return err
 	}
 	if count != 1 {
+		query, ok := map[string]string{
+			"project": `SELECT status,version FROM projects WHERE id=?`,
+			"agent":   `SELECT status,version FROM agents WHERE id=?`,
+			"task":    `SELECT status,version FROM tasks WHERE id=?`,
+			"run":     `SELECT state,version FROM runs WHERE id=?`,
+			"message": `SELECT state,version FROM messages WHERE id=?`,
+		}[entity]
+		if !ok {
+			return core.NewError(core.CodeInternal, "unknown CAS entity", false)
+		}
+		var state string
+		var version int64
+		if err := u.tx.QueryRowContext(u.ctx, query, id).Scan(&state, &version); err != nil {
+			return mapNotFound(entity, id, err)
+		}
 		return core.Conflict(core.CodeVersionConflict, fmt.Sprintf("%s %q changed", entity, id), state, version)
 	}
 	return nil

@@ -18,6 +18,10 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (Task, 
 	if err != nil {
 		return Task{}, err
 	}
+	description, err := optionalTextWithin("description", input.Description, MaximumTaskDescriptionBytes)
+	if err != nil {
+		return Task{}, err
+	}
 	requestID, err := s.requestID(input.RequestID)
 	if err != nil {
 		return Task{}, err
@@ -34,7 +38,7 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (Task, 
 	inputHash, err := inputFingerprint(struct {
 		ProjectID, AgentID, Kind, Title, Description string
 		Priority, MaxRetries                         int
-	}{projectID, agentID, string(input.Kind), title, input.Description, input.Priority, input.MaxRetries})
+	}{projectID, agentID, string(input.Kind), title, description, input.Priority, input.MaxRetries})
 	if err != nil {
 		return Task{}, err
 	}
@@ -83,7 +87,7 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (Task, 
 		now := s.nowText()
 		task = Task{
 			ID: taskID, ProjectID: projectID, Kind: TaskWork, CreatedByKind: "boss",
-			AssigneeAgentID: agentID, Title: title, Description: input.Description,
+			AssigneeAgentID: agentID, Title: title, Description: description,
 			Priority: input.Priority, Status: TaskQueued, Generation: 0, NextRunAt: now,
 			MaxRetries: input.MaxRetries, BaseSHA: baseSHA, Version: 1,
 			CreatedAt: now, UpdatedAt: now,

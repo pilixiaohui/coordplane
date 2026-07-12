@@ -89,7 +89,14 @@ func (c *Client) JSON(ctx context.Context, method, path string, input, output an
 		return fmt.Errorf("transport: Unix request: %w", err)
 	}
 	defer response.Body.Close()
-	decoder := json.NewDecoder(io.LimitReader(response.Body, maxResponseBytes))
+	raw, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
+	if err != nil {
+		return fmt.Errorf("transport: read JSON response: %w", err)
+	}
+	if len(raw) > maxResponseBytes {
+		return fmt.Errorf("transport: JSON response exceeds %d bytes", maxResponseBytes)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	var envelope Envelope
 	if err := decoder.Decode(&envelope); err != nil {

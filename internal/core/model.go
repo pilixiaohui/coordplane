@@ -239,17 +239,76 @@ type Snapshot struct {
 	Events   []Event   `json:"events,omitempty"`
 }
 
+// StatusProjection is the bounded SQLite view used to build Status. It keeps
+// current operational state separate from the paginated history surfaces.
+type StatusProjection struct {
+	Snapshot  Snapshot   `json:"snapshot"`
+	Tasks     []TaskView `json:"tasks,omitempty"`
+	Truncated bool       `json:"-"`
+}
+
+type TaskProjection struct {
+	Project Project    `json:"project"`
+	Task    TaskDetail `json:"task"`
+}
+
+type TaskPage struct {
+	Items      []TaskSummary `json:"items"`
+	NextCursor string        `json:"next_cursor,omitempty"`
+}
+
+type RunPage struct {
+	Items      []RunSummary `json:"items"`
+	NextCursor string       `json:"next_cursor,omitempty"`
+}
+
+type ProjectPage struct {
+	Items      []ProjectSummary `json:"items"`
+	NextCursor string           `json:"next_cursor,omitempty"`
+}
+
+type ProjectDetail struct {
+	Project
+	ActualCanonicalSHA   string `json:"actual_canonical_sha,omitempty"`
+	ActualCanonicalError string `json:"actual_canonical_error,omitempty"`
+}
+
+type AgentPage struct {
+	Items      []AgentSummary `json:"items"`
+	NextCursor string         `json:"next_cursor,omitempty"`
+}
+
+type MessagePage struct {
+	Items      []Message `json:"items"`
+	NextCursor string    `json:"next_cursor,omitempty"`
+}
+
 type Status struct {
-	DaemonReady bool       `json:"daemon_ready"`
-	Reason      string     `json:"reason,omitempty"`
-	Snapshot    Snapshot   `json:"snapshot"`
-	ActualRefs  []GitState `json:"actual_refs,omitempty"`
-	Tasks       []TaskView `json:"tasks,omitempty"`
+	DaemonReady      bool       `json:"daemon_ready"`
+	Reason           string     `json:"reason,omitempty"`
+	SummaryTruncated bool       `json:"summary_truncated,omitempty"`
+	Snapshot         Snapshot   `json:"snapshot"`
+	ActualRefs       []GitState `json:"actual_refs,omitempty"`
+	Tasks            []TaskView `json:"tasks,omitempty"`
 }
 
 // TaskView is a read-only status projection. It joins the six persisted
 // objects and actual Git state without becoming another durable object.
 type TaskView struct {
+	Task                  TaskSummary `json:"task"`
+	CurrentRun            *RunSummary `json:"current_run,omitempty"`
+	LatestProgress        *Event      `json:"latest_progress,omitempty"`
+	PendingMessageCount   int         `json:"pending_message_count"`
+	DeliveredMessageCount int         `json:"delivered_message_count"`
+	ActualCanonicalSHA    string      `json:"actual_canonical_sha,omitempty"`
+	ActualCanonicalError  string      `json:"actual_canonical_error,omitempty"`
+	Stale                 bool        `json:"stale"`
+	Derived               bool        `json:"derived"`
+}
+
+// TaskDetail is the bounded single-Task read. It keeps the complete Task while
+// joining at most one current Run and one latest progress Event.
+type TaskDetail struct {
 	Task                  Task   `json:"task"`
 	CurrentRun            *Run   `json:"current_run,omitempty"`
 	LatestProgress        *Event `json:"latest_progress,omitempty"`
@@ -259,6 +318,100 @@ type TaskView struct {
 	ActualCanonicalError  string `json:"actual_canonical_error,omitempty"`
 	Stale                 bool   `json:"stale"`
 	Derived               bool   `json:"derived"`
+}
+
+// TaskSummary deliberately omits descriptions and terminal history fields;
+// the exact Task remains available from the paginated task read surface.
+type TaskSummary struct {
+	ID                         string     `json:"id"`
+	ProjectID                  string     `json:"project_id"`
+	Kind                       TaskKind   `json:"kind"`
+	ParentTaskID               string     `json:"parent_task_id,omitempty"`
+	AssigneeAgentID            string     `json:"assignee_agent_id"`
+	Title                      string     `json:"title"`
+	TitleTruncated             bool       `json:"title_truncated,omitempty"`
+	Priority                   int        `json:"priority"`
+	Status                     TaskStatus `json:"status"`
+	CurrentRunID               string     `json:"current_run_id,omitempty"`
+	Generation                 int64      `json:"generation"`
+	NextRunAt                  string     `json:"next_run_at"`
+	RetryCount                 int        `json:"retry_count"`
+	MaxRetries                 int        `json:"max_retries"`
+	WaitReason                 string     `json:"wait_reason,omitempty"`
+	ResultSummary              string     `json:"result_summary,omitempty"`
+	FailureReason              string     `json:"failure_reason,omitempty"`
+	TextTruncated              bool       `json:"text_truncated,omitempty"`
+	BaseSHA                    string     `json:"base_sha,omitempty"`
+	HeadSHA                    string     `json:"head_sha,omitempty"`
+	TaskRef                    string     `json:"task_ref,omitempty"`
+	AcceptedByKind             string     `json:"accepted_by_kind,omitempty"`
+	AcceptedByID               string     `json:"accepted_by_id,omitempty"`
+	AcceptedIntegrationAgentID string     `json:"accepted_integration_agent_id,omitempty"`
+	FinalCanonicalSHA          string     `json:"final_canonical_sha,omitempty"`
+	IntegrationTaskID          string     `json:"integration_task_id,omitempty"`
+	SourceTaskID               string     `json:"source_task_id,omitempty"`
+	SourceRunID                string     `json:"source_run_id,omitempty"`
+	SourceTaskRef              string     `json:"source_task_ref,omitempty"`
+	SourceHeadSHA              string     `json:"source_head_sha,omitempty"`
+	PendingAction              string     `json:"pending_action,omitempty"`
+	PendingActionID            string     `json:"pending_action_id,omitempty"`
+	Version                    int64      `json:"version"`
+	CreatedAt                  string     `json:"created_at"`
+	UpdatedAt                  string     `json:"updated_at"`
+	SubmittedAt                string     `json:"submitted_at,omitempty"`
+	CompletedAt                string     `json:"completed_at,omitempty"`
+	ClosedAt                   string     `json:"closed_at,omitempty"`
+}
+
+// RunSummary contains only current coordination facts. Full immutable Run
+// history is served through the run page and show endpoints.
+type RunSummary struct {
+	ID                   string   `json:"id"`
+	ProjectID            string   `json:"project_id"`
+	TaskID               string   `json:"task_id"`
+	AgentID              string   `json:"agent_id"`
+	Generation           int64    `json:"generation"`
+	State                RunState `json:"state"`
+	ContainerIDPresent   bool     `json:"container_id_present"`
+	NativeSessionPresent bool     `json:"native_session_present"`
+	HeartbeatAt          string   `json:"heartbeat_at,omitempty"`
+	DeadlineAt           string   `json:"deadline_at,omitempty"`
+	LastObservedAt       string   `json:"last_observed_at,omitempty"`
+	LaunchPhase          string   `json:"launch_phase"`
+	CleanupState         string   `json:"cleanup_state"`
+	TerminalReason       string   `json:"terminal_reason,omitempty"`
+	LastError            string   `json:"last_error,omitempty"`
+	RuntimeErrorCode     string   `json:"runtime_error_code,omitempty"`
+	TextTruncated        bool     `json:"text_truncated,omitempty"`
+	Version              int64    `json:"version"`
+	CreatedAt            string   `json:"created_at"`
+	StartedAt            string   `json:"started_at,omitempty"`
+	EndedAt              string   `json:"ended_at,omitempty"`
+}
+
+type ProjectSummary struct {
+	ID                 string        `json:"id"`
+	Name               string        `json:"name"`
+	CanonicalRef       string        `json:"canonical_ref"`
+	CanonicalSHA       string        `json:"canonical_sha"`
+	IntegrationAgentID string        `json:"integration_agent_id,omitempty"`
+	Status             ProjectStatus `json:"status"`
+	PendingAction      string        `json:"pending_action,omitempty"`
+	LastError          string        `json:"last_error,omitempty"`
+	Version            int64         `json:"version"`
+	CreatedAt          string        `json:"created_at"`
+	UpdatedAt          string        `json:"updated_at"`
+}
+
+type AgentSummary struct {
+	ID          string      `json:"id"`
+	DisplayName string      `json:"display_name"`
+	AdapterID   string      `json:"adapter_id"`
+	Image       string      `json:"image"`
+	Status      AgentStatus `json:"status"`
+	Version     int64       `json:"version"`
+	CreatedAt   string      `json:"created_at"`
+	UpdatedAt   string      `json:"updated_at"`
 }
 
 type GitState struct {

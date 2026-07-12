@@ -7,8 +7,16 @@ type Repository interface {
 	Project(context.Context, string) (Project, error)
 	ProjectsByStatus(context.Context, ...ProjectStatus) ([]Project, error)
 	Agent(context.Context, string) (Agent, error)
+	Projects(context.Context, ProjectFilter) (ProjectPage, error)
+	Agents(context.Context, AgentFilter) (AgentPage, error)
+	Task(context.Context, string) (Task, error)
+	Run(context.Context, string) (Run, error)
 	Snapshot(context.Context, string) (Snapshot, error)
-	Messages(context.Context, MessageFilter) ([]Message, error)
+	StatusProjection(context.Context, string) (StatusProjection, error)
+	TaskProjection(context.Context, string) (TaskProjection, error)
+	Tasks(context.Context, TaskFilter) (TaskPage, error)
+	Runs(context.Context, RunFilter) (RunPage, error)
+	Messages(context.Context, MessageFilter) (MessagePage, error)
 	Events(context.Context, EventFilter) ([]Event, error)
 }
 
@@ -61,6 +69,32 @@ type MessageFilter struct {
 	TaskID        string
 	RecipientKind string
 	RecipientID   string
+	Cursor        string
+	Limit         int
+}
+
+type ProjectFilter struct {
+	Cursor string
+	Limit  int
+}
+
+type AgentFilter struct {
+	Cursor string
+	Limit  int
+}
+
+type TaskFilter struct {
+	ProjectID string
+	Cursor    string
+	Limit     int
+}
+
+type RunFilter struct {
+	ProjectID string
+	TaskID    string
+	AgentID   string
+	Cursor    string
+	Limit     int
 }
 
 type EventFilter struct {
