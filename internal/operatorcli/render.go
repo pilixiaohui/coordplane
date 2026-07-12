@@ -75,7 +75,7 @@ func render(writer io.Writer, mode string, value any) error {
 			return err
 		}
 		if typed.SummaryTruncated {
-			if _, err := fmt.Fprintln(writer, `more=run "coordplane project list", "coordplane agent list", or "coordplane task list"; follow next_cursor until empty`); err != nil {
+			if _, err := fmt.Fprintln(writer, `more=for omitted objects, run "coordplane project list", "coordplane agent list", or "coordplane task list" and follow next_cursor until empty; use each item-specific show command for truncated fields`); err != nil {
 				return err
 			}
 		}
@@ -236,19 +236,30 @@ func renderTask(writer io.Writer, task core.Task) error {
 }
 
 func renderTaskSummary(writer io.Writer, task core.TaskSummary) error {
-	_, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", task.ID, task.Kind, task.Status, task.AssigneeAgentID, task.Title)
-	return err
+	if _, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\ttitle_truncated=%t\ttext_truncated=%t\n",
+		task.ID, task.Kind, task.Status, task.AssigneeAgentID, task.Title, task.TitleTruncated, task.TextTruncated); err != nil {
+		return err
+	}
+	return renderTaskTruncationHint(writer, task.ID, task.TitleTruncated || task.TextTruncated)
 }
 
 func renderTaskView(writer io.Writer, view core.TaskView) error {
 	runID := ""
+	runTextTruncated := false
 	if view.CurrentRun != nil {
 		runID = view.CurrentRun.ID
+		runTextTruncated = view.CurrentRun.TextTruncated
 	}
-	_, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\trun=%s\tpending=%d\tdelivered=%d\tcanonical=%s\tstale=%t\n",
+	if _, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\trun=%s\tpending=%d\tdelivered=%d\tcanonical=%s\tstale=%t\ttitle_truncated=%t\ttask_text_truncated=%t\trun_text_truncated=%t\n",
 		view.Task.ID, view.Task.Status, view.Task.AssigneeAgentID, view.Task.Title, runID,
-		view.PendingMessageCount, view.DeliveredMessageCount, view.ActualCanonicalSHA, view.Stale)
-	return err
+		view.PendingMessageCount, view.DeliveredMessageCount, view.ActualCanonicalSHA, view.Stale,
+		view.Task.TitleTruncated, view.Task.TextTruncated, runTextTruncated); err != nil {
+		return err
+	}
+	if err := renderTaskTruncationHint(writer, view.Task.ID, view.Task.TitleTruncated || view.Task.TextTruncated); err != nil {
+		return err
+	}
+	return renderRunTruncationHint(writer, runID, runTextTruncated)
 }
 
 func renderTaskDetail(writer io.Writer, detail core.TaskDetail) error {
@@ -273,7 +284,26 @@ func renderRun(writer io.Writer, run core.Run) error {
 }
 
 func renderRunSummary(writer io.Writer, run core.RunSummary) error {
-	_, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\tgeneration=%d\n", run.ID, run.State, run.TaskID, run.AgentID, run.Generation)
+	if _, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\tgeneration=%d\ttext_truncated=%t\n",
+		run.ID, run.State, run.TaskID, run.AgentID, run.Generation, run.TextTruncated); err != nil {
+		return err
+	}
+	return renderRunTruncationHint(writer, run.ID, run.TextTruncated)
+}
+
+func renderTaskTruncationHint(writer io.Writer, taskID string, truncated bool) error {
+	if !truncated {
+		return nil
+	}
+	_, err := fmt.Fprintf(writer, "more=run %q for full Task text\n", "coordplane task show "+taskID+" --output json")
+	return err
+}
+
+func renderRunTruncationHint(writer io.Writer, runID string, truncated bool) error {
+	if !truncated {
+		return nil
+	}
+	_, err := fmt.Fprintf(writer, "more=run %q for full Run text\n", "coordplane run show "+runID+" --output json")
 	return err
 }
 

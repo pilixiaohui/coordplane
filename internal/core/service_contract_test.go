@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -494,6 +495,119 @@ func TestP1MutationsEmitCanonicalEvents(t *testing.T) {
 		if !found {
 			t.Errorf("canonical mutation event %q was not emitted", kind)
 		}
+	}
+}
+
+func TestStatusPropagatesPerItemTextTruncationFromSQLite(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*testing.T, *harness, core.Project, core.Agent) string
+		check func(*testing.T, core.TaskView)
+	}{
+		{
+			name: "task title",
+			setup: func(t *testing.T, h *harness, project core.Project, agent core.Agent) string {
+				task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+					ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
+					Title: strings.Repeat("title", 60), RequestID: "long-title-task",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return task.ID
+			},
+			check: func(t *testing.T, view core.TaskView) {
+				if !view.Task.TitleTruncated || view.Task.TextTruncated {
+					t.Fatalf("task truncation flags = title:%t text:%t", view.Task.TitleTruncated, view.Task.TextTruncated)
+				}
+			},
+		},
+		{
+			name: "task failure",
+			setup: func(t *testing.T, h *harness, project core.Project, agent core.Agent) string {
+				task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+					ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
+					Title: "failure task", RequestID: "long-failure-task",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
+				if err != nil || !ok || claim.Task.ID != task.ID {
+					t.Fatalf("claim=%#v ok=%t err=%v", claim, ok, err)
+				}
+				if _, err := h.service.InterruptRun(context.Background(), claim.Run.ID, strings.Repeat("failure", 90), "long-failure"); err != nil {
+					t.Fatal(err)
+				}
+				return task.ID
+			},
+			check: func(t *testing.T, view core.TaskView) {
+				if view.Task.TitleTruncated || !view.Task.TextTruncated {
+					t.Fatalf("task truncation flags = title:%t text:%t", view.Task.TitleTruncated, view.Task.TextTruncated)
+				}
+			},
+		},
+		{
+			name: "current run error",
+			setup: func(t *testing.T, h *harness, project core.Project, agent core.Agent) string {
+				task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+					ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
+					Title: "current run task", RequestID: "long-current-run-task",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
+				if err != nil || !ok || claim.Task.ID != task.ID {
+					t.Fatalf("claim=%#v ok=%t err=%v", claim, ok, err)
+				}
+				if err := h.database.Transact(context.Background(), func(tx core.Transaction) error {
+					run, err := tx.Run(claim.Run.ID)
+					if err != nil {
+						return err
+					}
+					version, state := run.Version, run.State
+					run.LastError = strings.Repeat("runtime error", 50)
+					run.Version++
+					return tx.UpdateRun(run, version, state)
+				}); err != nil {
+					t.Fatal(err)
+				}
+				return task.ID
+			},
+			check: func(t *testing.T, view core.TaskView) {
+				if view.CurrentRun == nil || !view.CurrentRun.TextTruncated {
+					t.Fatalf("current run summary = %#v", view.CurrentRun)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := newHarness(t)
+			agent := h.addAgent(t, "status-truncation-agent")
+			project := h.addProject(t, "status-truncation-project", "")
+			taskID := test.setup(t, h, project, agent)
+
+			status, err := h.service.Status(context.Background(), project.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(status.Tasks) > core.StatusSnapshotLimit {
+				t.Fatalf("status task count = %d, want at most %d", len(status.Tasks), core.StatusSnapshotLimit)
+			}
+			if !status.SummaryTruncated {
+				t.Fatal("status did not propagate per-item truncation")
+			}
+			for _, view := range status.Tasks {
+				if view.Task.ID == taskID {
+					test.check(t, view)
+					return
+				}
+			}
+			t.Fatalf("status omitted task %s", taskID)
+		})
 	}
 }
 

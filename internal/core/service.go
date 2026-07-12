@@ -110,6 +110,8 @@ func (s *Service) Status(ctx context.Context, projectID string) (Status, error) 
 	}
 	for index := range status.Tasks {
 		task := &status.Tasks[index]
+		status.SummaryTruncated = status.SummaryTruncated || task.Task.TitleTruncated || task.Task.TextTruncated ||
+			(task.CurrentRun != nil && task.CurrentRun.TextTruncated)
 		gitState := actualByProject[task.Task.ProjectID]
 		task.ActualCanonicalSHA = gitState.ActualSHA
 		task.ActualCanonicalError = gitState.Error

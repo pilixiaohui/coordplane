@@ -1,13 +1,16 @@
 package contract_test
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"coordplane/internal/core"
+	"coordplane/internal/store"
 )
 
 func TestStatusHumanBinaryReportsTruncatedTasksAndAgents(t *testing.T) {
@@ -74,5 +77,188 @@ func TestStatusHumanBinaryReportsTruncatedTasksAndAgents(t *testing.T) {
 		if !strings.Contains(string(humanOutput), hint) {
 			t.Errorf("truncated status output lacks continuation hint %q:\n%s", hint, humanOutput)
 		}
+	}
+}
+
+func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "cp-field-trunc-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	dataDir := filepath.Join(root, "data")
+	socket := filepath.Join(dataDir, "operator.sock")
+	configPath := writeConfig(t, root, dataDir, socket, "")
+	source := createRepository(t, root)
+	daemon := startDaemon(t, configPath, socket)
+	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
+
+	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"agent", "add", "--socket", socket,
+		"--display-name", "Field truncation agent",
+		"--adapter", "one-shot", "--image", "agent:latest",
+		"--instructions-file", filepath.Join(root, "agent.md"),
+		"--request-id", "field-truncation-agent", "--output", "json")
+	var agent core.Agent
+	decodeJSON(t, agentRaw, &agent)
+
+	projectRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"project", "add", "--socket", socket, "--name", "field-truncation-project",
+		"--repo", source, "--ref", "refs/heads/main",
+		"--request-id", "field-truncation-project", "--output", "json")
+	var project core.Project
+	decodeJSON(t, projectRaw, &project)
+
+	longTitle := "field-truncation-" + strings.Repeat("T", 300)
+	longReason := "runtime interrupted: " + strings.Repeat("R", 700)
+	if len(longTitle) <= 256 || len(longTitle) > 512 || len(longReason) <= 512 || len(longReason) > core.MaximumTerminalTextBytes {
+		t.Fatalf("fixture is outside legal field bounds: title=%d reason=%d", len(longTitle), len(longReason))
+	}
+	taskRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"task", "create", "--socket", socket, "--project", project.ID,
+		"--agent", agent.ID, "--title", longTitle, "--max-retries", "0",
+		"--request-id", "field-truncation-task", "--output", "json")
+	var task core.Task
+	decodeJSON(t, taskRaw, &task)
+	if task.Title != longTitle {
+		t.Fatalf("production task create changed legal title: got %d bytes, want %d", len(task.Title), len(longTitle))
+	}
+
+	stopDaemon(t, daemon, socket)
+	database, err := store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := core.NewService(database, &contractGit{sha: project.InitialSHA, root: filepath.Join(dataDir, "repos")}, core.ServiceOptions{MaxParallelRuns: 1})
+	if err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	claim, ok, err := service.ClaimNext(context.Background(), project.ID)
+	if err != nil || !ok || claim.Task.ID != task.ID {
+		_ = database.Close()
+		t.Fatalf("claim field-truncation task: claim=%#v ok=%t err=%v", claim, ok, err)
+	}
+	if _, err := service.ActivateRun(context.Background(), claim.Run.ID, "field-truncation-active"); err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	interrupted, err := service.InterruptRun(context.Background(), claim.Run.ID, longReason, "field-truncation-interrupt")
+	if err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	if interrupted.TerminalReason != longReason {
+		_ = database.Close()
+		t.Fatalf("P1 interrupt changed legal terminal reason: got %d bytes, want %d", len(interrupted.TerminalReason), len(longReason))
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	daemon = startDaemon(t, configPath, socket)
+
+	statusRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"status", "--socket", socket, "--project", project.ID, "--output", "json")
+	var status core.Status
+	decodeJSON(t, statusRaw, &status)
+	if len(status.Snapshot.Projects) != 1 || len(status.Snapshot.Agents) != 1 || len(status.Tasks) != 1 {
+		t.Fatalf("fixture unexpectedly hit the %d-object projection bound: %#v", core.StatusSnapshotLimit, status)
+	}
+	if !status.SummaryTruncated {
+		t.Fatalf("status did not propagate per-item field truncation: %#v", status)
+	}
+	taskSummary := status.Tasks[0].Task
+	if taskSummary.ID != task.ID || !taskSummary.TitleTruncated || !taskSummary.TextTruncated {
+		t.Fatalf("status task does not disclose field truncation: %#v", taskSummary)
+	}
+	if taskSummary.Title != longTitle[:256] || taskSummary.FailureReason != ("RUN_INTERRUPTED: " + longReason)[:512] {
+		t.Fatalf("status task summaries are not deterministically clipped: %#v", taskSummary)
+	}
+
+	statusCommand := exec.Command(testBinaries.coordplane,
+		"status", "--socket", socket, "--project", project.ID)
+	statusHuman, err := statusCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("human status: %v\n%s", err, statusHuman)
+	}
+	for _, field := range []string{
+		"summary_truncated=true",
+		"title_truncated=true",
+		"task_text_truncated=true",
+		"run_text_truncated=false",
+		fmt.Sprintf("coordplane task show %s --output json", task.ID),
+	} {
+		if !strings.Contains(string(statusHuman), field) {
+			t.Errorf("human status does not disclose %q:\n%s", field, statusHuman)
+		}
+	}
+
+	tasksRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"task", "list", "--socket", socket, "--project", project.ID, "--output", "json")
+	var tasks core.TaskPage
+	decodeJSON(t, tasksRaw, &tasks)
+	if len(tasks.Items) != 1 || tasks.Items[0].ID != task.ID ||
+		!tasks.Items[0].TitleTruncated || !tasks.Items[0].TextTruncated {
+		t.Fatalf("task list does not disclose field truncation: %#v", tasks)
+	}
+	if tasks.Items[0].Title != longTitle[:256] || tasks.Items[0].FailureReason != ("RUN_INTERRUPTED: " + longReason)[:512] {
+		t.Fatalf("task list summaries are not deterministically clipped: %#v", tasks.Items[0])
+	}
+	taskListCommand := exec.Command(testBinaries.coordplane,
+		"task", "list", "--socket", socket, "--project", project.ID)
+	taskListHuman, err := taskListCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("human task list: %v\n%s", err, taskListHuman)
+	}
+	for _, field := range []string{
+		"title_truncated=true",
+		"text_truncated=true",
+		fmt.Sprintf("coordplane task show %s --output json", task.ID),
+	} {
+		if !strings.Contains(string(taskListHuman), field) {
+			t.Errorf("human task list does not disclose %q:\n%s", field, taskListHuman)
+		}
+	}
+
+	runsRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"run", "list", "--socket", socket, "--project", project.ID, "--output", "json")
+	var runs core.RunPage
+	decodeJSON(t, runsRaw, &runs)
+	if len(runs.Items) != 1 || runs.Items[0].ID != claim.Run.ID || !runs.Items[0].TextTruncated {
+		t.Fatalf("run list does not disclose terminal text truncation: %#v", runs)
+	}
+	if runs.Items[0].TerminalReason != longReason[:512] {
+		t.Fatalf("run terminal summary is not deterministically clipped: %#v", runs.Items[0])
+	}
+	runCommand := exec.Command(testBinaries.coordplane,
+		"run", "list", "--socket", socket, "--project", project.ID)
+	runHuman, err := runCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("human run list: %v\n%s", err, runHuman)
+	}
+	for _, field := range []string{
+		"text_truncated=true",
+		fmt.Sprintf("coordplane run show %s --output json", claim.Run.ID),
+	} {
+		if !strings.Contains(string(runHuman), field) {
+			t.Errorf("human run list does not disclose %q:\n%s", field, runHuman)
+		}
+	}
+
+	taskDetailRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"task", "show", task.ID, "--socket", socket, "--output", "json")
+	var taskDetail core.TaskDetail
+	decodeJSON(t, taskDetailRaw, &taskDetail)
+	wantFailure := "RUN_INTERRUPTED: " + longReason
+	if taskDetail.Task.Status != core.TaskFailed || taskDetail.Task.Title != longTitle || taskDetail.Task.FailureReason != wantFailure {
+		t.Fatalf("task show did not recover full fields: title=%d/%d failure=%d/%d",
+			len(taskDetail.Task.Title), len(longTitle), len(taskDetail.Task.FailureReason), len(wantFailure))
+	}
+	runDetailRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"run", "show", claim.Run.ID, "--socket", socket, "--output", "json")
+	var runDetail core.Run
+	decodeJSON(t, runDetailRaw, &runDetail)
+	if runDetail.State != core.RunInterrupted || runDetail.TerminalReason != longReason {
+		t.Fatalf("run show did not recover full terminal reason: got %d bytes, want %d", len(runDetail.TerminalReason), len(longReason))
 	}
 }
