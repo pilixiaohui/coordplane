@@ -219,24 +219,26 @@ func runEvents(ctx context.Context, args []string, getenv environment, stdout, s
 	flags.StringVar(&filter.EntityType, "entity-type", "", "entity type")
 	flags.StringVar(&filter.EntityID, "entity-id", "", "entity ID")
 	flags.StringVar(&filter.RunID, "run-id", "", "run ID")
-	flags.IntVar(&filter.Limit, "limit", 0, "maximum events")
+	flags.StringVar(&filter.Cursor, "cursor", "", "opaque next-page cursor")
+	flags.IntVar(&filter.Limit, "limit", 0, "maximum events (default 20, maximum 100)")
 	if err := parseNoPositionals(flags, args[1:]); err != nil {
 		return err
 	}
-	if filter.Limit < 0 {
-		return errors.New("--limit must be a non-negative integer")
+	if _, err := core.NormalizeEventPageLimit(filter.Limit); err != nil {
+		return err
 	}
 	query := url.Values{}
 	addQuery(query, "project_id", filter.ProjectID)
 	addQuery(query, "entity_type", filter.EntityType)
 	addQuery(query, "entity_id", filter.EntityID)
 	addQuery(query, "run_id", filter.RunID)
+	addQuery(query, "cursor", filter.Cursor)
 	if filter.Limit > 0 {
 		query.Set("limit", fmt.Sprint(filter.Limit))
 	}
-	var events []core.Event
-	if err := request(ctx, *cfg, clients, http.MethodGet, withQuery("/v1/events", query), nil, &events); err != nil {
+	var page core.EventPage
+	if err := request(ctx, *cfg, clients, http.MethodGet, withQuery("/v1/events", query), nil, &page); err != nil {
 		return err
 	}
-	return render(stdout, cfg.output, events)
+	return render(stdout, cfg.output, page)
 }

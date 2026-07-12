@@ -283,6 +283,11 @@ type MessagePage struct {
 	NextCursor string    `json:"next_cursor,omitempty"`
 }
 
+type EventPage struct {
+	Items      []Event `json:"items"`
+	NextCursor string  `json:"next_cursor,omitempty"`
+}
+
 type Status struct {
 	DaemonReady      bool       `json:"daemon_ready"`
 	Reason           string     `json:"reason,omitempty"`

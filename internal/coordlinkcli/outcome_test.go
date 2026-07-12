@@ -3,104 +3,73 @@ package coordlinkcli
 import (
 	"bytes"
 	"context"
+	"net/http"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 
-	"coordplane/internal/core"
 	"coordplane/internal/transport"
 )
 
-func TestTaskOutcomeCommandsUseTheFixedRunHandlerContract(t *testing.T) {
-	tests := []struct {
-		name         string
-		args         []string
-		wantOutcome  string
-		wantReason   string
-		wantSummary  string
-		wantExpected string
-	}{
-		{
-			name: "wait", args: []string{"task", "wait", "--reason", "awaiting review", "--request-id", "wait-1", "--output", "json"},
-			wantOutcome: "wait", wantReason: "awaiting review",
-		},
-		{
-			name: "fail", args: []string{"task", "fail", "--reason", "tests failed", "--request-id", "fail-1", "--output", "json"},
-			wantOutcome: "fail", wantReason: "tests failed",
-		},
-		{
-			name: "submit", args: []string{"task", "submit", "--summary", "ready", "--expected-head", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "--request-id", "submit-1", "--output", "json"},
-			wantOutcome: "submit", wantSummary: "ready", wantExpected: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		},
+func TestDeferredOutcomeCommandsAreRejectedBeforeScopedClient(t *testing.T) {
+	root := t.TempDir()
+	socket := filepath.Join(root, "recording.sock")
+	var socketRequests atomic.Int64
+	server, err := transport.NewUnixServer(root, socket, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		socketRequests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	if err != nil {
+		t.Fatal(err)
 	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve() }()
+	t.Cleanup(func() {
+		_ = server.Close()
+		<-serveDone
+	})
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			root := t.TempDir()
-			socket := filepath.Join(root, "api.sock")
-			operations := &outcomeOperations{wantToken: "run-token"}
-			server, err := transport.NewUnixServer(root, socket, transport.NewRunHandler(operations))
-			if err != nil {
-				t.Fatal(err)
-			}
-			serveDone := make(chan error, 1)
-			go func() { serveDone <- server.Serve() }()
-			t.Cleanup(func() {
-				_ = server.Close()
-				<-serveDone
-			})
-			getenv := func(name string) string {
-				switch name {
-				case socketEnvironment:
-					return socket
-				case tokenEnvironment:
-					return "run-token"
-				default:
-					return ""
-				}
-			}
+	environmentLookups := 0
+	getenv := func(name string) string {
+		environmentLookups++
+		switch name {
+		case socketEnvironment:
+			return socket
+		case tokenEnvironment:
+			return "run-token"
+		default:
+			return ""
+		}
+	}
+	for _, subcommand := range []string{"wait", "submit", "fail"} {
+		t.Run(subcommand, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			if code := Run(context.Background(), test.args, getenv, nil, &stdout, &stderr); code != 0 {
-				t.Fatalf("code=%d stderr=%s", code, stderr.String())
+			code := Run(context.Background(), []string{"task", subcommand}, getenv, nil, &stdout, &stderr)
+			if code == 0 || !strings.Contains(stderr.String(), `unknown task subcommand "`+subcommand+`"`) {
+				t.Fatalf("code=%d stderr=%q", code, stderr.String())
 			}
-			if operations.calls != 1 {
-				t.Fatalf("outcome calls = %d", operations.calls)
-			}
-			got := operations.input
-			if got.Token != "run-token" || got.Outcome != test.wantOutcome || got.Reason != test.wantReason || got.Summary != test.wantSummary || got.ExpectedHead != test.wantExpected {
-				t.Fatalf("outcome input = %#v", got)
-			}
-			if !bytes.Contains(stdout.Bytes(), []byte(`"status":"finishing"`)) {
-				t.Fatalf("stdout=%s", stdout.String())
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout=%q", stdout.String())
 			}
 		})
 	}
-}
-
-type outcomeOperations struct {
-	wantToken string
-	input     core.OutcomeInput
-	calls     int
-}
-
-func (o *outcomeOperations) CurrentTask(context.Context, string) (core.Task, error) {
-	return core.Task{}, nil
-}
-
-func (o *outcomeOperations) Progress(context.Context, core.ProgressInput) (core.Event, error) {
-	return core.Event{}, nil
-}
-
-func (o *outcomeOperations) AgentMessageToBoss(context.Context, core.AgentMessageInput) (core.Message, error) {
-	return core.Message{}, nil
-}
-
-func (o *outcomeOperations) RequestOutcome(_ context.Context, input core.OutcomeInput) (core.Task, error) {
-	o.calls++
-	o.input = input
-	if input.Token != o.wantToken {
-		return core.Task{}, core.NewError(core.CodeScopeDenied, "bad token", false)
+	if environmentLookups != 0 {
+		t.Fatalf("deferred commands performed %d scoped environment lookups", environmentLookups)
 	}
-	return core.Task{ID: "task-1", Status: core.TaskFinishing}, nil
+	if got := socketRequests.Load(); got != 0 {
+		t.Fatalf("deferred commands performed %d socket requests", got)
+	}
 }
 
-var _ transport.RunOperations = (*outcomeOperations)(nil)
+func TestHelpDoesNotAdvertiseDeferredOutcomeCommands(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := Run(context.Background(), []string{"help"}, nil, nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("code=%d stderr=%q", code, stderr.String())
+	}
+	for _, command := range []string{"task wait", "task submit", "task fail"} {
+		if strings.Contains(stdout.String(), command) {
+			t.Fatalf("help advertises deferred command %q:\n%s", command, stdout.String())
+		}
+	}
+}

@@ -116,9 +116,9 @@ func TestOperatorHandlerMapsBodiesPathsAndQueriesWithoutGenericDispatch(t *testi
 		t.Fatalf("message filter = %+v, want %+v", messageFilter, wantMessages)
 	}
 
-	assertOK(t, invoke(t, handler, http.MethodGet, "/v1/events?project_id=prj-1&entity_type=task&entity_id=tsk-1&run_id=run-1&limit=25", "", ""))
+	assertOK(t, invoke(t, handler, http.MethodGet, "/v1/events?project_id=prj-1&entity_type=task&entity_id=tsk-1&run_id=run-1&cursor=opaque-event&limit=25", "", ""))
 	eventFilter := operations.calls[len(operations.calls)-1].value.(core.EventFilter)
-	wantEvents := core.EventFilter{ProjectID: "prj-1", EntityType: "task", EntityID: "tsk-1", RunID: "run-1", Limit: 25}
+	wantEvents := core.EventFilter{ProjectID: "prj-1", EntityType: "task", EntityID: "tsk-1", RunID: "run-1", Cursor: "opaque-event", Limit: 25}
 	if eventFilter != wantEvents {
 		t.Fatalf("event filter = %+v, want %+v", eventFilter, wantEvents)
 	}
@@ -136,19 +136,15 @@ func TestOperatorHandlerMapsBodiesPathsAndQueriesWithoutGenericDispatch(t *testi
 
 func TestRunHandlerForwardsOnlyBearerTokenToCore(t *testing.T) {
 	tests := []struct {
-		name        string
-		method      string
-		path        string
-		body        string
-		call        string
-		wantOutcome string
+		name   string
+		method string
+		path   string
+		body   string
+		call   string
 	}{
 		{name: "current", method: http.MethodGet, path: "/v1/task/current", call: "current_task"},
 		{name: "progress", method: http.MethodPost, path: "/v1/progress", body: `{"summary":"working","request_id":"req-progress"}`, call: "progress"},
 		{name: "message", method: http.MethodPost, path: "/v1/message", body: `{"body":"result","request_id":"req-message"}`, call: "message"},
-		{name: "wait outcome", method: http.MethodPost, path: "/v1/task/outcome", body: `{"outcome":"wait","reason":"review","request_id":"req-wait"}`, call: "outcome", wantOutcome: "wait"},
-		{name: "fail outcome", method: http.MethodPost, path: "/v1/task/outcome", body: `{"outcome":"fail","reason":"tests failed","request_id":"req-fail"}`, call: "outcome", wantOutcome: "fail"},
-		{name: "submit outcome", method: http.MethodPost, path: "/v1/task/outcome", body: `{"outcome":"submit","summary":"ready","expected_head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","request_id":"req-submit"}`, call: "outcome", wantOutcome: "submit"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -158,13 +154,19 @@ func TestRunHandlerForwardsOnlyBearerTokenToCore(t *testing.T) {
 			if len(operations.calls) != 1 || operations.calls[0].name != test.call || operations.calls[0].token != "run-secret" {
 				t.Fatalf("run calls = %+v, want %s with bearer token", operations.calls, test.call)
 			}
-			if test.wantOutcome != "" {
-				input := operations.calls[0].value.(core.OutcomeInput)
-				if input.Outcome != test.wantOutcome {
-					t.Fatalf("outcome = %q, want %q", input.Outcome, test.wantOutcome)
-				}
-			}
 		})
+	}
+}
+
+func TestRunHandlerDoesNotExposeDeferredOutcomeRoute(t *testing.T) {
+	operations := &runFake{}
+	recorder := invoke(t, transport.NewRunHandler(operations), http.MethodPost, "/v1/task/outcome", `{"outcome":"submit"}`, "run-secret")
+	envelope := decodeEnvelope(t, recorder)
+	if recorder.Code != http.StatusNotFound || envelope.OK || envelope.Error == nil || envelope.Error.Code != core.CodeNotFound {
+		t.Fatalf("deferred outcome response = status:%d envelope:%+v", recorder.Code, envelope)
+	}
+	if len(operations.calls) != 0 {
+		t.Fatalf("deferred outcome route invoked operations: %+v", operations.calls)
 	}
 }
 
@@ -358,8 +360,8 @@ func (f *operatorFake) AcknowledgeBossMessage(_ context.Context, id, requestID s
 	return core.Message{}, f.record("ack_message", actionCall{id: id, requestID: requestID})
 }
 
-func (f *operatorFake) ListEvents(_ context.Context, filter core.EventFilter) ([]core.Event, error) {
-	return []core.Event{}, f.record("list_events", filter)
+func (f *operatorFake) ListEvents(_ context.Context, filter core.EventFilter) (core.EventPage, error) {
+	return core.EventPage{Items: []core.Event{}}, f.record("list_events", filter)
 }
 
 type runFake struct {
@@ -380,11 +382,6 @@ func (f *runFake) Progress(_ context.Context, input core.ProgressInput) (core.Ev
 func (f *runFake) AgentMessageToBoss(_ context.Context, input core.AgentMessageInput) (core.Message, error) {
 	f.calls = append(f.calls, recordedCall{name: "message", value: input, token: input.Token})
 	return core.Message{}, f.err
-}
-
-func (f *runFake) RequestOutcome(_ context.Context, input core.OutcomeInput) (core.Task, error) {
-	f.calls = append(f.calls, recordedCall{name: "outcome", value: input, token: input.Token})
-	return core.Task{}, f.err
 }
 
 func invoke(t *testing.T, handler http.Handler, method, path, body, token string) *httptest.ResponseRecorder {

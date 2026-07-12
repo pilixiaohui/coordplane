@@ -171,6 +171,7 @@ func NewOperatorHandler(operations OperatorOperations) http.Handler {
 			EntityType: strings.TrimSpace(query.Get("entity_type")),
 			EntityID:   strings.TrimSpace(query.Get("entity_id")),
 			RunID:      strings.TrimSpace(query.Get("run_id")),
+			Cursor:     strings.TrimSpace(query.Get("cursor")),
 			Limit:      limit,
 		})
 		writeResult(w, result, err)
@@ -196,10 +197,6 @@ func NewRunHandler(operations RunOperations) http.Handler {
 	mux.HandleFunc("/v1/message", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.AgentMessageInput) (any, error) {
 		input.Token = ctx.Token
 		return operations.AgentMessageToBoss(ctx.Context, input)
-	})))
-	mux.HandleFunc("/v1/task/outcome", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.OutcomeInput) (any, error) {
-		input.Token = ctx.Token
-		return operations.RequestOutcome(ctx.Context, input)
 	})))
 	mux.HandleFunc("/", notFound)
 	return mux

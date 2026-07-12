@@ -6,6 +6,7 @@ const (
 	MaximumCompactPageLimit = 100
 	MessagePageLimit        = 20
 	EventPageLimit          = 20
+	MaximumEventPageLimit   = 100
 	StatusSnapshotLimit     = 8
 
 	MaximumMessageBodyBytes     = 64 << 10
@@ -63,8 +64,8 @@ func NormalizeEventPageLimit(limit int) (int, error) {
 	if limit == 0 {
 		return EventPageLimit, nil
 	}
-	if limit > EventPageLimit {
-		return 0, NewError(CodeInvalidArgument, "event limit must not exceed 20", false)
+	if limit > MaximumEventPageLimit {
+		return 0, NewError(CodeInvalidArgument, "event limit must not exceed 100", false)
 	}
 	return limit, nil
 }

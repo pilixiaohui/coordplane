@@ -17,6 +17,7 @@ type Repository interface {
 	Tasks(context.Context, TaskFilter) (TaskPage, error)
 	Runs(context.Context, RunFilter) (RunPage, error)
 	Messages(context.Context, MessageFilter) (MessagePage, error)
+	EventsPage(context.Context, EventFilter) (EventPage, error)
 	Events(context.Context, EventFilter) ([]Event, error)
 }
 
@@ -103,6 +104,7 @@ type EventFilter struct {
 	EntityID   string
 	RunID      string
 	Kind       string
+	Cursor     string
 	Limit      int
 }
 

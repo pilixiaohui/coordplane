@@ -93,8 +93,4 @@ func (o *runOperations) AgentMessageToBoss(context.Context, core.AgentMessageInp
 	return core.Message{}, nil
 }
 
-func (o *runOperations) RequestOutcome(context.Context, core.OutcomeInput) (core.Task, error) {
-	return core.Task{}, nil
-}
-
 var _ transport.RunOperations = (*runOperations)(nil)

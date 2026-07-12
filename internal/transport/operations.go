@@ -28,7 +28,7 @@ type OperatorOperations interface {
 	ListRuns(context.Context, core.RunFilter) (core.RunPage, error)
 	ListMessages(context.Context, core.MessageFilter) (core.MessagePage, error)
 	AcknowledgeBossMessage(context.Context, string, string) (core.Message, error)
-	ListEvents(context.Context, core.EventFilter) ([]core.Event, error)
+	ListEvents(context.Context, core.EventFilter) (core.EventPage, error)
 }
 
 // RunOperations is the fixed Agent-facing operation surface. The transport
@@ -37,7 +37,6 @@ type RunOperations interface {
 	CurrentTask(context.Context, string) (core.Task, error)
 	Progress(context.Context, core.ProgressInput) (core.Event, error)
 	AgentMessageToBoss(context.Context, core.AgentMessageInput) (core.Message, error)
-	RequestOutcome(context.Context, core.OutcomeInput) (core.Task, error)
 }
 
 var _ OperatorOperations = (*core.Service)(nil)

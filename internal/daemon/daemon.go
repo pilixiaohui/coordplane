@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"coordplane/internal/core"
 	"coordplane/internal/transport"
 )
 
@@ -85,25 +84,6 @@ func (d *Daemon) Close() error {
 		d.closeErr = errors.Join(serverErr, componentErr)
 	})
 	return d.closeErr
-}
-
-// NewRunServer composes the fixed Agent-facing socket from the daemon's
-// canonical Core instance. Runtime owns serving and closing the per-Run
-// listener because its lifetime is tied to the corresponding container.
-func (d *Daemon) NewRunServer(controlRoot, socketPath string) (*transport.UnixServer, error) {
-	if d == nil || d.components == nil || d.components.service == nil {
-		return nil, errors.New("coordplane daemon is not initialized")
-	}
-	return transport.NewUnixServer(controlRoot, socketPath, transport.NewRunHandler(d.components.service))
-}
-
-// RecordRunTerminal is the narrow runtime-to-Core terminal fact boundary. It
-// is deliberately absent from both operator and Agent transports.
-func (d *Daemon) RecordRunTerminal(ctx context.Context, input core.TerminalRunInput) (core.Run, error) {
-	if d == nil || d.components == nil || d.components.service == nil {
-		return core.Run{}, errors.New("coordplane daemon is not initialized")
-	}
-	return d.components.service.RecordRunTerminal(ctx, input)
 }
 
 func (d *Daemon) String() string {

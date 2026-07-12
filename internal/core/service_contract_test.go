@@ -163,10 +163,6 @@ func TestCT03StaleRunCannotWriteThroughAgentEntry(t *testing.T) {
 			_, err := h.service.AgentMessageToBoss(context.Background(), core.AgentMessageInput{Token: run1.Token, Body: "stale", RequestID: "stale-message"})
 			return err
 		}},
-		{"submit", func() error {
-			_, err := h.service.RequestOutcome(context.Background(), core.OutcomeInput{Token: run1.Token, Outcome: "submit", Summary: "stale", ExpectedHead: h.git.sha, RequestID: "stale-submit"})
-			return err
-		}},
 	}
 	for _, request := range requests {
 		t.Run(request.name, func(t *testing.T) {
@@ -181,62 +177,6 @@ func TestCT03StaleRunCannotWriteThroughAgentEntry(t *testing.T) {
 	}
 	if _, err := h.service.Progress(context.Background(), core.ProgressInput{Token: run2.Token, Summary: "current", RequestID: "progress-current"}); err != nil {
 		t.Fatalf("current run progress failed: %v", err)
-	}
-}
-
-func TestOutcomeReplayIsIdempotentAndRejectsChangedInputAfterTokenRevocation(t *testing.T) {
-	h := newHarness(t)
-	agent := h.addAgent(t, "outcome-agent")
-	project := h.addProject(t, "outcome-project", "")
-	task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
-		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
-		Title: "submit once", RequestID: "task-outcome",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
-	if err != nil || !ok {
-		t.Fatalf("claim: ok=%v err=%v", ok, err)
-	}
-	if claim.Task.ID != task.ID {
-		t.Fatalf("claimed task %s, want %s", claim.Task.ID, task.ID)
-	}
-	if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, "activate-outcome"); err != nil {
-		t.Fatal(err)
-	}
-
-	input := core.OutcomeInput{
-		Token: claim.Token, Outcome: "submit", Summary: "ready",
-		ExpectedHead: h.git.sha, RequestID: "submit-outcome",
-	}
-	first, err := h.service.RequestOutcome(context.Background(), input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first.Status != core.TaskFinishing {
-		t.Fatalf("outcome task status = %s, want %s", first.Status, core.TaskFinishing)
-	}
-	before := h.durableSignature(t, project.ID)
-
-	replayed, err := h.service.RequestOutcome(context.Background(), input)
-	if err != nil {
-		t.Fatalf("idempotent replay after token revocation: %v", err)
-	}
-	if replayed.ID != first.ID || replayed.Version != first.Version {
-		t.Fatalf("replayed task = %#v, want original %#v", replayed, first)
-	}
-	if after := h.durableSignature(t, project.ID); after != before {
-		t.Fatalf("idempotent replay changed durable state\nbefore=%s\nafter=%s", before, after)
-	}
-
-	input.Summary = "must not replace the accepted payload"
-	input.ExpectedHead = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	if _, err := h.service.RequestOutcome(context.Background(), input); !core.IsCode(err, core.CodeVersionConflict) {
-		t.Fatalf("changed idempotency input error = %v, want VERSION_CONFLICT", err)
-	}
-	if after := h.durableSignature(t, project.ID); after != before {
-		t.Fatalf("conflicting replay changed durable state\nbefore=%s\nafter=%s", before, after)
 	}
 }
 

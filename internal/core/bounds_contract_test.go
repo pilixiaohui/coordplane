@@ -59,16 +59,6 @@ func TestMessageAndProgressLimitPlusOneHaveNoDurableSideEffects(t *testing.T) {
 	if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, "activate-bounded"); err != nil {
 		t.Fatal(err)
 	}
-	before = h.durableSignature(t, project.ID)
-	if _, err := h.service.RequestOutcome(context.Background(), core.OutcomeInput{
-		Token: claim.Token, Outcome: "wait", Reason: strings.Repeat("w", core.MaximumOutcomeTextBytes+1),
-		RequestID: "oversized-outcome",
-	}); !core.IsCode(err, core.CodeInvalidArgument) {
-		t.Fatalf("oversized outcome reason error = %v, want INVALID_ARGUMENT", err)
-	}
-	if after := h.durableSignature(t, project.ID); after != before {
-		t.Fatalf("oversized outcome reason wrote durable state\nbefore=%s\nafter=%s", before, after)
-	}
 
 	before = h.durableSignature(t, project.ID)
 	progressRequestID := "bounded-progress"

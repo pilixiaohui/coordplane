@@ -181,13 +181,13 @@ func (s *Service) ListMessages(ctx context.Context, filter MessageFilter) (Messa
 	return s.repository.Messages(ctx, filter)
 }
 
-func (s *Service) ListEvents(ctx context.Context, filter EventFilter) ([]Event, error) {
+func (s *Service) ListEvents(ctx context.Context, filter EventFilter) (EventPage, error) {
 	limit, err := NormalizeEventPageLimit(filter.Limit)
 	if err != nil {
-		return nil, err
+		return EventPage{}, err
 	}
 	filter.Limit = limit
-	return s.repository.Events(ctx, filter)
+	return s.repository.EventsPage(ctx, filter)
 }
 
 func (s *Service) nowText() string {

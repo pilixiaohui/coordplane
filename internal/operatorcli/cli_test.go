@@ -155,8 +155,8 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 		},
 		{
 			name:   "events tail",
-			args:   []string{"events", "tail", "--project", "project-1", "--entity-type", "task", "--entity-id", "task-1", "--run-id", "run-1", "--limit", "25", "--output", "json"},
-			method: http.MethodGet, path: "/v1/events?entity_id=task-1&entity_type=task&limit=25&project_id=project-1&run_id=run-1",
+			args:   []string{"events", "tail", "--project", "project-1", "--entity-type", "task", "--entity-id", "task-1", "--run-id", "run-1", "--cursor", "next-event", "--limit", "25", "--output", "json"},
+			method: http.MethodGet, path: "/v1/events?cursor=next-event&entity_id=task-1&entity_type=task&limit=25&project_id=project-1&run_id=run-1",
 			outputHas: `"id":1`,
 		},
 	}
@@ -431,8 +431,8 @@ func (c *recordingClient) JSON(_ context.Context, method, path string, input, ou
 		*target = core.RunPage{Items: []core.RunSummary{{ID: "run-1", ProjectID: "project-1", TaskID: "task-1", AgentID: "agent-1", State: core.RunExited}}}
 	case *core.Run:
 		*target = core.Run{ID: "run-1", ProjectID: "project-1", TaskID: "task-1", AgentID: "agent-1", State: core.RunExited}
-	case *[]core.Event:
-		*target = c.status.Snapshot.Events
+	case *core.EventPage:
+		*target = core.EventPage{Items: c.status.Snapshot.Events, NextCursor: "next-event"}
 	}
 	return nil
 }

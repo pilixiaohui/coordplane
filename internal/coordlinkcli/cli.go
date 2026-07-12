@@ -46,6 +46,10 @@ func Run(ctx context.Context, args []string, getenv environment, stdin io.Reader
 		fmt.Fprintf(stderr, "unknown coordlink command %q\n", args[0])
 		return 1
 	}
+	if err := validateSocketCommand(args); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
 	client, err := scopedClient(getenv)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -92,39 +96,22 @@ func runTask(ctx context.Context, client *transport.Client, args []string, stdou
 			return err
 		}
 		return render(stdout, *output, task)
-	case "wait":
-		return runOutcome(ctx, client, "wait", args[1:], stdout, stderr)
-	case "submit":
-		return runOutcome(ctx, client, "submit", args[1:], stdout, stderr)
-	case "fail":
-		return runOutcome(ctx, client, "fail", args[1:], stdout, stderr)
 	default:
 		return fmt.Errorf("unknown task subcommand %q", args[0])
 	}
 }
 
-func runOutcome(ctx context.Context, client *transport.Client, outcome string, args []string, stdout, stderr io.Writer) error {
-	flags, output := outputFlags("task "+outcome, stderr)
-	var input core.OutcomeInput
-	flags.StringVar(&input.RequestID, "request-id", "", "idempotency key")
-	flags.StringVar(&input.Reason, "reason", "", "wait or failure reason")
-	flags.StringVar(&input.Summary, "summary", "", "result summary")
-	flags.StringVar(&input.ExpectedHead, "expected-head", "", "expected workspace HEAD")
-	if err := flags.Parse(args); err != nil {
-		return err
+func validateSocketCommand(args []string) error {
+	if args[0] != "task" {
+		return nil
 	}
-	if flags.NArg() != 0 {
-		return errors.New("unexpected positional arguments")
+	if len(args) == 1 {
+		return errors.New("task subcommand is required")
 	}
-	if err := validateOutput(*output); err != nil {
-		return err
+	if args[1] != "current" {
+		return fmt.Errorf("unknown task subcommand %q", args[1])
 	}
-	input.Outcome = outcome
-	var task core.Task
-	if err := client.JSON(ctx, http.MethodPost, "/v1/task/outcome", input, &task); err != nil {
-		return err
-	}
-	return render(stdout, *output, task)
+	return nil
 }
 
 func runProgress(ctx context.Context, client *transport.Client, args []string, stdout, stderr io.Writer) error {
@@ -235,9 +222,6 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "Usage:")
 	fmt.Fprintln(writer, "  coordlink version")
 	fmt.Fprintln(writer, "  coordlink task current [--output human|json]")
-	fmt.Fprintln(writer, "  coordlink task wait --reason TEXT [--request-id ID]")
-	fmt.Fprintln(writer, "  coordlink task submit --summary TEXT --expected-head SHA [--request-id ID]")
-	fmt.Fprintln(writer, "  coordlink task fail --reason TEXT [--request-id ID]")
 	fmt.Fprintln(writer, "  coordlink message send --to-boss --body TEXT [--request-id ID]")
 	fmt.Fprintln(writer, "  coordlink progress --summary TEXT [--request-id ID]")
 }

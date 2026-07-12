@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -144,6 +145,93 @@ func TestTaskRunAndMessageHistoryUseStableOpaqueCursorPages(t *testing.T) {
 	}
 	if _, err := database.Messages(ctx, core.MessageFilter{Limit: core.MessagePageLimit + 1}); !core.IsCode(err, core.CodeInvalidArgument) {
 		t.Fatalf("oversized message page error = %v, want INVALID_ARGUMENT", err)
+	}
+}
+
+func TestEventHistoryUsesOpaqueIDCursorWithoutGapsOrDuplicates(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, filepath.Join(t.TempDir(), "event-pages.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	payload, err := json.Marshal(map[string]string{"text": strings.Repeat("\x01", 4000)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const eventCount = 47
+	if err := database.Transact(ctx, func(tx core.Transaction) error {
+		for index := 1; index <= eventCount; index++ {
+			if _, err := tx.AppendEvent(core.Event{
+				ProjectID: "prj_events", EntityType: "daemon", EntityID: "daemon",
+				Kind: fmt.Sprintf("test.event.%02d", index), ActorKind: "daemon",
+				PayloadJSON: string(payload), CreatedAt: readTestTime,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cursor := ""
+	seen := make(map[int64]bool, eventCount)
+	var previousOldest int64
+	for pageNumber := 0; pageNumber < eventCount; pageNumber++ {
+		page, err := database.EventsPage(ctx, core.EventFilter{
+			ProjectID: "prj_events", Cursor: cursor, Limit: core.MaximumEventPageLimit,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Items) == 0 {
+			t.Fatalf("event page %d made no cursor progress", pageNumber)
+		}
+		raw, err := json.Marshal(page)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(raw) >= pageDataJSONBudget {
+			t.Fatalf("event page %d exceeded JSON budget: %d", pageNumber, len(raw))
+		}
+		for index, event := range page.Items {
+			if index > 0 && page.Items[index-1].ID >= event.ID {
+				t.Fatalf("event page %d is not ascending: %#v", pageNumber, page.Items)
+			}
+			if seen[event.ID] {
+				t.Fatalf("event ID %d appeared more than once", event.ID)
+			}
+			seen[event.ID] = true
+		}
+		oldest := page.Items[0].ID
+		newest := page.Items[len(page.Items)-1].ID
+		if previousOldest > 0 && newest >= previousOldest {
+			t.Fatalf("page %d did not move to older IDs: newest=%d previous_oldest=%d", pageNumber, newest, previousOldest)
+		}
+		previousOldest = oldest
+		if page.NextCursor == "" {
+			cursor = ""
+			break
+		}
+		if page.NextCursor == fmt.Sprint(oldest) {
+			t.Fatalf("event cursor exposed the keyset ID: %q", page.NextCursor)
+		}
+		cursor = page.NextCursor
+	}
+	if cursor != "" || len(seen) != eventCount {
+		t.Fatalf("event traversal cursor=%q count=%d, want %d", cursor, len(seen), eventCount)
+	}
+	for id := int64(1); id <= eventCount; id++ {
+		if !seen[id] {
+			t.Fatalf("event traversal omitted ID %d", id)
+		}
+	}
+	if _, err := database.EventsPage(ctx, core.EventFilter{Cursor: "not-an-event-cursor"}); !core.IsCode(err, core.CodeInvalidArgument) {
+		t.Fatalf("invalid event cursor error = %v, want INVALID_ARGUMENT", err)
+	}
+	if _, err := database.EventsPage(ctx, core.EventFilter{Limit: core.MaximumEventPageLimit + 1}); !core.IsCode(err, core.CodeInvalidArgument) {
+		t.Fatalf("oversized event page error = %v, want INVALID_ARGUMENT", err)
 	}
 }
 

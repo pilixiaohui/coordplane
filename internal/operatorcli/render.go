@@ -70,9 +70,14 @@ func render(writer io.Writer, mode string, value any) error {
 			}
 			messages += task.PendingMessageCount + task.DeliveredMessageCount
 		}
-		if _, err := fmt.Fprintf(writer, "ready=%t\tprojects=%d\tagents=%d\ttasks=%d\truns=%d\tmessages=%d\n",
-			typed.DaemonReady, len(typed.Snapshot.Projects), len(typed.Snapshot.Agents), len(typed.Tasks), runs, messages); err != nil {
+		if _, err := fmt.Fprintf(writer, "ready=%t\tprojects_shown=%d\tagents_shown=%d\ttasks_shown=%d\truns_shown=%d\tmessages_for_shown_tasks=%d\tsummary_truncated=%t\n",
+			typed.DaemonReady, len(typed.Snapshot.Projects), len(typed.Snapshot.Agents), len(typed.Tasks), runs, messages, typed.SummaryTruncated); err != nil {
 			return err
+		}
+		if typed.SummaryTruncated {
+			if _, err := fmt.Fprintln(writer, `more=run "coordplane project list", "coordplane agent list", or "coordplane task list"; follow next_cursor until empty`); err != nil {
+				return err
+			}
 		}
 		for _, project := range projectViews(typed) {
 			if err := renderProjectStatus(writer, project); err != nil {
@@ -171,6 +176,13 @@ func render(writer io.Writer, mode string, value any) error {
 	case core.MessagePage:
 		for _, message := range typed.Items {
 			if err := renderMessage(writer, message); err != nil {
+				return err
+			}
+		}
+		return renderNextCursor(writer, typed.NextCursor)
+	case core.EventPage:
+		for _, event := range typed.Items {
+			if err := renderEvent(writer, event); err != nil {
 				return err
 			}
 		}
