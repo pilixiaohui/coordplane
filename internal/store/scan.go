@@ -1,0 +1,188 @@
+package store
+
+import (
+	"database/sql"
+
+	"coordplane/internal/core"
+)
+
+const projectSelect = `SELECT id,name,source,source_ref,initial_sha,control_repo_path,canonical_ref,canonical_sha,integration_agent_id,status,pending_action,pending_action_id,pending_started_at,last_error,version,created_at,updated_at FROM projects`
+const agentSelect = `SELECT id,display_name,adapter_id,image,instructions_file,status,version,created_at,updated_at FROM agents`
+const taskSelect = `SELECT id,project_id,kind,parent_task_id,retry_of_task_id,created_by_kind,created_by_id,assignee_agent_id,title,description,priority,status,current_run_id,generation,next_run_at,retry_count,max_retries,wait_reason,result_summary,failure_reason,base_sha,head_sha,head_run_id,task_ref,accepted_by_kind,accepted_by_id,accepted_at,accepted_integration_agent_id,final_canonical_sha,integration_task_id,source_task_id,source_run_id,source_task_ref,source_head_sha,source_accept_version,observed_canonical_sha,pending_action,pending_action_id,pending_action_version,pending_action_run_id,pending_expected_sha,pending_target_sha,pending_started_at,version,created_at,updated_at,submitted_at,completed_at,closed_at FROM tasks`
+const runSelect = `SELECT id,project_id,task_id,agent_id,generation,resumed_from_run_id,adapter_id,image,instructions_hash,state,workspace_path,container_id,native_session_id,log_path,token_hash,token_revoked_at,requested_outcome,requested_summary,expected_head,requested_at,stop_requested_at,stop_reason,stop_operation_id,heartbeat_at,exit_code,terminal_reason,last_error,cleanup_state,launch_nonce,launch_operation_id,launch_phase,home_path,container_name,deadline_at,last_observed_at,launch_mode,resume_native_session_id,runtime_error_code,cleanup_operation_id,version,created_at,started_at,ended_at FROM runs`
+const messageSelect = `SELECT id,project_id,task_id,related_task_id,sender_kind,sender_id,recipient_kind,recipient_id,reply_to_message_id,system_code,body,wake,state,delivered_run_id,delivery_count,max_deliveries,next_delivery_at,last_delivery_error,idempotency_key,version,created_at,delivered_at,acknowledged_at FROM messages`
+const eventSelect = `SELECT id,project_id,entity_type,entity_id,kind,actor_kind,actor_id,run_id,request_id,operation_id,payload_json,created_at FROM events`
+
+type scanner interface {
+	Scan(...any) error
+}
+
+func scanProject(row scanner) (core.Project, error) {
+	var project core.Project
+	err := row.Scan(
+		&project.ID, &project.Name, &project.Source, &project.SourceRef, &project.InitialSHA,
+		&project.ControlRepoPath, &project.CanonicalRef, &project.CanonicalSHA,
+		&project.IntegrationAgentID, &project.Status, &project.PendingAction,
+		&project.PendingActionID, &project.PendingStartedAt, &project.LastError,
+		&project.Version, &project.CreatedAt, &project.UpdatedAt,
+	)
+	return project, err
+}
+
+func scanAgent(row scanner) (core.Agent, error) {
+	var agent core.Agent
+	err := row.Scan(
+		&agent.ID, &agent.DisplayName, &agent.AdapterID, &agent.Image,
+		&agent.InstructionsFile, &agent.Status, &agent.Version, &agent.CreatedAt,
+		&agent.UpdatedAt,
+	)
+	return agent, err
+}
+
+func scanTask(row scanner) (core.Task, error) {
+	var task core.Task
+	err := row.Scan(
+		&task.ID, &task.ProjectID, &task.Kind, &task.ParentTaskID, &task.RetryOfTaskID,
+		&task.CreatedByKind, &task.CreatedByID, &task.AssigneeAgentID, &task.Title,
+		&task.Description, &task.Priority, &task.Status, &task.CurrentRunID,
+		&task.Generation, &task.NextRunAt, &task.RetryCount, &task.MaxRetries,
+		&task.WaitReason, &task.ResultSummary, &task.FailureReason, &task.BaseSHA,
+		&task.HeadSHA, &task.HeadRunID, &task.TaskRef, &task.AcceptedByKind,
+		&task.AcceptedByID, &task.AcceptedAt, &task.AcceptedIntegrationAgentID,
+		&task.FinalCanonicalSHA, &task.IntegrationTaskID, &task.SourceTaskID,
+		&task.SourceRunID, &task.SourceTaskRef, &task.SourceHeadSHA,
+		&task.SourceAcceptVersion, &task.ObservedCanonicalSHA, &task.PendingAction,
+		&task.PendingActionID, &task.PendingActionVersion, &task.PendingActionRunID,
+		&task.PendingExpectedSHA, &task.PendingTargetSHA, &task.PendingStartedAt,
+		&task.Version, &task.CreatedAt, &task.UpdatedAt, &task.SubmittedAt,
+		&task.CompletedAt, &task.ClosedAt,
+	)
+	return task, err
+}
+
+func scanRun(row scanner) (core.Run, error) {
+	var run core.Run
+	var exitCode sql.NullInt64
+	err := row.Scan(
+		&run.ID, &run.ProjectID, &run.TaskID, &run.AgentID, &run.Generation,
+		&run.ResumedFromRunID, &run.AdapterID, &run.Image, &run.InstructionsHash,
+		&run.State, &run.WorkspacePath, &run.ContainerID, &run.NativeSessionID,
+		&run.LogPath, &run.TokenHash, &run.TokenRevokedAt, &run.RequestedOutcome,
+		&run.RequestedSummary, &run.ExpectedHead, &run.RequestedAt,
+		&run.StopRequestedAt, &run.StopReason, &run.StopOperationID, &run.HeartbeatAt,
+		&exitCode, &run.TerminalReason, &run.LastError, &run.CleanupState,
+		&run.LaunchNonce, &run.LaunchOperationID, &run.LaunchPhase, &run.HomePath,
+		&run.ContainerName, &run.DeadlineAt, &run.LastObservedAt, &run.LaunchMode,
+		&run.ResumeNativeSessionID, &run.RuntimeErrorCode, &run.CleanupOperationID,
+		&run.Version, &run.CreatedAt, &run.StartedAt, &run.EndedAt,
+	)
+	if exitCode.Valid {
+		value := int(exitCode.Int64)
+		run.ExitCode = &value
+	}
+	return run, err
+}
+
+func scanMessage(row scanner) (core.Message, error) {
+	var message core.Message
+	var wake int
+	err := row.Scan(
+		&message.ID, &message.ProjectID, &message.TaskID, &message.RelatedTaskID,
+		&message.SenderKind, &message.SenderID, &message.RecipientKind,
+		&message.RecipientID, &message.ReplyToMessageID, &message.SystemCode,
+		&message.Body, &wake, &message.State, &message.DeliveredRunID,
+		&message.DeliveryCount, &message.MaxDeliveries, &message.NextDeliveryAt,
+		&message.LastDeliveryError, &message.IdempotencyKey, &message.Version,
+		&message.CreatedAt, &message.DeliveredAt, &message.AcknowledgedAt,
+	)
+	message.Wake = wake == 1
+	return message, err
+}
+
+func scanEvent(row scanner) (core.Event, error) {
+	var event core.Event
+	err := row.Scan(
+		&event.ID, &event.ProjectID, &event.EntityType, &event.EntityID, &event.Kind,
+		&event.ActorKind, &event.ActorID, &event.RunID, &event.RequestID,
+		&event.OperationID, &event.PayloadJSON, &event.CreatedAt,
+	)
+	return event, err
+}
+
+func collectProjects(rows *sql.Rows) ([]core.Project, error) {
+	defer rows.Close()
+	var projects []core.Project
+	for rows.Next() {
+		project, err := scanProject(rows)
+		if err != nil {
+			return nil, err
+		}
+		projects = append(projects, project)
+	}
+	return projects, rows.Err()
+}
+
+func collectAgents(rows *sql.Rows) ([]core.Agent, error) {
+	defer rows.Close()
+	var agents []core.Agent
+	for rows.Next() {
+		agent, err := scanAgent(rows)
+		if err != nil {
+			return nil, err
+		}
+		agents = append(agents, agent)
+	}
+	return agents, rows.Err()
+}
+
+func collectTasks(rows *sql.Rows) ([]core.Task, error) {
+	defer rows.Close()
+	var tasks []core.Task
+	for rows.Next() {
+		task, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, task)
+	}
+	return tasks, rows.Err()
+}
+
+func collectRuns(rows *sql.Rows) ([]core.Run, error) {
+	defer rows.Close()
+	var runs []core.Run
+	for rows.Next() {
+		run, err := scanRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, run)
+	}
+	return runs, rows.Err()
+}
+
+func collectMessages(rows *sql.Rows) ([]core.Message, error) {
+	defer rows.Close()
+	var messages []core.Message
+	for rows.Next() {
+		message, err := scanMessage(rows)
+		if err != nil {
+			return nil, err
+		}
+		messages = append(messages, message)
+	}
+	return messages, rows.Err()
+}
+
+func collectEvents(rows *sql.Rows) ([]core.Event, error) {
+	defer rows.Close()
+	var events []core.Event
+	for rows.Next() {
+		event, err := scanEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
+}

@@ -27,7 +27,7 @@ func TestMakeBuildProducesTraceableBinariesAndValidManifest(t *testing.T) {
 		wantCommit  = "build-gate-commit"
 	)
 	cmd := exec.Command("make", "build",
-		"COORDPLANE_RELEASE_HEALTH_DIR="+outputDir,
+		"BUILD_DIR="+outputDir,
 		"BUILD_VERSION="+wantVersion,
 		"BUILD_COMMIT="+wantCommit,
 		"BUILD_DIRTY=false",

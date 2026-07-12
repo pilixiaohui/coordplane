@@ -5,403 +5,239 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
-	"coordplane/internal/events"
-	"coordplane/internal/ids"
+	"coordplane/internal/core"
+
+	_ "modernc.org/sqlite"
 )
 
-const timeLayout = "2006-01-02T15:04:05.000000000Z07:00"
+const busyTimeoutMillis = 5000
+
+var allowedTables = map[string]bool{
+	"projects": true, "agents": true, "tasks": true, "runs": true,
+	"messages": true, "events": true, "schema_migrations": true,
+	"request_dedupes": true,
+}
 
 type Store struct {
-	db *sql.DB
-}
-
-func New(db *sql.DB) *Store {
-	return &Store{db: db}
-}
-
-func (s *Store) DB() *sql.DB {
-	return s.db
+	db   *sql.DB
+	path string
 }
 
 type MigrationResult struct {
-	Applied []string
+	Applied []int `json:"applied"`
 }
 
-type migration struct {
-	Version string
-	Name    string
-	SQL     string
-	ApplyTx func(context.Context, *sql.Tx) error
+type SchemaInfo struct {
+	Tables      []string `json:"tables"`
+	JournalMode string   `json:"journal_mode"`
+	ForeignKeys bool     `json:"foreign_keys"`
+	BusyTimeout int      `json:"busy_timeout_ms"`
 }
 
-var migrations = []migration{
-	{
-		Version: "001_core_store_queue_events",
-		Name:    "core store, event log, and DB queue",
-		SQL:     coreSchemaSQL,
-	},
-	{
-		Version: "002_team_config_skill_registry",
-		Name:    "TeamConfig and skill registry",
-		SQL:     teamConfigSkillSchemaSQL,
-	},
-	{
-		Version: "003_session_lifecycle_guards",
-		Name:    "session lifecycle prepare leases and active guards",
-		SQL:     sessionLifecycleSchemaSQL,
-	},
-	{
-		Version: "004_object_store",
-		Name:    "durable immutable object blobs",
-		SQL:     objectStoreSchemaSQL,
-	},
-	{
-		Version: "005_controlled_git_v1",
-		Name:    "controlled Git repositories, workspaces, operations, locks, and changesets",
-		SQL:     controlledGitSchemaSQL,
-	},
-	{
-		Version: "006_controlled_git_v2",
-		Name:    "controlled Git merge attempts, conflict sets, and rollback points",
-		SQL:     controlledGitV2SchemaSQL,
-	},
-	{
-		Version: "007_runtime_evidence",
-		Name:    "runtime instances and inspect evidence",
-		SQL:     runtimeEvidenceSchemaSQL,
-	},
-	{
-		Version: "008_cli_sessions",
-		Name:    "durable CLI sessions and process evidence",
-		SQL:     cliSessionSchemaSQL,
-	},
-	{
-		Version: "009_command_runs",
-		Name:    "agent-facing command runs and durable command evidence",
-		SQL:     commandRunSchemaSQL,
-	},
-	{
-		Version: "010_runtime_tokens",
-		Name:    "runtime-issued bearer token hashes",
-		SQL:     runtimeTokenSchemaSQL,
-	},
-	{
-		Version: "011_validation_assessments",
-		Name:    "canonical validation assessments and evidence",
-		SQL:     validationAssessmentSchemaSQL,
-	},
-	{
-		Version: "012_release_acceptances",
-		Name:    "release acceptance predicate ledger",
-		SQL:     releaseAcceptanceSchemaSQL,
-	},
-	{
-		Version: "013_contract_team_scopes",
-		Name:    "durable contract to TeamConfig scope binding",
-		SQL:     contractTeamScopeSchemaSQL,
-	},
-	{
-		Version: "014_agent_communication_envelopes",
-		Name:    "canonical agent communication envelopes and mailbox projection",
-		SQL:     agentCommunicationEnvelopeSchemaSQL,
-	},
-	{
-		Version: "015_controlled_git_operation_evidence",
-		Name:    "controlled Git repository aliases and operation execution evidence",
-		SQL:     controlledGitOperationEvidenceSchemaSQL,
-	},
-	{
-		Version: "016_controlled_git_operation_subject_kind",
-		Name:    "controlled Git operation subject origin evidence",
-		SQL:     controlledGitOperationSubjectKindSchemaSQL,
-	},
-	{
-		Version: "017_operator_task_runs",
-		Name:    "operator root task run idempotency ledger",
-		SQL:     operatorTaskRunsSchemaSQL,
-	},
-	{
-		Version: "018_capability_audit_outcomes",
-		Name:    "capability audit outcomes and runtime scope",
-		SQL:     capabilityAuditOutcomeSchemaSQL,
-	},
-	{
-		Version: "019_managed_runtime_cleanup",
-		Name:    "managed runtime cleanup ownership and recovery ledger",
-		SQL:     managedRuntimeCleanupSchemaSQL,
-	},
-	{
-		Version: "020_contract_completion_evidence",
-		Name:    "canonical contract completion evidence bindings",
-		SQL:     contractCompletionEvidenceSchemaSQL,
-	},
-	{
-		Version: "021_provider_tool_outcomes",
-		Name:    "redacted provider tool outcome projection",
-		SQL:     providerToolOutcomeSchemaSQL,
-	},
-	{
-		Version: "022_provider_audit_requirement",
-		Name:    "durable provider audit requirement",
-		SQL:     providerAuditRequirementSchemaSQL,
-	},
-	{
-		Version: "023_provider_audit_requirement_backfill",
-		Name:    "canonical provider audit requirement and legacy backfill",
-		SQL:     providerAuditRequirementBackfillSchemaSQL,
-		ApplyTx: backfillProviderAuditRequirements,
-	},
+func Open(ctx context.Context, path string) (*Store, error) {
+	path = strings.TrimSpace(path)
+	if path == "" || path == ":memory:" || strings.Contains(path, "mode=memory") {
+		return nil, core.NewError(core.CodeInvalidArgument, "store requires a file-backed SQLite path", false)
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return nil, core.WrapError(core.CodeInvalidArgument, "resolve SQLite path", false, err)
+	}
+	u := &url.URL{Scheme: "file", Path: filepath.ToSlash(absolute)}
+	query := u.Query()
+	query.Add("_pragma", "foreign_keys(1)")
+	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeoutMillis))
+	query.Add("_pragma", "journal_mode(WAL)")
+	u.RawQuery = query.Encode()
+	db, err := sql.Open("sqlite", u.String())
+	if err != nil {
+		return nil, core.WrapError(core.CodeInternal, "open SQLite", false, err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	store := &Store{db: db, path: absolute}
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, core.WrapError(core.CodeInternal, "open SQLite", false, err)
+	}
+	if _, err := store.Migrate(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.configure(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+func (s *Store) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
+}
+
+func (s *Store) Path() string {
+	if s == nil {
+		return ""
+	}
+	return s.path
 }
 
 func (s *Store) Migrate(ctx context.Context) (MigrationResult, error) {
 	if s == nil || s.db == nil {
-		return MigrationResult{}, errors.New("store: nil database")
+		return MigrationResult{}, core.NewError(core.CodeInternal, "nil store", false)
 	}
-	if _, err := s.db.ExecContext(ctx, `
-CREATE TABLE IF NOT EXISTS schema_migrations (
-  version TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  applied_at TEXT NOT NULL
-)`); err != nil {
-		return MigrationResult{}, fmt.Errorf("create schema_migrations: %w", err)
-	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
+	tables, err := s.tableNames(ctx)
 	if err != nil {
-		return MigrationResult{}, fmt.Errorf("begin migration tx: %w", err)
+		return MigrationResult{}, core.WrapError(core.CodeInternal, "inspect SQLite schema", false, err)
 	}
-	defer func() {
-		_ = tx.Rollback()
-	}()
-
-	var result MigrationResult
-	for _, m := range migrations {
-		var existing string
-		err := tx.QueryRowContext(ctx, `SELECT version FROM schema_migrations WHERE version = ?`, m.Version).Scan(&existing)
-		switch {
-		case err == nil:
-			continue
-		case errors.Is(err, sql.ErrNoRows):
-		default:
-			return MigrationResult{}, fmt.Errorf("read migration %s: %w", m.Version, err)
+	if err := validateExistingTables(tables); err != nil {
+		return MigrationResult{}, err
+	}
+	result := MigrationResult{}
+	if len(tables) == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return MigrationResult{}, core.WrapError(core.CodeInternal, "begin schema migration", false, err)
 		}
-
-		if err := execStatements(ctx, tx, m.SQL); err != nil {
-			return MigrationResult{}, fmt.Errorf("apply migration %s: %w", m.Version, err)
-		}
-		if m.ApplyTx != nil {
-			if err := m.ApplyTx(ctx, tx); err != nil {
-				return MigrationResult{}, fmt.Errorf("backfill migration %s: %w", m.Version, err)
+		defer tx.Rollback()
+		for _, statement := range splitStatements(schemaSQL) {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return MigrationResult{}, core.WrapError(core.CodeInternal, "apply schema migration", false, err)
 			}
 		}
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)`,
-			m.Version, m.Name, formatTime(time.Now()),
-		); err != nil {
-			return MigrationResult{}, fmt.Errorf("record migration %s: %w", m.Version, err)
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, schemaVersion, schemaName, now); err != nil {
+			return MigrationResult{}, core.WrapError(core.CodeInternal, "record schema migration", false, err)
 		}
-		result.Applied = append(result.Applied, m.Version)
+		if err := tx.Commit(); err != nil {
+			return MigrationResult{}, core.WrapError(core.CodeInternal, "commit schema migration", false, err)
+		}
+		result.Applied = []int{schemaVersion}
 	}
-
-	if err := tx.Commit(); err != nil {
-		return MigrationResult{}, fmt.Errorf("commit migrations: %w", err)
+	if len(tables) > 0 && len(tables) != len(allowedTables) {
+		return MigrationResult{}, core.NewError(core.CodeLegacySchemaRebuildRequired, "incomplete CoordPlane v1 schema requires backup and a new data_dir", false)
+	}
+	if err := s.validateCanonicalDatabase(ctx); err != nil {
+		return MigrationResult{}, err
 	}
 	return result, nil
 }
 
-func (s *Store) Tx(ctx context.Context, fn func(context.Context, *sql.Tx) error) error {
+func (s *Store) SchemaInfo(ctx context.Context) (SchemaInfo, error) {
+	tables, err := s.tableNames(ctx)
+	if err != nil {
+		return SchemaInfo{}, err
+	}
+	info := SchemaInfo{Tables: tables}
+	var foreignKeys int
+	if err := s.db.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&info.JournalMode); err != nil {
+		return SchemaInfo{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+		return SchemaInfo{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&info.BusyTimeout); err != nil {
+		return SchemaInfo{}, err
+	}
+	info.ForeignKeys = foreignKeys == 1
+	return info, nil
+}
+
+func (s *Store) configure(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `PRAGMA foreign_keys=ON`); err != nil {
+		return core.WrapError(core.CodeInternal, "enable SQLite foreign keys", false, err)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`PRAGMA busy_timeout=%d`, busyTimeoutMillis)); err != nil {
+		return core.WrapError(core.CodeInternal, "configure SQLite busy timeout", false, err)
+	}
+	var mode string
+	if err := s.db.QueryRowContext(ctx, `PRAGMA journal_mode=WAL`).Scan(&mode); err != nil {
+		return core.WrapError(core.CodeInternal, "enable SQLite WAL", false, err)
+	}
+	if !strings.EqualFold(mode, "wal") {
+		return core.NewError(core.CodeInternal, "SQLite did not enter WAL mode", false)
+	}
+	return nil
+}
+
+func (s *Store) Transact(ctx context.Context, fn func(core.Transaction) error) error {
 	if s == nil || s.db == nil {
-		return errors.New("store: nil database")
+		return core.NewError(core.CodeInternal, "nil store", false)
+	}
+	if fn == nil {
+		return core.NewError(core.CodeInvalidArgument, "transaction callback is required", false)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
+		return core.WrapError(core.CodeInternal, "begin transaction", true, err)
 	}
-	defer func() {
-		_ = tx.Rollback()
-	}()
-	if err := fn(ctx, tx); err != nil {
+	defer tx.Rollback()
+	if err := fn(&unitOfWork{ctx: ctx, tx: tx}); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit tx: %w", err)
+		return core.WrapError(core.CodeInternal, "commit transaction", true, err)
 	}
 	return nil
 }
 
-func (s *Store) AppendEvent(ctx context.Context, event events.Event) (string, error) {
-	if s == nil || s.db == nil {
-		return "", errors.New("store: nil database")
-	}
-	return appendEvent(ctx, s.db, event)
-}
-
-func AppendEventTx(ctx context.Context, tx *sql.Tx, event events.Event) (string, error) {
-	if tx == nil {
-		return "", errors.New("store: nil transaction")
-	}
-	return appendEvent(ctx, tx, event)
-}
-
-type eventExecer interface {
-	ExecContext(context.Context, string, ...any) (sql.Result, error)
-}
-
-func appendEvent(ctx context.Context, execer eventExecer, event events.Event) (string, error) {
-	if event.Type == "" {
-		return "", errors.New("store: event type is required")
-	}
-	if event.AggregateType == "" {
-		return "", errors.New("store: event aggregate type is required")
-	}
-	if event.AggregateID == "" {
-		return "", errors.New("store: event aggregate id is required")
-	}
-	if event.ID == "" {
-		id, err := ids.New("evt")
-		if err != nil {
-			return "", err
-		}
-		event.ID = id
-	}
-	if event.TenantID == "" {
-		event.TenantID = "default"
-	}
-	if event.OccurredAt.IsZero() {
-		event.OccurredAt = time.Now()
-	}
-	payload := string(event.PayloadJSON)
-	if payload == "" {
-		payload = "{}"
-	}
-
-	_, err := execer.ExecContext(ctx, `
-INSERT INTO events (
-  id, tenant_id, trace_id, subject_kind, subject_id, agent_id, runtime_id,
-  capability_name, event_type, aggregate_type, aggregate_id, payload_json, occurred_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		event.ID, event.TenantID, event.TraceID, event.SubjectKind, event.SubjectID,
-		event.AgentID, event.RuntimeID, event.CapabilityName, event.Type,
-		event.AggregateType, event.AggregateID, payload, formatTime(event.OccurredAt),
-	)
+func (s *Store) tableNames(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
 	if err != nil {
-		return "", fmt.Errorf("append event %s: %w", event.Type, err)
-	}
-	return event.ID, nil
-}
-
-type EventFilter struct {
-	TraceID       string
-	AggregateID   string
-	AggregateType string
-	Limit         int
-}
-
-func (s *Store) ListEvents(ctx context.Context, filter EventFilter) ([]events.Event, error) {
-	if s == nil || s.db == nil {
-		return nil, errors.New("store: nil database")
-	}
-	clauses := make([]string, 0, 3)
-	args := make([]any, 0, 4)
-	if filter.TraceID != "" {
-		clauses = append(clauses, "trace_id = ?")
-		args = append(args, filter.TraceID)
-	}
-	if filter.AggregateID != "" {
-		clauses = append(clauses, "aggregate_id = ?")
-		args = append(args, filter.AggregateID)
-	}
-	if filter.AggregateType != "" {
-		clauses = append(clauses, "aggregate_type = ?")
-		args = append(args, filter.AggregateType)
-	}
-
-	query := `SELECT id, tenant_id, trace_id, subject_kind, subject_id, agent_id, runtime_id,
-  capability_name, event_type, aggregate_type, aggregate_id, payload_json, occurred_at
-FROM events`
-	if len(clauses) > 0 {
-		query += " WHERE " + strings.Join(clauses, " AND ")
-	}
-	query += " ORDER BY occurred_at ASC, id ASC"
-	if filter.Limit > 0 {
-		query += " LIMIT ?"
-		args = append(args, filter.Limit)
-	}
-
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("list events: %w", err)
+		return nil, err
 	}
 	defer rows.Close()
-
-	var out []events.Event
+	var names []string
 	for rows.Next() {
-		event, err := scanEvent(rows)
-		if err != nil {
+		var name string
+		if err := rows.Scan(&name); err != nil {
 			return nil, err
 		}
-		out = append(out, event)
+		names = append(names, name)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate events: %w", err)
-	}
-	return out, nil
+	return names, rows.Err()
 }
 
-type eventScanner interface {
-	Scan(...any) error
-}
-
-func scanEvent(row eventScanner) (events.Event, error) {
-	var event events.Event
-	var payload string
-	var occurredAt string
-	if err := row.Scan(
-		&event.ID,
-		&event.TenantID,
-		&event.TraceID,
-		&event.SubjectKind,
-		&event.SubjectID,
-		&event.AgentID,
-		&event.RuntimeID,
-		&event.CapabilityName,
-		&event.Type,
-		&event.AggregateType,
-		&event.AggregateID,
-		&payload,
-		&occurredAt,
-	); err != nil {
-		return events.Event{}, fmt.Errorf("scan event: %w", err)
+func validateExistingTables(tables []string) error {
+	if len(tables) == 0 {
+		return nil
 	}
-	parsed, err := parseTime(occurredAt)
-	if err != nil {
-		return events.Event{}, fmt.Errorf("parse event time: %w", err)
-	}
-	event.PayloadJSON = []byte(payload)
-	event.OccurredAt = parsed
-	return event, nil
-}
-
-func execStatements(ctx context.Context, tx *sql.Tx, script string) error {
-	for _, statement := range strings.Split(script, ";") {
-		statement = strings.TrimSpace(statement)
-		if statement == "" {
-			continue
+	var unexpected []string
+	for _, table := range tables {
+		if !allowedTables[table] {
+			unexpected = append(unexpected, table)
 		}
-		if _, err := tx.ExecContext(ctx, statement); err != nil {
-			return err
-		}
+	}
+	if len(unexpected) > 0 {
+		sort.Strings(unexpected)
+		return core.NewError(core.CodeLegacySchemaRebuildRequired, "legacy database tables detected: "+strings.Join(unexpected, ", "), false)
 	}
 	return nil
 }
 
-func formatTime(t time.Time) string {
-	return t.UTC().Format(timeLayout)
+func splitStatements(script string) []string {
+	parts := strings.Split(script, ";")
+	statements := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			statements = append(statements, part)
+		}
+	}
+	return statements
 }
 
-func parseTime(value string) (time.Time, error) {
-	return time.Parse(timeLayout, value)
+func mapNotFound(entity, id string, err error) error {
+	if errors.Is(err, sql.ErrNoRows) {
+		return core.NewError(core.CodeNotFound, fmt.Sprintf("%s %q was not found", entity, id), false)
+	}
+	return err
 }

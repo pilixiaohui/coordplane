@@ -1,507 +1,243 @@
 package coordlinkcli
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"os"
 	"strings"
 
 	"coordplane/internal/buildinfo"
-	"coordplane/internal/capability"
+	"coordplane/internal/core"
+	"coordplane/internal/transport"
 )
-
-type EnvFunc func(string) string
 
 const (
-	providerPolicyModeEnv       = "COORDPLANE_PROVIDER_POLICY_MODE"
-	providerPolicyModeStrict    = "strict_coordlink_call"
-	providerPolicyAllowlistEnv  = "COORDPLANE_PROVIDER_ALLOWED_CAPABILITIES"
-	providerPolicyAuditTraceEnv = "COORDPLANE_PROVIDER_AUDIT_TRACE_ID"
-	providerPolicyAuditAgentEnv = "COORDPLANE_PROVIDER_AUDIT_AGENT_ID"
-	providerPolicyAuditLeaseEnv = "COORDPLANE_PROVIDER_AUDIT_LEASE_ID"
+	socketEnvironment = "COORDPLANE_RUN_SOCKET"
+	tokenEnvironment  = "COORDPLANE_RUN_TOKEN"
 )
 
-type commonConfig struct {
-	BackendURL  string
-	AgentID     string
-	RuntimeID   string
-	WorkspaceID string
-	Token       string
-	TenantID    string
-}
+type environment func(string) string
 
-func Run(ctx context.Context, args []string, getenv EnvFunc, stdin io.Reader, stdout, stderr io.Writer) int {
+func Run(ctx context.Context, args []string, getenv environment, stdin io.Reader, stdout, stderr io.Writer) int {
+	_ = stdin
 	if getenv == nil {
-		getenv = os.Getenv
-	}
-	if stdin == nil {
-		stdin = os.Stdin
-	}
-	if stdout == nil {
-		stdout = os.Stdout
-	}
-	if stderr == nil {
-		stderr = os.Stderr
+		getenv = func(string) string { return "" }
 	}
 	if len(args) == 0 {
-		usage(stderr)
-		return 2
+		printUsage(stdout)
+		return 0
 	}
-	switch args[0] {
-	case "version":
+	if args[0] == "version" {
 		if err := json.NewEncoder(stdout).Encode(buildinfo.Current()); err != nil {
-			fmt.Fprintf(stderr, "coordlink version: %v\n", err)
+			fmt.Fprintln(stderr, err)
 			return 1
 		}
 		return 0
-	case "capability":
-		return runCapability(ctx, args[1:], getenv, stdout, stderr)
-	case "call":
-		return runCall(ctx, args[1:], getenv, stdin, stdout, stderr)
-	case "skill":
-		return runSkill(ctx, args[1:], getenv, stdout, stderr)
-	case "-h", "--help", "help":
-		usage(stdout)
-		return 0
-	default:
-		fmt.Fprintf(stderr, "coordlink: unknown command %q\n", args[0])
-		usage(stderr)
-		return 2
 	}
+	if args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
+		printUsage(stdout)
+		return 0
+	}
+	if args[0] != "task" && args[0] != "progress" && args[0] != "message" {
+		fmt.Fprintf(stderr, "unknown coordlink command %q\n", args[0])
+		return 1
+	}
+	client, err := scopedClient(getenv)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	defer client.CloseIdleConnections()
+
+	var runErr error
+	switch args[0] {
+	case "task":
+		runErr = runTask(ctx, client, args[1:], stdout, stderr)
+	case "progress":
+		runErr = runProgress(ctx, client, args[1:], stdout, stderr)
+	case "message":
+		runErr = runMessage(ctx, client, args[1:], stdout, stderr)
+	default:
+		runErr = fmt.Errorf("unknown coordlink command %q", args[0])
+	}
+	if runErr != nil {
+		fmt.Fprintln(stderr, runErr)
+		return 1
+	}
+	return 0
 }
 
-func runCapability(ctx context.Context, args []string, getenv EnvFunc, stdout, stderr io.Writer) int {
+func runTask(ctx context.Context, client *transport.Client, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "coordlink capability: missing subcommand")
-		return 2
+		return errors.New("task subcommand is required")
 	}
 	switch args[0] {
-	case "list":
-		cfg, ok := parseCommon("coordlink capability list", args[1:], getenv, stderr)
-		if !ok {
-			return 2
+	case "current":
+		flags, output := outputFlags("task current", stderr)
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
 		}
-		if err := cfg.validate(); err != nil {
-			fmt.Fprintln(stderr, err)
-			return 2
+		if flags.NArg() != 0 {
+			return errors.New("unexpected positional arguments")
 		}
-		endpoint := strings.TrimRight(cfg.BackendURL, "/") + "/capabilities?agent_id=" + url.QueryEscape(cfg.AgentID)
-		return do(ctx, http.MethodGet, endpoint, nil, cfg, stdout, stderr)
+		if err := validateOutput(*output); err != nil {
+			return err
+		}
+		var task core.Task
+		if err := client.JSON(ctx, http.MethodGet, "/v1/task/current", nil, &task); err != nil {
+			return err
+		}
+		return render(stdout, *output, task)
+	case "wait":
+		return runOutcome(ctx, client, "wait", args[1:], stdout, stderr)
+	case "submit":
+		return runOutcome(ctx, client, "submit", args[1:], stdout, stderr)
+	case "fail":
+		return runOutcome(ctx, client, "fail", args[1:], stdout, stderr)
 	default:
-		fmt.Fprintf(stderr, "coordlink capability: unknown subcommand %q\n", args[0])
-		return 2
+		return fmt.Errorf("unknown task subcommand %q", args[0])
 	}
 }
 
-func runCall(ctx context.Context, args []string, getenv EnvFunc, stdin io.Reader, stdout, stderr io.Writer) int {
-	if len(args) == 0 {
-		fmt.Fprintln(stderr, "coordlink call: missing capability name")
-		return 2
+func runOutcome(ctx context.Context, client *transport.Client, outcome string, args []string, stdout, stderr io.Writer) error {
+	flags, output := outputFlags("task "+outcome, stderr)
+	var input core.OutcomeInput
+	flags.StringVar(&input.RequestID, "request-id", "", "idempotency key")
+	flags.StringVar(&input.Reason, "reason", "", "wait or failure reason")
+	flags.StringVar(&input.Summary, "summary", "", "result summary")
+	flags.StringVar(&input.ExpectedHead, "expected-head", "", "expected workspace HEAD")
+	if err := flags.Parse(args); err != nil {
+		return err
 	}
-	capabilityName := args[0]
-	strictProviderPolicy := providerPolicyStrict(getenv)
-	if strictProviderPolicy {
-		if err := validateProviderPolicyCallArgs(capabilityName, args[1:], getenv); err != nil {
-			fmt.Fprintln(stderr, err)
-			return 2
-		}
+	if flags.NArg() != 0 {
+		return errors.New("unexpected positional arguments")
 	}
-	fs := flag.NewFlagSet("coordlink call", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	cfg := commonFromEnv(getenv)
-	addCommonFlags(fs, &cfg)
-	inputValue := fs.String("input", "{}", "JSON input object; use '-' to read stdin")
-	inputFile := fs.String("input-file", "", "file containing JSON input object")
-	scopeValue := fs.String("scope", "", "JSON scope object")
-	leaseID := fs.String("lease-id", getenv("COORDPLANE_LEASE_ID"), "lease id to include in scope when --scope is omitted")
-	traceID := fs.String("trace-id", getenv("COORDPLANE_TRACE_ID"), "trace id")
-	idempotencyKey := fs.String("idempotency-key", "", "idempotency key")
-	if err := fs.Parse(args[1:]); err != nil {
-		return 2
+	if err := validateOutput(*output); err != nil {
+		return err
 	}
-	if err := cfg.validate(); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 2
+	input.Outcome = outcome
+	var task core.Task
+	if err := client.JSON(ctx, http.MethodPost, "/v1/task/outcome", input, &task); err != nil {
+		return err
 	}
-	if strictProviderPolicy {
-		if err := validateProviderPolicyCallEnv(capabilityName, cfg, *traceID, *leaseID, getenv); err != nil {
-			fmt.Fprintln(stderr, err)
-			return 2
-		}
-	}
-	input, err := rawInput(*inputValue, *inputFile, stdin)
-	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 2
-	}
-	scope, err := rawScope(*scopeValue, *leaseID)
-	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 2
-	}
-	call := capability.Call{
-		CapabilityName: capabilityName,
-		TraceID:        *traceID,
-		IdempotencyKey: *idempotencyKey,
-		Subject: capability.Subject{
-			TenantID:    cfg.TenantID,
-			Kind:        "agent",
-			ID:          cfg.AgentID,
-			AgentID:     cfg.AgentID,
-			RuntimeID:   cfg.RuntimeID,
-			WorkspaceID: cfg.WorkspaceID,
-		},
-		Scope: scope,
-		Input: input,
-	}
-	body, err := json.Marshal(call)
-	if err != nil {
-		fmt.Fprintf(stderr, "coordlink call: marshal request: %v\n", err)
-		return 2
-	}
-	endpoint := strings.TrimRight(cfg.BackendURL, "/") + "/call"
-	return do(ctx, http.MethodPost, endpoint, body, cfg, stdout, stderr)
+	return render(stdout, *output, task)
 }
 
-func providerPolicyStrict(getenv EnvFunc) bool {
-	return strings.TrimSpace(getenv(providerPolicyModeEnv)) == providerPolicyModeStrict
+func runProgress(ctx context.Context, client *transport.Client, args []string, stdout, stderr io.Writer) error {
+	flags, output := outputFlags("progress", stderr)
+	var input core.ProgressInput
+	flags.StringVar(&input.Summary, "summary", "", "short progress summary")
+	flags.StringVar(&input.RequestID, "request-id", "", "idempotency key")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("unexpected positional arguments")
+	}
+	if err := validateOutput(*output); err != nil {
+		return err
+	}
+	var event core.Event
+	if err := client.JSON(ctx, http.MethodPost, "/v1/progress", input, &event); err != nil {
+		return err
+	}
+	return render(stdout, *output, event)
 }
 
-func validateProviderPolicyCallArgs(capabilityName string, tail []string, getenv EnvFunc) error {
-	if !providerPolicyCapabilityAllowed(capabilityName, getenv(providerPolicyAllowlistEnv)) {
-		return providerPolicyDenied()
+func runMessage(ctx context.Context, client *transport.Client, args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 || args[0] != "send" {
+		return errors.New("message subcommand must be send")
 	}
-	seenInput := false
-	seenIdempotency := false
-	for i := 0; i < len(tail); i++ {
-		arg := tail[i]
-		if arg == "" || !strings.HasPrefix(arg, "--") {
-			return providerPolicyDenied()
-		}
-		name, value, hasValue := strings.Cut(arg, "=")
-		switch name {
-		case "--input":
-			if seenInput {
-				return providerPolicyDenied()
-			}
-			if !hasValue {
-				i++
-				if i >= len(tail) || strings.HasPrefix(tail[i], "--") {
-					return providerPolicyDenied()
-				}
-				value = tail[i]
-			}
-			if !providerPolicyJSONObject(value) {
-				return providerPolicyDenied()
-			}
-			seenInput = true
-		case "--idempotency-key":
-			if seenIdempotency {
-				return providerPolicyDenied()
-			}
-			if !hasValue {
-				i++
-				if i >= len(tail) || strings.HasPrefix(tail[i], "--") {
-					return providerPolicyDenied()
-				}
-				value = tail[i]
-			}
-			if !providerPolicyIdempotencyKey(value) {
-				return providerPolicyDenied()
-			}
-			seenIdempotency = true
+	flags, output := outputFlags("message send", stderr)
+	var input core.AgentMessageInput
+	var toBoss bool
+	flags.BoolVar(&toBoss, "to-boss", false, "send to Boss")
+	flags.StringVar(&input.Body, "body", "", "message body")
+	flags.StringVar(&input.ReplyTo, "reply-to", "", "message being replied to")
+	flags.StringVar(&input.RequestID, "request-id", "", "idempotency key")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if !toBoss {
+		return errors.New("P1 message send requires --to-boss")
+	}
+	if flags.NArg() != 0 {
+		return errors.New("unexpected positional arguments")
+	}
+	if err := validateOutput(*output); err != nil {
+		return err
+	}
+	var message core.Message
+	if err := client.JSON(ctx, http.MethodPost, "/v1/message", input, &message); err != nil {
+		return err
+	}
+	return render(stdout, *output, message)
+}
+
+func scopedClient(getenv environment) (*transport.Client, error) {
+	socket := strings.TrimSpace(getenv(socketEnvironment))
+	if socket == "" {
+		return nil, fmt.Errorf("%s is required", socketEnvironment)
+	}
+	token := strings.TrimSpace(getenv(tokenEnvironment))
+	if token == "" {
+		return nil, fmt.Errorf("%s is required", tokenEnvironment)
+	}
+	return transport.NewUnixClient(socket, transport.WithBearerToken(token))
+}
+
+func outputFlags(name string, stderr io.Writer) (*flag.FlagSet, *string) {
+	flags := flag.NewFlagSet(name, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	output := flags.String("output", "human", "human or json")
+	return flags, output
+}
+
+func render(writer io.Writer, mode string, value any) error {
+	if err := validateOutput(mode); err != nil {
+		return err
+	}
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "json":
+		return json.NewEncoder(writer).Encode(value)
+	case "human", "":
+		switch typed := value.(type) {
+		case core.Task:
+			_, err := fmt.Fprintf(writer, "%s\t%s\t%s\n", typed.ID, typed.Status, typed.Title)
+			return err
+		case core.Message:
+			_, err := fmt.Fprintf(writer, "%s\t%s\t%s\n", typed.ID, typed.State, typed.Body)
+			return err
+		case core.Event:
+			_, err := fmt.Fprintf(writer, "%d\t%s\t%s\n", typed.ID, typed.Kind, typed.EntityID)
+			return err
 		default:
-			return providerPolicyDenied()
+			return json.NewEncoder(writer).Encode(value)
 		}
 	}
 	return nil
 }
 
-func providerPolicyJSONObject(raw string) bool {
-	decoder := json.NewDecoder(bytes.NewBufferString(raw))
-	decoder.UseNumber()
-	var value any
-	if err := decoder.Decode(&value); err != nil {
-		return false
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return false
-	}
-	object, ok := value.(map[string]any)
-	return ok && object != nil
-}
-
-func providerPolicyIdempotencyKey(value string) bool {
-	if value == "" || len(value) > 128 {
-		return false
-	}
-	for _, char := range value {
-		switch {
-		case char >= 'a' && char <= 'z':
-		case char >= 'A' && char <= 'Z':
-		case char >= '0' && char <= '9':
-		case char == '.', char == '_', char == '-', char == ':':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-func validateProviderPolicyCallEnv(capabilityName string, cfg commonConfig, traceID, leaseID string, getenv EnvFunc) error {
-	if !providerPolicyCapabilityAllowed(capabilityName, getenv(providerPolicyAllowlistEnv)) {
-		return providerPolicyDenied()
-	}
-	if cfg.BackendURL == "" || cfg.AgentID == "" || cfg.RuntimeID == "" || cfg.WorkspaceID == "" ||
-		cfg.Token == "" || traceID == "" || leaseID == "" {
-		return providerPolicyDenied()
-	}
-	for _, check := range []struct {
-		got  string
-		want string
-	}{
-		{got: cfg.BackendURL, want: getenv("COORDPLANE_BACKEND_URL")},
-		{got: cfg.AgentID, want: getenv("COORDPLANE_AGENT_ID")},
-		{got: cfg.RuntimeID, want: getenv("COORDPLANE_RUNTIME_ID")},
-		{got: cfg.WorkspaceID, want: getenv("COORDPLANE_WORKSPACE_ID")},
-		{got: cfg.Token, want: getenv("COORDPLANE_TOKEN")},
-		{got: traceID, want: getenv("COORDPLANE_TRACE_ID")},
-		{got: leaseID, want: getenv("COORDPLANE_LEASE_ID")},
-	} {
-		if strings.TrimSpace(check.want) == "" || check.got != check.want {
-			return providerPolicyDenied()
-		}
-	}
-	for _, check := range []struct {
-		got  string
-		want string
-	}{
-		{got: traceID, want: getenv(providerPolicyAuditTraceEnv)},
-		{got: cfg.AgentID, want: getenv(providerPolicyAuditAgentEnv)},
-		{got: leaseID, want: getenv(providerPolicyAuditLeaseEnv)},
-	} {
-		if strings.TrimSpace(check.want) != "" && check.got != check.want {
-			return providerPolicyDenied()
-		}
-	}
-	return nil
-}
-
-func providerPolicyCapabilityAllowed(capabilityName, rawAllowlist string) bool {
-	capabilityName = strings.TrimSpace(capabilityName)
-	if capabilityName == "" || strings.HasPrefix(capabilityName, "-") {
-		return false
-	}
-	for _, allowed := range strings.Split(rawAllowlist, ",") {
-		if capabilityName == strings.TrimSpace(allowed) {
-			return true
-		}
-	}
-	return false
-}
-
-func providerPolicyDenied() error {
-	return fmt.Errorf("COORDLINK_PROVIDER_POLICY_REJECTED: only inline JSON object --input and a restricted --idempotency-key are allowed")
-}
-
-func runSkill(ctx context.Context, args []string, getenv EnvFunc, stdout, stderr io.Writer) int {
-	if len(args) == 0 {
-		fmt.Fprintln(stderr, "coordlink skill: missing subcommand")
-		return 2
-	}
-	switch args[0] {
-	case "list":
-		cfg, ok := parseCommon("coordlink skill list", args[1:], getenv, stderr)
-		if !ok {
-			return 2
-		}
-		if err := cfg.validate(); err != nil {
-			fmt.Fprintln(stderr, err)
-			return 2
-		}
-		endpoint := strings.TrimRight(cfg.BackendURL, "/") + "/skills?agent_id=" + url.QueryEscape(cfg.AgentID)
-		return do(ctx, http.MethodGet, endpoint, nil, cfg, stdout, stderr)
-	case "read":
-		if len(args) < 2 {
-			fmt.Fprintln(stderr, "coordlink skill read: missing skill name")
-			return 2
-		}
-		name := args[1]
-		cfg, ok := parseCommon("coordlink skill read", args[2:], getenv, stderr)
-		if !ok {
-			return 2
-		}
-		if err := cfg.validate(); err != nil {
-			fmt.Fprintln(stderr, err)
-			return 2
-		}
-		endpoint := strings.TrimRight(cfg.BackendURL, "/") + "/skills/" + url.PathEscape(name) + "?agent_id=" + url.QueryEscape(cfg.AgentID)
-		return do(ctx, http.MethodGet, endpoint, nil, cfg, stdout, stderr)
+func validateOutput(mode string) error {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "human", "json":
+		return nil
 	default:
-		fmt.Fprintf(stderr, "coordlink skill: unknown subcommand %q\n", args[0])
-		return 2
+		return errors.New("--output must be human or json")
 	}
 }
 
-func parseCommon(name string, args []string, getenv EnvFunc, stderr io.Writer) (commonConfig, bool) {
-	fs := flag.NewFlagSet(name, flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	cfg := commonFromEnv(getenv)
-	addCommonFlags(fs, &cfg)
-	if err := fs.Parse(args); err != nil {
-		return commonConfig{}, false
-	}
-	return cfg, true
-}
-
-func commonFromEnv(getenv EnvFunc) commonConfig {
-	cfg := commonConfig{
-		BackendURL:  getenv("COORDPLANE_BACKEND_URL"),
-		AgentID:     getenv("COORDPLANE_AGENT_ID"),
-		RuntimeID:   getenv("COORDPLANE_RUNTIME_ID"),
-		WorkspaceID: getenv("COORDPLANE_WORKSPACE_ID"),
-		Token:       getenv("COORDPLANE_TOKEN"),
-		TenantID:    getenv("COORDPLANE_TENANT_ID"),
-	}
-	if cfg.TenantID == "" {
-		cfg.TenantID = "default"
-	}
-	return cfg
-}
-
-func addCommonFlags(fs *flag.FlagSet, cfg *commonConfig) {
-	fs.StringVar(&cfg.BackendURL, "backend", cfg.BackendURL, "CoordPlane backend URL")
-	fs.StringVar(&cfg.AgentID, "agent", cfg.AgentID, "agent id")
-	fs.StringVar(&cfg.RuntimeID, "runtime", cfg.RuntimeID, "runtime id")
-	fs.StringVar(&cfg.WorkspaceID, "workspace", cfg.WorkspaceID, "workspace id")
-	fs.StringVar(&cfg.Token, "token", cfg.Token, "agent token")
-	fs.StringVar(&cfg.TenantID, "tenant", cfg.TenantID, "tenant id")
-}
-
-func (c commonConfig) validate() error {
-	if c.BackendURL == "" {
-		return fmt.Errorf("coordlink: backend URL is required via --backend or COORDPLANE_BACKEND_URL")
-	}
-	if c.AgentID == "" {
-		return fmt.Errorf("coordlink: agent id is required via --agent or COORDPLANE_AGENT_ID")
-	}
-	return nil
-}
-
-func rawInput(inputValue, inputFile string, stdin io.Reader) (json.RawMessage, error) {
-	var raw []byte
-	var err error
-	switch {
-	case inputFile != "":
-		raw, err = os.ReadFile(inputFile)
-	case inputValue == "-":
-		raw, err = io.ReadAll(stdin)
-	default:
-		raw = []byte(inputValue)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("coordlink call: read input: %w", err)
-	}
-	return rawObject(raw, "input")
-}
-
-func rawScope(scopeValue, leaseID string) (json.RawMessage, error) {
-	if strings.TrimSpace(scopeValue) != "" {
-		return rawObject([]byte(scopeValue), "scope")
-	}
-	if leaseID != "" {
-		raw, err := json.Marshal(map[string]string{"lease_id": leaseID})
-		if err != nil {
-			return nil, err
-		}
-		return json.RawMessage(raw), nil
-	}
-	return json.RawMessage(`{}`), nil
-}
-
-func rawObject(raw []byte, field string) (json.RawMessage, error) {
-	if strings.TrimSpace(string(raw)) == "" {
-		raw = []byte(`{}`)
-	}
-	var decoded map[string]any
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		return nil, fmt.Errorf("coordlink call: %s must be a JSON object: %w", field, err)
-	}
-	normalized, err := json.Marshal(decoded)
-	if err != nil {
-		return nil, err
-	}
-	return json.RawMessage(normalized), nil
-}
-
-func do(ctx context.Context, method, endpoint string, body []byte, cfg commonConfig, stdout, stderr io.Writer) int {
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
-	if err != nil {
-		fmt.Fprintf(stderr, "coordlink: create request: %v\n", err)
-		return 1
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-CoordPlane-Agent-ID", cfg.AgentID)
-	if cfg.RuntimeID != "" {
-		req.Header.Set("X-CoordPlane-Runtime-ID", cfg.RuntimeID)
-	}
-	if cfg.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+cfg.Token)
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		fmt.Fprintf(stderr, "coordlink: request failed: %v\n", err)
-		return 1
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Fprintf(stderr, "coordlink: read response: %v\n", err)
-		return 1
-	}
-	if len(raw) > 0 {
-		_, _ = stdout.Write(raw)
-		if raw[len(raw)-1] != '\n' {
-			_, _ = stdout.Write([]byte("\n"))
-		}
-	}
-	var envelope struct {
-		Status capability.Status `json:"status"`
-	}
-	if err := json.Unmarshal(raw, &envelope); err != nil || envelope.Status == "" {
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			return 0
-		}
-		return 1
-	}
-	switch envelope.Status {
-	case capability.StatusAccepted:
-		return 0
-	case capability.StatusRejected:
-		return 2
-	default:
-		return 1
-	}
-}
-
-func usage(w io.Writer) {
-	fmt.Fprintln(w, "usage:")
-	fmt.Fprintln(w, "  coordlink version")
-	fmt.Fprintln(w, "  coordlink capability list [--backend URL] [--agent AGENT]")
-	fmt.Fprintln(w, "  coordlink call CAPABILITY [--input JSON|-] [--input-file PATH] [--scope JSON] [--lease-id ID]")
-	fmt.Fprintln(w, "  coordlink skill list [--backend URL] [--agent AGENT]")
-	fmt.Fprintln(w, "  coordlink skill read NAME [--backend URL] [--agent AGENT]")
+func printUsage(writer io.Writer) {
+	fmt.Fprintln(writer, "Usage:")
+	fmt.Fprintln(writer, "  coordlink version")
+	fmt.Fprintln(writer, "  coordlink task current [--output human|json]")
+	fmt.Fprintln(writer, "  coordlink task wait --reason TEXT [--request-id ID]")
+	fmt.Fprintln(writer, "  coordlink task submit --summary TEXT --expected-head SHA [--request-id ID]")
+	fmt.Fprintln(writer, "  coordlink task fail --reason TEXT [--request-id ID]")
+	fmt.Fprintln(writer, "  coordlink message send --to-boss --body TEXT [--request-id ID]")
+	fmt.Fprintln(writer, "  coordlink progress --summary TEXT [--request-id ID]")
 }

@@ -1,0 +1,111 @@
+package config_test
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"coordplane/internal/config"
+)
+
+func TestLoadAcceptsStrictMinimalConfigAndZeroRetention(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	cfg, err := config.Load(writeConfig(t, validConfig(dataDir)))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.DataDir != dataDir || cfg.OperatorSocket != filepath.Join(dataDir, "operator.sock") {
+		t.Fatalf("paths = data_dir %q operator_socket %q", cfg.DataDir, cfg.OperatorSocket)
+	}
+	if cfg.MaxParallelRuns != 4 {
+		t.Fatalf("max_parallel_runs = %d, want 4", cfg.MaxParallelRuns)
+	}
+	if cfg.Retention.CompletedWorkspace != 0 || cfg.Retention.TerminalTaskRef != 168*time.Hour || cfg.Retention.RunLog != 0 {
+		t.Fatalf("retention = %+v", cfg.Retention)
+	}
+	if len(cfg.Runtime.ProviderEnvAllowlist) != 1 || cfg.Runtime.ProviderEnvAllowlist[0] != "ANTHROPIC_AUTH_TOKEN" {
+		t.Fatalf("provider allowlist = %#v", cfg.Runtime.ProviderEnvAllowlist)
+	}
+}
+
+func TestLoadRejectsInvalidConfigWithoutFallback(t *testing.T) {
+	base := t.TempDir()
+	dataDir := filepath.Join(base, "data")
+	valid := validConfig(dataDir)
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "unknown top-level field", raw: valid + "unexpected: true\n", want: "field unexpected not found"},
+		{name: "unknown nested field", raw: strings.Replace(valid, "  default_image:", "  unexpected: true\n  default_image:", 1), want: "field unexpected not found"},
+		{name: "second document", raw: valid + "---\n" + valid, want: "multiple YAML documents"},
+		{name: "empty second document", raw: valid + "---\n", want: "multiple YAML documents"},
+		{name: "negative retention", raw: strings.Replace(valid, "completed_workspace: 0", "completed_workspace: -1s", 1), want: "positive duration or 0"},
+		{name: "missing retention is not implicit zero", raw: strings.Replace(valid, "  run_log: 0\n", "", 1), want: "all retention fields are required"},
+		{name: "non-positive parallelism", raw: strings.Replace(valid, "max_parallel_runs: 4", "max_parallel_runs: 0", 1), want: "must be positive"},
+		{name: "relative data directory", raw: strings.Replace(valid, "data_dir: "+dataDir, "data_dir: relative/data", 1), want: "absolute path"},
+		{name: "operator socket outside", raw: strings.Replace(valid, filepath.Join(dataDir, "operator.sock"), filepath.Join(base, "operator.sock"), 1), want: "inside data_dir"},
+		{name: "workspace traversal outside", raw: strings.Replace(valid, filepath.Join(dataDir, "workspaces"), filepath.Join(dataDir, "..", "workspaces"), 1), want: "inside data_dir"},
+		{name: "invalid provider env", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN=value", 1), want: "valid environment variable name"},
+		{name: "duplicate provider env", raw: strings.Replace(valid, "    - ANTHROPIC_AUTH_TOKEN\n", "    - ANTHROPIC_AUTH_TOKEN\n    - ANTHROPIC_AUTH_TOKEN\n", 1), want: "contains duplicate"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := config.Load(writeConfig(t, test.raw))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load() error = %v, want containing %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsRuntimeRootEscapingThroughSymlink(t *testing.T) {
+	base := t.TempDir()
+	dataDir := filepath.Join(base, "data")
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("create data dir: %v", err)
+	}
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatalf("create outside dir: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dataDir, "escaped")); err != nil {
+		t.Fatalf("create symlink: %v", err)
+	}
+
+	raw := strings.Replace(validConfig(dataDir), filepath.Join(dataDir, "workspaces"), filepath.Join(dataDir, "escaped", "workspaces"), 1)
+	_, err := config.Load(writeConfig(t, raw))
+	if err == nil || !strings.Contains(err.Error(), "inside data_dir") {
+		t.Fatalf("Load() error = %v, want symlink escape rejection", err)
+	}
+}
+
+func validConfig(dataDir string) string {
+	return "data_dir: " + dataDir + "\n" +
+		"operator_socket: " + filepath.Join(dataDir, "operator.sock") + "\n" +
+		"max_parallel_runs: 4\n" +
+		"retention:\n" +
+		"  completed_workspace: 0\n" +
+		"  terminal_task_ref: 168h\n" +
+		"  run_log: 0\n" +
+		"runtime:\n" +
+		"  docker_network: coordplane\n" +
+		"  workspace_root: " + filepath.Join(dataDir, "workspaces") + "\n" +
+		"  agent_home_root: " + filepath.Join(dataDir, "agent-homes") + "\n" +
+		"  log_root: " + filepath.Join(dataDir, "logs") + "\n" +
+		"  default_image: coordplane-agent:latest\n" +
+		"  provider_env_allowlist:\n" +
+		"    - ANTHROPIC_AUTH_TOKEN\n"
+}
+
+func writeConfig(t *testing.T, raw string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "coordplane.yaml")
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}

@@ -1,226 +1,302 @@
-package store_test
+package store
 
 import (
 	"context"
 	"database/sql"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
-	"coordplane/internal/events"
-	"coordplane/internal/store"
+	"coordplane/internal/core"
 
 	_ "modernc.org/sqlite"
 )
 
-func TestMigrateCreatesCanonicalTablesAndIsIdempotent(t *testing.T) {
+func TestCT01FileMigrationIsExactAndIdempotent(t *testing.T) {
 	ctx := context.Background()
-	s := newTestStore(t)
-
-	first, err := s.Migrate(ctx)
+	path := filepath.Join(t.TempDir(), "coordplane.db")
+	store, err := Open(ctx, path)
 	if err != nil {
-		t.Fatalf("first migrate: %v", err)
+		t.Fatal(err)
 	}
-	if got, want := first.Applied, []string{
-		"001_core_store_queue_events",
-		"002_team_config_skill_registry",
-		"003_session_lifecycle_guards",
-		"004_object_store",
-		"005_controlled_git_v1",
-		"006_controlled_git_v2",
-		"007_runtime_evidence",
-		"008_cli_sessions",
-		"009_command_runs",
-		"010_runtime_tokens",
-		"011_validation_assessments",
-		"012_release_acceptances",
-		"013_contract_team_scopes",
-		"014_agent_communication_envelopes",
-		"015_controlled_git_operation_evidence",
-		"016_controlled_git_operation_subject_kind",
-		"017_operator_task_runs",
-		"018_capability_audit_outcomes",
-		"019_managed_runtime_cleanup",
-		"020_contract_completion_evidence",
-		"021_provider_tool_outcomes",
-		"022_provider_audit_requirement",
-		"023_provider_audit_requirement_backfill",
-	}; !equalStrings(got, want) {
-		t.Fatalf("applied migrations = %v, want %v", got, want)
-	}
-
-	second, err := s.Migrate(ctx)
+	info, err := store.SchemaInfo(ctx)
 	if err != nil {
-		t.Fatalf("second migrate: %v", err)
+		t.Fatal(err)
 	}
-	if len(second.Applied) != 0 {
-		t.Fatalf("second migrate applied %v, want none", second.Applied)
+	wantTables := []string{"agents", "events", "messages", "projects", "request_dedupes", "runs", "schema_migrations", "tasks"}
+	if !reflect.DeepEqual(info.Tables, wantTables) {
+		t.Fatalf("tables = %v, want %v", info.Tables, wantTables)
 	}
+	if info.JournalMode != "wal" || !info.ForeignKeys || info.BusyTimeout != busyTimeoutMillis {
+		t.Fatalf("SQLite pragmas = %#v", info)
+	}
+	result, err := store.Migrate(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Applied) != 0 {
+		t.Fatalf("second migration applied %v", result.Applied)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	info, err = reopened.SchemaInfo(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(info.Tables, wantTables) {
+		t.Fatalf("reopened tables = %v", info.Tables)
+	}
+}
 
-	for _, table := range []string{
-		"agents",
-		"work_contracts",
-		"assignments",
-		"leases",
-		"attempts",
-		"session_routes",
-		"threads",
-		"messages",
-		"agent_communication_envelopes",
-		"mailbox_items",
-		"evidence",
-		"delivery_attempts",
-		"capability_calls",
-		"artifacts",
-		"transcripts",
-		"queue_items",
-		"events",
-		"team_config_versions",
-		"team_config_agents",
-		"skill_packages",
-		"prepare_leases",
-		"active_guards",
-		"object_blobs",
-		"git_repositories",
-		"git_workspaces",
-		"git_operations",
-		"git_locks",
-		"changesets",
-		"git_merge_attempts",
-		"git_conflict_sets",
-		"git_rollback_points",
-		"runtime_instances",
-		"cli_sessions",
-		"command_runs",
-		"runtime_tokens",
-		"validation_assessments",
-		"release_acceptances",
-		"contract_team_scopes",
-		"operator_task_runs",
-		"contract_completion_evidence",
-		"provider_tool_outcomes",
-	} {
-		var name string
-		err := s.DB().QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
+func TestCT01SQLitePragmasSurviveConnectionReplacement(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "connection-churn.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.db.SetConnMaxLifetime(time.Nanosecond)
+
+	for range 3 {
+		time.Sleep(time.Millisecond)
+		info, err := store.SchemaInfo(ctx)
 		if err != nil {
-			t.Fatalf("table %s missing after migration: %v", table, err)
+			t.Fatal(err)
+		}
+		if info.JournalMode != "wal" || !info.ForeignKeys || info.BusyTimeout != busyTimeoutMillis {
+			t.Fatalf("replacement connection SQLite pragmas = %#v", info)
 		}
 	}
-	for _, column := range []string{"envelope_id", "trigger_turn"} {
-		if !columnExists(t, ctx, s.DB(), "mailbox_items", column) {
-			t.Fatalf("mailbox_items.%s missing after migration", column)
-		}
-	}
-	for _, column := range []string{"runtime_id", "execution_location", "subject_kind"} {
-		if !columnExists(t, ctx, s.DB(), "git_operations", column) {
-			t.Fatalf("git_operations.%s missing after migration", column)
-		}
-	}
-	if !columnExists(t, ctx, s.DB(), "git_repositories", "alias") {
-		t.Fatal("git_repositories.alias missing after migration")
-	}
-	for _, column := range []string{"error_code", "retryable", "attempt_id", "lease_id", "runtime_id"} {
-		if !columnExists(t, ctx, s.DB(), "capability_calls", column) {
-			t.Fatalf("capability_calls.%s missing after migration", column)
-		}
+	if store.db.Stats().MaxLifetimeClosed == 0 {
+		t.Fatal("test did not replace a SQLite connection")
 	}
 }
 
-func equalStrings(got, want []string) bool {
-	if len(got) != len(want) {
-		return false
-	}
-	for i := range got {
-		if got[i] != want[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func columnExists(t *testing.T, ctx context.Context, db *sql.DB, table, column string) bool {
-	t.Helper()
-	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
-	if err != nil {
-		t.Fatalf("pragma table_info(%s): %v", table, err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var cid int
-		var name, typ string
-		var notNull int
-		var defaultValue any
-		var pk int
-		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
-			t.Fatalf("scan table_info(%s): %v", table, err)
-		}
-		if name == column {
-			return true
-		}
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate table_info(%s): %v", table, err)
-	}
-	return false
-}
-
-func TestAppendEventPersistsTraceableFact(t *testing.T) {
+func TestCT01LegacyDatabaseFailsClosedWithoutSchemaRewrite(t *testing.T) {
 	ctx := context.Background()
-	s := newTestStore(t)
-	if _, err := s.Migrate(ctx); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-
-	occurredAt := time.Date(2026, 7, 4, 3, 0, 0, 0, time.UTC)
-	id, err := s.AppendEvent(ctx, events.Event{
-		ID:             "evt_test",
-		TenantID:       "default",
-		TraceID:        "trace_123",
-		SubjectKind:    "agent",
-		SubjectID:      "agent_builder",
-		AgentID:        "agent_builder",
-		RuntimeID:      "runtime_external",
-		CapabilityName: "contract.add",
-		Type:           "contract.created",
-		AggregateType:  "work_contract",
-		AggregateID:    "ctr_123",
-		PayloadJSON:    []byte(`{"title":"build protocol kernel"}`),
-		OccurredAt:     occurredAt,
-	})
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
-		t.Fatalf("append event: %v", err)
+		t.Fatal(err)
 	}
-	if id != "evt_test" {
-		t.Fatalf("event id = %q, want evt_test", id)
+	if _, err := db.Exec(`CREATE TABLE work_contracts(id TEXT PRIMARY KEY, status TEXT); INSERT INTO work_contracts VALUES('old','active')`); err != nil {
+		t.Fatal(err)
 	}
-
-	got, err := s.ListEvents(ctx, store.EventFilter{TraceID: "trace_123"})
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := Open(ctx, path)
+	if opened != nil {
+		_ = opened.Close()
+		t.Fatal("legacy database unexpectedly opened")
+	}
+	if !core.IsCode(err, core.CodeLegacySchemaRebuildRequired) {
+		t.Fatalf("error = %v", err)
+	}
+	db, err = sql.Open("sqlite", path)
 	if err != nil {
-		t.Fatalf("list events: %v", err)
+		t.Fatal(err)
 	}
-	if len(got) != 1 {
-		t.Fatalf("events length = %d, want 1", len(got))
+	defer db.Close()
+	var status string
+	if err := db.QueryRow(`SELECT status FROM work_contracts WHERE id='old'`).Scan(&status); err != nil || status != "active" {
+		t.Fatalf("legacy row changed: status=%q err=%v", status, err)
 	}
-	event := got[0]
-	if event.Type != "contract.created" || event.AggregateID != "ctr_123" {
-		t.Fatalf("event = %+v, want persisted contract.created fact", event)
+	var newTables int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='projects'`).Scan(&newTables); err != nil {
+		t.Fatal(err)
 	}
-	if string(event.PayloadJSON) != `{"title":"build protocol kernel"}` {
-		t.Fatalf("payload = %s", event.PayloadJSON)
-	}
-	if !event.OccurredAt.Equal(occurredAt) {
-		t.Fatalf("occurred_at = %s, want %s", event.OccurredAt, occurredAt)
+	if newTables != 0 {
+		t.Fatal("new schema was written beside legacy schema")
 	}
 }
 
-func newTestStore(t *testing.T) *store.Store {
-	t.Helper()
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	db.SetMaxOpenConns(1)
-	t.Cleanup(func() {
+func TestCT01PartialOrCorruptDatabaseNeverBecomesReady(t *testing.T) {
+	t.Run("partial allowed table", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "partial.db")
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`CREATE TABLE agents(id TEXT PRIMARY KEY)`); err != nil {
+			t.Fatal(err)
+		}
 		_ = db.Close()
+		store, err := Open(context.Background(), path)
+		if store != nil {
+			_ = store.Close()
+			t.Fatal("partial database unexpectedly opened")
+		}
+		if err == nil {
+			t.Fatal("partial database returned no error")
+		}
 	})
-	return store.New(db)
+	t.Run("corrupt bytes", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "corrupt.db")
+		if err := os.WriteFile(path, []byte("not a sqlite database"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		store, err := Open(context.Background(), path)
+		if store != nil {
+			_ = store.Close()
+			t.Fatal("corrupt database unexpectedly opened")
+		}
+		if err == nil {
+			t.Fatal("corrupt database returned no error")
+		}
+	})
+}
+
+func TestCT01ExistingSchemaDriftFailsClosed(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *sql.DB)
+	}{
+		{
+			name: "critical index dropped",
+			mutate: func(t *testing.T, db *sql.DB) {
+				if _, err := db.Exec(`DROP INDEX runs_one_live_per_agent`); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "allowed table structurally changed",
+			mutate: func(t *testing.T, db *sql.DB) {
+				if _, err := db.Exec(`ALTER TABLE events RENAME COLUMN payload_json TO payload_text`); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "hidden migration history",
+			mutate: func(t *testing.T, db *sql.DB) {
+				if _, err := db.Exec(`INSERT INTO schema_migrations(version,name,applied_at) VALUES(0,'legacy','2026-07-12T00:00:00Z')`); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "foreign key violation",
+			mutate: func(t *testing.T, db *sql.DB) {
+				const now = "2026-07-12T00:00:00Z"
+				if _, err := db.Exec(`INSERT INTO agents(id,display_name,adapter_id,image,instructions_file,status,version,created_at,updated_at) VALUES('agt_orphan','Orphan','one-shot','image','/instructions','active',1,?,?)`, now, now); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := db.Exec(`INSERT INTO tasks(id,project_id,kind,created_by_kind,assignee_agent_id,title,description,status,next_run_at,version,created_at,updated_at) VALUES('tsk_orphan','prj_missing','work','boss','agt_orphan','Orphan','Orphan','queued',?,1,?,?)`, now, now, now); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "drift.db")
+			opened, err := Open(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := opened.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, db)
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			reopened, err := Open(context.Background(), path)
+			if reopened != nil {
+				_ = reopened.Close()
+				t.Fatal("structurally drifted database unexpectedly opened")
+			}
+			if !core.IsCode(err, core.CodeLegacySchemaRebuildRequired) {
+				t.Fatalf("Open() error = %v, want %s", err, core.CodeLegacySchemaRebuildRequired)
+			}
+		})
+	}
+}
+
+func TestMutationAndEventRollbackTogether(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "atomic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	agent := core.Agent{
+		ID: "agt_atomic", DisplayName: "Atomic", AdapterID: "one-shot", Image: "image",
+		InstructionsFile: "/instructions", Status: core.AgentActive, Version: 1,
+		CreatedAt: "2026-07-12T00:00:00Z", UpdatedAt: "2026-07-12T00:00:00Z",
+	}
+	err = store.Transact(ctx, func(tx core.Transaction) error {
+		if err := tx.InsertAgent(agent); err != nil {
+			return err
+		}
+		_, err := tx.AppendEvent(core.Event{
+			EntityType: "legacy-object", EntityID: agent.ID, Kind: "agent.created",
+			ActorKind: "boss", PayloadJSON: "{}", CreatedAt: agent.CreatedAt,
+		})
+		return err
+	})
+	if err == nil {
+		t.Fatal("invalid event unexpectedly committed")
+	}
+	snapshot, err := store.Snapshot(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Agents) != 0 {
+		t.Fatalf("business row survived event failure: %#v", snapshot.Agents)
+	}
+	events, err := store.Events(ctx, core.EventFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("events survived rollback: %#v", events)
+	}
+}
+
+func TestEventsLimitReturnsTheRecentTailInStableOrder(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "events.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	err = store.Transact(ctx, func(tx core.Transaction) error {
+		for _, kind := range []string{"first", "second", "third"} {
+			if _, err := tx.AppendEvent(core.Event{
+				EntityType: "daemon", EntityID: "daemon", Kind: kind,
+				ActorKind: "daemon", PayloadJSON: "{}", CreatedAt: "2026-07-12T00:00:00Z",
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.Events(ctx, core.EventFilter{Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].Kind != "second" || events[1].Kind != "third" {
+		t.Fatalf("event tail = %#v", events)
+	}
 }

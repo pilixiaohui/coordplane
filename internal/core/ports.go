@@ -1,0 +1,101 @@
+package core
+
+import "context"
+
+type Repository interface {
+	Transact(context.Context, func(Transaction) error) error
+	Project(context.Context, string) (Project, error)
+	ProjectsByStatus(context.Context, ...ProjectStatus) ([]Project, error)
+	Agent(context.Context, string) (Agent, error)
+	Snapshot(context.Context, string) (Snapshot, error)
+	Messages(context.Context, MessageFilter) ([]Message, error)
+	Events(context.Context, EventFilter) ([]Event, error)
+}
+
+type Transaction interface {
+	Dedupe(string, string, string) ([]byte, bool, error)
+	PutDedupe(string, string, string, []byte, string) error
+
+	Project(string) (Project, error)
+	ProjectByName(string) (Project, error)
+	InsertProject(Project) error
+	UpdateProject(Project, int64, ProjectStatus) error
+	ProjectsByIntegrationAgent(string) ([]Project, error)
+	ProjectBlockers(string) (LifecycleBlockers, error)
+
+	Agent(string) (Agent, error)
+	InsertAgent(Agent) error
+	UpdateAgent(Agent, int64, AgentStatus) error
+	AgentBlockers(string) (LifecycleBlockers, error)
+
+	Task(string) (Task, error)
+	RunnableTasks(string) ([]Task, error)
+	Conversation(string, string) (Task, error)
+	InsertTask(Task) error
+	UpdateTask(Task, int64, TaskStatus) error
+
+	Run(string) (Run, error)
+	RunByTokenHash(string) (Run, error)
+	InsertRun(Run) error
+	UpdateRun(Run, int64, RunState) error
+	LiveRunCount(string, string) (int, error)
+
+	Message(string) (Message, error)
+	MessagesForTask(string) ([]Message, error)
+	InsertMessage(Message) error
+	UpdateMessage(Message, int64, MessageState) error
+
+	AppendEvent(Event) (Event, error)
+}
+
+type LifecycleBlockers struct {
+	LiveRuns                  int
+	OpenTasks                 int
+	PendingActions            int
+	AcceptedIntegrationSource int
+	UnresolvedAgentMessages   int
+}
+
+type MessageFilter struct {
+	ProjectID     string
+	TaskID        string
+	RecipientKind string
+	RecipientID   string
+}
+
+type EventFilter struct {
+	ProjectID  string
+	EntityType string
+	EntityID   string
+	RunID      string
+	Kind       string
+	Limit      int
+}
+
+type ProjectGit interface {
+	Preflight(context.Context, string, string) (ProjectGitFact, error)
+	ControlPath(string) string
+	Initialize(context.Context, ProjectGitIntent) (ProjectGitFact, error)
+	Verify(context.Context, ProjectGitIntent) (ProjectGitFact, error)
+	Exists(string) bool
+	Resolve(context.Context, string, string) (string, error)
+}
+
+type ProjectGitIntent struct {
+	ProjectID      string
+	Source         string
+	SourceRef      string
+	InitialSHA     string
+	ControlRepo    string
+	CanonicalRef   string
+	OperationID    string
+	ExpectedStatus ProjectStatus
+}
+
+type ProjectGitFact struct {
+	Source       string
+	SourceRef    string
+	InitialSHA   string
+	CanonicalRef string
+	CanonicalSHA string
+}
