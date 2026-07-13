@@ -56,7 +56,7 @@ func TestMessageAndProgressLimitPlusOneHaveNoDurableSideEffects(t *testing.T) {
 	if err != nil || !ok || claim.Task.ID != chat.Task.ID {
 		t.Fatalf("claim bounded conversation: claim=%#v ok=%t err=%v", claim, ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, "activate-bounded"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), claim.Run.ID, "activate-bounded"); err != nil {
 		t.Fatal(err)
 	}
 

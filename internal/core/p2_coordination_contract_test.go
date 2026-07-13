@@ -28,7 +28,7 @@ func TestP2OutcomeIntentReplaysAfterRevocationAndTerminalAppliesOnce(t *testing.
 	if err != nil || !ok || claim.Task.ID != work.ID {
 		t.Fatalf("claim=%#v ok=%t err=%v", claim, ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, "outcome-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), claim.Run.ID, "outcome-active"); err != nil {
 		t.Fatal(err)
 	}
 	input := core.OutcomeInput{
@@ -59,7 +59,7 @@ func TestP2OutcomeIntentReplaysAfterRevocationAndTerminalAppliesOnce(t *testing.
 		RunID: claim.Run.ID, State: core.RunExited, ExitCode: intPointer(0),
 		TerminalReason: "agent stopped after wait", RequestID: "wait-terminal",
 	}
-	terminal, err := h.service.RecordRunTerminal(context.Background(), terminalInput)
+	terminal, err := recordRunTerminal(h, context.Background(), terminalInput)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestP2OutcomeIntentReplaysAfterRevocationAndTerminalAppliesOnce(t *testing.
 		t.Fatalf("wait terminal projection = %#v", terminal.Task)
 	}
 	beforeTerminalReplay := h.durableSignature(t, project.ID)
-	if _, err := h.service.RecordRunTerminal(context.Background(), terminalInput); err != nil {
+	if _, err := recordRunTerminal(h, context.Background(), terminalInput); err != nil {
 		t.Fatalf("terminal replay: %v", err)
 	}
 	if after := h.durableSignature(t, project.ID); after != beforeTerminalReplay {
@@ -89,7 +89,7 @@ func TestP2UnackedDeliveryRedeliversWithBackoffWhileAckWins(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("claim ok=%t err=%v", ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, "delivery-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), claim.Run.ID, "delivery-active"); err != nil {
 		t.Fatal(err)
 	}
 	second, err := h.service.Chat(context.Background(), core.ChatInput{
@@ -114,7 +114,7 @@ func TestP2UnackedDeliveryRedeliversWithBackoffWhileAckWins(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	terminal, err := h.service.RecordRunTerminal(context.Background(), core.RunTerminalInput{
+	terminal, err := recordRunTerminal(h, context.Background(), core.RunTerminalInput{
 		RunID: claim.Run.ID, State: core.RunExited, ExitCode: intPointer(0), RequestID: "delivery-terminal",
 	})
 	if err != nil {
@@ -163,7 +163,7 @@ func TestP2TerminalReroutePreservesRedeliveryBackoff(t *testing.T) {
 	if err != nil || !ok || parentClaim.Task.ID != parent.ID {
 		t.Fatalf("parent claim = %#v ok=%t err=%v", parentClaim, ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), parentClaim.Run.ID, "reroute-parent-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), parentClaim.Run.ID, "reroute-parent-active"); err != nil {
 		t.Fatal(err)
 	}
 	child, err := h.service.CreateChildTask(context.Background(), core.CreateChildTaskInput{
@@ -193,7 +193,7 @@ func TestP2TerminalReroutePreservesRedeliveryBackoff(t *testing.T) {
 	if err != nil || !ok || childClaim.Task.ID != child.ID {
 		t.Fatalf("child claim = %#v ok=%t err=%v", childClaim, ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), childClaim.Run.ID, "reroute-child-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), childClaim.Run.ID, "reroute-child-active"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.service.RecordMessagesDelivered(context.Background(), core.MessageDeliveryInput{
@@ -219,7 +219,7 @@ func TestP2TerminalReroutePreservesRedeliveryBackoff(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	terminal, err := h.service.RecordRunTerminal(context.Background(), core.RunTerminalInput{
+	terminal, err := recordRunTerminal(h, context.Background(), core.RunTerminalInput{
 		RunID: childClaim.Run.ID, State: core.RunExited,
 		ExitCode: intPointer(1), RequestID: "reroute-terminal",
 	})
@@ -283,7 +283,7 @@ func TestP2ChildCreateReplaysAfterOutcomeAndFinishingBlocksCancel(t *testing.T) 
 	if err != nil || !ok {
 		t.Fatalf("claim ok=%t err=%v", ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, "parent-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), claim.Run.ID, "parent-active"); err != nil {
 		t.Fatal(err)
 	}
 	childInput := core.CreateChildTaskInput{
@@ -329,7 +329,7 @@ func TestP2PendingAckWinsDelayedDeliveryRecord(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("claim ok=%t err=%v", ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, "ack-race-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), claim.Run.ID, "ack-race-active"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.service.AcknowledgeAgentMessages(context.Background(), core.AcknowledgeMessagesInput{
@@ -378,7 +378,7 @@ func TestP2ExhaustedWakeRemainsWaitingUntilExplicitRetry(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("claim ok=%t err=%v", ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, "exhaust-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), claim.Run.ID, "exhaust-active"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.service.RecordMessagesDelivered(context.Background(), core.MessageDeliveryInput{
@@ -391,7 +391,7 @@ func TestP2ExhaustedWakeRemainsWaitingUntilExplicitRetry(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	terminal, err := h.service.RecordRunTerminal(context.Background(), core.RunTerminalInput{
+	terminal, err := recordRunTerminal(h, context.Background(), core.RunTerminalInput{
 		RunID: claim.Run.ID, State: core.RunExited, ExitCode: intPointer(0), RequestID: "exhaust-terminal",
 	})
 	if err != nil {
@@ -480,7 +480,7 @@ func TestP2ChildFailureReroutesUnresolvedMessageAndWakesParent(t *testing.T) {
 	if err != nil || !ok || parentClaim.Task.ID != parent.ID {
 		t.Fatalf("parent claim=%#v ok=%t err=%v", parentClaim, ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), parentClaim.Run.ID, "notify-parent-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), parentClaim.Run.ID, "notify-parent-active"); err != nil {
 		t.Fatal(err)
 	}
 	child, err := h.service.CreateChildTask(context.Background(), core.CreateChildTaskInput{
@@ -495,7 +495,7 @@ func TestP2ChildFailureReroutesUnresolvedMessageAndWakesParent(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.service.RecordRunTerminal(context.Background(), core.RunTerminalInput{
+	if _, err := recordRunTerminal(h, context.Background(), core.RunTerminalInput{
 		RunID: parentClaim.Run.ID, State: core.RunExited, ExitCode: intPointer(0), RequestID: "notify-parent-terminal",
 	}); err != nil {
 		t.Fatal(err)
@@ -504,7 +504,7 @@ func TestP2ChildFailureReroutesUnresolvedMessageAndWakesParent(t *testing.T) {
 	if err != nil || !ok || childClaim.Task.ID != child.ID {
 		t.Fatalf("child claim=%#v ok=%t err=%v", childClaim, ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), childClaim.Run.ID, "notify-child-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), childClaim.Run.ID, "notify-child-active"); err != nil {
 		t.Fatal(err)
 	}
 	const unresolvedID = "msg_notify_unresolved"
@@ -524,7 +524,7 @@ func TestP2ChildFailureReroutesUnresolvedMessageAndWakesParent(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	terminal, err := h.service.RecordRunTerminal(context.Background(), core.RunTerminalInput{
+	terminal, err := recordRunTerminal(h, context.Background(), core.RunTerminalInput{
 		RunID: childClaim.Run.ID, State: core.RunExited, ExitCode: intPointer(1), RequestID: "notify-child-terminal",
 	})
 	if err != nil {

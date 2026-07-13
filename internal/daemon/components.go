@@ -10,9 +10,11 @@ import (
 	"sync"
 	"syscall"
 
+	"coordplane/internal/adapter"
 	"coordplane/internal/config"
 	"coordplane/internal/core"
 	"coordplane/internal/gitrepo"
+	containerruntime "coordplane/internal/runtime"
 	"coordplane/internal/store"
 )
 
@@ -21,6 +23,7 @@ type components struct {
 	lock    *DataDirLock
 	store   *store.Store
 	service *core.Service
+	runtime *runtimeController
 
 	closeOnce sync.Once
 	closeErr  error
@@ -83,6 +86,23 @@ func buildComponents(ctx context.Context, configPath string) (*components, error
 	if err := service.ReconcileProjects(ctx); err != nil {
 		return fail(fmt.Errorf("reconcile projects: %w", err))
 	}
+	workspaceManager, err := gitrepo.NewWorkspaceManager(initializer, cfg.Runtime.WorkspaceRoot)
+	if err != nil {
+		return fail(err)
+	}
+	if err := validateRuntimeContainerIdentity(); err != nil {
+		return fail(err)
+	}
+	executor, err := containerruntime.NewDockerExecutorFromEnvironment()
+	if err != nil {
+		return fail(err)
+	}
+	result.runtime = newRuntimeController(
+		cfg, service, executor, adapter.Production(), workspaceManager, resolveCoordlinkExecutable(),
+	)
+	if err := result.runtime.Reconcile(ctx); err != nil {
+		return fail(fmt.Errorf("reconcile runtime: %w", err))
+	}
 	return result, nil
 }
 
@@ -94,11 +114,14 @@ func (c *components) Close() error {
 		if c.service != nil {
 			c.service.SetReady(false, "daemon stopped")
 		}
-		var databaseErr error
+		var runtimeErr, databaseErr error
+		if c.runtime != nil {
+			runtimeErr = c.runtime.Close()
+		}
 		if c.store != nil {
 			databaseErr = c.store.Close()
 		}
-		c.closeErr = errors.Join(databaseErr, c.lock.Close())
+		c.closeErr = errors.Join(runtimeErr, databaseErr, c.lock.Close())
 	})
 	return c.closeErr
 }

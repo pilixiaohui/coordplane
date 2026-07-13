@@ -198,14 +198,17 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
 
 func (u *unitOfWork) UpdateRun(run core.Run, expectedVersion int64, expectedState core.RunState) error {
 	result, err := u.tx.ExecContext(u.ctx, `
-UPDATE runs SET state=?,container_id=?,native_session_id=?,token_revoked_at=?,requested_outcome=?,requested_summary=?,expected_head=?,requested_at=?,stop_requested_at=?,stop_reason=?,stop_operation_id=?,heartbeat_at=?,exit_code=?,terminal_reason=?,last_error=?,cleanup_state=?,launch_nonce=?,launch_operation_id=?,launch_phase=?,deadline_at=?,last_observed_at=?,runtime_error_code=?,cleanup_operation_id=?,version=?,started_at=?,ended_at=?
+UPDATE runs SET resumed_from_run_id=?,instructions_hash=?,state=?,workspace_path=?,container_id=?,native_session_id=?,log_path=?,token_revoked_at=?,requested_outcome=?,requested_summary=?,expected_head=?,requested_at=?,stop_requested_at=?,stop_reason=?,stop_operation_id=?,heartbeat_at=?,exit_code=?,terminal_reason=?,last_error=?,cleanup_state=?,launch_nonce=?,launch_operation_id=?,launch_phase=?,home_path=?,container_name=?,deadline_at=?,last_observed_at=?,launch_mode=?,resume_native_session_id=?,runtime_error_code=?,cleanup_operation_id=?,version=?,started_at=?,ended_at=?
 WHERE id=? AND version=? AND state=?`,
-		run.State, run.ContainerID, run.NativeSessionID, run.TokenRevokedAt, run.RequestedOutcome,
-		run.RequestedSummary, run.ExpectedHead, run.RequestedAt, run.StopRequestedAt,
-		run.StopReason, run.StopOperationID, run.HeartbeatAt, run.ExitCode, run.TerminalReason,
-		run.LastError, run.CleanupState, run.LaunchNonce, run.LaunchOperationID,
-		run.LaunchPhase, run.DeadlineAt, run.LastObservedAt, run.RuntimeErrorCode,
-		run.CleanupOperationID, run.Version, run.StartedAt, run.EndedAt,
+		run.ResumedFromRunID, run.InstructionsHash, run.State, run.WorkspacePath,
+		run.ContainerID, run.NativeSessionID, run.LogPath, run.TokenRevokedAt,
+		run.RequestedOutcome, run.RequestedSummary, run.ExpectedHead, run.RequestedAt,
+		run.StopRequestedAt, run.StopReason, run.StopOperationID, run.HeartbeatAt,
+		run.ExitCode, run.TerminalReason, run.LastError, run.CleanupState,
+		run.LaunchNonce, run.LaunchOperationID, run.LaunchPhase, run.HomePath,
+		run.ContainerName, run.DeadlineAt, run.LastObservedAt, run.LaunchMode,
+		run.ResumeNativeSessionID, run.RuntimeErrorCode, run.CleanupOperationID,
+		run.Version, run.StartedAt, run.EndedAt,
 		run.ID, expectedVersion, expectedState,
 	)
 	return u.casResult(result, err, "run", run.ID)
@@ -224,6 +227,17 @@ func (u *unitOfWork) LiveRunCount(projectID, agentID string) (int, error) {
 	}
 	var count int
 	err := u.tx.QueryRowContext(u.ctx, query, args...).Scan(&count)
+	return count, err
+}
+
+func (u *unitOfWork) AgentRuntimeOccupancy(agentID string) (int, error) {
+	var count int
+	err := u.tx.QueryRowContext(u.ctx, `
+SELECT COUNT(*) FROM runs
+WHERE agent_id=?
+  AND (state IN ('starting','active') OR cleanup_state IN ('pending','blocked'))`,
+		strings.TrimSpace(agentID),
+	).Scan(&count)
 	return count, err
 }
 

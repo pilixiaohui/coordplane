@@ -66,7 +66,7 @@ func TestP2BossChatFailureRollsBackBundledAcknowledgement(t *testing.T) {
 	if err != nil || !ok || claim.Task.ID != chat.Task.ID {
 		t.Fatalf("conversation claim = %#v ok=%t err=%v", claim, ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, "boss-ack-rollback-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), claim.Run.ID, "boss-ack-rollback-active"); err != nil {
 		t.Fatal(err)
 	}
 	message, err := h.service.SendAgentMessage(context.Background(), core.SendMessageInput{
@@ -82,7 +82,7 @@ func TestP2BossChatFailureRollsBackBundledAcknowledgement(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.service.RecordRunTerminal(context.Background(), core.RunTerminalInput{
+	if _, err := recordRunTerminal(h, context.Background(), core.RunTerminalInput{
 		RunID: claim.Run.ID, State: core.RunExited,
 		ExitCode: intPointer(1), RequestID: "boss-ack-rollback-terminal",
 	}); err != nil {

@@ -7,6 +7,24 @@ import (
 )
 
 func (s *Service) ClaimNext(ctx context.Context, projectID string) (Claim, bool, error) {
+	return s.claimNext(ctx, projectID, nil)
+}
+
+// ClaimNextForAdapters limits daemon admission to the compile-time adapter
+// catalog supplied by composition. A nil catalog is used only by focused Core
+// tests that do not execute a provider process.
+func (s *Service) ClaimNextForAdapters(ctx context.Context, projectID string, adapterIDs []string) (Claim, bool, error) {
+	allowed := make(map[string]struct{}, len(adapterIDs))
+	for _, adapterID := range adapterIDs {
+		adapterID = strings.TrimSpace(adapterID)
+		if adapterID != "" {
+			allowed[adapterID] = struct{}{}
+		}
+	}
+	return s.claimNext(ctx, projectID, allowed)
+}
+
+func (s *Service) claimNext(ctx context.Context, projectID string, allowedAdapters map[string]struct{}) (Claim, bool, error) {
 	var claim Claim
 	claimed := false
 	nowLimit := s.nowText()
@@ -41,7 +59,12 @@ func (s *Service) ClaimNext(ctx context.Context, projectID string) (Claim, bool,
 			if agent.Status != AgentActive {
 				continue
 			}
-			agentRuns, err := tx.LiveRunCount("", agent.ID)
+			if allowedAdapters != nil {
+				if _, allowed := allowedAdapters[agent.AdapterID]; !allowed {
+					continue
+				}
+			}
+			agentRuns, err := tx.AgentRuntimeOccupancy(agent.ID)
 			if err != nil {
 				return err
 			}
@@ -96,60 +119,6 @@ func (s *Service) ClaimNext(ctx context.Context, projectID string) (Claim, bool,
 		return nil
 	})
 	return claim, claimed, err
-}
-
-func (s *Service) ActivateRun(ctx context.Context, runID, requestID string) (Run, error) {
-	requestID, err := s.requestID(requestID)
-	if err != nil {
-		return Run{}, err
-	}
-	var run Run
-	err = s.repository.Transact(ctx, func(tx Transaction) error {
-		var err error
-		run, err = tx.Run(strings.TrimSpace(runID))
-		if err != nil {
-			return err
-		}
-		if err := ValidateRunTransition(run.State, RunActive); err != nil {
-			return Conflict(CodeInvalidState, "run cannot become active", string(run.State), run.Version)
-		}
-		task, err := tx.Task(run.TaskID)
-		if err != nil {
-			return err
-		}
-		if task.Status != TaskQueued || task.CurrentRunID != run.ID || task.Generation != run.Generation {
-			return Conflict(CodeVersionConflict, "task claim fence changed", string(task.Status), task.Version)
-		}
-		now := s.nowText()
-		runVersion := run.Version
-		run.State = RunActive
-		run.StartedAt = now
-		run.LastObservedAt = now
-		run.Version++
-		if err := tx.UpdateRun(run, runVersion, RunStarting); err != nil {
-			return err
-		}
-		taskVersion := task.Version
-		task.Status = TaskRunning
-		task.Version++
-		task.UpdatedAt = now
-		if err := tx.UpdateTask(task, taskVersion, TaskQueued); err != nil {
-			return err
-		}
-		if _, err := tx.AppendEvent(event(task.ProjectID, "run", run.ID, "run.active", "daemon", "", run.ID, requestID, run.LaunchOperationID, "{}", now)); err != nil {
-			return err
-		}
-		_, err = tx.AppendEvent(event(task.ProjectID, "task", task.ID, "task.running", "daemon", "", run.ID, requestID, "", "{}", now))
-		return err
-	})
-	return run, err
-}
-
-func (s *Service) InterruptRun(ctx context.Context, runID, reason, requestID string) (Run, error) {
-	result, err := s.RecordRunTerminal(ctx, RunTerminalInput{
-		RunID: runID, State: RunInterrupted, TerminalReason: reason, RequestID: requestID,
-	})
-	return result.Run, err
 }
 
 func (s *Service) projectRuntimeFailure(tx Transaction, task *Task, run Run, requestID, now string) error {

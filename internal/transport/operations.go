@@ -56,5 +56,13 @@ type RunOperations interface {
 	Progress(context.Context, core.ProgressInput) (core.Event, error)
 }
 
+// ScopedRunOperations adds the read-only listener-scope authorization needed
+// before a per-Run handler forwards any request to the regular Core operation.
+type ScopedRunOperations interface {
+	RunOperations
+	AuthorizeRunScope(context.Context, string, core.RunScope) error
+}
+
 var _ OperatorOperations = (*core.Service)(nil)
 var _ RunOperations = (*core.Service)(nil)
+var _ ScopedRunOperations = (*core.Service)(nil)

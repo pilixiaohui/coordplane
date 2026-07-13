@@ -9,7 +9,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 
 	"coordplane/internal/buildinfo"
 	"coordplane/internal/core"
@@ -17,11 +21,71 @@ import (
 )
 
 const (
-	socketEnvironment = "COORDPLANE_RUN_SOCKET"
-	tokenEnvironment  = "COORDPLANE_RUN_TOKEN"
+	socketEnvironment    = "COORDPLANE_RUN_SOCKET"
+	tokenFileEnvironment = "COORDPLANE_RUN_TOKEN_FILE"
+	maxRunTokenBytes     = 4096
+	runRetryMaxAttempts  = 20
+	runRetryDelay        = 50 * time.Millisecond
 )
 
 type environment func(string) string
+
+type jsonClient interface {
+	JSON(context.Context, string, string, any, any) error
+	CloseIdleConnections()
+}
+
+type retryingClient struct {
+	next        jsonClient
+	maxAttempts int
+	delay       time.Duration
+}
+
+func (c *retryingClient) JSON(ctx context.Context, method, path string, input, output any) error {
+	if c == nil || c.next == nil {
+		return errors.New("coordlink: Unix client is not initialized")
+	}
+	attempts := c.maxAttempts
+	if attempts <= 0 {
+		attempts = 1
+	}
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err := c.next.JSON(ctx, method, path, input, output)
+		if err == nil || !retryableRunRequest(err) || attempt == attempts || ctx.Err() != nil {
+			return err
+		}
+		c.next.CloseIdleConnections()
+		if c.delay <= 0 {
+			continue
+		}
+		timer := time.NewTimer(c.delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func (c *retryingClient) CloseIdleConnections() {
+	if c != nil && c.next != nil {
+		c.next.CloseIdleConnections()
+	}
+}
+
+func retryableRunRequest(err error) bool {
+	return core.IsCode(err, core.CodeRunStarting) ||
+		errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.EPIPE) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+}
 
 func Run(ctx context.Context, args []string, getenv environment, stdin io.Reader, stdout, stderr io.Writer) int {
 	_ = stdin
@@ -78,7 +142,7 @@ func Run(ctx context.Context, args []string, getenv environment, stdin io.Reader
 	return 0
 }
 
-func runTask(ctx context.Context, client *transport.Client, args []string, stdout, stderr io.Writer) error {
+func runTask(ctx context.Context, client jsonClient, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return errors.New("task subcommand is required")
 	}
@@ -183,7 +247,7 @@ func validateSocketCommand(args []string) error {
 	return nil
 }
 
-func runTaskAccept(ctx context.Context, client *transport.Client, args []string, stdout, stderr io.Writer) error {
+func runTaskAccept(ctx context.Context, client jsonClient, args []string, stdout, stderr io.Writer) error {
 	flags, output := outputFlags("task accept", stderr)
 	var input core.AcceptInput
 	var ackMessageIDs stringListFlag
@@ -206,7 +270,7 @@ func runTaskAccept(ctx context.Context, client *transport.Client, args []string,
 	return render(stdout, *output, task)
 }
 
-func runTaskRework(ctx context.Context, client *transport.Client, args []string, stdout, stderr io.Writer) error {
+func runTaskRework(ctx context.Context, client jsonClient, args []string, stdout, stderr io.Writer) error {
 	flags, output := outputFlags("task rework", stderr)
 	var input core.TaskActionInput
 	var ackMessageIDs stringListFlag
@@ -243,7 +307,7 @@ func parseTaskActionID(flags *flag.FlagSet, args []string) (string, error) {
 	return taskID, nil
 }
 
-func runOutcome(ctx context.Context, client *transport.Client, outcome core.Outcome, args []string, stdout, stderr io.Writer) error {
+func runOutcome(ctx context.Context, client jsonClient, outcome core.Outcome, args []string, stdout, stderr io.Writer) error {
 	flags, output := outputFlags("task "+string(outcome), stderr)
 	input := core.OutcomeInput{Outcome: outcome}
 	var ackMessageIDs stringListFlag
@@ -275,7 +339,7 @@ func runOutcome(ctx context.Context, client *transport.Client, outcome core.Outc
 	return render(stdout, *output, result)
 }
 
-func runProgress(ctx context.Context, client *transport.Client, args []string, stdout, stderr io.Writer) error {
+func runProgress(ctx context.Context, client jsonClient, args []string, stdout, stderr io.Writer) error {
 	flags, output := outputFlags("progress", stderr)
 	var input core.ProgressInput
 	flags.StringVar(&input.Summary, "summary", "", "short progress summary")
@@ -296,7 +360,7 @@ func runProgress(ctx context.Context, client *transport.Client, args []string, s
 	return render(stdout, *output, event)
 }
 
-func runInbox(ctx context.Context, client *transport.Client, args []string, stdout, stderr io.Writer) error {
+func runInbox(ctx context.Context, client jsonClient, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return errors.New("inbox subcommand is required")
 	}
@@ -366,7 +430,7 @@ func runInbox(ctx context.Context, client *transport.Client, args []string, stdo
 	}
 }
 
-func runMessage(ctx context.Context, client *transport.Client, args []string, stdout, stderr io.Writer) error {
+func runMessage(ctx context.Context, client jsonClient, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 || args[0] != "send" {
 		return errors.New("message subcommand must be send")
 	}
@@ -410,16 +474,48 @@ func runMessage(ctx context.Context, client *transport.Client, args []string, st
 	return render(stdout, *output, message)
 }
 
-func scopedClient(getenv environment) (*transport.Client, error) {
+func scopedClient(getenv environment) (jsonClient, error) {
 	socket := strings.TrimSpace(getenv(socketEnvironment))
 	if socket == "" {
 		return nil, fmt.Errorf("%s is required", socketEnvironment)
 	}
-	token := strings.TrimSpace(getenv(tokenEnvironment))
-	if token == "" {
-		return nil, fmt.Errorf("%s is required", tokenEnvironment)
+	token, err := runToken(getenv)
+	if err != nil {
+		return nil, err
 	}
-	return transport.NewUnixClient(socket, transport.WithBearerToken(token))
+	client, err := transport.NewUnixClient(socket, transport.WithBearerToken(token))
+	if err != nil {
+		return nil, err
+	}
+	return &retryingClient{next: client, maxAttempts: runRetryMaxAttempts, delay: runRetryDelay}, nil
+}
+
+func runToken(getenv environment) (string, error) {
+	if path := strings.TrimSpace(getenv(tokenFileEnvironment)); path != "" {
+		if !filepath.IsAbs(path) {
+			return "", fmt.Errorf("%s must be an absolute path", tokenFileEnvironment)
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return "", fmt.Errorf("read %s: %w", tokenFileEnvironment, err)
+		}
+		raw, readErr := io.ReadAll(io.LimitReader(file, maxRunTokenBytes+1))
+		closeErr := file.Close()
+		if readErr != nil {
+			return "", fmt.Errorf("read %s: %w", tokenFileEnvironment, readErr)
+		}
+		if closeErr != nil {
+			return "", fmt.Errorf("close %s: %w", tokenFileEnvironment, closeErr)
+		}
+		if len(raw) > maxRunTokenBytes {
+			return "", fmt.Errorf("%s exceeds %d bytes", tokenFileEnvironment, maxRunTokenBytes)
+		}
+		if token := strings.TrimSpace(string(raw)); token != "" {
+			return token, nil
+		}
+		return "", fmt.Errorf("%s is empty", tokenFileEnvironment)
+	}
+	return "", fmt.Errorf("%s is required", tokenFileEnvironment)
 }
 
 func outputFlags(name string, stderr io.Writer) (*flag.FlagSet, *string) {

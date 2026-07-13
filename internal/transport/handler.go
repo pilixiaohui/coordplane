@@ -276,6 +276,23 @@ func NewRunHandler(operations RunOperations) http.Handler {
 	return mux
 }
 
+// NewScopedRunHandler binds the fixed Agent surface to one expected Run. The
+// Core operation performs its normal authorization again, preserving token
+// revocation and generation fencing across the preflight/operation race.
+func NewScopedRunHandler(operations ScopedRunOperations, expected core.RunScope) http.Handler {
+	if operations == nil {
+		return unavailableHandler("scoped run operations are required")
+	}
+	next := NewRunHandler(operations)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := operations.AuthorizeRunScope(r.Context(), bearerToken(r), expected); err != nil {
+			writeError(w, err)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 type requestContext struct {
 	Context   context.Context
 	Token     string

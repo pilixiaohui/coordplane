@@ -145,15 +145,19 @@ type MessageDeliveryInput struct {
 }
 
 type RunTerminalInput struct {
-	RunID            string   `json:"run_id"`
-	State            RunState `json:"state"`
-	ExitCode         *int     `json:"exit_code,omitempty"`
-	TerminalReason   string   `json:"terminal_reason,omitempty"`
-	LastError        string   `json:"last_error,omitempty"`
-	RuntimeErrorCode string   `json:"runtime_error_code,omitempty"`
-	NativeSessionID  string   `json:"native_session_id,omitempty"`
-	RequestID        string   `json:"request_id"`
-	OperationID      string   `json:"operation_id,omitempty"`
+	RunID             string   `json:"run_id"`
+	Generation        int64    `json:"generation,omitempty"`
+	LaunchNonce       string   `json:"launch_nonce,omitempty"`
+	LaunchOperationID string   `json:"launch_operation_id,omitempty"`
+	ContainerID       string   `json:"container_id,omitempty"`
+	State             RunState `json:"state"`
+	ExitCode          *int     `json:"exit_code,omitempty"`
+	TerminalReason    string   `json:"terminal_reason,omitempty"`
+	LastError         string   `json:"last_error,omitempty"`
+	RuntimeErrorCode  string   `json:"runtime_error_code,omitempty"`
+	NativeSessionID   string   `json:"native_session_id,omitempty"`
+	RequestID         string   `json:"request_id"`
+	OperationID       string   `json:"operation_id,omitempty"`
 }
 
 type RunTerminalResult struct {

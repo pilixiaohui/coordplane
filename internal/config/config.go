@@ -28,12 +28,13 @@ type RetentionConfig struct {
 }
 
 type RuntimeConfig struct {
-	DockerNetwork        string   `yaml:"docker_network"`
-	WorkspaceRoot        string   `yaml:"workspace_root"`
-	AgentHomeRoot        string   `yaml:"agent_home_root"`
-	LogRoot              string   `yaml:"log_root"`
-	DefaultImage         string   `yaml:"default_image"`
-	ProviderEnvAllowlist []string `yaml:"provider_env_allowlist"`
+	DockerNetwork        string        `yaml:"docker_network"`
+	WorkspaceRoot        string        `yaml:"workspace_root"`
+	AgentHomeRoot        string        `yaml:"agent_home_root"`
+	LogRoot              string        `yaml:"log_root"`
+	DefaultImage         string        `yaml:"default_image"`
+	ProviderEnvAllowlist []string      `yaml:"provider_env_allowlist"`
+	RunTimeout           time.Duration `yaml:"-"`
 }
 
 type fileConfig struct {
@@ -41,13 +42,23 @@ type fileConfig struct {
 	OperatorSocket  string              `yaml:"operator_socket"`
 	MaxParallelRuns int                 `yaml:"max_parallel_runs"`
 	Retention       fileRetentionConfig `yaml:"retention"`
-	Runtime         RuntimeConfig       `yaml:"runtime"`
+	Runtime         fileRuntimeConfig   `yaml:"runtime"`
 }
 
 type fileRetentionConfig struct {
 	CompletedWorkspace *yamlDuration `yaml:"completed_workspace"`
 	TerminalTaskRef    *yamlDuration `yaml:"terminal_task_ref"`
 	RunLog             *yamlDuration `yaml:"run_log"`
+}
+
+type fileRuntimeConfig struct {
+	DockerNetwork        string        `yaml:"docker_network"`
+	WorkspaceRoot        string        `yaml:"workspace_root"`
+	AgentHomeRoot        string        `yaml:"agent_home_root"`
+	LogRoot              string        `yaml:"log_root"`
+	DefaultImage         string        `yaml:"default_image"`
+	ProviderEnvAllowlist []string      `yaml:"provider_env_allowlist"`
+	RunTimeout           *yamlDuration `yaml:"run_timeout,omitempty"`
 }
 
 type yamlDuration time.Duration
@@ -104,7 +115,15 @@ func Load(path string) (Config, error) {
 			TerminalTaskRef:    time.Duration(*raw.Retention.TerminalTaskRef),
 			RunLog:             time.Duration(*raw.Retention.RunLog),
 		},
-		Runtime: raw.Runtime,
+		Runtime: RuntimeConfig{
+			DockerNetwork: raw.Runtime.DockerNetwork,
+			WorkspaceRoot: raw.Runtime.WorkspaceRoot, AgentHomeRoot: raw.Runtime.AgentHomeRoot,
+			LogRoot: raw.Runtime.LogRoot, DefaultImage: raw.Runtime.DefaultImage,
+			ProviderEnvAllowlist: append([]string(nil), raw.Runtime.ProviderEnvAllowlist...),
+		},
+	}
+	if raw.Runtime.RunTimeout != nil {
+		cfg.Runtime.RunTimeout = time.Duration(*raw.Runtime.RunTimeout)
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -174,12 +193,18 @@ func (c *Config) Validate() error {
 	if c.Runtime.DefaultImage == "" {
 		return errors.New("validate config: runtime.default_image is required")
 	}
+	if c.Runtime.RunTimeout < 0 {
+		return errors.New("validate config: runtime.run_timeout must be a positive duration or 0")
+	}
 
 	seenEnv := make(map[string]struct{}, len(c.Runtime.ProviderEnvAllowlist))
 	for i, name := range c.Runtime.ProviderEnvAllowlist {
 		name = strings.TrimSpace(name)
 		if !validEnvName(name) {
 			return fmt.Errorf("validate config: runtime.provider_env_allowlist[%d] is not a valid environment variable name", i)
+		}
+		if reservedRuntimeEnvironment(name) {
+			return fmt.Errorf("validate config: runtime.provider_env_allowlist[%d] cannot override reserved environment variable %q", i, name)
 		}
 		if _, exists := seenEnv[name]; exists {
 			return fmt.Errorf("validate config: runtime.provider_env_allowlist contains duplicate %q", name)
@@ -188,6 +213,15 @@ func (c *Config) Validate() error {
 		c.Runtime.ProviderEnvAllowlist[i] = name
 	}
 	return nil
+}
+
+func reservedRuntimeEnvironment(name string) bool {
+	switch name {
+	case "HOME", "CODEX_HOME", "COORDPLANE_RUN_SOCKET", "COORDPLANE_RUN_TOKEN_FILE":
+		return true
+	default:
+		return false
+	}
 }
 
 func canonicalPath(name, value string) (string, error) {

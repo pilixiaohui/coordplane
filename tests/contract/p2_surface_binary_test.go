@@ -64,9 +64,7 @@ func TestP2CoordlinkBinaryFixedSurfacePersistsSuccessfulCoordination(t *testing.
 	if err != nil || !ok || claim.Task.ID != parent.ID {
 		t.Fatalf("parent claim = %#v ok=%t err=%v", claim, ok, err)
 	}
-	if _, err := service.ActivateRun(ctx, claim.Run.ID, "p2-surface-activate"); err != nil {
-		t.Fatal(err)
-	}
+	activateContractRuntimeRun(t, ctx, service, claim, "p2-surface")
 
 	socket := filepath.Join(root, "run.sock")
 	server, err := transport.NewUnixServer(root, socket, transport.NewRunHandler(service))
@@ -197,7 +195,7 @@ func TestP2CoordlinkBinaryFixedSurfacePersistsSuccessfulCoordination(t *testing.
 
 func runP2SurfaceCoordlink(t *testing.T, socket, token string, args ...string) []byte {
 	t.Helper()
-	raw, err := runCoordlink(socket, token, args...)
+	raw, err := runCoordlink(t, socket, token, args...)
 	if err != nil {
 		t.Fatalf("coordlink %v: %v\n%s", args, err, raw)
 	}

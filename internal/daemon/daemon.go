@@ -31,7 +31,8 @@ func Open(ctx context.Context, configPath string) (*Daemon, error) {
 	if err != nil {
 		return nil, errors.Join(err, components.Close())
 	}
-	components.service.SetReady(true, "")
+	healthy, reason := components.runtime.Healthy()
+	components.service.SetReady(healthy, reason)
 	return &Daemon{components: components, server: server}, nil
 }
 
@@ -49,23 +50,27 @@ func (d *Daemon) Serve(ctx context.Context) error {
 		return errors.New("coordplane daemon is not initialized")
 	}
 	serveResult := make(chan error, 1)
+	d.components.runtime.Start(ctx)
 	go func() {
 		serveResult <- d.server.Serve()
 	}()
 	select {
 	case err := <-serveResult:
 		d.components.service.SetReady(false, "operator socket stopped")
-		return err
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return errors.Join(err, d.components.runtime.Shutdown(shutdownCtx))
 	case <-ctx.Done():
 		d.components.service.SetReady(false, "daemon shutting down")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+		runtimeErr := d.components.runtime.Shutdown(shutdownCtx)
 		shutdownErr := d.server.Shutdown(shutdownCtx)
 		serveErr := <-serveResult
 		if errors.Is(ctx.Err(), context.Canceled) {
-			return errors.Join(shutdownErr, serveErr)
+			return errors.Join(runtimeErr, shutdownErr, serveErr)
 		}
-		return errors.Join(ctx.Err(), shutdownErr, serveErr)
+		return errors.Join(ctx.Err(), runtimeErr, shutdownErr, serveErr)
 	}
 }
 

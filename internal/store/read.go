@@ -63,6 +63,44 @@ func (s *Store) Run(ctx context.Context, id string) (core.Run, error) {
 	return run, mapNotFound("run", id, err)
 }
 
+func (s *Store) LiveRuns(ctx context.Context) ([]core.Run, error) {
+	rows, err := s.db.QueryContext(ctx, runSelect+` WHERE state IN ('starting','active') ORDER BY created_at,id`)
+	if err != nil {
+		return nil, err
+	}
+	return collectRuns(rows)
+}
+
+func (s *Store) RunsNeedingCleanup(ctx context.Context) ([]core.Run, error) {
+	rows, err := s.db.QueryContext(ctx, runSelect+` WHERE state NOT IN ('starting','active') AND cleanup_state IN ('pending','blocked') ORDER BY ended_at,id`)
+	if err != nil {
+		return nil, err
+	}
+	return collectRuns(rows)
+}
+
+func (s *Store) LatestTerminalRun(ctx context.Context, taskID, agentID string) (core.Run, error) {
+	query := runSelect + ` WHERE task_id=? AND state NOT IN ('starting','active')`
+	args := []any{taskID}
+	if agentID != "" {
+		query += ` AND agent_id=?`
+		args = append(args, agentID)
+	}
+	query += ` ORDER BY ended_at DESC,id DESC LIMIT 1`
+	run, err := scanRun(s.db.QueryRowContext(ctx, query, args...))
+	return run, mapNotFound("run", taskID, err)
+}
+
+func (s *Store) TaskHasStartedRun(ctx context.Context, taskID string) (bool, error) {
+	var exists bool
+	err := s.db.QueryRowContext(ctx, `
+SELECT EXISTS(
+	SELECT 1 FROM runs
+	WHERE task_id=? AND launch_phase IN ('start_issued','process_observed')
+)`, strings.TrimSpace(taskID)).Scan(&exists)
+	return exists, err
+}
+
 // Snapshot reads all six durable object families from one SQLite snapshot.
 func (s *Store) Snapshot(ctx context.Context, projectID string) (core.Snapshot, error) {
 	return s.snapshot(ctx, strings.TrimSpace(projectID), nil)

@@ -4,15 +4,125 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"coordplane/internal/core"
 	"coordplane/internal/transport"
 )
+
+func TestScopedClientReadsTokenFile(t *testing.T) {
+	root := t.TempDir()
+	socket := filepath.Join(root, "api.sock")
+	operations := &runOperations{wantToken: "file-token"}
+	server, err := transport.NewUnixServer(root, socket, transport.NewRunHandler(operations))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- server.Serve() }()
+	t.Cleanup(func() {
+		_ = server.Close()
+		<-done
+	})
+	tokenFile := filepath.Join(root, "token")
+	if err := os.WriteFile(tokenFile, []byte("file-token\n"), 0o440); err != nil {
+		t.Fatal(err)
+	}
+	getenv := func(name string) string {
+		switch name {
+		case socketEnvironment:
+			return socket
+		case tokenFileEnvironment:
+			return tokenFile
+		default:
+			return ""
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	code := Run(context.Background(), []string{
+		"progress", "--summary", "from file", "--request-id", "token-file-progress", "--output", "json",
+	}, getenv, nil, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	if operations.progressCalls != 1 {
+		t.Fatalf("progress calls = %d, want 1", operations.progressCalls)
+	}
+}
+
+func TestRetryingClientRetriesOnlyTransientErrorsWithStableRequestID(t *testing.T) {
+	transient := []error{
+		fmt.Errorf("dial: %w", syscall.ECONNREFUSED),
+		core.NewError(core.CodeRunStarting, "starting", true),
+	}
+	next := &retryScriptClient{errors: transient}
+	client := &retryingClient{next: next, maxAttempts: 3}
+	input := core.ProgressInput{Summary: "working", RequestID: "stable-request"}
+	var output core.Event
+	if err := client.JSON(context.Background(), http.MethodPost, "/v1/progress", input, &output); err != nil {
+		t.Fatal(err)
+	}
+	if next.calls != 3 {
+		t.Fatalf("calls = %d, want 3", next.calls)
+	}
+	for index, requestID := range next.requestIDs {
+		if requestID != input.RequestID {
+			t.Fatalf("attempt %d request ID = %q, want %q", index, requestID, input.RequestID)
+		}
+	}
+
+	denied := &retryScriptClient{errors: []error{core.NewError(core.CodeScopeDenied, "denied", false)}}
+	client = &retryingClient{next: denied, maxAttempts: 3}
+	if err := client.JSON(context.Background(), http.MethodPost, "/v1/progress", input, &output); !core.IsCode(err, core.CodeScopeDenied) {
+		t.Fatalf("scope error = %v, want %s", err, core.CodeScopeDenied)
+	}
+	if denied.calls != 1 {
+		t.Fatalf("scope denial retried %d times", denied.calls)
+	}
+
+	exhausted := &retryScriptClient{errors: []error{
+		fmt.Errorf("dial 1: %w", syscall.ENOENT),
+		fmt.Errorf("dial 2: %w", syscall.ENOENT),
+		fmt.Errorf("dial 3: %w", syscall.ENOENT),
+	}}
+	client = &retryingClient{next: exhausted, maxAttempts: 3}
+	if err := client.JSON(context.Background(), http.MethodPost, "/v1/progress", input, &output); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("exhausted error = %v, want ENOENT", err)
+	}
+	if exhausted.calls != 3 {
+		t.Fatalf("exhausted calls = %d, want 3", exhausted.calls)
+	}
+}
+
+type retryScriptClient struct {
+	errors     []error
+	calls      int
+	requestIDs []string
+}
+
+func (c *retryScriptClient) JSON(_ context.Context, _ string, _ string, input, output any) error {
+	c.calls++
+	if progress, ok := input.(core.ProgressInput); ok {
+		c.requestIDs = append(c.requestIDs, progress.RequestID)
+	}
+	if c.calls <= len(c.errors) && c.errors[c.calls-1] != nil {
+		return c.errors[c.calls-1]
+	}
+	if event, ok := output.(*core.Event); ok {
+		*event = core.Event{Kind: "task.progress"}
+	}
+	return nil
+}
+
+func (c *retryScriptClient) CloseIdleConnections() {}
 
 func TestLegacyCommandsAreRejectedBeforeSocketLookup(t *testing.T) {
 	for _, args := range [][]string{{"capability", "list"}, {"skill", "list"}, {"call", "anything"}} {
@@ -41,12 +151,13 @@ func TestProgressUsesPerRunSocketAndBearerToken(t *testing.T) {
 		_ = server.Close()
 		<-serveDone
 	})
+	tokenFile := writeRunTokenFile(t, "run-token")
 	getenv := func(name string) string {
 		switch name {
 		case socketEnvironment:
 			return socket
-		case tokenEnvironment:
-			return "run-token"
+		case tokenFileEnvironment:
+			return tokenFile
 		default:
 			return ""
 		}
@@ -172,6 +283,7 @@ func TestP2CommandsUseOnlyTheFixedPerRunSurface(t *testing.T) {
 }
 
 func TestMessageSendRejectsAmbiguousRecipientBeforeMutation(t *testing.T) {
+	tokenFile := writeRunTokenFile(t, "run-token")
 	for _, args := range [][]string{
 		{"message", "send", "--body", "missing recipient"},
 		{"message", "send", "--to-boss", "--to-agent", "agent-b", "--body", "ambiguous"},
@@ -181,8 +293,8 @@ func TestMessageSendRejectsAmbiguousRecipientBeforeMutation(t *testing.T) {
 			switch name {
 			case socketEnvironment:
 				return filepath.Join(t.TempDir(), "missing.sock")
-			case tokenEnvironment:
-				return "run-token"
+			case tokenFileEnvironment:
+				return tokenFile
 			default:
 				return ""
 			}
@@ -235,12 +347,13 @@ func runRecordedCommand(t *testing.T, args []string) recordedRequest {
 		_ = server.Close()
 		<-serveDone
 	})
+	tokenFile := writeRunTokenFile(t, "run-token")
 	getenv := func(name string) string {
 		switch name {
 		case socketEnvironment:
 			return socket
-		case tokenEnvironment:
-			return "run-token"
+		case tokenFileEnvironment:
+			return tokenFile
 		default:
 			return ""
 		}
@@ -250,6 +363,15 @@ func runRecordedCommand(t *testing.T, args []string) recordedRequest {
 		t.Fatalf("Run(%v) code=%d stderr=%s", args, code, stderr.String())
 	}
 	return <-requests
+}
+
+func writeRunTokenFile(t *testing.T, token string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(path, []byte(token+"\n"), 0o440); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func jsonValuesEqual(left, right any) bool {

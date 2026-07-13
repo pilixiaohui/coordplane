@@ -6,6 +6,14 @@ import (
 )
 
 func (s *Service) RequestRunStop(ctx context.Context, input RunStopInput) (Run, error) {
+	return s.requestRunStop(ctx, input, "boss")
+}
+
+func (s *Service) RequestRuntimeStop(ctx context.Context, input RunStopInput) (Run, error) {
+	return s.requestRunStop(ctx, input, "daemon")
+}
+
+func (s *Service) requestRunStop(ctx context.Context, input RunStopInput, actor string) (Run, error) {
 	runID, err := requireText("run_id", input.RunID)
 	if err != nil {
 		return Run{}, err
@@ -22,7 +30,8 @@ func (s *Service) RequestRunStop(ctx context.Context, input RunStopInput) (Run, 
 	}
 	var run Run
 	err = s.repository.Transact(ctx, func(tx Transaction) error {
-		if raw, ok, err := tx.Dedupe("boss", "run.stop", requestID); err != nil {
+		actorScope := actor
+		if raw, ok, err := tx.Dedupe(actorScope, "run.stop", requestID); err != nil {
 			return err
 		} else if ok {
 			result, err := decodeDedupe(raw, inputHash)
@@ -59,7 +68,7 @@ func (s *Service) RequestRunStop(ctx context.Context, input RunStopInput) (Run, 
 			if err := tx.UpdateRun(run, expectedVersion, expectedState); err != nil {
 				return err
 			}
-			if _, err := tx.AppendEvent(event(run.ProjectID, "run", run.ID, "run.stop_requested", "boss", "", run.ID, requestID, operationID, eventPayload(map[string]any{"reason": reason}), now)); err != nil {
+			if _, err := tx.AppendEvent(event(run.ProjectID, "run", run.ID, "run.stop_requested", actor, "", run.ID, requestID, operationID, eventPayload(map[string]any{"reason": reason}), now)); err != nil {
 				return err
 			}
 		} else if run.StopReason != reason || (requestedOperationID != "" && run.StopOperationID != requestedOperationID) {
@@ -69,7 +78,7 @@ func (s *Service) RequestRunStop(ctx context.Context, input RunStopInput) (Run, 
 		if err != nil {
 			return err
 		}
-		return tx.PutDedupe("boss", "run.stop", requestID, raw, now)
+		return tx.PutDedupe(actorScope, "run.stop", requestID, raw, now)
 	})
 	return run, err
 }

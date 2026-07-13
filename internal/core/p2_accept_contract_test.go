@@ -169,7 +169,7 @@ func TestCT08ReadableAssignmentDoesNotAuthorizeAgentAcceptOrRework(t *testing.T)
 	if err != nil || !ok || claim.Task.ID != controller.ID {
 		t.Fatalf("controller claim = %#v ok=%t err=%v", claim, ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, "scope-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), claim.Run.ID, "scope-active"); err != nil {
 		t.Fatal(err)
 	}
 	target = makeSubmittedTask(t, h, target, "dddddddddddddddddddddddddddddddddddddddd")

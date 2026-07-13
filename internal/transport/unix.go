@@ -14,9 +14,20 @@ import (
 	"time"
 )
 
+const unixSocketPathBytes = 108
+
 // ListenUnix opens a Unix socket inside an existing caller-owned data
 // directory. The caller must hold the data-directory lock before calling it.
 func ListenUnix(dataDir, socketPath string) (net.Listener, error) {
+	return ListenUnixWithMode(dataDir, socketPath, 0o600)
+}
+
+// ListenUnixWithMode opens a Unix socket with an explicit final permission
+// mode. The caller remains responsible for the socket directory's group.
+func ListenUnixWithMode(dataDir, socketPath string, mode os.FileMode) (net.Listener, error) {
+	if mode&^os.ModePerm != 0 || mode.Perm() == 0 {
+		return nil, errors.New("transport: Unix socket mode must contain only permission bits")
+	}
 	_, socketPath, err := ownedSocketPath(dataDir, socketPath)
 	if err != nil {
 		return nil, err
@@ -24,7 +35,12 @@ func ListenUnix(dataDir, socketPath string) (net.Listener, error) {
 	if err := removeStaleSocket(socketPath); err != nil {
 		return nil, err
 	}
-	listener, err := net.Listen("unix", socketPath)
+	listenPath, releasePath, err := usableUnixSocketPath(socketPath)
+	if err != nil {
+		return nil, err
+	}
+	defer releasePath()
+	listener, err := net.Listen("unix", listenPath)
 	if err != nil {
 		return nil, fmt.Errorf("transport: listen on Unix socket: %w", err)
 	}
@@ -41,7 +57,7 @@ func ListenUnix(dataDir, socketPath string) (net.Listener, error) {
 		return cleanup(errors.New("transport: Unix listener has an unexpected implementation"))
 	}
 	unixListener.SetUnlinkOnClose(false)
-	if err := os.Chmod(socketPath, 0o600); err != nil {
+	if err := os.Chmod(socketPath, mode.Perm()); err != nil {
 		return cleanup(fmt.Errorf("transport: chmod Unix socket: %w", err))
 	}
 	identity, err := os.Lstat(socketPath)
@@ -58,10 +74,16 @@ type UnixServer struct {
 }
 
 func NewUnixServer(dataDir, socketPath string, handler http.Handler) (*UnixServer, error) {
+	return NewUnixServerWithMode(dataDir, socketPath, 0o600, handler)
+}
+
+// NewUnixServerWithMode preserves the same ownership and stale-socket checks
+// as NewUnixServer while allowing the per-Run 0660 socket contract.
+func NewUnixServerWithMode(dataDir, socketPath string, mode os.FileMode, handler http.Handler) (*UnixServer, error) {
 	if handler == nil {
 		return nil, errors.New("transport: Unix server handler is required")
 	}
-	listener, err := ListenUnix(dataDir, socketPath)
+	listener, err := ListenUnixWithMode(dataDir, socketPath, mode)
 	if err != nil {
 		return nil, err
 	}
@@ -202,7 +224,12 @@ func removeStaleSocket(path string) error {
 		return errors.New("transport: refusing to remove a non-socket path")
 	}
 	dialer := net.Dialer{Timeout: 100 * time.Millisecond}
-	connection, dialErr := dialer.Dial("unix", path)
+	dialPath, releasePath, aliasErr := usableUnixSocketPath(path)
+	if aliasErr != nil {
+		return aliasErr
+	}
+	connection, dialErr := dialer.Dial("unix", dialPath)
+	releasePath()
 	if dialErr == nil {
 		_ = connection.Close()
 		return errors.New("transport: Unix socket is already active")
@@ -214,4 +241,31 @@ func removeStaleSocket(path string) error {
 		return fmt.Errorf("transport: remove stale Unix socket: %w", err)
 	}
 	return nil
+}
+
+func usableUnixSocketPath(path string) (string, func(), error) {
+	if len(path) < unixSocketPathBytes {
+		return path, func() {}, nil
+	}
+	parent := filepath.Dir(path)
+	fd, err := syscall.Open(parent, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return "", func() {}, errors.New("transport: open long Unix socket parent")
+	}
+	directory := os.NewFile(uintptr(fd), "unix-socket-parent")
+	if directory == nil {
+		_ = syscall.Close(fd)
+		return "", func() {}, errors.New("transport: open long Unix socket parent")
+	}
+	release := func() { _ = directory.Close() }
+	alias := filepath.Join("/proc/self/fd", fmt.Sprintf("%d", fd), filepath.Base(path))
+	if len(alias) >= unixSocketPathBytes {
+		release()
+		return "", func() {}, errors.New("transport: Unix socket basename is too long")
+	}
+	if _, err := os.Stat("/proc/self/fd"); err != nil {
+		release()
+		return "", func() {}, errors.New("transport: long Unix socket paths require /proc/self/fd")
+	}
+	return alias, release, nil
 }

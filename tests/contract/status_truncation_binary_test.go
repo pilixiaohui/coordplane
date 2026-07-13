@@ -143,15 +143,8 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 		_ = database.Close()
 		t.Fatalf("claim field-truncation task: claim=%#v ok=%t err=%v", claim, ok, err)
 	}
-	if _, err := service.ActivateRun(context.Background(), claim.Run.ID, "field-truncation-active"); err != nil {
-		_ = database.Close()
-		t.Fatal(err)
-	}
-	interrupted, err := service.InterruptRun(context.Background(), claim.Run.ID, longReason, "field-truncation-interrupt")
-	if err != nil {
-		_ = database.Close()
-		t.Fatal(err)
-	}
+	active := activateContractRuntimeRun(t, context.Background(), service, claim, "field-truncation")
+	interrupted := interruptContractRuntimeRun(t, context.Background(), service, active, longReason, "field-truncation-interrupt")
 	if interrupted.TerminalReason != longReason {
 		_ = database.Close()
 		t.Fatalf("P1 interrupt changed legal terminal reason: got %d bytes, want %d", len(interrupted.TerminalReason), len(longReason))

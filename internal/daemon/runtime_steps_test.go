@@ -1,0 +1,132 @@
+package daemon
+
+import (
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+
+	"coordplane/internal/adapter"
+	"coordplane/internal/config"
+	"coordplane/internal/core"
+	"coordplane/internal/gitrepo"
+)
+
+func TestRuntimeBuildToDeleteStepsComeFromStaticLists(t *testing.T) {
+	prepareNames := make([]string, 0, len(runtimePrepareSteps))
+	for _, step := range runtimePrepareSteps {
+		if step.name == "" || step.failureCode == "" || step.run == nil {
+			t.Fatalf("invalid runtime prepare step: %#v", step)
+		}
+		prepareNames = append(prepareNames, step.name)
+	}
+	wantPrepare := []string{
+		"prepareWorkspace", "prepareAgentHome", "writeRunToken", "writeBootstrap",
+		"openRunAPISocket", "createContainer", "attachStreams", "startCLI", "verifyLive",
+	}
+	if !reflect.DeepEqual(prepareNames, wantPrepare) {
+		t.Fatalf("runtime prepare steps = %v, want %v", prepareNames, wantPrepare)
+	}
+
+	cleanupNames := make([]string, 0, len(runtimeCleanupSteps))
+	for _, step := range runtimeCleanupSteps {
+		if step.name == "" || step.run == nil {
+			t.Fatalf("invalid runtime cleanup step: %#v", step)
+		}
+		cleanupNames = append(cleanupNames, step.name)
+	}
+	wantCleanup := []string{"stopContainer", "removeContainer", "closeRunAPISocket", "removeRunControl"}
+	if !reflect.DeepEqual(cleanupNames, wantCleanup) {
+		t.Fatalf("runtime cleanup steps = %v, want %v", cleanupNames, wantCleanup)
+	}
+}
+
+func TestBootstrapAdvertisesTheImportedSourceConvenienceRef(t *testing.T) {
+	source := &gitrepo.WorkspaceSource{
+		TaskID: "source-task", RunID: "source-run",
+		TaskRef: "refs/coordplane/tasks/source-task/runs/source-run",
+		HeadSHA: strings.Repeat("b", 40),
+	}
+	launch := core.RunLaunchContext{
+		Project: core.Project{ID: "project-a"},
+		Agent:   core.Agent{ID: "agent-a"},
+		Messages: []core.Message{{
+			ID: "message-a", TaskID: "conversation-task", RelatedTaskID: "review-task",
+			SenderKind: "boss", Body: "Review the fixed source.",
+		}},
+		Task: core.Task{
+			ID: "review-task", ProjectID: "project-a", Kind: core.TaskWork,
+			Title: "Review", BaseSHA: strings.Repeat("a", 40),
+			SourceTaskID: source.TaskID, SourceRunID: source.RunID,
+			SourceTaskRef: source.TaskRef, SourceHeadSHA: source.HeadSHA,
+		},
+	}
+	run := core.Run{ID: "run-a", Generation: 1}
+	bootstrap := buildBootstrap(
+		launch,
+		run,
+		"Follow the instructions.",
+		"/host/path/must-not-render",
+		gitrepo.WorkspaceSpec{ProjectID: "project-a", TaskID: "review-task", Source: source},
+	)
+	want := "Source convenience ref: " + source.ConvenienceRef()
+	if !strings.Contains(bootstrap, want) {
+		t.Fatalf("bootstrap omitted imported source ref %q:\n%s", want, bootstrap)
+	}
+	if strings.Contains(bootstrap, "Source convenience ref: refs/coordplane/source/") {
+		t.Fatalf("bootstrap retained the obsolete source ref:\n%s", bootstrap)
+	}
+	if messageScope := "[message-a] delivery_task=conversation-task related_task=review-task"; !strings.Contains(bootstrap, messageScope) {
+		t.Fatalf("bootstrap omitted durable Message scope %q:\n%s", messageScope, bootstrap)
+	}
+}
+
+func TestContainerSpecKeepsTrustedRuntimeEnvironmentOverProviderAllowlist(t *testing.T) {
+	for _, name := range []string{
+		"HOME",
+		"CODEX_HOME",
+		"COORDPLANE_RUN_SOCKET",
+		"COORDPLANE_RUN_TOKEN_FILE",
+	} {
+		t.Setenv(name, "/untrusted/provider-value")
+	}
+	coordlink, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := &runtimeController{
+		config: config.Config{Runtime: config.RuntimeConfig{
+			DockerNetwork: "none",
+			ProviderEnvAllowlist: []string{
+				"HOME", "CODEX_HOME", "COORDPLANE_RUN_SOCKET", "COORDPLANE_RUN_TOKEN_FILE",
+			},
+		}},
+		coordlink: coordlink,
+	}
+	run := core.Run{
+		ID: "run-env", ProjectID: "project-env", TaskID: "task-env", AgentID: "agent-env",
+		Generation: 1, LaunchNonce: "nonce-env", ContainerName: "coordplane-run-env",
+		Image: "agent:test", HomePath: "/runtime/agent-home",
+	}
+	spec, err := controller.containerSpec(run, core.TaskConversation, adapter.CommandSpec{
+		Executable: "codex",
+		Env: map[string]string{
+			"HOME":       "/home/agent",
+			"CODEX_HOME": "/home/agent",
+		},
+	}, "/runtime/run-control/run-env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"HOME":                      "/home/agent",
+		"CODEX_HOME":                "/home/agent",
+		"COORDPLANE_RUN_SOCKET":     "/run/coordplane/api.sock",
+		"COORDPLANE_RUN_TOKEN_FILE": "/run/coordplane/token",
+	}
+	for name, value := range want {
+		if spec.Command.Env[name] != value {
+			t.Errorf("container %s = %q, want trusted %q", name, spec.Command.Env[name], value)
+		}
+	}
+}

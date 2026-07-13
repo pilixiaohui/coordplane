@@ -149,6 +149,93 @@ func TestTaskRunAndMessageHistoryUseStableOpaqueCursorPages(t *testing.T) {
 	}
 }
 
+func TestTaskHasStartedRunSearchesBeyondTheFirstHundredHistoryRows(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, filepath.Join(t.TempDir(), "run-history.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	const (
+		projectID = "prj_run_history"
+		agentID   = "agt_run_history"
+		taskID    = "tsk_run_history"
+		otherTask = "tsk_without_started_run"
+	)
+	if err := database.Transact(ctx, func(tx core.Transaction) error {
+		if err := tx.InsertProject(core.Project{
+			ID: projectID, Name: "Run history", Source: "/source", SourceRef: "refs/heads/main",
+			InitialSHA: strings.Repeat("a", 40), ControlRepoPath: "/control/run-history.git",
+			CanonicalRef: "refs/heads/main", CanonicalSHA: strings.Repeat("a", 40),
+			Status: core.ProjectActive, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime,
+		}); err != nil {
+			return err
+		}
+		if err := tx.InsertAgent(core.Agent{
+			ID: agentID, DisplayName: "Run history", AdapterID: "test", Image: "test:latest",
+			InstructionsFile: "/instructions", Status: core.AgentActive,
+			Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime,
+		}); err != nil {
+			return err
+		}
+		for _, id := range []string{taskID, otherTask} {
+			if err := tx.InsertTask(core.Task{
+				ID: id, ProjectID: projectID, Kind: core.TaskWork, CreatedByKind: "boss",
+				AssigneeAgentID: agentID, Title: id, Status: core.TaskFailed, NextRunAt: readTestTime,
+				Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime,
+			}); err != nil {
+				return err
+			}
+		}
+		for index := 0; index <= core.MaximumCompactPageLimit+1; index++ {
+			phase := core.LaunchIntent
+			containerID := ""
+			if index == core.MaximumCompactPageLimit+1 {
+				phase = core.LaunchStartIssued
+				containerID = "container-after-first-page"
+			}
+			createdAt := fmt.Sprintf("2026-07-12T00:00:00.%09dZ", index)
+			if err := tx.InsertRun(core.Run{
+				ID: fmt.Sprintf("run_history_%03d", index), ProjectID: projectID,
+				TaskID: taskID, AgentID: agentID, Generation: int64(index + 1),
+				AdapterID: "test", Image: "test:latest", State: core.RunFailed,
+				ContainerID: containerID, TokenHash: fmt.Sprintf("token-history-%03d", index),
+				CleanupState: core.CleanupNotNeeded, LaunchNonce: fmt.Sprintf("nonce-%03d", index),
+				LaunchOperationID: fmt.Sprintf("operation-%03d", index), LaunchPhase: phase,
+				ContainerName: fmt.Sprintf("container-history-%03d", index), LaunchMode: "start",
+				Version: 1, CreatedAt: createdAt, EndedAt: createdAt,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	firstPage, err := database.Runs(ctx, core.RunFilter{TaskID: taskID, Limit: core.MaximumCompactPageLimit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(firstPage.Items) != core.MaximumCompactPageLimit || firstPage.NextCursor == "" {
+		t.Fatalf("first Run page = %d rows, next=%q", len(firstPage.Items), firstPage.NextCursor)
+	}
+	for _, run := range firstPage.Items {
+		if run.LaunchPhase == core.LaunchStartIssued || run.LaunchPhase == core.LaunchProcessObserved {
+			t.Fatalf("started Run unexpectedly appeared in first page: %#v", run)
+		}
+	}
+	started, err := database.TaskHasStartedRun(ctx, taskID)
+	if err != nil || !started {
+		t.Fatalf("TaskHasStartedRun(%s) = %t, err=%v", taskID, started, err)
+	}
+	started, err = database.TaskHasStartedRun(ctx, otherTask)
+	if err != nil || started {
+		t.Fatalf("TaskHasStartedRun(%s) = %t, err=%v", otherTask, started, err)
+	}
+}
+
 func TestEventHistoryUsesOpaqueIDCursorWithoutGapsOrDuplicates(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, filepath.Join(t.TempDir(), "event-pages.db"))

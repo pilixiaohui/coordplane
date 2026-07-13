@@ -122,7 +122,7 @@ func TestCT03StaleRunCannotWriteThroughAgentEntry(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("claim run1: ok=%v err=%v", ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), run1.Run.ID, "activate-1"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), run1.Run.ID, "activate-1"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.service.Progress(context.Background(), core.ProgressInput{Token: run1.Token, Summary: "live\a", RequestID: "progress-live"}); err != nil {
@@ -137,9 +137,11 @@ func TestCT03StaleRunCannotWriteThroughAgentEntry(t *testing.T) {
 			t.Fatalf("progress payload is not valid JSON: %q", event.PayloadJSON)
 		}
 	}
-	if _, err := h.service.InterruptRun(context.Background(), run1.Run.ID, "test rollover", "interrupt-1"); err != nil {
+	interrupted, err := interruptRun(t, h, context.Background(), run1.Run.ID, "test rollover", "interrupt-1")
+	if err != nil {
 		t.Fatal(err)
 	}
+	recordCleanupRemoved(t, h, interrupted, "interrupt-cleanup-1")
 	h.clock.Advance(time.Second)
 	run2, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 	if err != nil || !ok {
@@ -148,7 +150,7 @@ func TestCT03StaleRunCannotWriteThroughAgentEntry(t *testing.T) {
 	if run2.Run.Generation != run1.Run.Generation+1 {
 		t.Fatalf("run generations: old=%d new=%d", run1.Run.Generation, run2.Run.Generation)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), run2.Run.ID, "activate-2"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), run2.Run.ID, "activate-2"); err != nil {
 		t.Fatal(err)
 	}
 	before := h.durableSignature(t, project.ID)
@@ -203,7 +205,7 @@ func TestAgentMessageReplyCannotCrossProject(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, "activate-reply"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), claim.Run.ID, "activate-reply"); err != nil {
 		t.Fatal(err)
 	}
 	beforeFirst := h.durableSignature(t, firstProject.ID)
@@ -254,7 +256,7 @@ func TestAgentMessageRelatedTaskCannotEscapeRunScope(t *testing.T) {
 	if err != nil || !ok || claim.Task.ID != current.ID {
 		t.Fatalf("claim = %#v ok=%t err=%v", claim, ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, "related-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), claim.Run.ID, "related-active"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -412,7 +414,7 @@ func TestCT07KindErrorsRemainStableWhileTaskIsFinishing(t *testing.T) {
 		if err != nil || !ok || claim.Task.ID != chat.Task.ID {
 			t.Fatalf("conversation claim = %#v ok=%t err=%v", claim, ok, err)
 		}
-		if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, "finishing-conversation-kind-active"); err != nil {
+		if _, err := activateRun(t, h, context.Background(), claim.Run.ID, "finishing-conversation-kind-active"); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := h.service.RequestOutcome(context.Background(), core.OutcomeInput{
@@ -486,7 +488,7 @@ func TestCT09LifecycleGuardsAndRepair(t *testing.T) {
 		if err != nil || !ok {
 			t.Fatalf("claim: ok=%v err=%v", ok, err)
 		}
-		if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, "busy-active"); err != nil {
+		if _, err := activateRun(t, h, context.Background(), claim.Run.ID, "busy-active"); err != nil {
 			t.Fatal(err)
 		}
 		paused, err := h.service.SetAgentStatus(context.Background(), agent.ID, core.AgentPaused, "pause")
@@ -678,7 +680,7 @@ func TestStatusPropagatesPerItemTextTruncationFromSQLite(t *testing.T) {
 				if err != nil || !ok || claim.Task.ID != task.ID {
 					t.Fatalf("claim=%#v ok=%t err=%v", claim, ok, err)
 				}
-				if _, err := h.service.InterruptRun(context.Background(), claim.Run.ID, strings.Repeat("failure", 90), "long-failure"); err != nil {
+				if _, err := interruptRun(t, h, context.Background(), claim.Run.ID, strings.Repeat("failure", 90), "long-failure"); err != nil {
 					t.Fatal(err)
 				}
 				return task.ID
@@ -825,6 +827,83 @@ func (h *harness) durableSignature(t *testing.T, projectID string) string {
 		t.Fatal(err)
 	}
 	return string(raw)
+}
+
+func prepareTestRun(t *testing.T, h *harness, ctx context.Context, runID, requestID string) (core.Run, error) {
+	t.Helper()
+	run, err := h.database.Run(ctx, runID)
+	if err != nil {
+		return core.Run{}, err
+	}
+	task, err := h.database.Task(ctx, run.TaskID)
+	if err != nil {
+		return core.Run{}, err
+	}
+	root := t.TempDir()
+	workspace := ""
+	if task.Kind != core.TaskConversation {
+		workspace = filepath.Join(root, "workspace")
+	}
+	return h.service.BeginRunLaunch(ctx, core.RunLaunchInput{
+		RunID: run.ID, Generation: run.Generation, LaunchNonce: "nonce-" + run.ID,
+		WorkspacePath: workspace, HomePath: filepath.Join(root, "home"),
+		LogPath: filepath.Join(root, "run.log"), InstructionsHash: "test-instructions",
+		LaunchMode: "start", CleanupOperationID: "cleanup-" + run.ID,
+		RequestID: requestID + "-prepare",
+	})
+}
+
+func activateRun(t *testing.T, h *harness, ctx context.Context, runID, requestID string) (core.Run, error) {
+	t.Helper()
+	prepared, err := prepareTestRun(t, h, ctx, runID, requestID)
+	if err != nil {
+		return core.Run{}, err
+	}
+	fact := runtimeFact(prepared, "container-"+prepared.ID)
+	fact.RequestID = requestID + "-created"
+	created, err := h.service.RecordContainerCreated(ctx, fact)
+	if err != nil {
+		return core.Run{}, err
+	}
+	fact = runtimeFact(created, created.ContainerID)
+	fact.RequestID = requestID + "-start"
+	started, err := h.service.RecordRunStartIssued(ctx, fact)
+	if err != nil {
+		return core.Run{}, err
+	}
+	fact = runtimeFact(started, started.ContainerID)
+	fact.RequestID = requestID
+	return h.service.ObserveProcessAndActivateRun(ctx, fact)
+}
+
+func interruptRun(t *testing.T, h *harness, ctx context.Context, runID, reason, requestID string) (core.Run, error) {
+	t.Helper()
+	run, err := h.database.Run(ctx, runID)
+	if err != nil {
+		return core.Run{}, err
+	}
+	if run.LaunchNonce == "" {
+		run, err = prepareTestRun(t, h, ctx, runID, requestID)
+		if err != nil {
+			return core.Run{}, err
+		}
+	}
+	input := runtimeTerminalInput(run, core.RunInterrupted, requestID)
+	input.TerminalReason = reason
+	result, err := h.service.RecordRuntimeRunTerminal(ctx, input)
+	return result.Run, err
+}
+
+func recordRunTerminal(h *harness, ctx context.Context, input core.RunTerminalInput) (core.RunTerminalResult, error) {
+	run, err := h.database.Run(ctx, input.RunID)
+	if err != nil {
+		return core.RunTerminalResult{}, err
+	}
+	input.Generation = run.Generation
+	input.LaunchNonce = run.LaunchNonce
+	input.LaunchOperationID = run.LaunchOperationID
+	input.ContainerID = run.ContainerID
+	return h.service.RecordRuntimeRunTerminal(ctx, input)
 }
 
 type testClock struct {

@@ -493,14 +493,18 @@ func TestP1BinaryReadSurfacesStayBoundedPastTwoMiBLedger(t *testing.T) {
 		_ = database.Close()
 		t.Fatalf("seed bounded run: claim=%#v ok=%t err=%v", claim, ok, err)
 	}
-	if _, err := service.ActivateRun(context.Background(), claim.Run.ID, "bounded-run-active"); err != nil {
+	activateContractRuntimeRun(t, context.Background(), service, claim, "bounded-run")
+	operatorServer, err := transport.NewUnixServer(dataDir, socket, transport.NewOperatorHandler(service))
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- operatorServer.Serve() }()
+	defer func() {
+		_ = operatorServer.Close()
+		<-serveDone
 		_ = database.Close()
-		t.Fatal(err)
-	}
-	if err := database.Close(); err != nil {
-		t.Fatal(err)
-	}
-	daemon = startDaemon(t, configPath, socket)
+	}()
 
 	statusRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"status", "--socket", socket, "--project", project.ID, "--output", "json")
@@ -637,17 +641,8 @@ func TestP1BinaryReadSurfacesStayBoundedPastTwoMiBLedger(t *testing.T) {
 		t.Fatalf("event traversal cursor=%q count=%d", eventCursor, len(seenEventIDs))
 	}
 
-	stopDaemon(t, daemon, socket)
-	database, err = store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	durableEvents, err := database.Events(context.Background(), core.EventFilter{ProjectID: project.ID})
 	if err != nil {
-		_ = database.Close()
-		t.Fatal(err)
-	}
-	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if len(seenEventIDs) != len(durableEvents) {
@@ -693,20 +688,14 @@ func TestCT03CoordlinkBinaryRejectsStaleRunWithoutSideEffects(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("run1 claim ok=%v err=%v", ok, err)
 	}
-	if _, err := service.ActivateRun(ctx, run1.Run.ID, "activate-1"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := service.InterruptRun(ctx, run1.Run.ID, "rotate", "interrupt"); err != nil {
-		t.Fatal(err)
-	}
+	activeRun1 := activateContractRuntimeRun(t, ctx, service, run1, "stale-run-1")
+	interruptContractRuntimeRun(t, ctx, service, activeRun1, "rotate", "interrupt")
 	now = now.Add(time.Second)
 	run2, ok, err := service.ClaimNext(ctx, project.ID)
 	if err != nil || !ok {
 		t.Fatalf("run2 claim ok=%v err=%v", ok, err)
 	}
-	if _, err := service.ActivateRun(ctx, run2.Run.ID, "activate-2"); err != nil {
-		t.Fatal(err)
-	}
+	activateContractRuntimeRun(t, ctx, service, run2, "stale-run-2")
 	controlRoot, err := os.MkdirTemp("/tmp", "coordplane-run-")
 	if err != nil {
 		t.Fatal(err)
@@ -740,7 +729,7 @@ func TestCT03CoordlinkBinaryRejectsStaleRunWithoutSideEffects(t *testing.T) {
 		{"message", "send", "--to-boss", "--body", "stale", "--request-id", "stale-message", "--output", "json"},
 	}
 	for _, args := range staleCalls {
-		raw, err := runCoordlink(socket, run1.Token, args...)
+		raw, err := runCoordlink(t, socket, run1.Token, args...)
 		if err == nil || !bytes.Contains(raw, []byte(core.CodeStaleRun)) {
 			t.Fatalf("coordlink %v err=%v output=%s", args, err, raw)
 		}
@@ -748,7 +737,7 @@ func TestCT03CoordlinkBinaryRejectsStaleRunWithoutSideEffects(t *testing.T) {
 			t.Fatalf("stale coordlink changed durable state\nbefore=%s\nafter=%s", before, after)
 		}
 	}
-	raw, err := runCoordlink(socket, run2.Token, "progress", "--summary", "current", "--request-id", "current-progress", "--output", "json")
+	raw, err := runCoordlink(t, socket, run2.Token, "progress", "--summary", "current", "--request-id", "current-progress", "--output", "json")
 	if err != nil || !bytes.Contains(raw, []byte(`"kind":"task.progress"`)) {
 		t.Fatalf("current coordlink err=%v output=%s", err, raw)
 	}
@@ -823,9 +812,7 @@ func TestP2CoordlinkBinaryPersistsOutcomeIntentBeforeTerminalFact(t *testing.T) 
 			if err != nil || !ok || claim.Task.ID != task.ID {
 				t.Fatalf("claim=%#v ok=%v err=%v", claim, ok, err)
 			}
-			if _, err := service.ActivateRun(ctx, claim.Run.ID, "activate-"+test.name); err != nil {
-				t.Fatal(err)
-			}
+			activateContractRuntimeRun(t, ctx, service, claim, "outcome-"+test.name)
 
 			controlRoot, err := os.MkdirTemp("/tmp", "coordplane-run-")
 			if err != nil {
@@ -845,7 +832,7 @@ func TestP2CoordlinkBinaryPersistsOutcomeIntentBeforeTerminalFact(t *testing.T) 
 			}()
 
 			args := test.args(gitFacts.sha)
-			raw, err := runCoordlink(socket, claim.Token, args...)
+			raw, err := runCoordlink(t, socket, claim.Token, args...)
 			if err != nil {
 				t.Fatalf("coordlink %v err=%v output=%s", args, err, raw)
 			}
@@ -869,7 +856,7 @@ func TestP2CoordlinkBinaryPersistsOutcomeIntentBeforeTerminalFact(t *testing.T) 
 				t.Fatalf("submit capture intent = %#v", gotTask)
 			}
 			beforeReplay := durableSignature(t, database, project.ID)
-			replayed, err := runCoordlink(socket, claim.Token, args...)
+			replayed, err := runCoordlink(t, socket, claim.Token, args...)
 			if err != nil {
 				t.Fatalf("idempotent outcome replay err=%v output=%s", err, replayed)
 			}
@@ -1004,9 +991,14 @@ func runBinaryJSON(t *testing.T, binary string, args ...string) []byte {
 	return raw
 }
 
-func runCoordlink(socket, token string, args ...string) ([]byte, error) {
+func runCoordlink(t *testing.T, socket, token string, args ...string) ([]byte, error) {
+	t.Helper()
+	tokenFile := filepath.Join(t.TempDir(), "run-token")
+	if err := os.WriteFile(tokenFile, []byte(token+"\n"), 0o440); err != nil {
+		t.Fatal(err)
+	}
 	command := exec.Command(testBinaries.coordlink, args...)
-	command.Env = append(os.Environ(), "COORDPLANE_RUN_SOCKET="+socket, "COORDPLANE_RUN_TOKEN="+token)
+	command.Env = append(os.Environ(), "COORDPLANE_RUN_SOCKET="+socket, "COORDPLANE_RUN_TOKEN_FILE="+tokenFile)
 	return command.CombinedOutput()
 }
 

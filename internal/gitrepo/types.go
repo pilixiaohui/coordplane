@@ -69,7 +69,8 @@ var contractPhaseHook phaseHook
 // Initializer owns the trusted Git process boundary for project repository
 // initialization and verification.
 type Initializer struct {
-	root      string
-	gitPath   string
-	phaseHook phaseHook
+	root        string
+	gitPath     string
+	maintenance projectLocks
+	phaseHook   phaseHook
 }

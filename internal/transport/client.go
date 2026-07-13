@@ -40,7 +40,12 @@ func NewUnixClient(socketPath string, options ...ClientOption) (*Client, error) 
 	httpTransport := &http.Transport{
 		DisableCompression: true,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return dialer.DialContext(ctx, "unix", socketPath)
+			dialPath, releasePath, err := usableUnixSocketPath(socketPath)
+			if err != nil {
+				return nil, err
+			}
+			defer releasePath()
+			return dialer.DialContext(ctx, "unix", dialPath)
 		},
 	}
 	client := &Client{

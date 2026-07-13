@@ -9,7 +9,7 @@ import (
 	"coordplane/internal/core"
 )
 
-func TestInterruptRunProjectsCanonicalRetryForStartingAndActiveRuns(t *testing.T) {
+func TestRuntimeTerminalProjectsCanonicalRetryForStartingAndActiveRuns(t *testing.T) {
 	tests := []struct {
 		name     string
 		activate bool
@@ -22,14 +22,15 @@ func TestInterruptRunProjectsCanonicalRetryForStartingAndActiveRuns(t *testing.T
 		t.Run(test.name, func(t *testing.T) {
 			h := newHarness(t)
 			project, claim := createClaimedWorkRun(t, h, "interrupt-"+test.name, 0)
+			var run core.Run
 			if test.activate {
-				if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, test.name+"-active"); err != nil {
-					t.Fatal(err)
-				}
+				run = prepareAndActivateRuntimeRun(t, h, claim, t.TempDir(), test.name)
+			} else {
+				run = prepareRuntimeRun(t, h, claim, t.TempDir(), test.name)
 			}
 			requestID := test.name + "-interrupt"
 
-			if _, err := h.service.InterruptRun(context.Background(), claim.Run.ID, "runtime lost", requestID); err != nil {
+			if _, err := recordInterruptedRun(h, run, "runtime lost", requestID); err != nil {
 				t.Fatal(err)
 			}
 
@@ -39,24 +40,25 @@ func TestInterruptRunProjectsCanonicalRetryForStartingAndActiveRuns(t *testing.T
 	}
 }
 
-func TestInterruptRunUsesRetryBudgetAndBackoffExactlyOnce(t *testing.T) {
+func TestRuntimeTerminalUsesRetryBudgetAndBackoffExactlyOnce(t *testing.T) {
 	h := newHarness(t)
 	project, first := createClaimedWorkRun(t, h, "one-retry", 1)
-	if _, err := h.service.InterruptRun(context.Background(), first.Run.ID, "start lost", "first-interrupt"); err != nil {
+	first.Run = prepareRuntimeRun(t, h, first, t.TempDir(), "first")
+	firstTerminal, err := recordInterruptedRun(h, first.Run, "start lost", "first-interrupt")
+	if err != nil {
 		t.Fatal(err)
 	}
 	assertRetryProjection(t, h, project.ID, first.Task.ID, first.Run.ID, core.TaskQueued, 1)
 	assertInterruptEvents(t, h, project.ID, "first-interrupt", "task.requeued")
+	recordCleanupRemoved(t, h, firstTerminal.Run, "first-cleanup")
 
 	h.clock.Advance(time.Second)
 	second, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 	if err != nil || !ok {
 		t.Fatalf("second claim: ok=%v err=%v", ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), second.Run.ID, "second-active"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.service.InterruptRun(context.Background(), second.Run.ID, "process lost", "second-interrupt"); err != nil {
+	second.Run = prepareAndActivateRuntimeRun(t, h, second, t.TempDir(), "second")
+	if _, err := recordInterruptedRun(h, second.Run, "process lost", "second-interrupt"); err != nil {
 		t.Fatal(err)
 	}
 	assertRetryProjection(t, h, project.ID, first.Task.ID, second.Run.ID, core.TaskFailed, 1)
@@ -72,11 +74,11 @@ func TestInterruptRunUsesRetryBudgetAndBackoffExactlyOnce(t *testing.T) {
 	}
 }
 
-func TestInterruptRunBoundsReasonAndReplaysWithoutDurableSideEffects(t *testing.T) {
+func TestRuntimeTerminalBoundsReasonAndReplaysWithoutDurableSideEffects(t *testing.T) {
 	h := newHarness(t)
 	project, claim := createActiveWorkRun(t, h, "bounded-interrupt", 0)
 	largeReason := strings.Repeat("\x01", core.MaximumEventPayloadBytes)
-	if _, err := h.service.InterruptRun(context.Background(), claim.Run.ID, largeReason, "bounded-interrupt"); err != nil {
+	if _, err := recordInterruptedRun(h, claim.Run, largeReason, "bounded-interrupt"); err != nil {
 		t.Fatalf("large interrupt reason did not converge: %v", err)
 	}
 
@@ -90,13 +92,13 @@ func TestInterruptRunBoundsReasonAndReplaysWithoutDurableSideEffects(t *testing.
 		t.Fatalf("bounded interrupt run = %#v", run)
 	}
 	beforeReplay := h.durableSignature(t, project.ID)
-	if _, err := h.service.InterruptRun(context.Background(), claim.Run.ID, largeReason, "bounded-interrupt-replay"); err != nil {
+	if _, err := recordInterruptedRun(h, claim.Run, largeReason, "bounded-interrupt-replay"); err != nil {
 		t.Fatalf("idempotent interrupt replay: %v", err)
 	}
 	if afterReplay := h.durableSignature(t, project.ID); afterReplay != beforeReplay {
 		t.Fatalf("interrupt replay changed durable state\nbefore=%s\nafter=%s", beforeReplay, afterReplay)
 	}
-	if _, err := h.service.InterruptRun(context.Background(), claim.Run.ID, "different reason", "changed-interrupt"); !core.IsCode(err, core.CodeInvalidState) {
+	if _, err := recordInterruptedRun(h, claim.Run, "different reason", "changed-interrupt"); !core.IsCode(err, core.CodeInvalidState) {
 		t.Fatalf("changed terminal fact error = %v, want %s", err, core.CodeInvalidState)
 	}
 	if afterConflict := h.durableSignature(t, project.ID); afterConflict != beforeReplay {
@@ -128,10 +130,25 @@ func createClaimedWorkRun(t *testing.T, h *harness, name string, maxRetries int)
 func createActiveWorkRun(t *testing.T, h *harness, name string, maxRetries int) (core.Project, core.Claim) {
 	t.Helper()
 	project, claim := createClaimedWorkRun(t, h, name, maxRetries)
-	if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, name+"-active"); err != nil {
+	claim.Run = prepareAndActivateRuntimeRun(t, h, claim, t.TempDir(), name)
+	return project, claim
+}
+
+func recordInterruptedRun(h *harness, run core.Run, reason, requestID string) (core.RunTerminalResult, error) {
+	input := runtimeTerminalInput(run, core.RunInterrupted, requestID)
+	input.TerminalReason = reason
+	return h.service.RecordRuntimeRunTerminal(context.Background(), input)
+}
+
+func recordCleanupRemoved(t *testing.T, h *harness, run core.Run, requestID string) {
+	t.Helper()
+	fact := runtimeFact(run, run.ContainerID)
+	fact.RequestID = requestID
+	if _, err := h.service.RecordRunCleanup(context.Background(), core.RunCleanupInput{
+		RunRuntimeFactInput: fact, CleanupOperationID: run.CleanupOperationID, State: core.CleanupRemoved,
+	}); err != nil {
 		t.Fatal(err)
 	}
-	return project, claim
 }
 
 func assertRetryProjection(t *testing.T, h *harness, projectID, taskID, runID string, status core.TaskStatus, retryCount int) {

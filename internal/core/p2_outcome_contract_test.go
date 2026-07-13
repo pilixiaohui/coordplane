@@ -37,7 +37,7 @@ func TestP2OutcomeAckBundleRollsBackAsAUnit(t *testing.T) {
 	if err != nil || !ok || claim.Task.ID != task.ID {
 		t.Fatalf("claim = %#v ok=%t err=%v", claim, ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, "rollback-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), claim.Run.ID, "rollback-active"); err != nil {
 		t.Fatal(err)
 	}
 	before := h.durableSignature(t, project.ID)
@@ -80,7 +80,7 @@ func TestP2FailAndSubmitRemainTwoPhaseAtRunTerminal(t *testing.T) {
 		if requested.Task.Status != core.TaskFinishing || requested.Run.State != core.RunActive {
 			t.Fatalf("premature fail projection = %#v", requested)
 		}
-		terminal, err := h.service.RecordRunTerminal(context.Background(), core.RunTerminalInput{
+		terminal, err := recordRunTerminal(h, context.Background(), core.RunTerminalInput{
 			RunID: claim.Run.ID, State: core.RunExited,
 			ExitCode: intPointer(1), RequestID: "terminal-fail-fact",
 		})
@@ -109,7 +109,7 @@ func TestP2FailAndSubmitRemainTwoPhaseAtRunTerminal(t *testing.T) {
 			requested.Task.PendingActionRunID != claim.Run.ID || requested.Task.PendingActionVersion != requested.Task.Version {
 			t.Fatalf("submit intent = %#v", requested.Task)
 		}
-		terminal, err := h.service.RecordRunTerminal(context.Background(), core.RunTerminalInput{
+		terminal, err := recordRunTerminal(h, context.Background(), core.RunTerminalInput{
 			RunID: claim.Run.ID, State: core.RunExited,
 			ExitCode: intPointer(0), RequestID: "terminal-submit-fact",
 		})
@@ -155,14 +155,14 @@ func TestP2FinishingWindowQueuesExactlyOnceOnlyForWakeMessage(t *testing.T) {
 			if err != nil || !ok || targetClaim.Task.ID != target.ID {
 				t.Fatalf("target claim = %#v ok=%t err=%v", targetClaim, ok, err)
 			}
-			if _, err := h.service.ActivateRun(context.Background(), targetClaim.Run.ID, "finishing-target-active-"+test.name); err != nil {
+			if _, err := activateRun(t, h, context.Background(), targetClaim.Run.ID, "finishing-target-active-"+test.name); err != nil {
 				t.Fatal(err)
 			}
 			senderClaim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 			if err != nil || !ok || senderClaim.Task.ID != sender.ID {
 				t.Fatalf("sender claim = %#v ok=%t err=%v", senderClaim, ok, err)
 			}
-			if _, err := h.service.ActivateRun(context.Background(), senderClaim.Run.ID, "finishing-sender-active-"+test.name); err != nil {
+			if _, err := activateRun(t, h, context.Background(), senderClaim.Run.ID, "finishing-sender-active-"+test.name); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := h.service.RequestOutcome(context.Background(), core.OutcomeInput{
@@ -181,7 +181,7 @@ func TestP2FinishingWindowQueuesExactlyOnceOnlyForWakeMessage(t *testing.T) {
 			if claim, ok, err := h.service.ClaimNext(context.Background(), project.ID); err != nil || ok {
 				t.Fatalf("second claim before old Run terminal = %#v ok=%t err=%v", claim, ok, err)
 			}
-			terminal, err := h.service.RecordRunTerminal(context.Background(), core.RunTerminalInput{
+			terminal, err := recordRunTerminal(h, context.Background(), core.RunTerminalInput{
 				RunID: targetClaim.Run.ID, State: core.RunExited,
 				ExitCode: intPointer(0), RequestID: "finishing-terminal-" + test.name,
 			})
@@ -191,6 +191,7 @@ func TestP2FinishingWindowQueuesExactlyOnceOnlyForWakeMessage(t *testing.T) {
 			if terminal.Task.Status != test.wantStatus || terminal.Task.CurrentRunID != "" {
 				t.Fatalf("finishing terminal projection = %#v", terminal.Task)
 			}
+			recordCleanupRemoved(t, h, terminal.Run, "finishing-cleanup-"+test.name)
 			claim, claimed, err := h.service.ClaimNext(context.Background(), project.ID)
 			if err != nil {
 				t.Fatal(err)
@@ -218,7 +219,7 @@ func createActiveWorkClaim(t *testing.T, h *harness, project core.Project, agent
 	if err != nil || !ok || claim.Task.ID != task.ID {
 		t.Fatalf("claim = %#v ok=%t err=%v", claim, ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, requestPrefix+"-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), claim.Run.ID, requestPrefix+"-active"); err != nil {
 		t.Fatal(err)
 	}
 	return claim

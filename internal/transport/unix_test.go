@@ -99,6 +99,50 @@ func TestUnixClientForwardsBearerAndDecodesCoreError(t *testing.T) {
 	}
 }
 
+func TestUnixServerAndClientSupportLongFilesystemPaths(t *testing.T) {
+	dataDir := t.TempDir()
+	parent := dataDir
+	for index := 0; index < 4; index++ {
+		parent = filepath.Join(parent, "long-control-directory-segment")
+	}
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socketPath := filepath.Join(parent, "api.sock")
+	if len(socketPath) < 108 {
+		t.Fatalf("test socket path is only %d bytes", len(socketPath))
+	}
+	operations := &operatorFake{}
+	server, err := transport.NewUnixServer(dataDir, socketPath, transport.NewOperatorHandler(operations))
+	if err != nil {
+		t.Fatalf("listen on long Unix path: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- server.Serve() }()
+	t.Cleanup(func() {
+		_ = server.Close()
+		<-done
+	})
+	if duplicate, err := transport.NewUnixServer(dataDir, socketPath, transport.NewOperatorHandler(&operatorFake{})); err == nil {
+		_ = duplicate.Close()
+		t.Fatal("second listener replaced an active long-path socket")
+	}
+	client, err := transport.NewUnixClient(socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var status core.Status
+	if err := client.JSON(ctx, http.MethodGet, "/v1/status?project_id=prj-long", nil, &status); err != nil {
+		t.Fatalf("request over long Unix path: %v", err)
+	}
+	if len(operations.calls) != 1 || operations.calls[0].value != "prj-long" {
+		t.Fatalf("operator calls = %#v", operations.calls)
+	}
+}
+
 func TestListenUnixReplacesOnlyAStaleSocketInsideOwnedDataDir(t *testing.T) {
 	dataDir := t.TempDir()
 	socketPath := filepath.Join(dataDir, "daemon.sock")

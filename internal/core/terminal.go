@@ -6,7 +6,13 @@ import (
 	"strings"
 )
 
-func (s *Service) RecordRunTerminal(ctx context.Context, input RunTerminalInput) (RunTerminalResult, error) {
+// RecordRuntimeRunTerminal is the daemon-owned terminal ingress. Every
+// external runtime fact is fenced against the durable Run identity before
+// terminal state can be written.
+func (s *Service) RecordRuntimeRunTerminal(ctx context.Context, input RunTerminalInput) (RunTerminalResult, error) {
+	if input.Generation < 1 || strings.TrimSpace(input.LaunchOperationID) == "" {
+		return RunTerminalResult{}, NewError(CodeInvalidArgument, "runtime terminal identity is incomplete", false)
+	}
 	runID, err := requireText("run_id", input.RunID)
 	if err != nil {
 		return RunTerminalResult{}, err
@@ -23,11 +29,17 @@ func (s *Service) RecordRunTerminal(ctx context.Context, input RunTerminalInput)
 	input.RuntimeErrorCode = boundedDurableText(input.RuntimeErrorCode, 256)
 	input.NativeSessionID = boundedDurableText(input.NativeSessionID, 1024)
 	input.OperationID = strings.TrimSpace(input.OperationID)
+	input.LaunchNonce = strings.TrimSpace(input.LaunchNonce)
+	input.LaunchOperationID = strings.TrimSpace(input.LaunchOperationID)
+	input.ContainerID = strings.TrimSpace(input.ContainerID)
 
 	var result RunTerminalResult
 	err = s.repository.Transact(ctx, func(tx Transaction) error {
 		run, err := tx.Run(runID)
 		if err != nil {
+			return err
+		}
+		if err := runtimeTerminalFence(run, input); err != nil {
 			return err
 		}
 		task, err := tx.Task(run.TaskID)
@@ -93,6 +105,24 @@ func (s *Service) RecordRunTerminal(ctx context.Context, input RunTerminalInput)
 		return nil
 	})
 	return result, err
+}
+
+func runtimeTerminalFence(run Run, input RunTerminalInput) error {
+	if run.Generation != input.Generation || run.LaunchOperationID == "" ||
+		run.LaunchOperationID != input.LaunchOperationID {
+		return Conflict(CodeStaleRun, "runtime terminal fence changed", string(run.State), run.Version)
+	}
+	if run.LaunchNonce == "" {
+		if (run.State != RunStarting && run.State != RunFailed) || run.LaunchPhase != LaunchIntent || run.ContainerID != "" ||
+			input.State != RunFailed || input.LaunchNonce != "" || input.ContainerID != "" {
+			return Conflict(CodeStaleRun, "only an unprepared Run may omit runtime ownership facts", string(run.State), run.Version)
+		}
+		return nil
+	}
+	if run.LaunchNonce != input.LaunchNonce || run.ContainerID != input.ContainerID {
+		return Conflict(CodeStaleRun, "runtime terminal ownership fence changed", string(run.State), run.Version)
+	}
+	return nil
 }
 
 func sameTerminalFact(run Run, input RunTerminalInput) bool {

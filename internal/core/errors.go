@@ -18,6 +18,7 @@ const (
 	CodeRunStarting                 ErrorCode = "RUN_STARTING"
 	CodeAgentBusy                   ErrorCode = "AGENT_BUSY"
 	CodeRuntimeUnavailable          ErrorCode = "RUNTIME_UNAVAILABLE"
+	CodeRuntimeInvariantViolation   ErrorCode = "RUNTIME_INVARIANT_VIOLATION"
 	CodeResumeUnavailable           ErrorCode = "RESUME_UNAVAILABLE"
 	CodeGitDirty                    ErrorCode = "GIT_DIRTY"
 	CodeGitStale                    ErrorCode = "GIT_STALE"

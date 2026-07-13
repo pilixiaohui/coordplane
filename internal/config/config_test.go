@@ -28,6 +28,9 @@ func TestLoadAcceptsStrictMinimalConfigAndZeroRetention(t *testing.T) {
 	if len(cfg.Runtime.ProviderEnvAllowlist) != 1 || cfg.Runtime.ProviderEnvAllowlist[0] != "ANTHROPIC_AUTH_TOKEN" {
 		t.Fatalf("provider allowlist = %#v", cfg.Runtime.ProviderEnvAllowlist)
 	}
+	if cfg.Runtime.RunTimeout != 0 {
+		t.Fatalf("default run timeout = %s, want disabled", cfg.Runtime.RunTimeout)
+	}
 }
 
 func TestLoadRejectsInvalidConfigWithoutFallback(t *testing.T) {
@@ -51,12 +54,43 @@ func TestLoadRejectsInvalidConfigWithoutFallback(t *testing.T) {
 		{name: "workspace traversal outside", raw: strings.Replace(valid, filepath.Join(dataDir, "workspaces"), filepath.Join(dataDir, "..", "workspaces"), 1), want: "inside data_dir"},
 		{name: "invalid provider env", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN=value", 1), want: "valid environment variable name"},
 		{name: "duplicate provider env", raw: strings.Replace(valid, "    - ANTHROPIC_AUTH_TOKEN\n", "    - ANTHROPIC_AUTH_TOKEN\n    - ANTHROPIC_AUTH_TOKEN\n", 1), want: "contains duplicate"},
+		{name: "negative run timeout", raw: strings.Replace(valid, "  default_image:", "  run_timeout: -1s\n  default_image:", 1), want: "runtime.run_timeout must be a positive duration or 0"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := config.Load(writeConfig(t, test.raw))
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("Load() error = %v, want containing %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsRuntimeRunTimeout(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	raw := strings.Replace(validConfig(dataDir), "  default_image:", "  run_timeout: 45s\n  default_image:", 1)
+	cfg, err := config.Load(writeConfig(t, raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Runtime.RunTimeout != 45*time.Second {
+		t.Fatalf("run timeout = %s, want 45s", cfg.Runtime.RunTimeout)
+	}
+}
+
+func TestLoadRejectsProviderAllowlistOverridesOfTrustedRuntimeEnvironment(t *testing.T) {
+	for _, name := range []string{
+		"HOME",
+		"CODEX_HOME",
+		"COORDPLANE_RUN_SOCKET",
+		"COORDPLANE_RUN_TOKEN_FILE",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dataDir := filepath.Join(t.TempDir(), "data")
+			raw := strings.Replace(validConfig(dataDir), "ANTHROPIC_AUTH_TOKEN", name, 1)
+			_, err := config.Load(writeConfig(t, raw))
+			if err == nil || !strings.Contains(err.Error(), "reserved environment variable") || !strings.Contains(err.Error(), name) {
+				t.Fatalf("Load() error = %v, want reserved %s rejection", err, name)
 			}
 		})
 	}

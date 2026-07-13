@@ -23,7 +23,7 @@ func TestP2RuntimeRetryExhaustionDisposesMessagesAndNotifiesParent(t *testing.T)
 	if err != nil || !ok || parentClaim.Task.ID != parent.ID {
 		t.Fatalf("parent claim = %#v ok=%t err=%v", parentClaim, ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), parentClaim.Run.ID, "runtime-parent-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), parentClaim.Run.ID, "runtime-parent-active"); err != nil {
 		t.Fatal(err)
 	}
 	child, err := h.service.CreateChildTask(context.Background(), core.CreateChildTaskInput{
@@ -46,10 +46,10 @@ func TestP2RuntimeRetryExhaustionDisposesMessagesAndNotifiesParent(t *testing.T)
 	if err != nil || !ok || childClaim.Task.ID != child.ID {
 		t.Fatalf("child claim = %#v ok=%t err=%v", childClaim, ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), childClaim.Run.ID, "runtime-child-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), childClaim.Run.ID, "runtime-child-active"); err != nil {
 		t.Fatal(err)
 	}
-	terminal, err := h.service.RecordRunTerminal(context.Background(), core.RunTerminalInput{
+	terminal, err := recordRunTerminal(h, context.Background(), core.RunTerminalInput{
 		RunID: childClaim.Run.ID, State: core.RunInterrupted,
 		TerminalReason: "runtime lost", RequestID: "runtime-child-terminal",
 	})
@@ -95,7 +95,7 @@ func TestP2ClosedParentChildResultFallsBackToBoss(t *testing.T) {
 	if err != nil || !ok || parentClaim.Task.ID != parent.ID {
 		t.Fatalf("parent claim = %#v ok=%t err=%v", parentClaim, ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), parentClaim.Run.ID, "fallback-parent-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), parentClaim.Run.ID, "fallback-parent-active"); err != nil {
 		t.Fatal(err)
 	}
 	child, err := h.service.CreateChildTask(context.Background(), core.CreateChildTaskInput{
@@ -116,7 +116,7 @@ func TestP2ClosedParentChildResultFallsBackToBoss(t *testing.T) {
 	if err != nil || !ok || childClaim.Task.ID != child.ID {
 		t.Fatalf("child claim = %#v ok=%t err=%v", childClaim, ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), childClaim.Run.ID, "fallback-child-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), childClaim.Run.ID, "fallback-child-active"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.service.RequestOutcome(context.Background(), core.OutcomeInput{
@@ -125,7 +125,7 @@ func TestP2ClosedParentChildResultFallsBackToBoss(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.service.RecordRunTerminal(context.Background(), core.RunTerminalInput{
+	if _, err := recordRunTerminal(h, context.Background(), core.RunTerminalInput{
 		RunID: childClaim.Run.ID, State: core.RunExited,
 		ExitCode: intPointer(1), RequestID: "fallback-child-terminal",
 	}); err != nil {
@@ -176,7 +176,7 @@ func TestP2CancelPreservesExistingRunStopOperation(t *testing.T) {
 	if persisted.TokenRevokedAt == "" {
 		t.Fatal("cancelled Run token remained valid")
 	}
-	terminal, err := h.service.RecordRunTerminal(context.Background(), core.RunTerminalInput{
+	terminal, err := recordRunTerminal(h, context.Background(), core.RunTerminalInput{
 		RunID: claim.Run.ID, State: core.RunCancelled,
 		TerminalReason: "cancelled by operator", RequestID: "cancel-terminal",
 	})
@@ -196,7 +196,7 @@ func waitAndTerminate(t *testing.T, h *harness, claim core.Claim, requestPrefix 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.service.RecordRunTerminal(context.Background(), core.RunTerminalInput{
+	if _, err := recordRunTerminal(h, context.Background(), core.RunTerminalInput{
 		RunID: claim.Run.ID, State: core.RunExited,
 		ExitCode: intPointer(0), RequestID: requestPrefix + "-terminal",
 	}); err != nil {

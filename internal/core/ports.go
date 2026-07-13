@@ -11,6 +11,10 @@ type Repository interface {
 	Agents(context.Context, AgentFilter) (AgentPage, error)
 	Task(context.Context, string) (Task, error)
 	Run(context.Context, string) (Run, error)
+	LiveRuns(context.Context) ([]Run, error)
+	RunsNeedingCleanup(context.Context) ([]Run, error)
+	LatestTerminalRun(context.Context, string, string) (Run, error)
+	TaskHasStartedRun(context.Context, string) (bool, error)
 	Snapshot(context.Context, string) (Snapshot, error)
 	StatusProjection(context.Context, string) (StatusProjection, error)
 	TaskProjection(context.Context, string) (TaskProjection, error)
@@ -48,6 +52,7 @@ type Transaction interface {
 	InsertRun(Run) error
 	UpdateRun(Run, int64, RunState) error
 	LiveRunCount(string, string) (int, error)
+	AgentRuntimeOccupancy(string) (int, error)
 
 	Message(string) (Message, error)
 	MessagesForTask(string) ([]Message, error)

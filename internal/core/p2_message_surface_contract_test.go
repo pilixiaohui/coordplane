@@ -95,7 +95,7 @@ func TestP2AgentInboxReadUsesCurrentRunScope(t *testing.T) {
 	if err != nil || !ok || claim.Task.ID != chat.Task.ID {
 		t.Fatalf("inbox claim = %#v ok=%t err=%v", claim, ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), claim.Run.ID, "inbox-read-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), claim.Run.ID, "inbox-read-active"); err != nil {
 		t.Fatal(err)
 	}
 	current, err := h.service.CurrentTask(context.Background(), claim.Token)
@@ -117,7 +117,7 @@ func TestP2AgentInboxReadUsesCurrentRunScope(t *testing.T) {
 	if err != nil || !ok || otherClaim.Task.ID != otherTask.ID {
 		t.Fatalf("other claim = %#v ok=%t err=%v", otherClaim, ok, err)
 	}
-	if _, err := h.service.ActivateRun(context.Background(), otherClaim.Run.ID, "inbox-read-other-active"); err != nil {
+	if _, err := activateRun(t, h, context.Background(), otherClaim.Run.ID, "inbox-read-other-active"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.service.InboxMessage(context.Background(), otherClaim.Token, chat.Message.ID); !core.IsCode(err, core.CodeScopeDenied) {
