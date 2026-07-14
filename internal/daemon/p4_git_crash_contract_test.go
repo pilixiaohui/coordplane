@@ -5,6 +5,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"coordplane/internal/core"
+	"coordplane/internal/gitcapture"
 	"coordplane/internal/gitrepo"
 	"coordplane/internal/store"
 )
@@ -51,6 +53,43 @@ func TestGT03SQLiteTaskRunAndRealGitCaptureRecoverAcrossProcessSIGKILL(t *testin
 				if persisted.Status != core.TaskSubmitted || persisted.PendingAction != "" || persisted.HeadSHA != head {
 					t.Fatalf("post-kill submitted task = %#v", persisted)
 				}
+				handoff := filepath.Join(h.root, "handoff", task.ProjectID, task.ID, claim.Run.ID)
+				if _, err := os.Stat(handoff); err != nil {
+					t.Fatalf("post-kill finalized handoff missing: %v", err)
+				}
+				if _, err := os.Stat(filepath.Join(handoff, gitcapture.ReadyName)); err != nil {
+					t.Fatalf("post-kill capture.ready missing: %v", err)
+				}
+				beforeRestart := p4StoreDurableSignature(t, postKill, h.project.ID)
+				closePostKill()
+				configPath := writeP4ComponentsConfig(t, h.root)
+				first, err := buildComponents(context.Background(), configPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				h.database = first.store
+				assertGT03RecoveredCapture(t, h, task, claim, head)
+				assertP4QuarantineEmpty(t, h.root)
+				if after := p4StoreDurableSignature(t, first.store, h.project.ID); after != beforeRestart {
+					t.Fatal("first production restart changed finalized capture state")
+				}
+				if err := first.Close(); err != nil {
+					t.Fatal(err)
+				}
+				second, err := buildComponents(context.Background(), configPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if after := p4StoreDurableSignature(t, second.store, h.project.ID); after != beforeRestart {
+					t.Fatal("second production restart changed finalized capture state")
+				}
+				h.database = second.store
+				assertGT03RecoveredCapture(t, h, task, claim, head)
+				assertP4QuarantineEmpty(t, h.root)
+				if err := second.Close(); err != nil {
+					t.Fatal(err)
+				}
+				return
 			} else if persisted.Status != core.TaskFinishing || persisted.PendingAction != "capture" || persisted.HeadSHA != "" {
 				t.Fatalf("post-kill pending task = %#v", persisted)
 			}
@@ -58,9 +97,6 @@ func TestGT03SQLiteTaskRunAndRealGitCaptureRecoverAcrossProcessSIGKILL(t *testin
 
 			request := captureHelperRequest(task, claim)
 			valid := []gitrepo.CaptureHelperRequest{request}
-			if test.phase == "submitted_before_cleanup" {
-				valid = nil
-			}
 			if err := (&dockerCaptureHelper{root: filepath.Join(h.root, "handoff")}).Recover(valid); err != nil {
 				t.Fatal(err)
 			}
@@ -69,25 +105,7 @@ func TestGT03SQLiteTaskRunAndRealGitCaptureRecoverAcrossProcessSIGKILL(t *testin
 				h.stopRun(t, claim, test.name)
 			}
 			h.reconcileGit(t)
-			submitted, err := h.database.Task(context.Background(), task.ID)
-			taskRef, refErr := gitrepo.TaskRef(task.ID, claim.Run.ID)
-			if refErr != nil {
-				t.Fatal(refErr)
-			}
-			if err != nil || submitted.Status != core.TaskSubmitted || submitted.HeadSHA != head || submitted.TaskRef != taskRef {
-				t.Fatalf("recovered capture = %#v err=%v", submitted, err)
-			}
-			refs := strings.Fields(gitOutput(t, "--git-dir="+h.project.ControlRepoPath, "for-each-ref", "--format=%(refname)", "refs/coordplane/tasks/"+task.ID))
-			if len(refs) != 1 || refs[0] != taskRef {
-				t.Fatalf("recovered refs = %#v, want %s", refs, taskRef)
-			}
-			if canonical := strings.TrimSpace(gitOutput(t, "--git-dir="+h.project.ControlRepoPath, "rev-parse", h.project.CanonicalRef+"^{commit}")); canonical != h.project.InitialSHA {
-				t.Fatalf("capture moved canonical to %s, want %s", canonical, h.project.InitialSHA)
-			}
-			if _, err := os.Stat(filepath.Join(h.root, "handoff", h.project.ID, task.ID, claim.Run.ID)); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("recovered handoff survived: %v", err)
-			}
-			gitOutput(t, "--git-dir="+h.project.ControlRepoPath, "fsck", "--full", "--strict")
+			assertGT03RecoveredCapture(t, h, task, claim, head)
 		})
 	}
 
@@ -123,6 +141,13 @@ func TestGT03SQLiteTaskRunAndRealGitCaptureRecoverAcrossProcessSIGKILL(t *testin
 		if actual := strings.TrimSpace(gitOutput(t, "--git-dir="+h.project.ControlRepoPath, "rev-parse", taskRef+"^{commit}")); actual != head {
 			t.Fatalf("diagnostic task ref = %s, want %s", actual, head)
 		}
+		legacyQuarantine := filepath.Join(h.root, "handoff", "quarantine", "legacy")
+		if err := os.MkdirAll(legacyQuarantine, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(legacyQuarantine, "bundle"), []byte("obsolete\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 		recovery := &dockerCaptureHelper{root: filepath.Join(h.root, "handoff")}
 		if err := recovery.Recover(nil); err != nil {
 			t.Fatal(err)
@@ -133,7 +158,69 @@ func TestGT03SQLiteTaskRunAndRealGitCaptureRecoverAcrossProcessSIGKILL(t *testin
 		if _, err := os.Stat(filepath.Join(h.root, "handoff", task.ProjectID, task.ID, claim.Run.ID)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("stale capture handoff survived production recovery: %v", err)
 		}
+		assertP4QuarantineEmpty(t, h.root)
 	})
+}
+
+func assertGT03RecoveredCapture(t *testing.T, h *realP4Harness, task core.Task, claim core.Claim, head string) {
+	t.Helper()
+	submitted, err := h.database.Task(context.Background(), task.ID)
+	taskRef, refErr := gitrepo.TaskRef(task.ID, claim.Run.ID)
+	if refErr != nil {
+		t.Fatal(refErr)
+	}
+	if err != nil || submitted.Status != core.TaskSubmitted || submitted.HeadSHA != head || submitted.TaskRef != taskRef {
+		t.Fatalf("recovered capture = %#v err=%v", submitted, err)
+	}
+	refs := strings.Fields(gitOutput(t, "--git-dir="+h.project.ControlRepoPath, "for-each-ref", "--format=%(refname)", "refs/coordplane/tasks/"+task.ID))
+	if len(refs) != 1 || refs[0] != taskRef {
+		t.Fatalf("recovered refs = %#v, want %s", refs, taskRef)
+	}
+	if canonical := strings.TrimSpace(gitOutput(t, "--git-dir="+h.project.ControlRepoPath, "rev-parse", h.project.CanonicalRef+"^{commit}")); canonical != h.project.InitialSHA {
+		t.Fatalf("capture moved canonical to %s, want %s", canonical, h.project.InitialSHA)
+	}
+	if _, err := os.Stat(filepath.Join(h.root, "handoff", h.project.ID, task.ID, claim.Run.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recovered handoff survived: %v", err)
+	}
+	gitOutput(t, "--git-dir="+h.project.ControlRepoPath, "fsck", "--full", "--strict")
+}
+
+func assertP4QuarantineEmpty(t *testing.T, root string) {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(root, "handoff", "quarantine"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("capture quarantine entries = %#v", entries)
+	}
+}
+
+func writeP4ComponentsConfig(t *testing.T, root string) string {
+	t.Helper()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "coordplane.yaml")
+	raw := fmt.Sprintf(`data_dir: %s
+operator_socket: %s
+max_parallel_runs: 4
+retention:
+  completed_workspace: 24h
+  terminal_task_ref: 168h
+  run_log: 168h
+runtime:
+  docker_network: coordplane
+  workspace_root: %s
+  agent_home_root: %s
+  log_root: %s
+  default_image: agent:test
+  provider_env_allowlist: []
+`, root, filepath.Join(root, "operator.sock"), filepath.Join(root, "workspaces"), filepath.Join(root, "homes"), filepath.Join(root, "logs"))
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestGT03ExistingTaskRefReplayIsIdempotentAndRejectsDifferentHead(t *testing.T) {

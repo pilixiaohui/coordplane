@@ -85,6 +85,19 @@ func buildComponents(ctx context.Context, configPath string) (*components, error
 	if err != nil {
 		return fail(err)
 	}
+	workspaceManager, err := gitrepo.NewWorkspaceManager(initializer, cfg.Runtime.WorkspaceRoot, captureHelper)
+	if err != nil {
+		return fail(err)
+	}
+	finalized, err := database.FinalizedCaptureTasks(ctx)
+	if err != nil {
+		return fail(fmt.Errorf("list finalized Git captures: %w", err))
+	}
+	for _, task := range finalized {
+		if err := workspaceManager.CleanupCapture(ctx, task.ProjectID, task.ID, task.HeadRunID); err != nil {
+			return fail(fmt.Errorf("clean finalized Git capture %s/%s: %w", task.ID, task.HeadRunID, err))
+		}
+	}
 	pending, err := database.PendingGitTasks(ctx)
 	if err != nil {
 		return fail(fmt.Errorf("list pending Git tasks: %w", err))
@@ -109,10 +122,6 @@ func buildComponents(ctx context.Context, configPath string) (*components, error
 	}
 	if err := captureHelper.Recover(validHandoffs); err != nil {
 		return fail(fmt.Errorf("recover Git capture handoffs: %w", err))
-	}
-	workspaceManager, err := gitrepo.NewWorkspaceManager(initializer, cfg.Runtime.WorkspaceRoot, captureHelper)
-	if err != nil {
-		return fail(err)
 	}
 	service, err := core.NewService(database, projectGitAdapter{initializer: initializer, workspaces: workspaceManager}, core.ServiceOptions{
 		MaxParallelRuns: cfg.MaxParallelRuns, AdapterIDs: adapter.Production().Names(),

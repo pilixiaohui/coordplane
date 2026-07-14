@@ -860,12 +860,16 @@ func newRealP4Service(t *testing.T, database *store.Store, controller core.Proje
 }
 
 func p4DurableSignature(t *testing.T, h *realP4Harness) string {
+	return p4StoreDurableSignature(t, h.database, h.project.ID)
+}
+
+func p4StoreDurableSignature(t *testing.T, database *store.Store, projectID string) string {
 	t.Helper()
-	snapshot, err := h.database.Snapshot(context.Background(), h.project.ID)
+	snapshot, err := database.Snapshot(context.Background(), projectID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	events, err := h.database.Events(context.Background(), core.EventFilter{ProjectID: h.project.ID})
+	events, err := database.Events(context.Background(), core.EventFilter{ProjectID: projectID})
 	if err != nil {
 		t.Fatal(err)
 	}

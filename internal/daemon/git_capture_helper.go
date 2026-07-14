@@ -178,6 +178,10 @@ func (h *dockerCaptureHelper) Cleanup(_ context.Context, request gitrepo.Capture
 func (h *dockerCaptureHelper) Recover(valid []gitrepo.CaptureHelperRequest) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	quarantineRoot := filepath.Join(h.root, "quarantine")
+	if err := os.RemoveAll(quarantineRoot); err != nil {
+		return err
+	}
 	wanted := make(map[string]struct{}, len(valid))
 	for _, request := range valid {
 		wanted[h.handoffPath(request)] = struct{}{}
@@ -187,7 +191,7 @@ func (h *dockerCaptureHelper) Recover(valid []gitrepo.CaptureHelperRequest) erro
 		return err
 	}
 	for _, project := range projects {
-		if !project.IsDir() || project.Name() == "quarantine" {
+		if !project.IsDir() {
 			continue
 		}
 		projectPath := filepath.Join(h.root, project.Name())
@@ -195,7 +199,7 @@ func (h *dockerCaptureHelper) Recover(valid []gitrepo.CaptureHelperRequest) erro
 			return err
 		}
 	}
-	return nil
+	return os.RemoveAll(quarantineRoot)
 }
 
 func (h *dockerCaptureHelper) recoverProject(projectPath string, wanted map[string]struct{}) error {
@@ -230,7 +234,11 @@ func (h *dockerCaptureHelper) quarantine(path string) error {
 		return err
 	}
 	digest := sha256.Sum256([]byte(path + time.Now().UTC().Format(time.RFC3339Nano)))
-	return os.Rename(path, filepath.Join(root, hex.EncodeToString(digest[:12])))
+	target := filepath.Join(root, hex.EncodeToString(digest[:12]))
+	if err := os.Rename(path, target); err != nil {
+		return err
+	}
+	return os.RemoveAll(target)
 }
 
 func (h *dockerCaptureHelper) handoffPath(request gitrepo.CaptureHelperRequest) string {

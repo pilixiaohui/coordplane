@@ -66,6 +66,15 @@ func (s *Store) PendingGitTasks(ctx context.Context) ([]core.Task, error) {
 	return collectTasks(rows)
 }
 
+func (s *Store) FinalizedCaptureTasks(ctx context.Context) ([]core.Task, error) {
+	rows, err := s.db.QueryContext(ctx, taskSelect+`
+WHERE head_sha<>'' AND head_run_id<>'' AND task_ref<>'' ORDER BY submitted_at,id`)
+	if err != nil {
+		return nil, err
+	}
+	return collectTasks(rows)
+}
+
 func (s *Store) TaskRefCandidates(ctx context.Context, closedBefore string) ([]core.Task, error) {
 	rows, err := s.db.QueryContext(ctx, taskSelect+`
 WHERE task_ref<>'' AND status IN ('completed','cancelled') AND closed_at<>'' AND closed_at<=?
