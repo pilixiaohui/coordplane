@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"coordplane/internal/core"
 	"coordplane/internal/store"
 	"coordplane/internal/transport"
+	"coordplane/tests/testsupport"
 )
 
 var testBinaries struct {
@@ -29,6 +31,11 @@ var testBinaries struct {
 }
 
 func TestMain(m *testing.M) {
+	release, err := testsupport.AcquireSerialResource(testsupport.DockerResource, "tests/contract", 3*time.Minute)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	directory, err := os.MkdirTemp("", "coordplane-p1-contract-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -71,6 +78,10 @@ func TestMain(m *testing.M) {
 		if code == 0 {
 			code = 1
 		}
+	}
+	if err := release(); err != nil {
+		fmt.Fprintf(os.Stderr, "release contract test resource: %v\n", err)
+		code = 1
 	}
 	os.Exit(code)
 }
@@ -955,20 +966,35 @@ func startDaemonBinaryWithEnv(t *testing.T, binary, configPath, socket string, e
 		t.Fatal(err)
 	}
 	process := &daemonProcess{command: command, output: output}
+	client, err := transport.NewUnixClient(socket)
+	if err != nil {
+		_ = command.Process.Kill()
+		_, _ = command.Process.Wait()
+		t.Fatalf("create daemon readiness client: %v", err)
+	}
+	started := time.Now()
 	deadline := time.Now().Add(5 * time.Second)
+	var lastStatus core.Status
+	var lastProbeErr error
 	for {
-		status := exec.Command(binary, "status", "--socket", socket, "--output", "json")
-		if raw, err := status.Output(); err == nil && bytes.Contains(raw, []byte(`"daemon_ready":true`)) {
+		probeContext, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		lastProbeErr = client.JSON(probeContext, http.MethodGet, "/v1/status", nil, &lastStatus)
+		cancel()
+		if lastProbeErr == nil && lastStatus.DaemonReady {
+			t.Logf("daemon ready after %s (pid=%d)", time.Since(started).Round(time.Millisecond), command.Process.Pid)
 			return process
 		}
 		if processExited(command.Process) {
-			_, _ = command.Process.Wait()
-			t.Fatalf("daemon exited before ready: %s", output.String())
+			exitErr := command.Wait()
+			t.Fatalf("daemon exited before ready after %s: %v\nlast status=%#v probe=%v\n%s",
+				time.Since(started).Round(time.Millisecond), exitErr, lastStatus, lastProbeErr, output.String())
 		}
 		if time.Now().After(deadline) {
 			_ = command.Process.Kill()
 			_, _ = command.Process.Wait()
-			t.Fatalf("daemon readiness timeout: %s", output.String())
+			socketInfo, socketErr := os.Lstat(socket)
+			t.Fatalf("daemon readiness timeout after %s (pid=%d): last status=%#v probe=%v socket=%#v socket_err=%v\n%s",
+				time.Since(started).Round(time.Millisecond), command.Process.Pid, lastStatus, lastProbeErr, socketInfo, socketErr, output.String())
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
