@@ -11,8 +11,6 @@ import (
 	"strings"
 )
 
-const maximumCaptureBundleBytes int64 = 64 << 20
-
 // CaptureSpec contains only durable task/run inputs and deterministic daemon
 // paths. ExpectedHead is an assertion; Capture always reads the actual HEAD.
 type CaptureSpec struct {
@@ -26,6 +24,59 @@ type CaptureFact struct {
 	HeadSHA string
 	TaskRef string
 }
+
+// CaptureHelper is the only production boundary allowed to derive Git facts
+// from an Agent-owned workspace. Implementations must isolate repository
+// config, use a read-only workspace, and atomically publish trusted facts.
+type CaptureHelper interface {
+	Capture(context.Context, CaptureHelperRequest) (CaptureHelperFact, error)
+	Inspect(context.Context, WorkspaceInspectRequest) (WorkspaceInspectFact, error)
+	Cleanup(context.Context, CaptureHelperRequest) error
+}
+
+type CaptureHelperRequest struct {
+	ProjectID    string
+	TaskID       string
+	RunID        string
+	Workspace    string
+	ExpectedHead string
+	BaseSHA      string
+	SourceSHA    string
+}
+
+type CaptureHelperFact struct {
+	HeadSHA     string
+	ReadyBundle string
+	BundleBytes int64
+	ObjectCount int
+}
+
+type WorkspaceInspectRequest struct {
+	ProjectID string
+	TaskID    string
+	Workspace string
+}
+
+type WorkspaceInspectFact struct {
+	HeadSHA      string
+	StatusDigest string
+	ObjectCount  int
+	Clean        bool
+	Unfinished   bool
+}
+
+type capturePhase string
+
+const (
+	capturePhaseIntentChecked    capturePhase = "intent_checked"
+	capturePhaseHandoffReady     capturePhase = "handoff_ready"
+	capturePhaseBundleVerified   capturePhase = "bundle_verified"
+	capturePhaseObjectsImported  capturePhase = "objects_imported"
+	capturePhaseTaskRefWritten   capturePhase = "task_ref_written"
+	capturePhaseIntegrityChecked capturePhase = "integrity_checked"
+)
+
+var contractCapturePhaseHook func(context.Context, capturePhase, CaptureSpec) error
 
 type AdvanceOutcome string
 
@@ -68,6 +119,13 @@ type DeleteTaskRefSpec struct {
 	CanonicalRef    string
 	TaskRef         string
 	ExpectedHead    string
+	AllowDiscard    bool
+}
+
+type TaskRefStateFact struct {
+	Exists    bool
+	ActualSHA string
+	Included  bool
 }
 
 // InvariantError identifies failures where controller Git truth can no longer
@@ -129,7 +187,13 @@ func (m *WorkspaceManager) Capture(ctx context.Context, spec CaptureSpec) (Captu
 	if err != nil {
 		return CaptureFact{}, m.publicError("capture", err)
 	}
-	if _, err := m.inspectCapture(ctx, path, spec.Workspace, spec.ExpectedHead); err != nil {
+	if err := m.validateFinalWorkspacePath(path, spec.Workspace); err != nil {
+		return CaptureFact{}, m.publicError("capture", err)
+	}
+	if m.capture == nil {
+		return CaptureFact{}, m.publicError("capture", errors.New("trusted capture helper is not configured"))
+	}
+	if err := runCapturePhaseHook(ctx, capturePhaseIntentChecked, spec); err != nil {
 		return CaptureFact{}, m.publicError("capture", err)
 	}
 
@@ -137,58 +201,96 @@ func (m *WorkspaceManager) Capture(ctx context.Context, spec CaptureSpec) (Captu
 	if err != nil {
 		return CaptureFact{}, m.publicError("capture", err)
 	}
-	defer unlock()
-
 	actualRef, exists, err := m.initializer.resolveRef(ctx, spec.ControlRepoPath, taskRef)
+	if err != nil {
+		unlock()
+		return CaptureFact{}, m.publicError("capture", err)
+	}
+	if exists {
+		if actualRef != spec.ExpectedHead {
+			unlock()
+			return CaptureFact{}, m.publicError("capture", &InvariantError{message: "task ref does not match expected head"})
+		}
+		if err := m.validateExistingCapture(ctx, spec, actualRef); err != nil {
+			unlock()
+			return CaptureFact{}, m.publicError("capture", err)
+		}
+		if err := m.cleanupCaptureImportRef(ctx, spec); err != nil {
+			unlock()
+			return CaptureFact{}, m.publicError("capture", err)
+		}
+		unlock()
+		_ = m.capture.Cleanup(context.Background(), CaptureHelperRequest{
+			ProjectID: spec.Workspace.ProjectID, TaskID: spec.Workspace.TaskID, RunID: spec.RunID,
+		})
+		return CaptureFact{HeadSHA: actualRef, TaskRef: taskRef}, nil
+	}
+	unlock()
+
+	helperRequest := CaptureHelperRequest{
+		ProjectID: spec.Workspace.ProjectID, TaskID: spec.Workspace.TaskID, RunID: spec.RunID,
+		Workspace: path, ExpectedHead: spec.ExpectedHead, BaseSHA: spec.Workspace.BaseSHA,
+	}
+	if spec.Workspace.Source != nil {
+		helperRequest.SourceSHA = spec.Workspace.Source.HeadSHA
+	}
+	handoff, err := m.capture.Capture(ctx, helperRequest)
+	if err != nil {
+		return CaptureFact{}, m.publicError("capture", err)
+	}
+	cleanupHandoff := false
+	defer func() {
+		if cleanupHandoff {
+			_ = m.capture.Cleanup(context.Background(), helperRequest)
+		}
+	}()
+	if handoff.HeadSHA != spec.ExpectedHead || handoff.ObjectCount <= 0 || handoff.BundleBytes <= 0 {
+		return CaptureFact{}, m.publicError("capture", &InvariantError{message: "capture helper facts do not match durable intent"})
+	}
+	if err := runCapturePhaseHook(ctx, capturePhaseHandoffReady, spec); err != nil {
+		return CaptureFact{}, m.publicError("capture", err)
+	}
+	info, err := os.Lstat(handoff.ReadyBundle)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return CaptureFact{}, m.publicError("capture", errors.New("capture handoff is not a direct regular file"))
+	}
+	if info.Size() != handoff.BundleBytes {
+		return CaptureFact{}, m.publicError("capture", &InvariantError{message: "capture bundle size does not match helper fact"})
+	}
+
+	unlock, err = m.initializer.maintenance.lock(ctx, spec.Workspace.ProjectID)
+	if err != nil {
+		return CaptureFact{}, m.publicError("capture", err)
+	}
+	defer unlock()
+	actualRef, exists, err = m.initializer.resolveRef(ctx, spec.ControlRepoPath, taskRef)
 	if err != nil {
 		return CaptureFact{}, m.publicError("capture", err)
 	}
 	if exists {
 		if actualRef != spec.ExpectedHead {
-			return CaptureFact{}, m.publicError("capture", &InvariantError{message: "task ref points to a different commit"})
+			return CaptureFact{}, m.publicError("capture", &InvariantError{message: "task ref does not match expected head"})
 		}
+		if err := m.validateExistingCapture(ctx, spec, actualRef); err != nil {
+			return CaptureFact{}, m.publicError("capture", err)
+		}
+		if err := m.cleanupCaptureImportRef(ctx, spec); err != nil {
+			return CaptureFact{}, m.publicError("capture", err)
+		}
+		cleanupHandoff = true
 		return CaptureFact{HeadSHA: actualRef, TaskRef: taskRef}, nil
 	}
-
-	handoffRoot := filepath.Join(m.initializer.root, ".handoff")
-	if err := m.initializer.ensureDirectSubdirectories(handoffRoot); err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
-	}
-	bundle, err := os.CreateTemp(handoffRoot, ".capture-*.bundle")
-	if err != nil {
-		return CaptureFact{}, m.publicError("capture", fmt.Errorf("create handoff: %w", err))
-	}
-	bundlePath := bundle.Name()
-	if err := bundle.Close(); err != nil {
-		_ = os.Remove(bundlePath)
-		return CaptureFact{}, m.publicError("capture", fmt.Errorf("close handoff placeholder: %w", err))
-	}
-	if err := os.Remove(bundlePath); err != nil {
-		return CaptureFact{}, m.publicError("capture", fmt.Errorf("prepare handoff path: %w", err))
-	}
-	defer os.Remove(bundlePath)
-
-	if _, err := m.git(ctx, "create capture bundle", "-C", path, "bundle", "create", bundlePath, "HEAD"); err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
-	}
-	info, err := os.Lstat(bundlePath)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return CaptureFact{}, m.publicError("capture", errors.New("capture handoff is not a direct regular file"))
-	}
-	if info.Size() <= 0 || info.Size() > maximumCaptureBundleBytes {
-		return CaptureFact{}, m.publicError("capture", errors.New("capture handoff exceeds size limit"))
-	}
-	if _, err := m.git(ctx, "verify capture bundle", "--git-dir="+spec.ControlRepoPath, "bundle", "verify", bundlePath); err != nil {
+	if _, err := m.git(ctx, "verify capture bundle", "--git-dir="+spec.ControlRepoPath, "bundle", "verify", handoff.ReadyBundle); err != nil {
 		return CaptureFact{}, m.publicError("capture", &InvariantError{message: "capture bundle verification failed", cause: err})
 	}
-	if _, err := m.inspectCapture(ctx, path, spec.Workspace, spec.ExpectedHead); err != nil {
+	if err := runCapturePhaseHook(ctx, capturePhaseBundleVerified, spec); err != nil {
 		return CaptureFact{}, m.publicError("capture", err)
 	}
 
 	importRef := "refs/coordplane/imports/" + spec.Workspace.TaskID + "/" + spec.RunID
 	if _, err := m.initializer.git(ctx,
 		"-c", "protocol.file.allow=always", "--git-dir="+spec.ControlRepoPath,
-		"fetch", "--force", "--no-tags", "--no-write-fetch-head", bundlePath, "HEAD:"+importRef,
+		"fetch", "--force", "--no-tags", "--no-write-fetch-head", handoff.ReadyBundle, "HEAD:"+importRef,
 	); err != nil {
 		return CaptureFact{}, m.publicError("capture", &InvariantError{message: "import capture handoff", cause: err})
 	}
@@ -199,6 +301,13 @@ func (m *WorkspaceManager) Capture(ctx context.Context, spec CaptureSpec) (Captu
 	if err != nil || !exists || imported != spec.ExpectedHead {
 		return CaptureFact{}, m.publicError("capture", &InvariantError{message: "imported capture does not match actual head", cause: err})
 	}
+	typeName, err := m.initializer.git(ctx, "--git-dir="+spec.ControlRepoPath, "cat-file", "-t", imported)
+	if err != nil || strings.TrimSpace(typeName) != "commit" {
+		return CaptureFact{}, m.publicError("capture", &InvariantError{message: "imported capture is not a commit", cause: err})
+	}
+	if err := runCapturePhaseHook(ctx, capturePhaseObjectsImported, spec); err != nil {
+		return CaptureFact{}, m.publicError("capture", err)
+	}
 	if err := m.validateCapturedAncestry(ctx, spec.ControlRepoPath, spec.Workspace, imported); err != nil {
 		return CaptureFact{}, m.publicError("capture", err)
 	}
@@ -208,6 +317,9 @@ func (m *WorkspaceManager) Capture(ctx context.Context, spec CaptureSpec) (Captu
 			return CaptureFact{}, m.publicError("capture", &InvariantError{message: "create immutable task ref", cause: err})
 		}
 	}
+	if err := runCapturePhaseHook(ctx, capturePhaseTaskRefWritten, spec); err != nil {
+		return CaptureFact{}, m.publicError("capture", err)
+	}
 	current, exists, err := m.initializer.resolveRef(ctx, spec.ControlRepoPath, taskRef)
 	if err != nil || !exists || current != imported {
 		return CaptureFact{}, m.publicError("capture", &InvariantError{message: "task ref read-back mismatch", cause: err})
@@ -215,49 +327,47 @@ func (m *WorkspaceManager) Capture(ctx context.Context, spec CaptureSpec) (Captu
 	if _, err := m.initializer.git(ctx, "--git-dir="+spec.ControlRepoPath, "fsck", "--connectivity-only", "--strict"); err != nil {
 		return CaptureFact{}, m.publicError("capture", &InvariantError{message: "control repository fsck failed", cause: err})
 	}
+	if err := runCapturePhaseHook(ctx, capturePhaseIntegrityChecked, spec); err != nil {
+		return CaptureFact{}, m.publicError("capture", err)
+	}
+	cleanupHandoff = true
 	return CaptureFact{HeadSHA: current, TaskRef: taskRef}, nil
 }
 
-func (m *WorkspaceManager) inspectCapture(ctx context.Context, path string, spec WorkspaceSpec, expected string) (string, error) {
-	fact, err := m.inspect(ctx, path, spec, false)
-	if err != nil {
-		return "", err
+func runCapturePhaseHook(ctx context.Context, phase capturePhase, spec CaptureSpec) error {
+	if contractCapturePhaseHook == nil {
+		return nil
 	}
-	if fact.HeadSHA != expected {
-		return "", errors.New("actual workspace HEAD does not match expected head")
+	return contractCapturePhaseHook(ctx, phase, spec)
+}
+
+func (m *WorkspaceManager) validateExistingCapture(ctx context.Context, spec CaptureSpec, head string) error {
+	typeName, err := m.initializer.git(ctx, "--git-dir="+spec.ControlRepoPath, "cat-file", "-t", head)
+	if err != nil || strings.TrimSpace(typeName) != "commit" {
+		return &InvariantError{message: "existing task ref is not a commit", cause: err}
 	}
-	status, err := m.git(ctx, "inspect capture status", "-C", path, "status", "--porcelain=v1", "--untracked-files=all")
-	if err != nil {
-		return "", err
+	if err := m.validateCapturedAncestry(ctx, spec.ControlRepoPath, spec.Workspace, head); err != nil {
+		return err
 	}
-	if strings.TrimSpace(status) != "" {
-		return "", errors.New("workspace must be clean before capture")
+	if _, err := m.initializer.git(ctx, "--git-dir="+spec.ControlRepoPath, "fsck", "--connectivity-only", "--strict"); err != nil {
+		return &InvariantError{message: "control repository fsck failed during capture recovery", cause: err}
 	}
-	gitDir := filepath.Join(path, ".git")
-	for _, name := range []string{"MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-apply", "rebase-merge"} {
-		if exists, err := pathExists(filepath.Join(gitDir, name)); err != nil {
-			return "", err
-		} else if exists {
-			return "", errors.New("workspace has an unfinished Git operation")
-		}
+	return nil
+}
+
+func (m *WorkspaceManager) cleanupCaptureImportRef(ctx context.Context, spec CaptureSpec) error {
+	importRef := "refs/coordplane/imports/" + spec.Workspace.TaskID + "/" + spec.RunID
+	actual, exists, err := m.initializer.resolveRef(ctx, spec.ControlRepoPath, importRef)
+	if err != nil || !exists {
+		return err
 	}
-	ancestor, err := m.initializer.isAncestor(ctx, path, false, spec.BaseSHA, fact.HeadSHA)
-	if err != nil {
-		return "", err
+	if actual != spec.ExpectedHead {
+		return &InvariantError{message: "capture import ref points to a different commit"}
 	}
-	if !ancestor {
-		return "", errors.New("workspace base is not an ancestor of actual HEAD")
+	if _, err := m.initializer.git(ctx, "--git-dir="+spec.ControlRepoPath, "update-ref", "-d", importRef, actual); err != nil {
+		return &InvariantError{message: "remove recovered capture import ref", cause: err}
 	}
-	if spec.Source != nil {
-		ancestor, err = m.initializer.isAncestor(ctx, path, false, spec.Source.HeadSHA, fact.HeadSHA)
-		if err != nil {
-			return "", err
-		}
-		if !ancestor {
-			return "", errors.New("integration HEAD does not contain source head")
-		}
-	}
-	return fact.HeadSHA, nil
+	return nil
 }
 
 func (m *WorkspaceManager) validateCapturedAncestry(ctx context.Context, controlPath string, spec WorkspaceSpec, head string) error {
@@ -511,9 +621,9 @@ func (i *Initializer) Checkout(ctx context.Context, spec CheckoutSpec) (fact Che
 	return fact, err
 }
 
-// DeleteTaskRef performs derived GC only after the caller rechecks its durable
-// predicate while this project's maintenance lock is held.
-func (i *Initializer) DeleteTaskRef(ctx context.Context, spec DeleteTaskRefSpec, authorize func() (bool, error)) (bool, error) {
+// DeleteTaskRefAndPrune owns the complete final DB-check, expected-old delete,
+// reachability check, and prune window under one project maintenance lock.
+func (i *Initializer) DeleteTaskRefAndPrune(ctx context.Context, spec DeleteTaskRefSpec, authorize func() (bool, error)) (bool, error) {
 	if authorize == nil {
 		return false, errors.New("gitrepo: task ref GC authorization is required")
 	}
@@ -552,7 +662,7 @@ func (i *Initializer) DeleteTaskRef(ctx context.Context, spec DeleteTaskRefSpec,
 		return false, err
 	}
 	if !exists {
-		return true, nil
+		return true, i.pruneLocked(ctx, spec.ControlRepoPath)
 	}
 	if actual != spec.ExpectedHead {
 		return false, &InvariantError{message: "task ref changed before GC"}
@@ -565,7 +675,7 @@ func (i *Initializer) DeleteTaskRef(ctx context.Context, spec DeleteTaskRefSpec,
 	if err != nil {
 		return false, &InvariantError{message: "verify task ref reachability during GC", cause: err}
 	}
-	if !included {
+	if !included && !spec.AllowDiscard {
 		return false, nil
 	}
 	if _, err := i.git(ctx, "--git-dir="+spec.ControlRepoPath, "update-ref", "-d", spec.TaskRef, actual); err != nil {
@@ -578,26 +688,46 @@ func (i *Initializer) DeleteTaskRef(ctx context.Context, spec DeleteTaskRefSpec,
 	if err != nil {
 		return false, err
 	}
-	return !exists, nil
+	if exists {
+		return false, nil
+	}
+	return true, i.pruneLocked(ctx, spec.ControlRepoPath)
 }
 
-// Prune runs separately from ref deletion. It skips already-packed clean
-// repositories and always verifies the resulting object graph.
-func (i *Initializer) Prune(ctx context.Context, projectID, controlPath string) error {
-	if err := validateID("project", projectID); err != nil {
-		return err
+func (i *Initializer) TaskRefState(ctx context.Context, spec DeleteTaskRefSpec) (TaskRefStateFact, error) {
+	if err := validateID("project", spec.ProjectID); err != nil {
+		return TaskRefStateFact{}, err
 	}
-	if err := i.validateFinalPath(controlPath); err != nil {
-		return err
+	if err := i.validateFinalPath(spec.ControlRepoPath); err != nil {
+		return TaskRefStateFact{}, err
 	}
-	if controlPath != filepath.Join(i.root, projectID+".git") {
-		return errors.New("gitrepo: control repository does not match project")
+	if spec.ControlRepoPath != filepath.Join(i.root, spec.ProjectID+".git") {
+		return TaskRefStateFact{}, errors.New("gitrepo: control repository does not match project")
 	}
-	unlock, err := i.maintenance.lock(ctx, projectID)
+	if err := i.validateBranchRef(ctx, spec.CanonicalRef); err != nil {
+		return TaskRefStateFact{}, err
+	}
+	unlock, err := i.maintenance.lock(ctx, spec.ProjectID)
 	if err != nil {
-		return err
+		return TaskRefStateFact{}, err
 	}
 	defer unlock()
+	actual, exists, err := i.resolveRef(ctx, spec.ControlRepoPath, spec.TaskRef)
+	if err != nil || !exists {
+		return TaskRefStateFact{Exists: exists}, err
+	}
+	canonical, canonicalExists, err := i.resolveRef(ctx, spec.ControlRepoPath, spec.CanonicalRef)
+	if err != nil || !canonicalExists {
+		return TaskRefStateFact{}, &InvariantError{message: "canonical ref missing during GC preview", cause: err}
+	}
+	included, err := i.isAncestor(ctx, spec.ControlRepoPath, true, actual, canonical)
+	if err != nil {
+		return TaskRefStateFact{}, err
+	}
+	return TaskRefStateFact{Exists: true, ActualSHA: actual, Included: included}, nil
+}
+
+func (i *Initializer) pruneLocked(ctx context.Context, controlPath string) error {
 	output, err := i.git(ctx, "--git-dir="+controlPath, "count-objects", "-v")
 	if err != nil {
 		return err

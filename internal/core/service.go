@@ -16,24 +16,29 @@ import (
 )
 
 type ServiceOptions struct {
-	Now             func() time.Time
-	NewID           func(string) (string, error)
-	MaxParallelRuns int
-	AdapterIDs      []string
+	Now                         func() time.Time
+	NewID                       func(string) (string, error)
+	MaxParallelRuns             int
+	AdapterIDs                  []string
+	CompletedWorkspaceRetention time.Duration
+	TerminalTaskRefRetention    time.Duration
 }
 
 type Service struct {
-	repository Repository
-	projectGit ProjectGit
-	now        func() time.Time
-	newID      func(string) (string, error)
-	maxRuns    int
-	adapters   map[string]struct{}
+	repository                  Repository
+	projectGit                  ProjectGit
+	now                         func() time.Time
+	newID                       func(string) (string, error)
+	maxRuns                     int
+	adapters                    map[string]struct{}
+	completedWorkspaceRetention time.Duration
+	terminalTaskRefRetention    time.Duration
 
 	readyMu       sync.RWMutex
 	ready         bool
 	readyReason   string
 	runtimeStatus *RuntimeStatus
+	gcMu          sync.Mutex
 }
 
 func NewService(repository Repository, projectGit ProjectGit, options ServiceOptions) (*Service, error) {
@@ -52,6 +57,9 @@ func NewService(repository Repository, projectGit ProjectGit, options ServiceOpt
 	if options.MaxParallelRuns <= 0 {
 		options.MaxParallelRuns = 1
 	}
+	if options.CompletedWorkspaceRetention < 0 || options.TerminalTaskRefRetention < 0 {
+		return nil, NewError(CodeInvalidArgument, "GC retention durations cannot be negative", false)
+	}
 	adapters := make(map[string]struct{}, len(options.AdapterIDs))
 	for _, adapterID := range options.AdapterIDs {
 		if adapterID == "" || strings.TrimSpace(adapterID) != adapterID {
@@ -66,12 +74,14 @@ func NewService(repository Repository, projectGit ProjectGit, options ServiceOpt
 		return nil, NewError(CodeInvalidArgument, "at least one adapter ID is required", false)
 	}
 	return &Service{
-		repository: repository,
-		projectGit: projectGit,
-		now:        options.Now,
-		newID:      options.NewID,
-		maxRuns:    options.MaxParallelRuns,
-		adapters:   adapters,
+		repository:                  repository,
+		projectGit:                  projectGit,
+		now:                         options.Now,
+		newID:                       options.NewID,
+		maxRuns:                     options.MaxParallelRuns,
+		adapters:                    adapters,
+		completedWorkspaceRetention: options.CompletedWorkspaceRetention,
+		terminalTaskRefRetention:    options.TerminalTaskRefRetention,
 	}, nil
 }
 

@@ -152,8 +152,8 @@ func (u *unitOfWork) Conversation(projectID, agentID string) (core.Task, error) 
 
 func (u *unitOfWork) InsertTask(task core.Task) error {
 	_, err := u.tx.ExecContext(u.ctx, `
-INSERT INTO tasks(id,project_id,kind,parent_task_id,retry_of_task_id,created_by_kind,created_by_id,assignee_agent_id,title,description,priority,status,current_run_id,generation,next_run_at,retry_count,max_retries,wait_reason,result_summary,failure_reason,base_sha,head_sha,head_run_id,task_ref,accepted_by_kind,accepted_by_id,accepted_at,accepted_integration_agent_id,final_canonical_sha,integration_task_id,source_task_id,source_run_id,source_task_ref,source_head_sha,source_accept_version,observed_canonical_sha,pending_action,pending_action_id,pending_action_version,pending_action_run_id,pending_expected_sha,pending_target_sha,pending_started_at,version,created_at,updated_at,submitted_at,completed_at,closed_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+INSERT INTO tasks(id,project_id,kind,parent_task_id,retry_of_task_id,created_by_kind,created_by_id,assignee_agent_id,title,description,priority,status,current_run_id,generation,next_run_at,retry_count,max_retries,wait_reason,result_summary,failure_reason,base_sha,head_sha,head_run_id,task_ref,accepted_by_kind,accepted_by_id,accepted_at,accepted_integration_agent_id,final_canonical_sha,integration_task_id,source_task_id,source_run_id,source_task_ref,source_head_sha,source_ref_released_at,source_accept_version,observed_canonical_sha,pending_action,pending_action_id,pending_action_version,pending_action_run_id,pending_expected_sha,pending_target_sha,pending_started_at,version,created_at,updated_at,submitted_at,completed_at,closed_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		taskValues(task)...,
 	)
 	return err
@@ -161,14 +161,14 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
 
 func (u *unitOfWork) UpdateTask(task core.Task, expectedVersion int64, expectedStatus core.TaskStatus) error {
 	result, err := u.tx.ExecContext(u.ctx, `
-UPDATE tasks SET status=?,current_run_id=?,generation=?,next_run_at=?,retry_count=?,max_retries=?,wait_reason=?,result_summary=?,failure_reason=?,base_sha=?,head_sha=?,head_run_id=?,task_ref=?,accepted_by_kind=?,accepted_by_id=?,accepted_at=?,accepted_integration_agent_id=?,final_canonical_sha=?,integration_task_id=?,source_task_id=?,source_run_id=?,source_task_ref=?,source_head_sha=?,source_accept_version=?,observed_canonical_sha=?,pending_action=?,pending_action_id=?,pending_action_version=?,pending_action_run_id=?,pending_expected_sha=?,pending_target_sha=?,pending_started_at=?,version=?,updated_at=?,submitted_at=?,completed_at=?,closed_at=?
+UPDATE tasks SET status=?,current_run_id=?,generation=?,next_run_at=?,retry_count=?,max_retries=?,wait_reason=?,result_summary=?,failure_reason=?,base_sha=?,head_sha=?,head_run_id=?,task_ref=?,accepted_by_kind=?,accepted_by_id=?,accepted_at=?,accepted_integration_agent_id=?,final_canonical_sha=?,integration_task_id=?,source_task_id=?,source_run_id=?,source_task_ref=?,source_head_sha=?,source_ref_released_at=?,source_accept_version=?,observed_canonical_sha=?,pending_action=?,pending_action_id=?,pending_action_version=?,pending_action_run_id=?,pending_expected_sha=?,pending_target_sha=?,pending_started_at=?,version=?,updated_at=?,submitted_at=?,completed_at=?,closed_at=?
 WHERE id=? AND version=? AND status=?`,
 		task.Status, task.CurrentRunID, task.Generation, task.NextRunAt, task.RetryCount,
 		task.MaxRetries, task.WaitReason, task.ResultSummary, task.FailureReason, task.BaseSHA,
 		task.HeadSHA, task.HeadRunID, task.TaskRef, task.AcceptedByKind, task.AcceptedByID,
 		task.AcceptedAt, task.AcceptedIntegrationAgentID, task.FinalCanonicalSHA,
 		task.IntegrationTaskID, task.SourceTaskID, task.SourceRunID, task.SourceTaskRef,
-		task.SourceHeadSHA, task.SourceAcceptVersion, task.ObservedCanonicalSHA,
+		task.SourceHeadSHA, task.SourceRefReleasedAt, task.SourceAcceptVersion, task.ObservedCanonicalSHA,
 		task.PendingAction, task.PendingActionID, task.PendingActionVersion,
 		task.PendingActionRunID, task.PendingExpectedSHA, task.PendingTargetSHA,
 		task.PendingStartedAt, task.Version, task.UpdatedAt, task.SubmittedAt,
@@ -367,6 +367,7 @@ func taskValues(task core.Task) []any {
 		task.TaskRef, task.AcceptedByKind, task.AcceptedByID, task.AcceptedAt,
 		task.AcceptedIntegrationAgentID, task.FinalCanonicalSHA, task.IntegrationTaskID,
 		task.SourceTaskID, task.SourceRunID, task.SourceTaskRef, task.SourceHeadSHA,
+		task.SourceRefReleasedAt,
 		task.SourceAcceptVersion, task.ObservedCanonicalSHA, task.PendingAction,
 		task.PendingActionID, task.PendingActionVersion, task.PendingActionRunID,
 		task.PendingExpectedSHA, task.PendingTargetSHA, task.PendingStartedAt,

@@ -10,6 +10,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"coordplane/internal/gitcapture"
 )
 
 func TestGT01MaterializeCreatesExactPrivateClone(t *testing.T) {
@@ -321,11 +323,56 @@ func newWorkspaceFixture(t *testing.T) (*Initializer, *WorkspaceManager, Project
 	if _, err := initializer.Initialize(ctx, project); err != nil {
 		t.Fatal(err)
 	}
-	manager, err := NewWorkspaceManager(initializer, filepath.Join(t.TempDir(), "workspaces"))
+	manager, err := NewWorkspaceManager(initializer, filepath.Join(t.TempDir(), "workspaces"), testCaptureHelper{root: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return initializer, manager, project, sourceRepo, initial
+}
+
+type testCaptureHelper struct{ root string }
+
+func (h testCaptureHelper) Capture(ctx context.Context, request CaptureHelperRequest) (CaptureHelperFact, error) {
+	handoff := filepath.Join(h.root, request.ProjectID, request.TaskID, request.RunID)
+	if err := os.MkdirAll(handoff, 0o700); err != nil {
+		return CaptureHelperFact{}, err
+	}
+	fact, err := gitcapture.Capture(ctx, gitcapture.Request{
+		Workspace: request.Workspace, Handoff: handoff, ExpectedHead: request.ExpectedHead,
+		BaseSHA: request.BaseSHA, SourceSHA: request.SourceSHA,
+		MaximumBundleBytes: 64 << 20, MaximumObjects: 250_000,
+	})
+	return CaptureHelperFact{
+		HeadSHA: fact.HeadSHA, ReadyBundle: filepath.Join(handoff, gitcapture.ReadyName, gitcapture.BundleName),
+		BundleBytes: fact.BundleBytes, ObjectCount: fact.ObjectCount,
+	}, err
+}
+
+func (h testCaptureHelper) Inspect(ctx context.Context, request WorkspaceInspectRequest) (WorkspaceInspectFact, error) {
+	return inspectWithGitCapture(ctx, h.root, request)
+}
+
+func (h testCaptureHelper) Cleanup(_ context.Context, request CaptureHelperRequest) error {
+	return os.RemoveAll(filepath.Join(h.root, request.ProjectID, request.TaskID, request.RunID))
+}
+
+func inspectWithGitCapture(ctx context.Context, root string, request WorkspaceInspectRequest) (WorkspaceInspectFact, error) {
+	parent := filepath.Join(root, request.ProjectID, request.TaskID)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return WorkspaceInspectFact{}, err
+	}
+	handoff, err := os.MkdirTemp(parent, "inspect-")
+	if err != nil {
+		return WorkspaceInspectFact{}, err
+	}
+	defer os.RemoveAll(handoff)
+	fact, err := gitcapture.Inspect(ctx, gitcapture.InspectRequest{
+		Workspace: request.Workspace, Handoff: handoff, MaximumObjects: 250_000,
+	})
+	return WorkspaceInspectFact{
+		HeadSHA: fact.HeadSHA, StatusDigest: fact.StatusDigest, ObjectCount: fact.ObjectCount,
+		Clean: fact.Clean, Unfinished: fact.Unfinished,
+	}, err
 }
 
 func assertPrivateWorkspace(t *testing.T, initializer *Initializer, manager *WorkspaceManager, spec WorkspaceSpec, path string) {

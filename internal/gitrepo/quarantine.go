@@ -74,6 +74,14 @@ func (i *Initializer) QuarantineUnknown(registrations []RegisteredPath) ([]strin
 			if err := requireEmptyDirectory(filepath.Join(i.root, name), "empty Git template"); err != nil {
 				return nil, err
 			}
+		case ".empty-checkout-template":
+			if err := requireEmptyDirectory(filepath.Join(i.root, name), "empty checkout template"); err != nil {
+				return nil, err
+			}
+		case ".handoff":
+			if err := requireEmptyDirectory(filepath.Join(i.root, name), "checkout handoff root"); err != nil {
+				return nil, err
+			}
 		default:
 			if _, ok := knownFinal[name]; ok {
 				continue

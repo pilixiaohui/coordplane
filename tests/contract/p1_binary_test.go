@@ -462,6 +462,156 @@ func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 	}
 }
 
+func TestGT07FormalOperatorBinaryChecksOutExactControllerTaskRef(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "data")
+	socket := filepath.Join(dataDir, "operator.sock")
+	configPath := writeConfig(t, root, dataDir, socket, "")
+	source := createRepository(t, root)
+	daemon := startDaemon(t, configPath, socket)
+	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"agent", "add", "--socket", socket, "--display-name", "Checkout reviewer",
+		"--adapter", "codex", "--image", "agent:latest", "--instructions-file", filepath.Join(root, "agent.md"),
+		"--request-id", "checkout-agent", "--output", "json")
+	var agent core.Agent
+	decodeJSON(t, agentRaw, &agent)
+	projectRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"project", "add", "--socket", socket, "--name", "checkout-project",
+		"--repo", source, "--ref", "refs/heads/main", "--integration-agent", agent.ID,
+		"--request-id", "checkout-project", "--output", "json")
+	var project core.Project
+	decodeJSON(t, projectRaw, &project)
+	runBinaryJSON(t, testBinaries.coordplane,
+		"agent", "pause", agent.ID, "--socket", socket, "--request-id", "checkout-pause", "--output", "json")
+	taskRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"task", "create", "--socket", socket, "--project", project.ID, "--agent", agent.ID,
+		"--title", "checkout exact ref", "--request-id", "checkout-task", "--output", "json")
+	var task core.Task
+	decodeJSON(t, taskRaw, &task)
+	stopDaemon(t, daemon, socket)
+
+	database, err := store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err = database.Project(context.Background(), project.ID)
+	if err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	head := project.InitialSHA
+	taskRef := "refs/coordplane/tasks/" + task.ID + "/runs/run-checkout-contract"
+	err = database.Transact(context.Background(), func(tx core.Transaction) error {
+		persisted, err := tx.Task(task.ID)
+		if err != nil {
+			return err
+		}
+		expectedVersion, expectedStatus := persisted.Version, persisted.Status
+		persisted.Status = core.TaskSubmitted
+		persisted.HeadSHA = head
+		persisted.HeadRunID = "run-checkout-contract"
+		persisted.TaskRef = taskRef
+		persisted.ResultSummary = "captured checkout fixture"
+		persisted.SubmittedAt = "2026-07-14T00:00:00.000000000Z"
+		persisted.UpdatedAt = persisted.SubmittedAt
+		persisted.Version++
+		if err := tx.InsertRun(core.Run{
+			ID: "run-checkout-contract", ProjectID: project.ID, TaskID: task.ID, AgentID: agent.ID,
+			Generation: 1, AdapterID: "codex", Image: "agent:latest", State: core.RunExited,
+			TokenHash: "checkout-contract-token", CleanupState: "removed", LaunchPhase: "process_observed",
+			ContainerName: "checkout-contract", LaunchMode: "start", Version: 1,
+			CreatedAt: persisted.SubmittedAt, EndedAt: persisted.SubmittedAt,
+		}); err != nil {
+			return err
+		}
+		return tx.UpdateTask(persisted, expectedVersion, expectedStatus)
+	})
+	if err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	gitDir(t, project.ControlRepoPath, "update-ref", taskRef, head)
+
+	daemon = startDaemon(t, configPath, socket)
+	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
+	destination := filepath.Join(root, "review-checkout")
+	checkoutRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"task", "checkout", task.ID, "--socket", socket, "--dest", destination, "--output", "json")
+	var checkout core.GitCheckoutFact
+	decodeJSON(t, checkoutRaw, &checkout)
+	if checkout.HeadSHA != head || checkout.Destination != destination {
+		t.Fatalf("formal checkout = %#v", checkout)
+	}
+	if got := strings.TrimSpace(git(t, destination, "rev-parse", "HEAD^{commit}")); got != head {
+		t.Fatalf("checked-out HEAD = %s, want %s", got, head)
+	}
+	if remotes := strings.TrimSpace(git(t, destination, "remote")); remotes != "" {
+		t.Fatalf("checked-out review has remotes: %q", remotes)
+	}
+	stopDaemon(t, daemon, socket)
+	database, err = store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = database.Transact(context.Background(), func(tx core.Transaction) error {
+		persisted, err := tx.Task(task.ID)
+		if err != nil {
+			return err
+		}
+		expectedVersion, expectedStatus := persisted.Version, persisted.Status
+		persisted.Status = core.TaskCompleted
+		persisted.CompletedAt = "2026-07-14T00:01:00.000000000Z"
+		persisted.ClosedAt = persisted.CompletedAt
+		persisted.UpdatedAt = persisted.CompletedAt
+		persisted.Version++
+		return tx.UpdateTask(persisted, expectedVersion, expectedStatus)
+	})
+	if closeErr := database.Close(); err != nil || closeErr != nil {
+		t.Fatalf("complete checkout task: mutation=%v close=%v", err, closeErr)
+	}
+	daemon = startDaemon(t, configPath, socket)
+	previewRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"gc", "preview", "--socket", socket, "--output", "json")
+	var preview core.GCPreview
+	decodeJSON(t, previewRaw, &preview)
+	var workspaceTarget core.GCWorkspaceTarget
+	for _, candidate := range preview.Workspaces {
+		if candidate.TaskID == task.ID {
+			workspaceTarget = candidate
+		}
+	}
+	if workspaceTarget.Fingerprint == "" {
+		t.Fatalf("formal gc preview omitted workspace identity: %#v", preview)
+	}
+	workspaceDiscardRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"gc", "discard-workspace", "--socket", socket, "--task", task.ID,
+		"--expected-fingerprint", workspaceTarget.Fingerprint, "--request-id", "binary-discard-workspace", "--output", "json")
+	var workspaceDiscard core.GCDiscardResult
+	decodeJSON(t, workspaceDiscardRaw, &workspaceDiscard)
+	if !workspaceDiscard.Discarded || workspaceDiscard.TaskID != task.ID {
+		t.Fatalf("formal workspace discard = %#v", workspaceDiscard)
+	}
+	refArgs := []string{
+		"gc", "discard-task-ref", "--socket", socket, "--task", task.ID, "--run", "run-checkout-contract",
+		"--expected-sha", head, "--request-id", "binary-discard-ref", "--output", "json",
+	}
+	firstDiscardRaw := runBinaryJSON(t, testBinaries.coordplane, refArgs...)
+	replayDiscardRaw := runBinaryJSON(t, testBinaries.coordplane, refArgs...)
+	if !bytes.Equal(firstDiscardRaw, replayDiscardRaw) {
+		t.Fatalf("formal task-ref discard replay differs:\nfirst=%s\nreplay=%s", firstDiscardRaw, replayDiscardRaw)
+	}
+	runRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"gc", "run", "--socket", socket, "--confirm", "--request-id", "binary-gc-run", "--output", "json")
+	var runResult core.GCRunResult
+	decodeJSON(t, runRaw, &runResult)
+	if !runResult.Completed {
+		t.Fatalf("formal gc run = %#v", runResult)
+	}
+}
+
 func TestP1ServeRejectsUnknownConfigBeforeCreatingDatabase(t *testing.T) {
 	root := t.TempDir()
 	dataDir := filepath.Join(root, "data")
@@ -1145,6 +1295,16 @@ func git(t *testing.T, directory string, args ...string) string {
 	return string(raw)
 }
 
+func gitDir(t *testing.T, directory string, args ...string) string {
+	t.Helper()
+	command := exec.Command("git", append([]string{"--git-dir=" + directory}, args...)...)
+	raw, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git --git-dir %v: %v\n%s", args, err, raw)
+	}
+	return string(raw)
+}
+
 func decodeJSON(t *testing.T, raw []byte, target any) {
 	t.Helper()
 	if err := json.Unmarshal(raw, target); err != nil {
@@ -1224,7 +1384,19 @@ func (g *contractGit) Checkout(_ context.Context, intent core.GitCheckoutIntent)
 	return core.GitCheckoutFact{Destination: intent.Destination, HeadSHA: intent.ExpectedSHA}, nil
 }
 
-func (g *contractGit) DeleteTaskRef(_ context.Context, _ core.GitDeleteRefIntent, authorize func() (bool, error)) (bool, error) {
+func (g *contractGit) WorkspaceState(_ context.Context, intent core.GitWorkspaceStateIntent) (core.GitWorkspaceStateFact, error) {
+	return core.GitWorkspaceStateFact{Exists: true, Fingerprint: "contract-workspace", HeadSHA: intent.ExpectedHead, Clean: true}, nil
+}
+
+func (g *contractGit) DiscardWorkspace(_ context.Context, _ core.GitDiscardWorkspaceIntent, authorize func() (bool, error)) (bool, error) {
+	return authorize()
+}
+
+func (g *contractGit) TaskRefState(_ context.Context, intent core.GitDeleteRefIntent) (core.GitTaskRefStateFact, error) {
+	return core.GitTaskRefStateFact{Exists: true, ActualSHA: intent.ExpectedSHA, Included: true}, nil
+}
+
+func (g *contractGit) DeleteTaskRefAndPrune(_ context.Context, _ core.GitDeleteRefIntent, authorize func() (bool, error)) (bool, error) {
 	return authorize()
 }
 

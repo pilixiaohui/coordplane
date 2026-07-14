@@ -3,6 +3,8 @@ package gitrepo
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -49,18 +51,26 @@ type WorkspaceFact struct {
 	SourceRef  string
 }
 
+type WorkspaceStateFact struct {
+	Exists      bool
+	Fingerprint string
+	HeadSHA     string
+	Clean       bool
+}
+
 // WorkspaceManager owns private clone materialization and verification. The
 // caller owns lifecycle authorization and decides whether Materialize or
 // Verify is legal for the current durable Run history.
 type WorkspaceManager struct {
 	initializer *Initializer
 	root        string
+	capture     CaptureHelper
 }
 
 // NewWorkspaceManager binds private workspaces to one daemon-owned repository
 // initializer. The roots must be disjoint so a workspace mount can never
 // contain a control repository by configuration.
-func NewWorkspaceManager(initializer *Initializer, workspaceRoot string) (*WorkspaceManager, error) {
+func NewWorkspaceManager(initializer *Initializer, workspaceRoot string, helpers ...CaptureHelper) (*WorkspaceManager, error) {
 	if initializer == nil {
 		return nil, errors.New("gitrepo: workspace initializer is required")
 	}
@@ -87,7 +97,14 @@ func NewWorkspaceManager(initializer *Initializer, workspaceRoot string) (*Works
 	if pathsOverlap(root, initializer.root) {
 		return nil, errors.New("gitrepo: workspace and control repository roots must be disjoint")
 	}
-	return &WorkspaceManager{initializer: initializer, root: root}, nil
+	if len(helpers) > 1 || (len(helpers) == 1 && helpers[0] == nil) {
+		return nil, errors.New("gitrepo: exactly one non-nil capture helper may be configured")
+	}
+	manager := &WorkspaceManager{initializer: initializer, root: root}
+	if len(helpers) == 1 {
+		manager.capture = helpers[0]
+	}
+	return manager, nil
 }
 
 // Path returns the only valid host workspace path for a Task.
@@ -278,24 +295,12 @@ func (m *WorkspaceManager) Delete(ctx context.Context, spec WorkspaceSpec, expec
 	if err := m.validateFinalWorkspacePath(path, spec); err != nil {
 		return false, m.publicError("delete", err)
 	}
-	fact, err := m.inspect(ctx, path, spec, false)
+	fact, err := m.inspectWorkspaceState(ctx, path, spec)
 	if err != nil {
 		return false, m.publicError("delete", err)
 	}
-	if fact.HeadSHA != expectedHead {
+	if fact.HeadSHA != expectedHead || !fact.Clean || fact.Unfinished {
 		return false, nil
-	}
-	status, err := m.git(ctx, "inspect workspace GC status", "-C", path, "status", "--porcelain=v1", "--untracked-files=all")
-	if err != nil || strings.TrimSpace(status) != "" {
-		return false, nil
-	}
-	gitDir := filepath.Join(path, ".git")
-	for _, name := range []string{"MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-apply", "rebase-merge"} {
-		if operationExists, operationErr := pathExists(filepath.Join(gitDir, name)); operationErr != nil {
-			return false, m.publicError("delete", operationErr)
-		} else if operationExists {
-			return false, nil
-		}
 	}
 	if err := os.RemoveAll(path); err != nil {
 		return false, m.publicError("delete", err)
@@ -307,6 +312,139 @@ func (m *WorkspaceManager) Delete(ctx context.Context, spec WorkspaceSpec, expec
 		return false, m.publicError("delete", err)
 	}
 	return true, nil
+}
+
+func (m *WorkspaceManager) State(ctx context.Context, spec WorkspaceSpec, expectedHead string, taskVersion int64) (WorkspaceStateFact, error) {
+	if taskVersion < 1 {
+		return WorkspaceStateFact{}, errors.New("gitrepo: workspace state requires a positive task version")
+	}
+	if err := m.validateSpec(ctx, spec); err != nil {
+		return WorkspaceStateFact{}, m.publicError("state", err)
+	}
+	if err := validateObjectID(expectedHead); err != nil {
+		return WorkspaceStateFact{}, m.publicError("state", err)
+	}
+	unlock, err := m.initializer.maintenance.lock(ctx, spec.ProjectID)
+	if err != nil {
+		return WorkspaceStateFact{}, err
+	}
+	defer unlock()
+	return m.stateLocked(ctx, spec, expectedHead, taskVersion)
+}
+
+func (m *WorkspaceManager) Discard(
+	ctx context.Context,
+	spec WorkspaceSpec,
+	expectedHead string,
+	taskVersion int64,
+	expectedFingerprint string,
+	authorize func() (bool, error),
+) (bool, error) {
+	if authorize == nil {
+		return false, errors.New("gitrepo: workspace discard authorization is required")
+	}
+	if strings.TrimSpace(expectedFingerprint) == "" {
+		return false, errors.New("gitrepo: expected workspace fingerprint is required")
+	}
+	if err := m.validateSpec(ctx, spec); err != nil {
+		return false, m.publicError("discard", err)
+	}
+	unlock, err := m.initializer.maintenance.lock(ctx, spec.ProjectID)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	allowed, err := authorize()
+	if err != nil || !allowed {
+		return false, err
+	}
+	state, err := m.stateLocked(ctx, spec, expectedHead, taskVersion)
+	if err != nil {
+		return false, err
+	}
+	if !state.Exists {
+		return true, nil
+	}
+	if state.Fingerprint != expectedFingerprint {
+		return false, errors.New("gitrepo: workspace fingerprint changed before discard")
+	}
+	path, err := m.Path(spec.ProjectID, spec.TaskID)
+	if err != nil {
+		return false, err
+	}
+	markerPath, err := m.markerPath(spec.ProjectID, spec.TaskID)
+	if err != nil {
+		return false, err
+	}
+	if err := os.RemoveAll(path); err != nil {
+		return false, m.publicError("discard", err)
+	}
+	if err := os.Remove(markerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, m.publicError("discard", err)
+	}
+	if err := syncDirectory(filepath.Dir(path)); err != nil {
+		return false, m.publicError("discard", err)
+	}
+	return true, nil
+}
+
+func (m *WorkspaceManager) stateLocked(ctx context.Context, spec WorkspaceSpec, expectedHead string, taskVersion int64) (WorkspaceStateFact, error) {
+	path, err := m.Path(spec.ProjectID, spec.TaskID)
+	if err != nil {
+		return WorkspaceStateFact{}, err
+	}
+	exists, err := pathExists(path)
+	if err != nil {
+		return WorkspaceStateFact{}, err
+	}
+	if !exists {
+		digest := sha256.Sum256([]byte(spec.TaskID + "\x00" + fmt.Sprint(taskVersion) + "\x00absent"))
+		return WorkspaceStateFact{Fingerprint: hex.EncodeToString(digest[:]), Clean: true}, nil
+	}
+	if err := m.validateFinalWorkspacePath(path, spec); err != nil {
+		return WorkspaceStateFact{}, err
+	}
+	fact, err := m.inspectWorkspaceState(ctx, path, spec)
+	if err != nil {
+		return WorkspaceStateFact{}, err
+	}
+	identity := strings.Join([]string{
+		spec.TaskID, fmt.Sprint(taskVersion), expectedHead, fact.HeadSHA, fact.StatusDigest,
+		fmt.Sprint(fact.Unfinished),
+	}, "\x00")
+	fingerprint := sha256.Sum256([]byte(identity))
+	return WorkspaceStateFact{
+		Exists: true, Fingerprint: hex.EncodeToString(fingerprint[:]),
+		HeadSHA: fact.HeadSHA, Clean: fact.Clean && !fact.Unfinished,
+	}, nil
+}
+
+func (m *WorkspaceManager) inspectWorkspaceState(
+	ctx context.Context,
+	path string,
+	spec WorkspaceSpec,
+) (WorkspaceInspectFact, error) {
+	if m.capture == nil {
+		return WorkspaceInspectFact{}, errors.New("trusted workspace inspection helper is not configured")
+	}
+	fact, err := m.capture.Inspect(ctx, WorkspaceInspectRequest{
+		ProjectID: spec.ProjectID, TaskID: spec.TaskID, Workspace: path,
+	})
+	if err != nil {
+		return WorkspaceInspectFact{}, err
+	}
+	if err := validateObjectID(fact.HeadSHA); err != nil {
+		return WorkspaceInspectFact{}, fmt.Errorf("trusted workspace inspection returned invalid HEAD: %w", err)
+	}
+	statusDigest, err := hex.DecodeString(fact.StatusDigest)
+	if err != nil || len(statusDigest) != sha256.Size || fact.ObjectCount < 1 {
+		return WorkspaceInspectFact{}, errors.New("trusted workspace inspection returned invalid facts")
+	}
+	empty := sha256.Sum256(nil)
+	if fact.Clean != (fact.StatusDigest == hex.EncodeToString(empty[:])) {
+		return WorkspaceInspectFact{}, errors.New("trusted workspace inspection returned inconsistent clean state")
+	}
+	return fact, nil
 }
 
 func (m *WorkspaceManager) materializeLocked(ctx context.Context, spec WorkspaceSpec) (fact WorkspaceFact, resultErr error) {

@@ -54,6 +54,10 @@ func TestOperatorHandlerHasOnlyTheFixedRouteSurface(t *testing.T) {
 		{name: "ack message", method: http.MethodPost, path: "/v1/messages/msg-1/ack", call: "ack_message"},
 		{name: "retry message", method: http.MethodPost, path: "/v1/messages/msg-1/retry", call: "retry_message"},
 		{name: "events", method: http.MethodGet, path: "/v1/events", call: "list_events"},
+		{name: "gc preview", method: http.MethodGet, path: "/v1/gc/preview", call: "gc_preview"},
+		{name: "gc run", method: http.MethodPost, path: "/v1/gc/run", body: `{"confirm":true}`, call: "gc_run"},
+		{name: "gc discard workspace", method: http.MethodPost, path: "/v1/gc/discard-workspace", body: `{}`, call: "gc_discard_workspace"},
+		{name: "gc discard task ref", method: http.MethodPost, path: "/v1/gc/discard-task-ref", body: `{}`, call: "gc_discard_task_ref"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -450,6 +454,26 @@ func (f *operatorFake) Task(_ context.Context, id string) (core.TaskDetail, erro
 
 func (f *operatorFake) CheckoutTask(_ context.Context, input core.TaskCheckoutInput) (core.GitCheckoutFact, error) {
 	return core.GitCheckoutFact{}, f.record("checkout_task", input)
+}
+
+func (f *operatorFake) GCPreview(context.Context) (core.GCPreview, error) {
+	f.record("gc_preview", nil)
+	return core.GCPreview{}, nil
+}
+
+func (f *operatorFake) GCRun(_ context.Context, input core.GCRunInput) (core.GCRunResult, error) {
+	f.record("gc_run", input)
+	return core.GCRunResult{Completed: true}, nil
+}
+
+func (f *operatorFake) GCDiscardWorkspace(_ context.Context, input core.GCDiscardWorkspaceInput) (core.GCDiscardResult, error) {
+	f.record("gc_discard_workspace", input)
+	return core.GCDiscardResult{TaskID: input.TaskID, Discarded: true}, nil
+}
+
+func (f *operatorFake) GCDiscardTaskRef(_ context.Context, input core.GCDiscardTaskRefInput) (core.GCDiscardResult, error) {
+	f.record("gc_discard_task_ref", input)
+	return core.GCDiscardResult{TaskID: input.TaskID, RunID: input.RunID, Discarded: true}, nil
 }
 
 func (f *operatorFake) Run(_ context.Context, id string) (core.Run, error) {

@@ -220,6 +220,19 @@ func NewOperatorHandler(operations OperatorOperations) http.Handler {
 		})
 		writeResult(w, result, err)
 	}))
+	mux.HandleFunc("/v1/gc/preview", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		result, err := operations.GCPreview(r.Context())
+		writeResult(w, result, err)
+	}))
+	mux.HandleFunc("/v1/gc/run", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.GCRunInput) (any, error) {
+		return operations.GCRun(ctx.Context, input)
+	})))
+	mux.HandleFunc("/v1/gc/discard-workspace", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.GCDiscardWorkspaceInput) (any, error) {
+		return operations.GCDiscardWorkspace(ctx.Context, input)
+	})))
+	mux.HandleFunc("/v1/gc/discard-task-ref", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.GCDiscardTaskRefInput) (any, error) {
+		return operations.GCDiscardTaskRef(ctx.Context, input)
+	})))
 	mux.HandleFunc("/", notFound)
 	return mux
 }

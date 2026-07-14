@@ -195,3 +195,21 @@ type TaskCheckoutInput struct {
 	TaskID      string `json:"task_id"`
 	Destination string `json:"destination"`
 }
+
+type GCRunInput struct {
+	Confirm   bool   `json:"confirm"`
+	RequestID string `json:"request_id"`
+}
+
+type GCDiscardWorkspaceInput struct {
+	TaskID              string `json:"task_id"`
+	ExpectedFingerprint string `json:"expected_fingerprint"`
+	RequestID           string `json:"request_id"`
+}
+
+type GCDiscardTaskRefInput struct {
+	TaskID      string `json:"task_id"`
+	RunID       string `json:"run_id"`
+	ExpectedSHA string `json:"expected_sha"`
+	RequestID   string `json:"request_id"`
+}

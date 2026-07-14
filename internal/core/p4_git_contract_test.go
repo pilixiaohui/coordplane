@@ -92,6 +92,179 @@ func TestCT05SourceTaskCreationAndCheckoutCopyExactCapturedIdentity(t *testing.T
 	}
 }
 
+func TestGT07TerminalDurableSourceReferenceBlocksTaskRefGCUntilRelease(t *testing.T) {
+	h := newHarness(t)
+	worker := h.addAgent(t, "durable-source-worker")
+	integrator := h.addAgent(t, "durable-source-integrator")
+	project := h.addProject(t, "durable-source-project", integrator.ID)
+	source := createAndSubmitCodeTask(t, h, project, worker, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "durable-source")
+	if err := h.service.ReconcileGit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	source, err := h.database.Task(context.Background(), source.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+		ProjectID: project.ID, AssigneeAgentID: integrator.ID, Kind: core.TaskWork,
+		Title: "terminal source consumer", SourceTaskID: source.ID, RequestID: "create-terminal-consumer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.CancelTask(context.Background(), core.TaskActionInput{
+		TaskID: consumer.ID, Reason: "review finished", RequestID: "cancel-terminal-consumer",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	eligible, err := h.database.TaskRefEligible(context.Background(), source.ID, source.TaskRef, "9999-12-31T23:59:59Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eligible {
+		t.Fatal("terminal consumer's unreleased durable source ref allowed source task-ref GC")
+	}
+}
+
+func TestGT07FormalGCDiscardIsCASFencedIdempotentAndReleasesSourceRef(t *testing.T) {
+	h := newHarness(t)
+	worker := h.addAgent(t, "gc-worker")
+	integrator := h.addAgent(t, "gc-integrator")
+	project := h.addProject(t, "gc-project", integrator.ID)
+	source := createAndSubmitCodeTask(t, h, project, worker, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "gc-source")
+	if err := h.service.ReconcileGit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.RequestAccept(context.Background(), core.AcceptInput{
+		TaskID: source.ID, IntegrationAgentID: integrator.ID, RequestID: "gc-source-accept",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.ReconcileGit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	source, err := h.database.Task(context.Background(), source.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+		ProjectID: project.ID, AssigneeAgentID: integrator.ID, Kind: core.TaskWork,
+		Title: "discarded terminal consumer", SourceTaskID: source.ID, RequestID: "gc-consumer-create",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer, err = h.service.CancelTask(context.Background(), core.TaskActionInput{
+		TaskID: consumer.ID, Reason: "review complete", RequestID: "gc-consumer-cancel",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview, err := h.service.GCPreview(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var target core.GCWorkspaceTarget
+	for _, candidate := range preview.Workspaces {
+		if candidate.TaskID == consumer.ID {
+			target = candidate
+		}
+	}
+	if target.Fingerprint == "" {
+		t.Fatalf("GC preview omitted consumer workspace identity: %#v", preview)
+	}
+	input := core.GCDiscardWorkspaceInput{
+		TaskID: consumer.ID, ExpectedFingerprint: target.Fingerprint, RequestID: "gc-discard-consumer",
+	}
+	first, err := h.service.GCDiscardWorkspace(context.Background(), input)
+	if err != nil || !first.Discarded {
+		t.Fatalf("discard workspace = %#v err=%v", first, err)
+	}
+	replay, err := h.service.GCDiscardWorkspace(context.Background(), input)
+	if err != nil || replay != first {
+		t.Fatalf("discard replay = %#v err=%v, want %#v", replay, err, first)
+	}
+	input.ExpectedFingerprint = "changed"
+	if _, err := h.service.GCDiscardWorkspace(context.Background(), input); !core.IsCode(err, core.CodeVersionConflict) {
+		t.Fatalf("request-id input mismatch error = %v", err)
+	}
+	released, err := h.database.Task(context.Background(), consumer.ID)
+	if err != nil || released.SourceRefReleasedAt == "" {
+		t.Fatalf("released consumer = %#v err=%v", released, err)
+	}
+	eligible, err := h.database.TaskRefEligible(context.Background(), source.ID, source.TaskRef, "9999-12-31T23:59:59Z")
+	if err != nil || !eligible {
+		t.Fatalf("source ref after explicit release eligible=%t err=%v", eligible, err)
+	}
+
+	refInput := core.GCDiscardTaskRefInput{
+		TaskID: source.ID, RunID: source.HeadRunID, ExpectedSHA: source.HeadSHA, RequestID: "gc-discard-source-ref",
+	}
+	refResult, err := h.service.GCDiscardTaskRef(context.Background(), refInput)
+	if err != nil || !refResult.Discarded {
+		t.Fatalf("discard task ref = %#v err=%v", refResult, err)
+	}
+	refReplay, err := h.service.GCDiscardTaskRef(context.Background(), refInput)
+	if err != nil || refReplay != refResult {
+		t.Fatalf("discard task ref replay = %#v err=%v", refReplay, err)
+	}
+}
+
+func TestGT07ConcurrentGCRequestIDConflictHasOneDestructiveSuccess(t *testing.T) {
+	h := newHarness(t)
+	worker := h.addAgent(t, "gc-request-worker")
+	integrator := h.addAgent(t, "gc-request-integrator")
+	project := h.addProject(t, "gc-request-project", integrator.ID)
+	task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+		ProjectID: project.ID, AssigneeAgentID: worker.ID, Kind: core.TaskWork,
+		Title: "cancelled discard target", RequestID: "gc-request-task",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.CancelTask(context.Background(), core.TaskActionInput{
+		TaskID: task.ID, Reason: "discard", RequestID: "gc-request-cancel",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	errorsByFingerprint := make(chan struct {
+		fingerprint string
+		err         error
+	}, 2)
+	for _, fingerprint := range []string{"workspace-fingerprint", "different-fingerprint"} {
+		fingerprint := fingerprint
+		go func() {
+			<-start
+			_, err := h.service.GCDiscardWorkspace(context.Background(), core.GCDiscardWorkspaceInput{
+				TaskID: task.ID, ExpectedFingerprint: fingerprint, RequestID: "shared-gc-request",
+			})
+			errorsByFingerprint <- struct {
+				fingerprint string
+				err         error
+			}{fingerprint, err}
+		}()
+	}
+	close(start)
+	successes := 0
+	for range 2 {
+		result := <-errorsByFingerprint
+		if result.err == nil {
+			successes++
+			continue
+		}
+		if !core.IsCode(result.err, core.CodeVersionConflict) {
+			t.Fatalf("fingerprint %s error = %v", result.fingerprint, result.err)
+		}
+	}
+	h.git.mu.Lock()
+	destructiveCalls := h.git.discardWorkspaceCalls
+	h.git.mu.Unlock()
+	if successes != 1 || destructiveCalls != 1 {
+		t.Fatalf("GC request race successes=%d destructive_calls=%d", successes, destructiveCalls)
+	}
+}
+
 func TestGT05StaleCreatesOneIntegrationTaskAndFinalCASCompletesBoth(t *testing.T) {
 	h := newHarness(t)
 	worker := h.addAgent(t, "stale-worker")

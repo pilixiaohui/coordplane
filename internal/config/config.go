@@ -12,7 +12,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const DefaultShutdownGrace = 5 * time.Second
+const (
+	DefaultShutdownGrace     = 5 * time.Second
+	DefaultCaptureTimeout    = 2 * time.Minute
+	DefaultCaptureBundleSize = int64(64 << 20)
+	DefaultCaptureObjects    = 250_000
+	DefaultHandoffSize       = int64(256 << 20)
+)
 
 // Config is the complete v1 daemon configuration surface.
 type Config struct {
@@ -21,6 +27,15 @@ type Config struct {
 	MaxParallelRuns int             `yaml:"max_parallel_runs"`
 	Retention       RetentionConfig `yaml:"retention"`
 	Runtime         RuntimeConfig   `yaml:"runtime"`
+	Git             GitConfig       `yaml:"git"`
+}
+
+type GitConfig struct {
+	CaptureHelperImage  string        `yaml:"capture_helper_image"`
+	CaptureTimeout      time.Duration `yaml:"-"`
+	MaximumBundleBytes  int64         `yaml:"maximum_bundle_bytes"`
+	MaximumObjects      int           `yaml:"maximum_objects"`
+	MaximumHandoffBytes int64         `yaml:"maximum_handoff_bytes"`
 }
 
 type RetentionConfig struct {
@@ -46,6 +61,15 @@ type fileConfig struct {
 	MaxParallelRuns int                 `yaml:"max_parallel_runs"`
 	Retention       fileRetentionConfig `yaml:"retention"`
 	Runtime         fileRuntimeConfig   `yaml:"runtime"`
+	Git             fileGitConfig       `yaml:"git"`
+}
+
+type fileGitConfig struct {
+	CaptureHelperImage  string        `yaml:"capture_helper_image"`
+	CaptureTimeout      *yamlDuration `yaml:"capture_timeout,omitempty"`
+	MaximumBundleBytes  int64         `yaml:"maximum_bundle_bytes"`
+	MaximumObjects      int           `yaml:"maximum_objects"`
+	MaximumHandoffBytes int64         `yaml:"maximum_handoff_bytes"`
 }
 
 type fileRetentionConfig struct {
@@ -126,12 +150,32 @@ func Load(path string) (Config, error) {
 			ProviderEnvAllowlist: append([]string(nil), raw.Runtime.ProviderEnvAllowlist...),
 			ShutdownGrace:        DefaultShutdownGrace,
 		},
+		Git: GitConfig{
+			CaptureHelperImage: raw.Git.CaptureHelperImage,
+			CaptureTimeout:     DefaultCaptureTimeout, MaximumBundleBytes: raw.Git.MaximumBundleBytes,
+			MaximumObjects: raw.Git.MaximumObjects, MaximumHandoffBytes: raw.Git.MaximumHandoffBytes,
+		},
 	}
 	if raw.Runtime.RunTimeout != nil {
 		cfg.Runtime.RunTimeout = time.Duration(*raw.Runtime.RunTimeout)
 	}
 	if raw.Runtime.ShutdownGrace != nil {
 		cfg.Runtime.ShutdownGrace = time.Duration(*raw.Runtime.ShutdownGrace)
+	}
+	if raw.Git.CaptureTimeout != nil {
+		cfg.Git.CaptureTimeout = time.Duration(*raw.Git.CaptureTimeout)
+	}
+	if cfg.Git.MaximumBundleBytes == 0 {
+		cfg.Git.MaximumBundleBytes = DefaultCaptureBundleSize
+	}
+	if cfg.Git.MaximumObjects == 0 {
+		cfg.Git.MaximumObjects = DefaultCaptureObjects
+	}
+	if cfg.Git.MaximumHandoffBytes == 0 {
+		cfg.Git.MaximumHandoffBytes = DefaultHandoffSize
+	}
+	if strings.TrimSpace(cfg.Git.CaptureHelperImage) == "" {
+		cfg.Git.CaptureHelperImage = cfg.Runtime.DefaultImage
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -206,6 +250,22 @@ func (c *Config) Validate() error {
 	}
 	if c.Runtime.ShutdownGrace <= 0 {
 		return errors.New("validate config: runtime.shutdown_grace must be a positive duration")
+	}
+	c.Git.CaptureHelperImage = strings.TrimSpace(c.Git.CaptureHelperImage)
+	if c.Git.CaptureHelperImage == "" {
+		c.Git.CaptureHelperImage = c.Runtime.DefaultImage
+	}
+	if c.Git.CaptureTimeout <= 0 {
+		return errors.New("validate config: git.capture_timeout must be a positive duration")
+	}
+	if c.Git.MaximumBundleBytes <= 0 {
+		return errors.New("validate config: git.maximum_bundle_bytes must be positive")
+	}
+	if c.Git.MaximumObjects <= 0 {
+		return errors.New("validate config: git.maximum_objects must be positive")
+	}
+	if c.Git.MaximumHandoffBytes < c.Git.MaximumBundleBytes {
+		return errors.New("validate config: git.maximum_handoff_bytes must be at least maximum_bundle_bytes")
 	}
 
 	seenEnv := make(map[string]struct{}, len(c.Runtime.ProviderEnvAllowlist))

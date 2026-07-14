@@ -158,9 +158,11 @@ type TaskGit interface {
 	ResolveTaskRef(context.Context, GitTaskRefIntent) (string, error)
 	UseTaskRef(context.Context, GitTaskRefIntent, func(string) error) error
 	Checkout(context.Context, GitCheckoutIntent) (GitCheckoutFact, error)
-	DeleteTaskRef(context.Context, GitDeleteRefIntent, func() (bool, error)) (bool, error)
+	WorkspaceState(context.Context, GitWorkspaceStateIntent) (GitWorkspaceStateFact, error)
+	DiscardWorkspace(context.Context, GitDiscardWorkspaceIntent, func() (bool, error)) (bool, error)
+	TaskRefState(context.Context, GitDeleteRefIntent) (GitTaskRefStateFact, error)
+	DeleteTaskRefAndPrune(context.Context, GitDeleteRefIntent, func() (bool, error)) (bool, error)
 	DeleteWorkspace(context.Context, GitDeleteWorkspaceIntent, func() (bool, error)) (bool, error)
-	Prune(context.Context, string, string) error
 }
 
 type GitSource struct {
@@ -231,6 +233,7 @@ type GitDeleteRefIntent struct {
 	CanonicalRef string
 	TaskRef      string
 	ExpectedSHA  string
+	AllowDiscard bool
 }
 
 type GitDeleteWorkspaceIntent struct {
@@ -239,4 +242,27 @@ type GitDeleteWorkspaceIntent struct {
 	BaseSHA      string
 	ExpectedHead string
 	Source       *GitSource
+}
+
+type GitWorkspaceStateIntent struct {
+	GitDeleteWorkspaceIntent
+	TaskVersion int64
+}
+
+type GitWorkspaceStateFact struct {
+	Exists      bool   `json:"exists"`
+	Fingerprint string `json:"fingerprint"`
+	HeadSHA     string `json:"head_sha,omitempty"`
+	Clean       bool   `json:"clean"`
+}
+
+type GitDiscardWorkspaceIntent struct {
+	GitWorkspaceStateIntent
+	ExpectedFingerprint string
+}
+
+type GitTaskRefStateFact struct {
+	Exists    bool   `json:"exists"`
+	ActualSHA string `json:"actual_sha,omitempty"`
+	Included  bool   `json:"included_in_canonical"`
 }

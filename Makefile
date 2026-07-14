@@ -11,8 +11,9 @@ build:
 	mkdir -p $(BUILD_DIR)/bin
 	go build -buildvcs=false -ldflags "$(BUILD_LDFLAGS) -X '$(BUILDINFO_PACKAGE).component=coordplane'" -o $(BUILD_DIR)/bin/coordplane ./cmd/coordplane
 	go build -buildvcs=false -ldflags "$(BUILD_LDFLAGS) -X '$(BUILDINFO_PACKAGE).component=coordlink'" -o $(BUILD_DIR)/bin/coordlink ./cmd/coordlink
-	chmod 0755 $(BUILD_DIR)/bin/coordplane $(BUILD_DIR)/bin/coordlink
-	cd $(BUILD_DIR)/bin && sha256sum coordplane coordlink > build-manifest.sha256
+	CGO_ENABLED=0 go build -buildvcs=false -o $(BUILD_DIR)/bin/coordplane-git-helper ./cmd/coordplane-git-helper
+	chmod 0755 $(BUILD_DIR)/bin/coordplane $(BUILD_DIR)/bin/coordlink $(BUILD_DIR)/bin/coordplane-git-helper
+	cd $(BUILD_DIR)/bin && sha256sum coordplane coordlink coordplane-git-helper > build-manifest.sha256
 
 test:
 	go test -buildvcs=false ./... -count=1

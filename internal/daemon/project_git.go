@@ -103,11 +103,32 @@ func (a projectGitAdapter) Checkout(ctx context.Context, intent core.GitCheckout
 	return core.GitCheckoutFact{Destination: fact.Destination, HeadSHA: fact.HeadSHA}, err
 }
 
-func (a projectGitAdapter) DeleteTaskRef(ctx context.Context, intent core.GitDeleteRefIntent, authorize func() (bool, error)) (bool, error) {
-	return a.initializer.DeleteTaskRef(ctx, gitrepo.DeleteTaskRefSpec{
+func (a projectGitAdapter) WorkspaceState(ctx context.Context, intent core.GitWorkspaceStateIntent) (core.GitWorkspaceStateFact, error) {
+	spec := workspaceSpec(intent.GitDeleteWorkspaceIntent)
+	fact, err := a.workspaces.State(ctx, spec, intent.ExpectedHead, intent.TaskVersion)
+	return core.GitWorkspaceStateFact{
+		Exists: fact.Exists, Fingerprint: fact.Fingerprint, HeadSHA: fact.HeadSHA, Clean: fact.Clean,
+	}, err
+}
+
+func (a projectGitAdapter) DiscardWorkspace(ctx context.Context, intent core.GitDiscardWorkspaceIntent, authorize func() (bool, error)) (bool, error) {
+	spec := workspaceSpec(intent.GitDeleteWorkspaceIntent)
+	return a.workspaces.Discard(ctx, spec, intent.ExpectedHead, intent.TaskVersion, intent.ExpectedFingerprint, authorize)
+}
+
+func (a projectGitAdapter) TaskRefState(ctx context.Context, intent core.GitDeleteRefIntent) (core.GitTaskRefStateFact, error) {
+	fact, err := a.initializer.TaskRefState(ctx, gitrepo.DeleteTaskRefSpec{
+		ProjectID: intent.ProjectID, ControlRepoPath: intent.ControlRepo,
+		CanonicalRef: intent.CanonicalRef, TaskRef: intent.TaskRef, ExpectedHead: intent.ExpectedSHA,
+	})
+	return core.GitTaskRefStateFact{Exists: fact.Exists, ActualSHA: fact.ActualSHA, Included: fact.Included}, err
+}
+
+func (a projectGitAdapter) DeleteTaskRefAndPrune(ctx context.Context, intent core.GitDeleteRefIntent, authorize func() (bool, error)) (bool, error) {
+	return a.initializer.DeleteTaskRefAndPrune(ctx, gitrepo.DeleteTaskRefSpec{
 		ProjectID: intent.ProjectID, ControlRepoPath: intent.ControlRepo,
 		CanonicalRef: intent.CanonicalRef, TaskRef: intent.TaskRef,
-		ExpectedHead: intent.ExpectedSHA,
+		ExpectedHead: intent.ExpectedSHA, AllowDiscard: intent.AllowDiscard,
 	}, authorize)
 }
 
@@ -115,6 +136,11 @@ func (a projectGitAdapter) DeleteWorkspace(ctx context.Context, intent core.GitD
 	if a.workspaces == nil {
 		return false, fmt.Errorf("workspace manager is not configured")
 	}
+	spec := workspaceSpec(intent)
+	return a.workspaces.Delete(ctx, spec, intent.ExpectedHead, authorize)
+}
+
+func workspaceSpec(intent core.GitDeleteWorkspaceIntent) gitrepo.WorkspaceSpec {
 	spec := gitrepo.WorkspaceSpec{ProjectID: intent.ProjectID, TaskID: intent.TaskID, BaseSHA: intent.BaseSHA}
 	if intent.Source != nil {
 		spec.Source = &gitrepo.WorkspaceSource{
@@ -122,11 +148,7 @@ func (a projectGitAdapter) DeleteWorkspace(ctx context.Context, intent core.GitD
 			TaskRef: intent.Source.TaskRef, HeadSHA: intent.Source.HeadSHA,
 		}
 	}
-	return a.workspaces.Delete(ctx, spec, intent.ExpectedHead, authorize)
-}
-
-func (a projectGitAdapter) Prune(ctx context.Context, projectID, controlPath string) error {
-	return a.initializer.Prune(ctx, projectID, controlPath)
+	return spec
 }
 
 func gitProject(intent core.ProjectGitIntent) gitrepo.Project {

@@ -77,6 +77,7 @@ CREATE TABLE tasks (
   source_run_id TEXT NOT NULL DEFAULT '',
   source_task_ref TEXT NOT NULL DEFAULT '',
   source_head_sha TEXT NOT NULL DEFAULT '',
+	  source_ref_released_at TEXT NOT NULL DEFAULT '',
   source_accept_version INTEGER NOT NULL DEFAULT 0,
   observed_canonical_sha TEXT NOT NULL DEFAULT '',
   pending_action TEXT NOT NULL DEFAULT '' CHECK (pending_action IN ('','capture','advance')),

@@ -52,15 +52,13 @@ func (s *Service) ReconcileGitGC(ctx context.Context, closedBefore string) error
 		return NewError(CodeGitInvariantViolation, "task Git executor is not configured", false)
 	}
 	var result error
-	projects := make(map[string]Project)
 	for _, task := range candidates {
 		project, err := s.repository.Project(ctx, task.ProjectID)
 		if err != nil {
 			result = errors.Join(result, err)
 			continue
 		}
-		projects[project.ID] = project
-		_, err = executor.DeleteTaskRef(ctx, GitDeleteRefIntent{
+		_, err = executor.DeleteTaskRefAndPrune(ctx, GitDeleteRefIntent{
 			ProjectID: task.ProjectID, ControlRepo: project.ControlRepoPath,
 			CanonicalRef: project.CanonicalRef, TaskRef: task.TaskRef, ExpectedSHA: task.HeadSHA,
 		}, func() (bool, error) {
@@ -70,15 +68,14 @@ func (s *Service) ReconcileGitGC(ctx context.Context, closedBefore string) error
 			result = errors.Join(result, fmt.Errorf("GC task ref %s: %w", task.ID, err))
 		}
 	}
-	for _, project := range projects {
-		if err := executor.Prune(ctx, project.ID, project.ControlRepoPath); err != nil {
-			result = errors.Join(result, fmt.Errorf("GC project %s: %w", project.ID, err))
-		}
-	}
 	return result
 }
 
 func (s *Service) ReconcileWorkspaceGC(ctx context.Context, closedBefore string) error {
+	return s.reconcileWorkspaceGC(ctx, closedBefore, false, "")
+}
+
+func (s *Service) reconcileWorkspaceGC(ctx context.Context, closedBefore string, releaseSource bool, requestID string) error {
 	candidates, err := s.repository.WorkspaceCandidates(ctx, closedBefore)
 	if err != nil {
 		return err
@@ -105,11 +102,17 @@ func (s *Service) ReconcileWorkspaceGC(ctx context.Context, closedBefore string)
 				TaskRef: task.SourceTaskRef, HeadSHA: task.SourceHeadSHA,
 			}
 		}
-		_, err := executor.DeleteWorkspace(ctx, intent, func() (bool, error) {
+		deleted, err := executor.DeleteWorkspace(ctx, intent, func() (bool, error) {
 			return s.repository.WorkspaceEligible(ctx, task.ID, closedBefore)
 		})
 		if err != nil {
 			result = errors.Join(result, fmt.Errorf("GC workspace %s: %w", task.ID, err))
+			continue
+		}
+		if releaseSource && deleted {
+			if err := s.releaseSourceReference(ctx, task.ID, requestID); err != nil {
+				result = errors.Join(result, fmt.Errorf("release source ref for %s: %w", task.ID, err))
+			}
 		}
 	}
 	return result

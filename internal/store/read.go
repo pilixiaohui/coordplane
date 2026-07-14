@@ -101,7 +101,7 @@ func (s *Store) TaskRefEligible(ctx context.Context, taskID, taskRef, closedBefo
 		err = tx.QueryRowContext(ctx, `
 SELECT COUNT(*) FROM tasks
 WHERE (pending_action<>'' AND (task_ref=? OR source_task_ref=?))
-   OR (status NOT IN ('completed','cancelled') AND source_task_ref=?)`, taskRef, taskRef, taskRef).Scan(&blockers)
+   OR (source_task_ref=? AND source_ref_released_at='')`, taskRef, taskRef, taskRef).Scan(&blockers)
 		if err != nil {
 			return false, err
 		}
@@ -555,7 +555,8 @@ func taskSummary(task core.Task) core.TaskSummary {
 		FinalCanonicalSHA:          task.FinalCanonicalSHA, IntegrationTaskID: task.IntegrationTaskID,
 		SourceTaskID: task.SourceTaskID, SourceRunID: task.SourceRunID,
 		SourceTaskRef: task.SourceTaskRef, SourceHeadSHA: task.SourceHeadSHA,
-		PendingAction: task.PendingAction, PendingActionID: task.PendingActionID,
+		SourceRefReleasedAt: task.SourceRefReleasedAt,
+		PendingAction:       task.PendingAction, PendingActionID: task.PendingActionID,
 		Version: task.Version, CreatedAt: task.CreatedAt, UpdatedAt: task.UpdatedAt,
 		SubmittedAt: task.SubmittedAt, CompletedAt: task.CompletedAt, ClosedAt: task.ClosedAt,
 	}

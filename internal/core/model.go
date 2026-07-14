@@ -126,6 +126,7 @@ type Task struct {
 	SourceRunID                string     `json:"source_run_id,omitempty"`
 	SourceTaskRef              string     `json:"source_task_ref,omitempty"`
 	SourceHeadSHA              string     `json:"source_head_sha,omitempty"`
+	SourceRefReleasedAt        string     `json:"source_ref_released_at,omitempty"`
 	SourceAcceptVersion        int64      `json:"source_accept_version,omitempty"`
 	ObservedCanonicalSHA       string     `json:"observed_canonical_sha,omitempty"`
 	PendingAction              string     `json:"pending_action,omitempty"`
@@ -365,6 +366,7 @@ type TaskSummary struct {
 	SourceRunID                string     `json:"source_run_id,omitempty"`
 	SourceTaskRef              string     `json:"source_task_ref,omitempty"`
 	SourceHeadSHA              string     `json:"source_head_sha,omitempty"`
+	SourceRefReleasedAt        string     `json:"source_ref_released_at,omitempty"`
 	PendingAction              string     `json:"pending_action,omitempty"`
 	PendingActionID            string     `json:"pending_action_id,omitempty"`
 	Version                    int64      `json:"version"`
@@ -431,6 +433,41 @@ type GitState struct {
 	CanonicalRef string `json:"canonical_ref"`
 	ActualSHA    string `json:"actual_sha,omitempty"`
 	Error        string `json:"error,omitempty"`
+}
+
+type GCPreview struct {
+	GeneratedAt string              `json:"generated_at"`
+	Workspaces  []GCWorkspaceTarget `json:"workspaces"`
+	TaskRefs    []GCTaskRefTarget   `json:"task_refs"`
+}
+
+type GCWorkspaceTarget struct {
+	TaskID      string   `json:"task_id"`
+	TaskVersion int64    `json:"task_version"`
+	Exists      bool     `json:"exists"`
+	Fingerprint string   `json:"fingerprint"`
+	ActualHead  string   `json:"actual_head,omitempty"`
+	Eligible    bool     `json:"eligible"`
+	Reasons     []string `json:"reasons,omitempty"`
+}
+
+type GCTaskRefTarget struct {
+	TaskID    string   `json:"task_id"`
+	RunID     string   `json:"run_id"`
+	ActualSHA string   `json:"actual_sha,omitempty"`
+	Exists    bool     `json:"exists"`
+	Eligible  bool     `json:"eligible"`
+	Reasons   []string `json:"reasons,omitempty"`
+}
+
+type GCRunResult struct {
+	Completed bool `json:"completed"`
+}
+
+type GCDiscardResult struct {
+	TaskID    string `json:"task_id"`
+	RunID     string `json:"run_id,omitempty"`
+	Discarded bool   `json:"discarded"`
 }
 
 func IsTaskClosed(status TaskStatus) bool {

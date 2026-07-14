@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -132,6 +133,57 @@ func TestGT02DirtyOrMismatchedWorkspaceCreatesNoControlRef(t *testing.T) {
 	}
 }
 
+func TestGT03CorruptReadyBundleFailsLoudAndLeavesControllerFSCKClean(t *testing.T) {
+	ctx := context.Background()
+	initializer, manager, project, _, initial := newWorkspaceFixture(t)
+	manager.capture = corruptCaptureHelper{next: manager.capture}
+	spec := WorkspaceSpec{ProjectID: project.ID, TaskID: "task-corrupt", BaseSHA: initial}
+	workspace, err := manager.Materialize(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitOutput(t, workspace.Path, "config", "user.name", "Corrupt Capture")
+	gitOutput(t, workspace.Path, "config", "user.email", "corrupt@example.invalid")
+	head := commitFile(t, workspace.Path, "corrupt.txt", "corrupt me\n", "corrupt capture")
+	_, err = manager.Capture(ctx, CaptureSpec{
+		Workspace: spec, RunID: "run-corrupt", ExpectedHead: head, ControlRepoPath: project.ControlRepoPath,
+	})
+	if err == nil {
+		t.Fatalf("corrupt capture error = %v", err)
+	}
+	taskRef, _ := TaskRef(spec.TaskID, "run-corrupt")
+	if _, exists, resolveErr := initializer.resolveRef(ctx, project.ControlRepoPath, taskRef); resolveErr != nil || exists {
+		t.Fatalf("corrupt capture task ref exists=%t err=%v", exists, resolveErr)
+	}
+	gitDirOutput(t, project.ControlRepoPath, "fsck", "--full", "--strict")
+}
+
+type corruptCaptureHelper struct{ next CaptureHelper }
+
+func (h corruptCaptureHelper) Capture(ctx context.Context, request CaptureHelperRequest) (CaptureHelperFact, error) {
+	fact, err := h.next.Capture(ctx, request)
+	if err != nil {
+		return CaptureHelperFact{}, err
+	}
+	raw, err := os.ReadFile(fact.ReadyBundle)
+	if err != nil {
+		return CaptureHelperFact{}, err
+	}
+	raw[len(raw)/2] ^= 0xff
+	if err := os.WriteFile(fact.ReadyBundle, raw, 0o600); err != nil {
+		return CaptureHelperFact{}, err
+	}
+	return fact, nil
+}
+
+func (h corruptCaptureHelper) Inspect(ctx context.Context, request WorkspaceInspectRequest) (WorkspaceInspectFact, error) {
+	return h.next.Inspect(ctx, request)
+}
+
+func (h corruptCaptureHelper) Cleanup(ctx context.Context, request CaptureHelperRequest) error {
+	return h.next.Cleanup(ctx, request)
+}
+
 func TestGT04AdvanceUsesExpectedOldCASAndClassifiesNonFastForwardAsStale(t *testing.T) {
 	ctx := context.Background()
 	initializer, manager, project, _, initial := newWorkspaceFixture(t)
@@ -194,6 +246,152 @@ func TestGT04AdvanceUsesExpectedOldCASAndClassifiesNonFastForwardAsStale(t *test
 	}
 	if got := gitDirOutput(t, project.ControlRepoPath, "rev-parse", second.TaskRef+"^{commit}"); got != second.HeadSHA {
 		t.Fatalf("stale result lost task ref: got %s want %s", got, second.HeadSHA)
+	}
+}
+
+func TestGT04ConcurrentExpectedOldCASBarrierUpdatesCanonicalExactlyOnce(t *testing.T) {
+	ctx := context.Background()
+	initializer, manager, project, _, initial := newWorkspaceFixture(t)
+	capture := func(taskID, runID, filename string) CaptureFact {
+		t.Helper()
+		spec := WorkspaceSpec{ProjectID: project.ID, TaskID: taskID, BaseSHA: initial}
+		workspace, err := manager.Materialize(ctx, spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gitOutput(t, workspace.Path, "config", "user.name", taskID)
+		gitOutput(t, workspace.Path, "config", "user.email", taskID+"@example.invalid")
+		head := commitFile(t, workspace.Path, filename, taskID+"\n", taskID)
+		fact, err := manager.Capture(ctx, CaptureSpec{
+			Workspace: spec, RunID: runID, ExpectedHead: head, ControlRepoPath: project.ControlRepoPath,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fact
+	}
+	left := capture("task-cas-left", "run-cas-left", "left.txt")
+	right := capture("task-cas-right", "run-cas-right", "right.txt")
+	start := make(chan struct{})
+	type result struct {
+		fact AdvanceFact
+		err  error
+	}
+	results := make(chan result, 2)
+	for _, captured := range []CaptureFact{left, right} {
+		captured := captured
+		go func() {
+			<-start
+			fact, err := initializer.Advance(ctx, AdvanceSpec{
+				ProjectID: project.ID, ControlRepoPath: project.ControlRepoPath,
+				CanonicalRef: project.CanonicalRef, TaskRef: captured.TaskRef,
+				ExpectedOldSHA: initial, TargetSHA: captured.HeadSHA,
+			})
+			results <- result{fact: fact, err: err}
+		}()
+	}
+	close(start)
+	updated, stale := 0, 0
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		switch result.fact.Outcome {
+		case AdvanceUpdated:
+			updated++
+		case AdvanceStale:
+			stale++
+		default:
+			t.Fatalf("concurrent advance = %#v", result.fact)
+		}
+	}
+	if updated != 1 || stale != 1 {
+		t.Fatalf("concurrent outcomes updated=%d stale=%d", updated, stale)
+	}
+	canonical := gitDirOutput(t, project.ControlRepoPath, "rev-parse", project.CanonicalRef+"^{commit}")
+	if canonical != left.HeadSHA && canonical != right.HeadSHA {
+		t.Fatalf("canonical = %s, want one captured head", canonical)
+	}
+}
+
+func TestGT06RealSameLineConflictIsResolvedByIntegrationWorkspace(t *testing.T) {
+	ctx := context.Background()
+	initializer, manager, project, _, initial := newWorkspaceFixture(t)
+	capture := func(taskID, runID, content string) CaptureFact {
+		t.Helper()
+		spec := WorkspaceSpec{ProjectID: project.ID, TaskID: taskID, BaseSHA: initial}
+		workspace, err := manager.Materialize(ctx, spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gitOutput(t, workspace.Path, "config", "user.name", taskID)
+		gitOutput(t, workspace.Path, "config", "user.email", taskID+"@example.invalid")
+		head := commitFile(t, workspace.Path, "shared.txt", content, taskID)
+		fact, err := manager.Capture(ctx, CaptureSpec{
+			Workspace: spec, RunID: runID, ExpectedHead: head, ControlRepoPath: project.ControlRepoPath,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fact
+	}
+	canonicalResult := capture("task-conflict-canonical", "run-conflict-canonical", "canonical line\n")
+	sourceResult := capture("task-conflict-source", "run-conflict-source", "source line\n")
+	if _, err := initializer.Advance(ctx, AdvanceSpec{
+		ProjectID: project.ID, ControlRepoPath: project.ControlRepoPath,
+		CanonicalRef: project.CanonicalRef, TaskRef: canonicalResult.TaskRef,
+		ExpectedOldSHA: initial, TargetSHA: canonicalResult.HeadSHA,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	source := WorkspaceSource{
+		TaskID: "task-conflict-source", RunID: "run-conflict-source",
+		TaskRef: sourceResult.TaskRef, HeadSHA: sourceResult.HeadSHA,
+	}
+	integrationSpec := WorkspaceSpec{
+		ProjectID: project.ID, TaskID: "task-conflict-integration",
+		BaseSHA: canonicalResult.HeadSHA, Source: &source,
+	}
+	workspace, err := manager.Materialize(ctx, integrationSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitOutput(t, workspace.Path, "config", "user.name", "Conflict Integrator")
+	gitOutput(t, workspace.Path, "config", "user.email", "integrator@example.invalid")
+	merge := exec.Command("git", "-C", workspace.Path, "merge", "--no-ff", source.ConvenienceRef(), "-m", "merge source")
+	merge.Env = append(os.Environ(), "LC_ALL=C")
+	if raw, err := merge.CombinedOutput(); err == nil {
+		t.Fatalf("same-line merge unexpectedly succeeded: %s", raw)
+	}
+	if got := gitOutput(t, workspace.Path, "diff", "--name-only", "--diff-filter=U"); got != "shared.txt" {
+		t.Fatalf("unmerged paths = %q", got)
+	}
+	if err := os.WriteFile(filepath.Join(workspace.Path, "shared.txt"), []byte("canonical line\nsource line\n"), 0o660); err != nil {
+		t.Fatal(err)
+	}
+	gitOutput(t, workspace.Path, "add", "shared.txt")
+	gitOutput(t, workspace.Path, "commit", "-q", "-m", "resolve same-line conflict")
+	head := gitOutput(t, workspace.Path, "rev-parse", "HEAD^{commit}")
+	captured, err := manager.Capture(ctx, CaptureSpec{
+		Workspace: integrationSpec, RunID: "run-conflict-integration", ExpectedHead: head,
+		ControlRepoPath: project.ControlRepoPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanced, err := initializer.Advance(ctx, AdvanceSpec{
+		ProjectID: project.ID, ControlRepoPath: project.ControlRepoPath,
+		CanonicalRef: project.CanonicalRef, TaskRef: captured.TaskRef,
+		ExpectedOldSHA: canonicalResult.HeadSHA, TargetSHA: head,
+	})
+	if err != nil || advanced.Outcome != AdvanceUpdated || advanced.ActualSHA != head {
+		t.Fatalf("resolved integration advance = %#v err=%v", advanced, err)
+	}
+	for _, ancestor := range []string{canonicalResult.HeadSHA, sourceResult.HeadSHA} {
+		if included, err := initializer.isAncestor(ctx, project.ControlRepoPath, true, ancestor, head); err != nil || !included {
+			t.Fatalf("resolved lineage %s -> %s included=%t err=%v", ancestor, head, included, err)
+		}
 	}
 }
 
@@ -344,7 +542,7 @@ func TestGT07SourceUseAndExpectedOldTaskRefGCShareProjectMaintenanceLock(t *test
 		err     error
 	}, 1)
 	go func() {
-		deleted, err := initializer.DeleteTaskRef(ctx, DeleteTaskRefSpec{
+		deleted, err := initializer.DeleteTaskRefAndPrune(ctx, DeleteTaskRefSpec{
 			ProjectID: project.ID, ControlRepoPath: project.ControlRepoPath,
 			CanonicalRef: project.CanonicalRef, TaskRef: captured.TaskRef, ExpectedHead: head,
 		}, func() (bool, error) {
@@ -374,7 +572,7 @@ func TestGT07SourceUseAndExpectedOldTaskRefGCShareProjectMaintenanceLock(t *test
 	}
 
 	referenced.Store(false)
-	deleted, err := initializer.DeleteTaskRef(ctx, DeleteTaskRefSpec{
+	deleted, err := initializer.DeleteTaskRefAndPrune(ctx, DeleteTaskRefSpec{
 		ProjectID: project.ID, ControlRepoPath: project.ControlRepoPath,
 		CanonicalRef: project.CanonicalRef, TaskRef: captured.TaskRef, ExpectedHead: head,
 	}, func() (bool, error) { return true, nil })
@@ -384,15 +582,12 @@ func TestGT07SourceUseAndExpectedOldTaskRefGCShareProjectMaintenanceLock(t *test
 	if _, exists, err := initializer.resolveRef(ctx, project.ControlRepoPath, captured.TaskRef); err != nil || exists {
 		t.Fatalf("task ref after GC exists=%t err=%v", exists, err)
 	}
-	deleted, err = initializer.DeleteTaskRef(ctx, DeleteTaskRefSpec{
+	deleted, err = initializer.DeleteTaskRefAndPrune(ctx, DeleteTaskRefSpec{
 		ProjectID: project.ID, ControlRepoPath: project.ControlRepoPath,
 		CanonicalRef: project.CanonicalRef, TaskRef: captured.TaskRef, ExpectedHead: head,
 	}, func() (bool, error) { return true, nil })
 	if err != nil || !deleted {
 		t.Fatalf("absent ref replay deleted=%t err=%v", deleted, err)
-	}
-	if err := initializer.Prune(ctx, project.ID, project.ControlRepoPath); err != nil {
-		t.Fatal(err)
 	}
 	gitDirOutput(t, project.ControlRepoPath, "fsck", "--full", "--strict")
 }

@@ -39,6 +39,10 @@ type OperatorOperations interface {
 	AcknowledgeBossMessage(context.Context, string, string) (core.Message, error)
 	RetryMessage(context.Context, string, string) (core.Message, error)
 	ListEvents(context.Context, core.EventFilter) (core.EventPage, error)
+	GCPreview(context.Context) (core.GCPreview, error)
+	GCRun(context.Context, core.GCRunInput) (core.GCRunResult, error)
+	GCDiscardWorkspace(context.Context, core.GCDiscardWorkspaceInput) (core.GCDiscardResult, error)
+	GCDiscardTaskRef(context.Context, core.GCDiscardTaskRefInput) (core.GCDiscardResult, error)
 }
 
 // RunOperations is the fixed Agent-facing operation surface. The transport

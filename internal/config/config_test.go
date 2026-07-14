@@ -34,6 +34,11 @@ func TestLoadAcceptsStrictMinimalConfigAndZeroRetention(t *testing.T) {
 	if cfg.Runtime.ShutdownGrace != config.DefaultShutdownGrace {
 		t.Fatalf("default shutdown grace = %s, want %s", cfg.Runtime.ShutdownGrace, config.DefaultShutdownGrace)
 	}
+	if cfg.Git.CaptureHelperImage != cfg.Runtime.DefaultImage || cfg.Git.CaptureTimeout != config.DefaultCaptureTimeout ||
+		cfg.Git.MaximumBundleBytes != config.DefaultCaptureBundleSize || cfg.Git.MaximumObjects != config.DefaultCaptureObjects ||
+		cfg.Git.MaximumHandoffBytes != config.DefaultHandoffSize {
+		t.Fatalf("default Git capture config = %+v", cfg.Git)
+	}
 }
 
 func TestLoadRejectsInvalidConfigWithoutFallback(t *testing.T) {
@@ -59,6 +64,8 @@ func TestLoadRejectsInvalidConfigWithoutFallback(t *testing.T) {
 		{name: "duplicate provider env", raw: strings.Replace(valid, "    - ANTHROPIC_AUTH_TOKEN\n", "    - ANTHROPIC_AUTH_TOKEN\n    - ANTHROPIC_AUTH_TOKEN\n", 1), want: "contains duplicate"},
 		{name: "negative run timeout", raw: strings.Replace(valid, "  default_image:", "  run_timeout: -1s\n  default_image:", 1), want: "runtime.run_timeout must be a positive duration or 0"},
 		{name: "zero shutdown grace", raw: strings.Replace(valid, "  default_image:", "  shutdown_grace: 0\n  default_image:", 1), want: "runtime.shutdown_grace must be a positive duration"},
+		{name: "invalid capture timeout", raw: valid + "git:\n  capture_timeout: 0\n", want: "git.capture_timeout must be a positive duration"},
+		{name: "handoff below bundle", raw: valid + "git:\n  maximum_bundle_bytes: 20\n  maximum_handoff_bytes: 10\n", want: "at least maximum_bundle_bytes"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -91,6 +98,25 @@ func TestLoadAcceptsConfigurableShutdownGrace(t *testing.T) {
 	}
 	if cfg.Runtime.ShutdownGrace != 275*time.Millisecond {
 		t.Fatalf("shutdown grace = %s, want 275ms", cfg.Runtime.ShutdownGrace)
+	}
+}
+
+func TestLoadAcceptsBoundedGitCaptureHelperConfig(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	raw := validConfig(dataDir) + `git:
+  capture_helper_image: coordplane-git-helper:test
+  capture_timeout: 45s
+  maximum_bundle_bytes: 1048576
+  maximum_objects: 5000
+  maximum_handoff_bytes: 4194304
+`
+	cfg, err := config.Load(writeConfig(t, raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Git.CaptureHelperImage != "coordplane-git-helper:test" || cfg.Git.CaptureTimeout != 45*time.Second ||
+		cfg.Git.MaximumBundleBytes != 1<<20 || cfg.Git.MaximumObjects != 5000 || cfg.Git.MaximumHandoffBytes != 4<<20 {
+		t.Fatalf("Git capture config = %+v", cfg.Git)
 	}
 }
 

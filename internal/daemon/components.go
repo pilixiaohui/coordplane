@@ -75,12 +75,49 @@ func buildComponents(ctx context.Context, configPath string) (*components, error
 	if len(quarantined) > 0 {
 		return fail(fmt.Errorf("quarantined unowned repository paths %q; inspect the quarantine and restart", quarantined))
 	}
-	workspaceManager, err := gitrepo.NewWorkspaceManager(initializer, cfg.Runtime.WorkspaceRoot)
+	executor, err := containerruntime.NewDockerExecutorFromEnvironment()
+	if err != nil {
+		return fail(err)
+	}
+	captureHelper, err := newDockerCaptureHelper(
+		executor, cfg.Git, filepath.Join(cfg.DataDir, "handoff"), resolveGitCaptureHelperExecutable(),
+	)
+	if err != nil {
+		return fail(err)
+	}
+	pending, err := database.PendingGitTasks(ctx)
+	if err != nil {
+		return fail(fmt.Errorf("list pending Git tasks: %w", err))
+	}
+	validHandoffs := make([]gitrepo.CaptureHelperRequest, 0, len(pending))
+	for _, task := range pending {
+		if task.PendingAction != "capture" {
+			continue
+		}
+		run, runErr := database.Run(ctx, task.PendingActionRunID)
+		if runErr != nil {
+			return fail(fmt.Errorf("load capture Run %s: %w", task.PendingActionRunID, runErr))
+		}
+		request := gitrepo.CaptureHelperRequest{
+			ProjectID: task.ProjectID, TaskID: task.ID, RunID: run.ID,
+			Workspace: run.WorkspacePath, ExpectedHead: task.PendingExpectedSHA, BaseSHA: task.BaseSHA,
+		}
+		if task.SourceTaskID != "" {
+			request.SourceSHA = task.SourceHeadSHA
+		}
+		validHandoffs = append(validHandoffs, request)
+	}
+	if err := captureHelper.Recover(validHandoffs); err != nil {
+		return fail(fmt.Errorf("recover Git capture handoffs: %w", err))
+	}
+	workspaceManager, err := gitrepo.NewWorkspaceManager(initializer, cfg.Runtime.WorkspaceRoot, captureHelper)
 	if err != nil {
 		return fail(err)
 	}
 	service, err := core.NewService(database, projectGitAdapter{initializer: initializer, workspaces: workspaceManager}, core.ServiceOptions{
 		MaxParallelRuns: cfg.MaxParallelRuns, AdapterIDs: adapter.Production().Names(),
+		CompletedWorkspaceRetention: cfg.Retention.CompletedWorkspace,
+		TerminalTaskRefRetention:    cfg.Retention.TerminalTaskRef,
 	})
 	if err != nil {
 		return fail(err)
@@ -91,10 +128,6 @@ func buildComponents(ctx context.Context, configPath string) (*components, error
 		return fail(fmt.Errorf("reconcile projects: %w", err))
 	}
 	if err := validateRuntimeContainerIdentity(); err != nil {
-		return fail(err)
-	}
-	executor, err := containerruntime.NewDockerExecutorFromEnvironment()
-	if err != nil {
 		return fail(err)
 	}
 	result.runtime = newRuntimeController(

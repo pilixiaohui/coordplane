@@ -977,15 +977,16 @@ func (i *testIDs) New(prefix string) (string, error) {
 }
 
 type fakeGit struct {
-	mu              sync.Mutex
-	sha             string
-	initializeErr   error
-	initializeCalls int
-	exists          bool
-	captureErr      error
-	advanceErr      error
-	advanceOutcome  core.GitAdvanceOutcome
-	advanceActual   string
+	mu                    sync.Mutex
+	sha                   string
+	initializeErr         error
+	initializeCalls       int
+	exists                bool
+	captureErr            error
+	advanceErr            error
+	advanceOutcome        core.GitAdvanceOutcome
+	advanceActual         string
+	discardWorkspaceCalls int
 }
 
 func (g *fakeGit) Preflight(context.Context, string, string) (core.ProjectGitFact, error) {
@@ -1067,7 +1068,31 @@ func (g *fakeGit) Checkout(_ context.Context, intent core.GitCheckoutIntent) (co
 	return core.GitCheckoutFact{Destination: intent.Destination, HeadSHA: intent.ExpectedSHA}, nil
 }
 
-func (g *fakeGit) DeleteTaskRef(_ context.Context, _ core.GitDeleteRefIntent, authorize func() (bool, error)) (bool, error) {
+func (g *fakeGit) WorkspaceState(_ context.Context, intent core.GitWorkspaceStateIntent) (core.GitWorkspaceStateFact, error) {
+	return core.GitWorkspaceStateFact{
+		Exists: true, Fingerprint: "workspace-fingerprint", HeadSHA: intent.ExpectedHead, Clean: true,
+	}, nil
+}
+
+func (g *fakeGit) DiscardWorkspace(_ context.Context, intent core.GitDiscardWorkspaceIntent, authorize func() (bool, error)) (bool, error) {
+	if intent.ExpectedFingerprint != "workspace-fingerprint" {
+		return false, errors.New("workspace fingerprint changed before discard")
+	}
+	allowed, err := authorize()
+	if err != nil || !allowed {
+		return allowed, err
+	}
+	g.mu.Lock()
+	g.discardWorkspaceCalls++
+	g.mu.Unlock()
+	return true, nil
+}
+
+func (g *fakeGit) TaskRefState(_ context.Context, intent core.GitDeleteRefIntent) (core.GitTaskRefStateFact, error) {
+	return core.GitTaskRefStateFact{Exists: true, ActualSHA: intent.ExpectedSHA, Included: true}, nil
+}
+
+func (g *fakeGit) DeleteTaskRefAndPrune(_ context.Context, _ core.GitDeleteRefIntent, authorize func() (bool, error)) (bool, error) {
 	return authorize()
 }
 

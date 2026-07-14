@@ -165,7 +165,7 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 			name:   "task checkout",
 			args:   []string{"task", "checkout", "task-1", "--dest", "/tmp/review-task-1", "--output", "json"},
 			method: http.MethodPost, path: "/v1/tasks/task-1/checkout",
-			input: core.TaskCheckoutInput{TaskID: "task-1", Destination: "/tmp/review-task-1"},
+			input:     core.TaskCheckoutInput{TaskID: "task-1", Destination: "/tmp/review-task-1"},
 			outputHas: `"head_sha":"captured-head"`,
 		},
 		{
@@ -243,6 +243,29 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 			args:   []string{"events", "tail", "--project", "project-1", "--entity-type", "task", "--entity-id", "task-1", "--run-id", "run-1", "--cursor", "next-event", "--limit", "25", "--output", "json"},
 			method: http.MethodGet, path: "/v1/events?cursor=next-event&entity_id=task-1&entity_type=task&limit=25&project_id=project-1&run_id=run-1",
 			outputHas: `"id":1`,
+		},
+		{
+			name: "gc preview", args: []string{"gc", "preview", "--output", "json"},
+			method: http.MethodGet, path: "/v1/gc/preview", outputHas: `"workspaces"`,
+		},
+		{
+			name: "gc run", args: []string{"gc", "run", "--confirm", "--request-id", "gc-run", "--output", "json"},
+			method: http.MethodPost, path: "/v1/gc/run",
+			input: core.GCRunInput{Confirm: true, RequestID: "gc-run"}, outputHas: `"completed":true`,
+		},
+		{
+			name:   "gc discard workspace",
+			args:   []string{"gc", "discard-workspace", "--task", "task-1", "--expected-fingerprint", "fp-1", "--request-id", "gc-workspace", "--output", "json"},
+			method: http.MethodPost, path: "/v1/gc/discard-workspace",
+			input:     core.GCDiscardWorkspaceInput{TaskID: "task-1", ExpectedFingerprint: "fp-1", RequestID: "gc-workspace"},
+			outputHas: `"discarded":true`,
+		},
+		{
+			name:   "gc discard task ref",
+			args:   []string{"gc", "discard-task-ref", "--task", "task-1", "--run", "run-1", "--expected-sha", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "--request-id", "gc-ref", "--output", "json"},
+			method: http.MethodPost, path: "/v1/gc/discard-task-ref",
+			input:     core.GCDiscardTaskRefInput{TaskID: "task-1", RunID: "run-1", ExpectedSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", RequestID: "gc-ref"},
+			outputHas: `"discarded":true`,
 		},
 	}
 
@@ -533,6 +556,12 @@ func (c *recordingClient) JSON(_ context.Context, method, path string, input, ou
 		*target = core.Run{ID: "run-1", ProjectID: "project-1", TaskID: "task-1", AgentID: "agent-1", State: core.RunExited}
 	case *core.EventPage:
 		*target = core.EventPage{Items: c.status.Snapshot.Events, NextCursor: "next-event"}
+	case *core.GCPreview:
+		*target = core.GCPreview{Workspaces: []core.GCWorkspaceTarget{}, TaskRefs: []core.GCTaskRefTarget{}}
+	case *core.GCRunResult:
+		*target = core.GCRunResult{Completed: true}
+	case *core.GCDiscardResult:
+		*target = core.GCDiscardResult{TaskID: "task-1", RunID: "run-1", Discarded: true}
 	}
 	return nil
 }
