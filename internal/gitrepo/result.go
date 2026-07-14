@@ -77,6 +77,7 @@ const (
 )
 
 var contractCapturePhaseHook func(context.Context, capturePhase, CaptureSpec) error
+var contractTaskRefUseHook func(context.Context, string, string) error
 
 type AdvanceOutcome string
 
@@ -533,6 +534,11 @@ func (i *Initializer) UseTaskRef(ctx context.Context, projectID, controlPath, re
 	}
 	if !exists || actual != expected {
 		return &InvariantError{message: "task ref does not match saved task head"}
+	}
+	if contractTaskRefUseHook != nil {
+		if err := contractTaskRefUseHook(ctx, projectID, ref); err != nil {
+			return err
+		}
 	}
 	return use(actual)
 }

@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,10 +17,83 @@ import (
 	"coordplane/internal/gitcapture"
 	"coordplane/internal/gitrepo"
 	"coordplane/internal/store"
+	"coordplane/internal/transport"
 )
+
+func TestGT04CT08FormalCommandsDeterministicallyFenceAcceptAndRevocation(t *testing.T) {
+	binary := buildP4Binary(t, "coordplane")
+	competitors := []string{"rework", "cancel"}
+	for _, competitor := range competitors {
+		for _, order := range []string{"revocation_first", "accept_first"} {
+			t.Run(competitor+"/"+order, func(t *testing.T) {
+				h := newRealP4Harness(t)
+				task, _, head := prepareGT03Capture(t, h, "ct08-"+competitor+"-"+order, true)
+				h.reconcileGit(t)
+				gate := newBarrierProjectGit(projectGitAdapter{initializer: h.initializer, workspaces: h.workspaces}, order)
+				h.service = newRealP4Service(t, h.database, gate)
+				socket, stop := startP4OperatorServer(t, h.root, h.service)
+				defer stop()
+				acceptArgs := []string{"task", "accept", task.ID, "--socket", socket, "--request-id", "ct08-accept", "--output", "json"}
+				competeArgs := []string{"task", competitor, task.ID, "--socket", socket, "--reason", competitor, "--request-id", "ct08-" + competitor, "--output", "json"}
+
+				if order == "revocation_first" {
+					acceptResult := make(chan p4CLIResult, 1)
+					go func() { acceptResult <- runP4OperatorCLI(binary, acceptArgs...) }()
+					waitP4Barrier(t, gate.resolveEntered)
+					if result := runP4OperatorCLI(binary, competeArgs...); result.code != 0 {
+						t.Fatalf("winning %s command: %s", competitor, result.stderr)
+					}
+					winnerSignature := p4DurableSignature(t, h)
+					close(gate.resolveRelease)
+					if result := <-acceptResult; result.code == 0 || !strings.Contains(result.stderr, string(core.CodeInvalidState)) {
+						t.Fatalf("stale accept result = %#v", result)
+					}
+					if got := p4DurableSignature(t, h); got != winnerSignature {
+						t.Fatal("stale accept changed DB or Event state after revocation won")
+					}
+					if gate.advanceCallCount() != 0 {
+						t.Fatal("stale accept reached the mutating Git advance boundary")
+					}
+					assertP4Refs(t, h, h.project.InitialSHA, task.ID, head)
+					return
+				}
+
+				if result := runP4OperatorCLI(binary, acceptArgs...); result.code != 0 {
+					t.Fatalf("winning accept command: %s", result.stderr)
+				}
+				accepted, err := h.database.Task(context.Background(), task.ID)
+				if err != nil || accepted.PendingAction != "advance" || accepted.PendingActionID == "" ||
+					accepted.PendingActionVersion != accepted.Version || accepted.AcceptedIntegrationAgentID != h.integrator.ID {
+					t.Fatalf("accepted task = %#v err=%v", accepted, err)
+				}
+				reconcile := make(chan error, 1)
+				go func() { reconcile <- h.service.ReconcileGit(context.Background()) }()
+				waitP4Barrier(t, gate.advanceEntered)
+				beforeLoser := p4DurableSignature(t, h)
+				if result := runP4OperatorCLI(binary, competeArgs...); result.code == 0 || !strings.Contains(result.stderr, string(core.CodeActionInProgress)) {
+					t.Fatalf("losing %s result = %#v", competitor, result)
+				}
+				if got := p4DurableSignature(t, h); got != beforeLoser {
+					t.Fatalf("losing %s changed DB or Event state", competitor)
+				}
+				assertP4Refs(t, h, h.project.InitialSHA, task.ID, head)
+				close(gate.advanceRelease)
+				if err := <-reconcile; err != nil {
+					t.Fatal(err)
+				}
+				completed, err := h.database.Task(context.Background(), task.ID)
+				if err != nil || completed.Status != core.TaskCompleted || completed.FinalCanonicalSHA != head {
+					t.Fatalf("completed accepted task = %#v err=%v", completed, err)
+				}
+				assertP4Refs(t, h, head, task.ID, head)
+			})
+		}
+	}
+}
 
 func TestGT06RealConflictSecondStaleRequeuesSameIntegrationTaskAndCompletes(t *testing.T) {
 	h := newRealP4Harness(t)
+	coordlink := buildP4Binary(t, "coordlink")
 	ctx := context.Background()
 	sourceTask, err := h.service.CreateTask(ctx, core.CreateTaskInput{
 		ProjectID: h.project.ID, AssigneeAgentID: h.worker.ID, Kind: core.TaskWork,
@@ -38,9 +113,7 @@ func TestGT06RealConflictSecondStaleRequeuesSameIntegrationTaskAndCompletes(t *t
 	writeRealGitFile(t, sourceWorkspace.Path, "README.md", "source line\n")
 	sourceHead := commitRealGitWorkspace(t, sourceWorkspace.Path, "source same-line change")
 	h.submitAndStop(t, sourceClaim, sourceHead, "gt06-source")
-	if err := h.service.ReconcileGit(ctx); err != nil {
-		t.Fatal(err)
-	}
+	h.reconcileGit(t)
 	sourceTask, err = h.database.Task(ctx, sourceTask.ID)
 	if err != nil || sourceTask.Status != core.TaskSubmitted {
 		t.Fatalf("captured source = %#v err=%v", sourceTask, err)
@@ -52,54 +125,42 @@ func TestGT06RealConflictSecondStaleRequeuesSameIntegrationTaskAndCompletes(t *t
 	}
 
 	firstCanonical := h.captureAndAdvanceDirect(t, "canonical-first", h.project.InitialSHA, "README.md", "canonical line\n")
-	if err := h.service.ReconcileGit(ctx); err != nil {
-		t.Fatal(err)
-	}
+	h.reconcileGit(t)
 	snapshot, err := h.database.Snapshot(ctx, h.project.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	integration := onlyIntegrationTask(t, snapshot.Tasks)
-	if source := taskByID(t, snapshot.Tasks, sourceTask.ID); source.IntegrationTaskID != integration.ID || source.Status != core.TaskSubmitted {
-		t.Fatalf("source after first stale = %#v", source)
+	source, err := h.database.Task(ctx, sourceTask.ID)
+	if err != nil || source.IntegrationTaskID != integration.ID || source.Status != core.TaskSubmitted {
+		t.Fatalf("source after first stale = %#v err=%v", source, err)
 	}
 
 	firstClaim := h.claim(t, integration.ID)
 	integrationSpec := taskWorkspaceSpec(firstClaim.Task)
-	integrationWorkspace, err := h.workspaces.Materialize(ctx, integrationSpec)
+	firstRun := prepareP4ScriptedRun(t, h, firstClaim, "gt06-integration-first")
+	runP4IntegrationCLI(t, coordlink, firstRun, integrationSpec.Source.ConvenienceRef(), true)
+	firstIntegrationHead := strings.TrimSpace(gitIn(t, firstRun.workspace, "rev-parse", "HEAD^{commit}"))
+	firstRun.close(t)
+	h.stopRun(t, firstClaim, "gt06-integration-first")
+	progress, err := h.database.Events(ctx, core.EventFilter{ProjectID: h.project.ID, EntityType: "task", EntityID: integration.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.activate(t, firstClaim, integrationWorkspace.Path, "gt06-integration-first")
-	configureRealGitWorkspace(t, integrationWorkspace.Path, "Integration Worker")
-	merge := exec.Command("git", "-C", integrationWorkspace.Path, "merge", "--no-ff", integrationSpec.Source.ConvenienceRef(), "-m", "merge source")
-	merge.Env = append(os.Environ(), "LC_ALL=C")
-	if raw, err := merge.CombinedOutput(); err == nil {
-		t.Fatalf("same-line integration merge unexpectedly succeeded: %s", raw)
+	foundConflict := false
+	for _, event := range progress {
+		foundConflict = foundConflict || event.Kind == "task.progress" && strings.Contains(event.PayloadJSON, "same-line conflict")
 	}
-	if unmerged := strings.TrimSpace(gitIn(t, integrationWorkspace.Path, "diff", "--name-only", "--diff-filter=U")); unmerged != "README.md" {
-		t.Fatalf("unmerged paths = %q", unmerged)
+	if !foundConflict {
+		t.Fatalf("scripted integration CLI did not publish conflict progress: %#v", progress)
 	}
-	if _, err := h.service.Progress(ctx, core.ProgressInput{
-		Token: firstClaim.Token, Summary: "real same-line conflict in README.md", RequestID: "gt06-conflict-progress",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	writeRealGitFile(t, integrationWorkspace.Path, "README.md", "canonical line\nsource line\n")
-	gitIn(t, integrationWorkspace.Path, "add", "README.md")
-	gitIn(t, integrationWorkspace.Path, "commit", "-m", "resolve real same-line conflict")
-	firstIntegrationHead := strings.TrimSpace(gitIn(t, integrationWorkspace.Path, "rev-parse", "HEAD^{commit}"))
-	h.submitAndStop(t, firstClaim, firstIntegrationHead, "gt06-integration-first")
-	if err := h.service.ReconcileGit(ctx); err != nil {
-		t.Fatal(err)
-	}
+	h.reconcileGit(t)
 
 	secondCanonical := h.captureAndAdvanceDirect(t, "canonical-second", firstCanonical, "winner.txt", "second winner\n")
-	if err := h.service.ReconcileGit(ctx); err != nil {
-		t.Fatal(err)
-	}
+	h.reconcileGit(t)
 	requeued, err := h.database.Task(ctx, integration.ID)
-	if err != nil || requeued.Status != core.TaskQueued || requeued.Generation != firstClaim.Run.Generation || requeued.ObservedCanonicalSHA != firstCanonical {
+	if err != nil || requeued.Status != core.TaskQueued || requeued.Generation != firstClaim.Run.Generation ||
+		requeued.ObservedCanonicalSHA != firstCanonical || requeued.HeadSHA != firstIntegrationHead {
 		t.Fatalf("second-stale integration = %#v err=%v", requeued, err)
 	}
 	sourceAfterStale, err := h.database.Task(ctx, sourceTask.ID)
@@ -124,23 +185,16 @@ func TestGT06RealConflictSecondStaleRequeuesSameIntegrationTaskAndCompletes(t *t
 	if secondClaim.Run.Generation != firstClaim.Run.Generation+1 || secondClaim.Task.ID != integration.ID {
 		t.Fatalf("second integration claim = %#v", secondClaim)
 	}
-	canonicalRef, err := h.workspaces.RefreshCanonical(ctx, integrationSpec, h.project.ControlRepoPath, h.project.CanonicalRef, secondCanonical)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.TrimSpace(gitIn(t, integrationWorkspace.Path, "rev-parse", canonicalRef+"^{commit}")); got != secondCanonical {
+	secondRun := prepareP4ScriptedRun(t, h, secondClaim, "gt06-integration-second")
+	if got := strings.TrimSpace(gitIn(t, secondRun.workspace, "rev-parse", "refs/heads/coordplane/canonical^{commit}")); got != secondCanonical {
 		t.Fatalf("imported second canonical = %s, want %s", got, secondCanonical)
 	}
-	h.activate(t, secondClaim, integrationWorkspace.Path, "gt06-integration-second")
-	gitIn(t, integrationWorkspace.Path, "merge", "--no-ff", canonicalRef, "-m", "integrate second canonical")
-	finalHead := strings.TrimSpace(gitIn(t, integrationWorkspace.Path, "rev-parse", "HEAD^{commit}"))
-	h.submitAndStop(t, secondClaim, finalHead, "gt06-integration-second")
-	if err := h.service.ReconcileGit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.service.ReconcileGit(ctx); err != nil {
-		t.Fatal(err)
-	}
+	runP4IntegrationCLI(t, coordlink, secondRun, "refs/heads/coordplane/canonical", false)
+	finalHead := strings.TrimSpace(gitIn(t, secondRun.workspace, "rev-parse", "HEAD^{commit}"))
+	secondRun.close(t)
+	h.stopRun(t, secondClaim, "gt06-integration-second")
+	h.reconcileGit(t)
+	h.reconcileGit(t)
 	finalSource, err := h.database.Task(ctx, sourceTask.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -164,6 +218,139 @@ func TestGT06RealConflictSecondStaleRequeuesSameIntegrationTaskAndCompletes(t *t
 		t.Fatalf("nested integration task created: got %s want %s", got, integration.ID)
 	}
 	gitOutput(t, "--git-dir="+h.project.ControlRepoPath, "fsck", "--full", "--strict")
+}
+
+func TestGT07WorkspaceDeleteCrashReopenReleasesDurableSourceOnce(t *testing.T) {
+	h := newRealP4Harness(t)
+	ctx := context.Background()
+	source := completeP4Task(t, h, "gt07-replay-source")
+	consumer, err := h.service.CreateTask(ctx, core.CreateTaskInput{
+		ProjectID: h.project.ID, AssigneeAgentID: h.integrator.ID,
+		Title: "replay source consumer", SourceTaskID: source.ID, RequestID: "gt07-replay-create",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := taskWorkspaceSpec(consumer)
+	workspace, err := h.workspaces.Materialize(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer, err = h.service.CancelTask(ctx, core.TaskActionInput{
+		TaskID: consumer.ID, Reason: "finished", RequestID: "gt07-replay-cancel",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirty := filepath.Join(workspace.Path, "dirty.txt")
+	if err := os.WriteFile(dirty, []byte("preserve\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.ReconcileWorkspaceGC(ctx, consumer.ClosedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(workspace.Path); err != nil {
+		t.Fatalf("dirty workspace was deleted: %v", err)
+	}
+	if err := os.Remove(dirty); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := h.workspaces.Delete(ctx, spec, consumer.BaseSHA, func() (bool, error) { return true, nil })
+	if err != nil || !deleted {
+		t.Fatalf("pre-crash workspace delete = %t err=%v", deleted, err)
+	}
+	if _, err := os.Stat(workspace.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("workspace survived pre-crash delete: %v", err)
+	}
+	if persisted, err := h.database.Task(ctx, consumer.ID); err != nil || persisted.SourceRefReleasedAt != "" {
+		t.Fatalf("source ref released before restart = %#v err=%v", persisted, err)
+	}
+	if err := h.database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	h.database, err = store.Open(ctx, filepath.Join(h.root, "coordplane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = h.database.Close() })
+	h.service = newRealP4Service(t, h.database, projectGitAdapter{initializer: h.initializer, workspaces: h.workspaces})
+	if err := h.service.ReconcileWorkspaceGC(ctx, consumer.ClosedAt); err != nil {
+		t.Fatal(err)
+	}
+	released, err := h.database.Task(ctx, consumer.ID)
+	if err != nil || released.SourceRefReleasedAt == "" {
+		t.Fatalf("reopened source release = %#v err=%v", released, err)
+	}
+	stable := p4DurableSignature(t, h)
+	if err := h.service.ReconcileWorkspaceGC(ctx, consumer.ClosedAt); err != nil {
+		t.Fatal(err)
+	}
+	if replay := p4DurableSignature(t, h); replay != stable {
+		t.Fatal("absent workspace replay changed durable state")
+	}
+	events, err := h.database.Events(ctx, core.EventFilter{ProjectID: h.project.ID, EntityID: consumer.ID})
+	releaseEvents := 0
+	for _, event := range events {
+		if event.Kind == "gc.source_ref_released" {
+			releaseEvents++
+		}
+	}
+	if err != nil || releaseEvents != 1 {
+		t.Fatalf("source release events = %#v err=%v", events, err)
+	}
+	assertP4TaskRef(t, h, source.TaskRef, source.HeadSHA)
+}
+
+func TestGT07SourceRefRetentionUsesLaterIntegrationAndSourceClosedAt(t *testing.T) {
+	h := newRealP4Harness(t)
+	ctx := context.Background()
+	source, _, _ := prepareGT03Capture(t, h, "gt07-later-close-source", true)
+	h.reconcileGit(t)
+	source, err := h.database.Task(ctx, source.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.RequestAccept(ctx, core.AcceptInput{
+		TaskID: source.ID, IntegrationAgentID: h.integrator.ID, RequestID: "gt07-later-close-accept",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.captureAndAdvanceDirect(t, "gt07-later-close-winner", h.project.InitialSHA, "winner.txt", "winner\n")
+	h.reconcileGit(t)
+	snapshot, err := h.database.Snapshot(ctx, h.project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	integration := onlyIntegrationTask(t, snapshot.Tasks)
+	if _, err := h.workspaces.Materialize(ctx, taskWorkspaceSpec(integration)); err != nil {
+		t.Fatal(err)
+	}
+	integration, err = h.service.CancelTask(ctx, core.TaskActionInput{
+		TaskID: integration.ID, Reason: "cancel integration", RequestID: "gt07-later-close-integration",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.ReconcileWorkspaceGC(ctx, integration.ClosedAt); err != nil {
+		t.Fatal(err)
+	}
+	released, err := h.database.Task(ctx, integration.ID)
+	if err != nil || released.SourceRefReleasedAt == "" {
+		t.Fatalf("integration source release = %#v err=%v", released, err)
+	}
+	source, err = h.service.CancelTask(ctx, core.TaskActionInput{
+		TaskID: source.ID, Reason: "cancel source later", RequestID: "gt07-later-close-source",
+	})
+	if err != nil || source.ClosedAt <= integration.ClosedAt {
+		t.Fatalf("later source close = %#v integration=%#v err=%v", source, integration, err)
+	}
+	if eligible, err := h.database.TaskRefEligible(ctx, source.ID, source.TaskRef, integration.ClosedAt); err != nil || eligible {
+		t.Fatalf("integration cutoff eligible=%t err=%v", eligible, err)
+	}
+	if eligible, err := h.database.TaskRefEligible(ctx, source.ID, source.TaskRef, source.ClosedAt); err != nil || !eligible {
+		t.Fatalf("later source cutoff eligible=%t err=%v", eligible, err)
+	}
+	assertP4TaskRef(t, h, source.TaskRef, source.HeadSHA)
 }
 
 type realP4Harness struct {
@@ -262,6 +449,13 @@ func (h *realP4Harness) claim(t *testing.T, taskID string) core.Claim {
 		t.Fatalf("claim task %s = %#v ok=%t err=%v", taskID, claim, ok, err)
 	}
 	return claim
+}
+
+func (h *realP4Harness) reconcileGit(t *testing.T) {
+	t.Helper()
+	if err := h.service.ReconcileGit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (h *realP4Harness) activate(t *testing.T, claim core.Claim, workspace, prefix string) core.Run {
@@ -391,17 +585,6 @@ func onlyIntegrationTask(t *testing.T, tasks []core.Task) core.Task {
 	return found
 }
 
-func taskByID(t *testing.T, tasks []core.Task, id string) core.Task {
-	t.Helper()
-	for _, task := range tasks {
-		if task.ID == id {
-			return task
-		}
-	}
-	t.Fatalf("task %s missing: %#v", id, tasks)
-	return core.Task{}
-}
-
 func configureRealGitWorkspace(t *testing.T, workspace, name string) {
 	t.Helper()
 	gitIn(t, workspace, "config", "user.name", name)
@@ -420,6 +603,349 @@ func commitRealGitWorkspace(t *testing.T, workspace, message string) string {
 	gitIn(t, workspace, "add", "--all")
 	gitIn(t, workspace, "commit", "-m", message)
 	return strings.TrimSpace(gitIn(t, workspace, "rev-parse", "HEAD^{commit}"))
+}
+
+type barrierProjectGit struct {
+	projectGitAdapter
+	blockResolve                   bool
+	blockAdvance                   bool
+	resolveEntered, resolveRelease chan struct{}
+	advanceEntered, advanceRelease chan struct{}
+	resolveOnce, advanceOnce       sync.Once
+	mu                             sync.Mutex
+	advanceCalls                   int
+}
+
+func newBarrierProjectGit(adapter projectGitAdapter, order string) *barrierProjectGit {
+	return &barrierProjectGit{
+		projectGitAdapter: adapter,
+		blockResolve:      order == "revocation_first",
+		blockAdvance:      order == "accept_first",
+		resolveEntered:    make(chan struct{}), resolveRelease: make(chan struct{}),
+		advanceEntered: make(chan struct{}), advanceRelease: make(chan struct{}),
+	}
+}
+
+func (g *barrierProjectGit) ResolveTaskRef(ctx context.Context, intent core.GitTaskRefIntent) (string, error) {
+	actual, err := g.projectGitAdapter.ResolveTaskRef(ctx, intent)
+	if err == nil && g.blockResolve {
+		g.resolveOnce.Do(func() { close(g.resolveEntered) })
+		select {
+		case <-g.resolveRelease:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	return actual, err
+}
+
+func (g *barrierProjectGit) Advance(ctx context.Context, intent core.GitAdvanceIntent) (core.GitAdvanceFact, error) {
+	g.mu.Lock()
+	g.advanceCalls++
+	g.mu.Unlock()
+	if g.blockAdvance {
+		g.advanceOnce.Do(func() { close(g.advanceEntered) })
+		select {
+		case <-g.advanceRelease:
+		case <-ctx.Done():
+			return core.GitAdvanceFact{}, ctx.Err()
+		}
+	}
+	return g.projectGitAdapter.Advance(ctx, intent)
+}
+
+func (g *barrierProjectGit) advanceCallCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.advanceCalls
+}
+
+type p4CLIResult struct {
+	code   int
+	stderr string
+}
+
+func runP4OperatorCLI(binary string, args ...string) p4CLIResult {
+	raw, err := exec.Command(binary, args...).CombinedOutput()
+	if err != nil {
+		return p4CLIResult{code: 1, stderr: string(raw)}
+	}
+	return p4CLIResult{}
+}
+
+func buildP4Binary(t *testing.T, name string) string {
+	t.Helper()
+	working, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(t.TempDir(), name)
+	command := exec.Command("go", "build", "-buildvcs=false", "-o", binary, "./cmd/"+name)
+	command.Dir = filepath.Clean(filepath.Join(working, "..", ".."))
+	if raw, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("build formal %s binary: %v\n%s", name, err, raw)
+	}
+	return binary
+}
+
+type p4ScriptedRun struct {
+	controller *runtimeController
+	run        core.Run
+	workspace  string
+	socket     string
+	tokenFile  string
+	control    *runControl
+}
+
+func prepareP4ScriptedRun(t *testing.T, h *realP4Harness, claim core.Claim, prefix string) p4ScriptedRun {
+	t.Helper()
+	ctx := context.Background()
+	launch, err := h.service.RuntimeLaunchContext(ctx, claim.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := gitWorkspaceSpec(launch.Task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := h.workspaces.Path(launch.Project.ID, launch.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := h.service.BeginRunLaunch(ctx, core.RunLaunchInput{
+		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: prefix + "-nonce",
+		WorkspacePath: workspace, HomePath: filepath.Join(h.root, "homes", claim.Run.ID),
+		LogPath: filepath.Join(h.root, "logs", claim.Run.ID+".log"), InstructionsHash: prefix,
+		LaunchMode: "start", CleanupOperationID: prefix + "-cleanup", RequestID: prefix + "-prepare",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := &runtimeController{service: h.service, workspaces: h.workspaces, controls: make(map[string]*runControl)}
+	state := &runtimePrepareState{controller: controller, ctx: ctx, launch: launch, workspaceSpec: spec, run: run}
+	if err := prepareRuntimeWorkspace(state); err != nil {
+		t.Fatal(err)
+	}
+	fact := core.RunRuntimeFactInput{
+		RunID: run.ID, Generation: run.Generation, LaunchNonce: run.LaunchNonce,
+		LaunchOperationID: run.LaunchOperationID, ContainerID: prefix + "-container", RequestID: prefix + "-created",
+	}
+	run, err = h.service.RecordContainerCreated(ctx, fact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fact.ContainerID, fact.RequestID = run.ContainerID, prefix+"-started"
+	run, err = h.service.RecordRunStartIssued(ctx, fact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fact.RequestID = prefix + "-active"
+	run, err = h.service.ObserveProcessAndActivateRun(ctx, fact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlPath := filepath.Join(h.root, "run-control", run.ID)
+	if err := os.MkdirAll(controlPath, runControlDirectoryMode); err != nil {
+		t.Fatal(err)
+	}
+	tokenFile := filepath.Join(controlPath, "token")
+	if err := os.WriteFile(tokenFile, []byte(claim.Token+"\n"), runControlFileMode); err != nil {
+		t.Fatal(err)
+	}
+	control, err := controller.openRunControl(run, controlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.controls[run.ID] = control
+	return p4ScriptedRun{
+		controller: controller, run: run, workspace: workspace,
+		socket: filepath.Join(controlPath, "api.sock"), tokenFile: tokenFile, control: control,
+	}
+}
+
+func (r p4ScriptedRun) close(t *testing.T) {
+	t.Helper()
+	if err := r.controller.closeControl(r.run.ID, r.control); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runP4IntegrationCLI(t *testing.T, coordlink string, run p4ScriptedRun, mergeRef string, conflict bool) {
+	t.Helper()
+	mode := "refresh"
+	if conflict {
+		mode = "conflict"
+	}
+	script := `
+git config user.name "Scripted Integration CLI"
+git config user.email scripted-integration@example.invalid
+if [ "$3" = conflict ]; then
+  if git merge --no-ff "$2" -m "merge source"; then
+    exit 20
+  fi
+  [ "$(git diff --name-only --diff-filter=U)" = README.md ]
+  "$1" progress --summary "real same-line conflict in README.md" --request-id gt06-conflict-progress --output json >/dev/null
+  printf 'canonical line\nsource line\n' > README.md
+  git add README.md
+  git commit -m "resolve real same-line conflict"
+else
+  git merge --no-ff "$2" -m "integrate refreshed canonical"
+fi
+head=$(git rev-parse HEAD^{commit})
+"$1" task submit --summary "$3 resolved" --expected-head "$head" --request-id "gt06-$3-submit" --output json >/dev/null
+`
+	command := exec.Command("sh", "-eu", "-c", script, "scripted-integration", coordlink, mergeRef, mode)
+	command.Dir = run.workspace
+	command.Env = append(os.Environ(),
+		"COORDPLANE_RUN_SOCKET="+run.socket,
+		"COORDPLANE_RUN_TOKEN_FILE="+run.tokenFile,
+		"LC_ALL=C",
+	)
+	if raw, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("scripted integration CLI: %v\n%s", err, raw)
+	}
+}
+
+func startP4OperatorServer(t *testing.T, root string, service *core.Service) (string, func()) {
+	t.Helper()
+	socket := filepath.Join(root, "operator.sock")
+	server, err := transport.NewUnixServer(root, socket, transport.NewOperatorHandler(service))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- server.Serve() }()
+	var once sync.Once
+	return socket, func() {
+		once.Do(func() {
+			_ = server.Close()
+			<-done
+		})
+	}
+}
+
+func waitP4Barrier(t *testing.T, entered <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Git executor barrier timeout")
+	}
+}
+
+func waitP4File(t *testing.T, path string) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("path did not appear: %s", path)
+		}
+	}
+}
+
+func newRealP4Service(t *testing.T, database *store.Store, controller core.ProjectGit) *core.Service {
+	t.Helper()
+	service, err := core.NewService(database, controller, core.ServiceOptions{
+		Now: time.Now, NewID: (&realP4IDs{}).New, MaxParallelRuns: 4, AdapterIDs: []string{"codex"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.SetReady(true, "")
+	return service
+}
+
+func p4DurableSignature(t *testing.T, h *realP4Harness) string {
+	t.Helper()
+	snapshot, err := h.database.Snapshot(context.Background(), h.project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := h.database.Events(context.Background(), core.EventFilter{ProjectID: h.project.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(struct {
+		Snapshot core.Snapshot
+		Events   []core.Event
+	}{snapshot, events})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+func assertP4Refs(t *testing.T, h *realP4Harness, canonical, taskID, taskHead string) {
+	t.Helper()
+	if actual := strings.TrimSpace(gitOutput(t, "--git-dir="+h.project.ControlRepoPath, "rev-parse", h.project.CanonicalRef+"^{commit}")); actual != canonical {
+		t.Fatalf("canonical = %s, want %s", actual, canonical)
+	}
+	refs := strings.Fields(gitOutput(t, "--git-dir="+h.project.ControlRepoPath, "for-each-ref", "--format=%(objectname)", "refs/coordplane/tasks/"+taskID))
+	if len(refs) != 1 || refs[0] != taskHead {
+		t.Fatalf("task refs = %#v, want one %s", refs, taskHead)
+	}
+}
+
+func assertP4TaskRef(t *testing.T, h *realP4Harness, ref, head string) {
+	t.Helper()
+	if actual := strings.TrimSpace(gitOutput(t, "--git-dir="+h.project.ControlRepoPath, "rev-parse", ref+"^{commit}")); actual != head {
+		t.Fatalf("task ref %s = %s, want %s", ref, actual, head)
+	}
+}
+
+func completeP4Task(t *testing.T, h *realP4Harness, suffix string) core.Task {
+	t.Helper()
+	task, _, _ := prepareGT03Capture(t, h, suffix, true)
+	h.reconcileGit(t)
+	if _, err := h.service.RequestAccept(context.Background(), core.AcceptInput{
+		TaskID: task.ID, IntegrationAgentID: h.integrator.ID, RequestID: suffix + "-accept",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcileGit(t)
+	completed, err := h.database.Task(context.Background(), task.ID)
+	if err != nil || completed.Status != core.TaskCompleted {
+		t.Fatalf("completed task = %#v err=%v", completed, err)
+	}
+	return completed
+}
+
+func prepareGT03Capture(t *testing.T, h *realP4Harness, suffix string, terminal bool) (core.Task, core.Claim, string) {
+	t.Helper()
+	task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+		ProjectID: h.project.ID, AssigneeAgentID: h.worker.ID, Kind: core.TaskWork,
+		Title: "GT03 " + suffix, MaxRetries: 1, RequestID: "gt03-create-" + suffix,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := h.claim(t, task.ID)
+	workspace, err := h.workspaces.Materialize(context.Background(), taskWorkspaceSpec(claim.Task))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.activate(t, claim, workspace.Path, "gt03-"+suffix)
+	configureRealGitWorkspace(t, workspace.Path, "GT03 "+suffix)
+	writeRealGitFile(t, workspace.Path, "gt03-"+suffix+".txt", suffix+"\n")
+	head := commitRealGitWorkspace(t, workspace.Path, "GT03 "+suffix)
+	if _, err := h.service.RequestOutcome(context.Background(), core.OutcomeInput{
+		Token: claim.Token, Outcome: core.OutcomeSubmit, Summary: suffix,
+		ExpectedHead: head, RequestID: "gt03-submit-" + suffix,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if terminal {
+		h.stopRun(t, claim, "gt03-"+suffix)
+	}
+	task, err = h.database.Task(context.Background(), task.ID)
+	if err != nil || task.Status != core.TaskFinishing || task.PendingAction != "capture" {
+		t.Fatalf("prepared GT03 task = %#v err=%v", task, err)
+	}
+	return task, claim, head
 }
 
 type localCaptureHelper struct{ root string }

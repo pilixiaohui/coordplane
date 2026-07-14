@@ -699,10 +699,11 @@ func TestGT07FormalOperatorBinaryCreatesRetryLineageFromClosedSameProjectTask(t 
 	if replay.ID != retry.ID {
 		t.Fatalf("formal retry replay = %s, want %s", replay.ID, retry.ID)
 	}
-	beforeRaw := runBinaryJSON(t, testBinaries.coordplane,
-		"task", "list", "--socket", socket, "--project", project.ID, "--output", "json")
-	var before core.TaskPage
-	decodeJSON(t, beforeRaw, &before)
+	auditStore, err := store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = auditStore.Close() })
 	for _, invalid := range []struct {
 		name, target, requestID string
 		code                    core.ErrorCode
@@ -710,6 +711,8 @@ func TestGT07FormalOperatorBinaryCreatesRetryLineageFromClosedSameProjectTask(t 
 		{name: "open", target: open.ID, requestID: "retry-invalid-open", code: core.CodeInvalidState},
 		{name: "cross", target: cross.ID, requestID: "retry-invalid-cross", code: core.CodeScopeDenied},
 	} {
+		before := durableSignature(t, auditStore, project.ID)
+		canonicalBefore := strings.TrimSpace(git(t, controlRepo, "rev-parse", project.CanonicalRef+"^{commit}"))
 		command := exec.Command(testBinaries.coordplane,
 			"task", "create", "--socket", socket, "--project", project.ID, "--agent", agent.ID,
 			"--title", "invalid retry", "--retry-of", invalid.target,
@@ -718,13 +721,22 @@ func TestGT07FormalOperatorBinaryCreatesRetryLineageFromClosedSameProjectTask(t 
 		if err == nil || !bytes.Contains(raw, []byte(invalid.code)) {
 			t.Fatalf("%s retry err=%v output=%s", invalid.name, err, raw)
 		}
-	}
-	afterRaw := runBinaryJSON(t, testBinaries.coordplane,
-		"task", "list", "--socket", socket, "--project", project.ID, "--output", "json")
-	var after core.TaskPage
-	decodeJSON(t, afterRaw, &after)
-	if len(after.Items) != len(before.Items) {
-		t.Fatalf("rejected retry changed task count: before=%d after=%d", len(before.Items), len(after.Items))
+		if after := durableSignature(t, auditStore, project.ID); after != before {
+			t.Fatalf("%s rejected retry changed Task/Run/Message/Event state", invalid.name)
+		}
+		canonicalAfter := strings.TrimSpace(git(t, controlRepo, "rev-parse", project.CanonicalRef+"^{commit}"))
+		if canonicalAfter != canonicalBefore {
+			t.Fatalf("%s rejected retry changed canonical from %s to %s", invalid.name, canonicalBefore, canonicalAfter)
+		}
+		if err := auditStore.Transact(context.Background(), func(tx core.Transaction) error {
+			_, found, err := tx.Dedupe("boss", "task.create", invalid.requestID)
+			if err == nil && found {
+				t.Fatalf("%s rejected retry persisted dedupe", invalid.name)
+			}
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
