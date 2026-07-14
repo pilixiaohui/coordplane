@@ -19,6 +19,7 @@ type ServiceOptions struct {
 	Now             func() time.Time
 	NewID           func(string) (string, error)
 	MaxParallelRuns int
+	AdapterIDs      []string
 }
 
 type Service struct {
@@ -27,10 +28,12 @@ type Service struct {
 	now        func() time.Time
 	newID      func(string) (string, error)
 	maxRuns    int
+	adapters   map[string]struct{}
 
-	readyMu     sync.RWMutex
-	ready       bool
-	readyReason string
+	readyMu       sync.RWMutex
+	ready         bool
+	readyReason   string
+	runtimeStatus *RuntimeStatus
 }
 
 func NewService(repository Repository, projectGit ProjectGit, options ServiceOptions) (*Service, error) {
@@ -49,12 +52,26 @@ func NewService(repository Repository, projectGit ProjectGit, options ServiceOpt
 	if options.MaxParallelRuns <= 0 {
 		options.MaxParallelRuns = 1
 	}
+	adapters := make(map[string]struct{}, len(options.AdapterIDs))
+	for _, adapterID := range options.AdapterIDs {
+		if adapterID == "" || strings.TrimSpace(adapterID) != adapterID {
+			return nil, NewError(CodeInvalidArgument, "adapter IDs must be non-empty and canonical", false)
+		}
+		if _, duplicate := adapters[adapterID]; duplicate {
+			return nil, NewError(CodeInvalidArgument, "adapter IDs must be unique", false)
+		}
+		adapters[adapterID] = struct{}{}
+	}
+	if len(adapters) == 0 {
+		return nil, NewError(CodeInvalidArgument, "at least one adapter ID is required", false)
+	}
 	return &Service{
 		repository: repository,
 		projectGit: projectGit,
 		now:        options.Now,
 		newID:      options.NewID,
 		maxRuns:    options.MaxParallelRuns,
+		adapters:   adapters,
 	}, nil
 }
 
@@ -65,6 +82,13 @@ func (s *Service) SetReady(ready bool, reason string) {
 	s.readyReason = strings.TrimSpace(reason)
 }
 
+func (s *Service) SetRuntimeStatus(status RuntimeStatus) {
+	s.readyMu.Lock()
+	defer s.readyMu.Unlock()
+	copy := status
+	s.runtimeStatus = &copy
+}
+
 func (s *Service) Status(ctx context.Context, projectID string) (Status, error) {
 	projection, err := s.repository.StatusProjection(ctx, strings.TrimSpace(projectID))
 	if err != nil {
@@ -73,6 +97,10 @@ func (s *Service) Status(ctx context.Context, projectID string) (Status, error) 
 	status := Status{Snapshot: projection.Snapshot, Tasks: projection.Tasks, SummaryTruncated: projection.Truncated}
 	s.readyMu.RLock()
 	status.DaemonReady = s.ready
+	if s.runtimeStatus != nil {
+		copy := *s.runtimeStatus
+		status.Runtime = &copy
+	}
 	var truncated bool
 	status.Reason, truncated = boundedStatusText(s.readyReason, 1024)
 	status.SummaryTruncated = status.SummaryTruncated || truncated

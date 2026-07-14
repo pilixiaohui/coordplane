@@ -289,12 +289,19 @@ type EventPage struct {
 }
 
 type Status struct {
-	DaemonReady      bool       `json:"daemon_ready"`
-	Reason           string     `json:"reason,omitempty"`
-	SummaryTruncated bool       `json:"summary_truncated,omitempty"`
-	Snapshot         Snapshot   `json:"snapshot"`
-	ActualRefs       []GitState `json:"actual_refs,omitempty"`
-	Tasks            []TaskView `json:"tasks,omitempty"`
+	DaemonReady      bool           `json:"daemon_ready"`
+	Reason           string         `json:"reason,omitempty"`
+	Runtime          *RuntimeStatus `json:"runtime,omitempty"`
+	SummaryTruncated bool           `json:"summary_truncated,omitempty"`
+	Snapshot         Snapshot       `json:"snapshot"`
+	ActualRefs       []GitState     `json:"actual_refs,omitempty"`
+	Tasks            []TaskView     `json:"tasks,omitempty"`
+}
+
+type RuntimeStatus struct {
+	WorkspaceQuotaEnabled bool   `json:"workspace_quota_enabled"`
+	WorkspaceQuotaReason  string `json:"workspace_quota_reason"`
+	TmpfsLimitBytes       int64  `json:"tmpfs_limit_bytes"`
 }
 
 // TaskView is a read-only status projection. It joins the six persisted

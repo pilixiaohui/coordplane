@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"time"
 
 	"coordplane/internal/transport"
 )
@@ -57,12 +56,12 @@ func (d *Daemon) Serve(ctx context.Context) error {
 	select {
 	case err := <-serveResult:
 		d.components.service.SetReady(false, "operator socket stopped")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), d.components.runtime.shutdownGrace()+runtimeShutdownOverhead)
 		defer cancel()
 		return errors.Join(err, d.components.runtime.Shutdown(shutdownCtx))
 	case <-ctx.Done():
 		d.components.service.SetReady(false, "daemon shutting down")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), d.components.runtime.shutdownGrace()+runtimeShutdownOverhead)
 		defer cancel()
 		runtimeErr := d.components.runtime.Shutdown(shutdownCtx)
 		shutdownErr := d.server.Shutdown(shutdownCtx)

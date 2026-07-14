@@ -49,7 +49,7 @@ func TestGT00ProjectIntentAndRealGitPhasesReconcileAfterRestart(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			service, err := core.NewService(database, adapter, core.ServiceOptions{})
+			service, err := core.NewService(database, adapter, core.ServiceOptions{AdapterIDs: []string{"one-shot"}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -85,7 +85,7 @@ func TestGT00ProjectIntentAndRealGitPhasesReconcileAfterRestart(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer reopened.Close()
-			restarted, err := core.NewService(reopened, adapter, core.ServiceOptions{})
+			restarted, err := core.NewService(reopened, adapter, core.ServiceOptions{AdapterIDs: []string{"one-shot"}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -146,7 +146,7 @@ func TestGT00RepairRetriesOnlyNeverActiveInitializationAtSavedSHA(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer database.Close()
-	service, err := core.NewService(database, adapter, core.ServiceOptions{})
+	service, err := core.NewService(database, adapter, core.ServiceOptions{AdapterIDs: []string{"one-shot"}})
 	if err != nil {
 		t.Fatal(err)
 	}

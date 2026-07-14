@@ -9,6 +9,8 @@ import (
 
 const codexAdapterName = "codex"
 
+const ContainerBootstrapPath = "/run/coordplane/bootstrap"
+
 type Codex struct{}
 
 func (Codex) Name() string { return codexAdapterName }
@@ -28,7 +30,7 @@ func (Codex) BuildStartCommand(spec LaunchSpec) (CommandSpec, error) {
 	if spec.Conversation {
 		args = append(args, "--skip-git-repo-check")
 	}
-	args = append(args, "--", spec.Bootstrap)
+	args = append(args, "--", bootstrapReferencePrompt())
 	return CommandSpec{
 		Executable: "codex",
 		Args:       args,
@@ -54,7 +56,7 @@ func (Codex) BuildResumeCommand(spec ResumeSpec) (CommandSpec, error) {
 	if spec.Conversation {
 		args = append(args, "--skip-git-repo-check")
 	}
-	args = append(args, sessionID, "--", spec.Bootstrap)
+	args = append(args, sessionID, "--", bootstrapReferencePrompt())
 	return CommandSpec{
 		Executable: "codex",
 		Args:       args,
@@ -108,8 +110,8 @@ func (Codex) ParseEvent(frame []byte) (Event, error) {
 }
 
 func validateLaunch(spec LaunchSpec) error {
-	if strings.TrimSpace(spec.Bootstrap) == "" {
-		return errors.New("adapter: bootstrap prompt is required")
+	if spec.BootstrapPath != ContainerBootstrapPath {
+		return errors.New("adapter: bootstrap path must be the fixed run-control file")
 	}
 	if spec.ContainerHome != "/home/agent" {
 		return errors.New("adapter: container home must be /home/agent")
@@ -122,6 +124,10 @@ func validateLaunch(spec LaunchSpec) error {
 		return errors.New("adapter: code work directory must be /workspace/project")
 	}
 	return nil
+}
+
+func bootstrapReferencePrompt() string {
+	return "Read and follow the complete CoordPlane run bootstrap at " + ContainerBootstrapPath + " before acting."
 }
 
 func protocolMessage(payload map[string]any) string {

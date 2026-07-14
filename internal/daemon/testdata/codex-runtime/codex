@@ -3,9 +3,9 @@ set -eu
 
 echo '{"type":"thread.started","thread_id":"scripted-session-p3"}'
 /usr/local/bin/coordlink progress --summary "provider process is live" --request-id scripted-progress --output json >/dev/null
+bootstrap=/run/coordplane/bootstrap
 
-case "$*" in
-  *"resume fallback"*)
+if grep -q "resume fallback" "$bootstrap"; then
     if [ "${2:-}" = "resume" ]; then
       echo '{"type":"turn.failed","error":{"message":"session not found"}}'
       exit 2
@@ -16,16 +16,27 @@ case "$*" in
     fi
     /usr/local/bin/coordlink task wait --reason "fresh fallback established" --request-id scripted-wait --output json >/dev/null
     sleep 30
-    ;;
-  *"outcome then hold"*)
+elif grep -q "outcome then hold" "$bootstrap"; then
     /usr/local/bin/coordlink task wait --reason "durable before restart" --request-id scripted-outcome-before-restart --output json >/dev/null
     sleep 30
-    ;;
-  *"hold until stopped"*)
+elif grep -q "verify all launch messages" "$bootstrap"; then
+    count=$(grep -c '^- \[' "$bootstrap")
+    [ "$count" -gt 20 ]
+    grep -q '\[body omitted: aggregate limit\]' "$bootstrap"
+    echo "$count" > /workspace/project/bootstrap-message-count
+    sleep 2
+    set -- task wait --reason "all bootstrap message IDs observed" --request-id scripted-bootstrap-wait
+    for id in $(sed -n 's/^- \[\([^]]*\)\].*/\1/p' "$bootstrap"); do
+      set -- "$@" --ack-message "$id"
+    done
+    /usr/local/bin/coordlink "$@" --output json >/dev/null
+    sleep 30
+elif grep -q "exit after active for crash matrix" "$bootstrap"; then
+    sleep 1
+elif grep -q "hold until stopped" "$bootstrap"; then
     echo "dirty runtime state" > /workspace/project/dirty-runtime.txt
     sleep 30
-    ;;
-esac
+fi
 
 echo '{"type":"turn.completed"}'
 echo 'done completed'

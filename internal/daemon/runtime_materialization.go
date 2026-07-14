@@ -10,10 +10,16 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"unicode/utf8"
 
 	"coordplane/internal/core"
 	"coordplane/internal/gitrepo"
 	containerruntime "coordplane/internal/runtime"
+)
+
+const (
+	runtimeBootstrapMessageBodyLimit  = 4 << 10
+	runtimeBootstrapMessageTotalLimit = 64 << 10
 )
 
 func (c *runtimeController) acquireRunOperation(runID string) *runOperation {
@@ -83,20 +89,45 @@ func buildBootstrap(
 	}
 	if len(launch.Messages) > 0 {
 		body.WriteString("Pending messages:\n")
+		remainingBodyBytes := runtimeBootstrapMessageTotalLimit
 		for _, message := range launch.Messages {
 			relatedTaskID := message.RelatedTaskID
 			if relatedTaskID == "" {
 				relatedTaskID = "none"
 			}
+			messageBody, truncated := boundedBootstrapMessageBody(message.Body, remainingBodyBytes)
+			remainingBodyBytes -= len(messageBody)
+			if truncated {
+				if messageBody == "" {
+					messageBody = "[body omitted: aggregate limit]"
+				} else {
+					messageBody += " [body truncated]"
+				}
+			}
 			fmt.Fprintf(
 				&body,
 				"- [%s] delivery_task=%s related_task=%s from %s/%s: %s\n",
-				message.ID, message.TaskID, relatedTaskID, message.SenderKind, message.SenderID, message.Body,
+				message.ID, message.TaskID, relatedTaskID, message.SenderKind, message.SenderID, messageBody,
 			)
 		}
 	}
 	body.WriteString("Use native Git commands in the private workspace. Use coordlink task wait, submit, or fail for an explicit outcome. CLI exit or text such as done does not complete the Task.\n")
 	return body.String()
+}
+
+func boundedBootstrapMessageBody(value string, remaining int) (string, bool) {
+	limit := min(runtimeBootstrapMessageBodyLimit, remaining)
+	if limit < 0 {
+		limit = 0
+	}
+	if len(value) <= limit {
+		return value, false
+	}
+	value = value[:limit]
+	for !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value, true
 }
 
 func containerWorkingDirectory(kind core.TaskKind) string {

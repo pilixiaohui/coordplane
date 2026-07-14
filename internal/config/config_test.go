@@ -31,6 +31,9 @@ func TestLoadAcceptsStrictMinimalConfigAndZeroRetention(t *testing.T) {
 	if cfg.Runtime.RunTimeout != 0 {
 		t.Fatalf("default run timeout = %s, want disabled", cfg.Runtime.RunTimeout)
 	}
+	if cfg.Runtime.ShutdownGrace != config.DefaultShutdownGrace {
+		t.Fatalf("default shutdown grace = %s, want %s", cfg.Runtime.ShutdownGrace, config.DefaultShutdownGrace)
+	}
 }
 
 func TestLoadRejectsInvalidConfigWithoutFallback(t *testing.T) {
@@ -55,6 +58,7 @@ func TestLoadRejectsInvalidConfigWithoutFallback(t *testing.T) {
 		{name: "invalid provider env", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN=value", 1), want: "valid environment variable name"},
 		{name: "duplicate provider env", raw: strings.Replace(valid, "    - ANTHROPIC_AUTH_TOKEN\n", "    - ANTHROPIC_AUTH_TOKEN\n    - ANTHROPIC_AUTH_TOKEN\n", 1), want: "contains duplicate"},
 		{name: "negative run timeout", raw: strings.Replace(valid, "  default_image:", "  run_timeout: -1s\n  default_image:", 1), want: "runtime.run_timeout must be a positive duration or 0"},
+		{name: "zero shutdown grace", raw: strings.Replace(valid, "  default_image:", "  shutdown_grace: 0\n  default_image:", 1), want: "runtime.shutdown_grace must be a positive duration"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -75,6 +79,18 @@ func TestLoadAcceptsRuntimeRunTimeout(t *testing.T) {
 	}
 	if cfg.Runtime.RunTimeout != 45*time.Second {
 		t.Fatalf("run timeout = %s, want 45s", cfg.Runtime.RunTimeout)
+	}
+}
+
+func TestLoadAcceptsConfigurableShutdownGrace(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	raw := strings.Replace(validConfig(dataDir), "  default_image:", "  shutdown_grace: 275ms\n  default_image:", 1)
+	cfg, err := config.Load(writeConfig(t, raw))
+	if err != nil {
+		t.Fatalf("load shutdown grace: %v", err)
+	}
+	if cfg.Runtime.ShutdownGrace != 275*time.Millisecond {
+		t.Fatalf("shutdown grace = %s, want 275ms", cfg.Runtime.ShutdownGrace)
 	}
 }
 

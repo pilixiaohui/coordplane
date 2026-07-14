@@ -23,7 +23,7 @@ func TestRT01PerRunSocketsRequireMatchingTokenScope(t *testing.T) {
 	t.Cleanup(func() { _ = database.Close() })
 	service, err := core.NewService(database, &contractGit{
 		sha: strings.Repeat("a", 40), root: filepath.Join(root, "repos"),
-	}, core.ServiceOptions{MaxParallelRuns: 2})
+	}, core.ServiceOptions{MaxParallelRuns: 2, AdapterIDs: []string{"one-shot"}})
 	if err != nil {
 		t.Fatal(err)
 	}

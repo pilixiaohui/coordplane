@@ -13,9 +13,9 @@ import (
 )
 
 const (
-	runtimeShutdownLimit  = 30 * time.Second
-	runtimeShutdownPoll   = 50 * time.Millisecond
-	runtimeShutdownReason = "daemon_shutdown"
+	runtimeShutdownOverhead = 25 * time.Second
+	runtimeShutdownPoll     = 50 * time.Millisecond
+	runtimeShutdownReason   = "daemon_shutdown"
 )
 
 type runtimeWorker struct {
@@ -44,7 +44,11 @@ func runScheduler(ctx context.Context, controller *runtimeController) {
 				continue
 			}
 			claim, operation, ok, err := controller.claimNext(ctx)
-			if err != nil || !ok {
+			if err != nil {
+				controller.setDegraded(err.Error())
+				continue
+			}
+			if !ok {
 				continue
 			}
 			_ = controller.launchOwned(ctx, claim, operation)
@@ -186,7 +190,7 @@ func (c *runtimeController) claimNext(ctx context.Context) (core.Claim, *runOper
 	if shuttingDown {
 		return core.Claim{}, nil, false, nil
 	}
-	claim, ok, err := c.service.ClaimNextForAdapters(ctx, "", c.adapters.Names())
+	claim, ok, err := c.service.ClaimNext(ctx, "")
 	if err != nil || !ok {
 		return claim, nil, ok, err
 	}
@@ -357,8 +361,9 @@ func (c *runtimeController) stopReconciledRun(
 	entry adapter.CLI,
 ) error {
 	if state.Status == containerruntime.StatusCreated {
-		stopCtx, cancel := context.WithTimeout(context.Background(), runtimeStopGrace+10*time.Second)
-		_, stopErr := c.executor.Stop(stopCtx, ref, runtimeStopGrace)
+		grace := c.shutdownGrace()
+		stopCtx, cancel := context.WithTimeout(context.Background(), grace+10*time.Second)
+		_, stopErr := c.executor.Stop(stopCtx, ref, grace)
 		cancel()
 		if stopErr != nil {
 			return stopErr
@@ -391,8 +396,9 @@ func (c *runtimeController) stopReconciledRun(
 	}
 	defer c.unregisterMonitor(monitor)
 	if state.Status == containerruntime.StatusRunning {
-		stopCtx, cancel := context.WithTimeout(context.Background(), runtimeStopGrace+10*time.Second)
-		_, stopErr := c.executor.Stop(stopCtx, ref, runtimeStopGrace)
+		grace := c.shutdownGrace()
+		stopCtx, cancel := context.WithTimeout(context.Background(), grace+10*time.Second)
+		_, stopErr := c.executor.Stop(stopCtx, ref, grace)
 		cancel()
 		if stopErr != nil {
 			_ = monitor.cancelAndCollectLogs(2 * time.Second)
@@ -402,7 +408,7 @@ func (c *runtimeController) stopReconciledRun(
 	select {
 	case result := <-monitor.wait:
 		return c.finishObservedRun(run, monitor, result)
-	case <-time.After(runtimeStopGrace + 10*time.Second):
+	case <-time.After(c.shutdownGrace() + 10*time.Second):
 		_ = monitor.cancelAndCollectLogs(2 * time.Second)
 		return errors.New("timed out waiting for reconciled container to stop")
 	}
@@ -505,7 +511,7 @@ func (c *runtimeController) detectOrphans(ctx context.Context) error {
 
 func (c *runtimeController) Shutdown(ctx context.Context) error {
 	c.stopRuntimeAdmission()
-	ctx, cancel := boundedRuntimeShutdownContext(ctx)
+	ctx, cancel := c.boundedRuntimeShutdownContext(ctx)
 	defer cancel()
 	c.mu.Lock()
 	c.shutdownCtx = ctx
@@ -540,34 +546,34 @@ func (c *runtimeController) stopRuntimeAdmission() {
 	c.claimMu.Unlock()
 }
 
-func boundedRuntimeShutdownContext(parent context.Context) (context.Context, context.CancelFunc) {
+func (c *runtimeController) boundedRuntimeShutdownContext(parent context.Context) (context.Context, context.CancelFunc) {
 	if parent == nil {
 		parent = context.Background()
 	}
 	if _, ok := parent.Deadline(); ok {
 		return context.WithCancel(parent)
 	}
-	return context.WithTimeout(parent, runtimeShutdownLimit)
+	return context.WithTimeout(parent, c.shutdownGrace()+runtimeShutdownOverhead)
 }
 
-func runtimeNaturalShutdownGrace(ctx context.Context) time.Duration {
+func (c *runtimeController) runtimeNaturalShutdownGrace(ctx context.Context) time.Duration {
 	deadline, ok := ctx.Deadline()
 	if !ok {
-		return runtimeStopGrace
+		return c.shutdownGrace()
 	}
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
 		return 0
 	}
 	grace := remaining / 4
-	if grace > runtimeStopGrace {
-		grace = runtimeStopGrace
+	if grace > c.shutdownGrace() {
+		grace = c.shutdownGrace()
 	}
 	return grace
 }
 
 func (c *runtimeController) waitForNaturalShutdown(ctx context.Context) error {
-	grace := runtimeNaturalShutdownGrace(ctx)
+	grace := c.runtimeNaturalShutdownGrace(ctx)
 	if grace <= 0 {
 		return ctx.Err()
 	}
@@ -759,7 +765,7 @@ func (c *runtimeController) shutdownRun(ctx context.Context, run core.Run) error
 		return c.cleanupRun(ctx, terminal.Run, runtimeRef(terminal.Run), nil, nil)
 	}
 	ref := runtimeRef(run)
-	grace := runtimeStopGrace
+	grace := c.shutdownGrace()
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining := time.Until(deadline)
 		if remaining < grace {

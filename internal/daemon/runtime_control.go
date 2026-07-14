@@ -57,18 +57,10 @@ func validateRunControl(
 	run core.Run,
 	authorize runScopeAuthorizer,
 ) error {
+	if err := validateRunControlIdentity(controlRoot, run); err != nil {
+		return err
+	}
 	path := filepath.Join(controlRoot, run.ID)
-	if err := validateRunControlDirectory(controlRoot, path, run.ID); err != nil {
-		return controlOwnershipError(err)
-	}
-	markerRaw, err := readOwnedRunControlFile(filepath.Join(path, runControlMarkerName))
-	if err != nil {
-		return controlOwnershipError(err)
-	}
-	marker, err := decodeRunControlMarker(markerRaw)
-	if err != nil || marker != markerForRun(run) {
-		return controlOwnershipError(errors.New("run control identity does not match the durable Run"))
-	}
 	tokenRaw, err := readOwnedRunControlFile(filepath.Join(path, "token"))
 	if err != nil {
 		return controlOwnershipError(err)
@@ -86,6 +78,22 @@ func validateRunControl(
 	}
 	if err := authorize(ctx, token, scope); err != nil {
 		return controlOwnershipError(errors.New("run control token does not match the durable Run"))
+	}
+	return nil
+}
+
+func validateRunControlIdentity(controlRoot string, run core.Run) error {
+	path := filepath.Join(controlRoot, run.ID)
+	if err := validateRunControlDirectory(controlRoot, path, run.ID); err != nil {
+		return controlOwnershipError(err)
+	}
+	markerRaw, err := readOwnedRunControlFile(filepath.Join(path, runControlMarkerName))
+	if err != nil {
+		return controlOwnershipError(err)
+	}
+	marker, err := decodeRunControlMarker(markerRaw)
+	if err != nil || marker != markerForRun(run) {
+		return controlOwnershipError(errors.New("run control identity does not match the durable Run"))
 	}
 	return nil
 }
@@ -120,6 +128,32 @@ func validateRunControlDirectory(root, path, runID string) error {
 }
 
 func readOwnedRunControlFile(path string) ([]byte, error) {
+	file, err := openOwnedRunControlFile(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, maxRunControlFileBytes+1))
+	if err != nil || len(raw) > maxRunControlFileBytes {
+		return nil, errors.New("run control file is unreadable or too large")
+	}
+	return raw, nil
+}
+
+func validateOwnedRunControlFile(path string) error {
+	file, err := openOwnedRunControlFile(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || info.Size() <= 0 {
+		return errors.New("run control file is empty or unreadable")
+	}
+	return nil
+}
+
+func openOwnedRunControlFile(path string) (*os.File, error) {
 	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, errors.New("run control file is missing or indirect")
@@ -129,27 +163,26 @@ func readOwnedRunControlFile(path string) ([]byte, error) {
 		_ = syscall.Close(fd)
 		return nil, errors.New("run control file descriptor is invalid")
 	}
-	defer file.Close()
 	opened, err := file.Stat()
 	if err != nil {
+		_ = file.Close()
 		return nil, errors.New("inspect opened run control file")
 	}
 	current, err := os.Lstat(path)
 	if err != nil || !os.SameFile(opened, current) {
+		_ = file.Close()
 		return nil, errors.New("run control file changed during validation")
 	}
 	stat, ok := opened.Sys().(*syscall.Stat_t)
 	if !ok || stat.Uid != uint32(os.Geteuid()) || stat.Gid != uint32(os.Getgid()) || stat.Nlink != 1 {
+		_ = file.Close()
 		return nil, errors.New("run control file has invalid ownership")
 	}
 	if !opened.Mode().IsRegular() || opened.Mode().Perm() != runControlFileMode {
+		_ = file.Close()
 		return nil, errors.New("run control file has invalid type or mode")
 	}
-	raw, err := io.ReadAll(io.LimitReader(file, maxRunControlFileBytes+1))
-	if err != nil || len(raw) > maxRunControlFileBytes {
-		return nil, errors.New("run control file is unreadable or too large")
-	}
-	return raw, nil
+	return file, nil
 }
 
 func decodeRunControlMarker(raw []byte) (runControlMarker, error) {

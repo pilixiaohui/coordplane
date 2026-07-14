@@ -1,10 +1,12 @@
 package daemon
 
 import (
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"coordplane/internal/adapter"
 	"coordplane/internal/config"
@@ -38,6 +40,40 @@ func TestRuntimeBuildToDeleteStepsComeFromStaticLists(t *testing.T) {
 	wantCleanup := []string{"stopContainer", "removeContainer", "closeRunAPISocket", "removeRunControl"}
 	if !reflect.DeepEqual(cleanupNames, wantCleanup) {
 		t.Fatalf("runtime cleanup steps = %v, want %v", cleanupNames, wantCleanup)
+	}
+}
+
+func TestBootstrapPreservesEveryMessageIDWithinBoundedUTF8Bodies(t *testing.T) {
+	launch := core.RunLaunchContext{
+		Project: core.Project{ID: "project-bootstrap"},
+		Agent:   core.Agent{ID: "agent-bootstrap"},
+		Task: core.Task{
+			ID: "task-bootstrap", ProjectID: "project-bootstrap", Kind: core.TaskConversation,
+			Title: "all message IDs",
+		},
+	}
+	for index := 0; index < core.MessagePageLimit+5; index++ {
+		launch.Messages = append(launch.Messages, core.Message{
+			ID: fmt.Sprintf("message-%02d", index), TaskID: "task-bootstrap",
+			SenderKind: "boss", Body: strings.Repeat("界", core.MaximumMessageBodyBytes/3),
+		})
+	}
+	bootstrap := buildBootstrap(launch, core.Run{ID: "run-bootstrap", Generation: 1}, "instructions", "", gitrepo.WorkspaceSpec{})
+	if !utf8.ValidString(bootstrap) {
+		t.Fatal("bootstrap is not valid UTF-8")
+	}
+	for index := range launch.Messages {
+		id := fmt.Sprintf("[message-%02d]", index)
+		if strings.Count(bootstrap, id) != 1 {
+			t.Fatalf("bootstrap Message ID %s count = %d", id, strings.Count(bootstrap, id))
+		}
+	}
+	bodyBytes := strings.Count(bootstrap, "界") * len("界")
+	if bodyBytes == 0 || bodyBytes > runtimeBootstrapMessageTotalLimit {
+		t.Fatalf("bootstrap Message body bytes = %d, want 1..%d", bodyBytes, runtimeBootstrapMessageTotalLimit)
+	}
+	if !strings.Contains(bootstrap, "[body truncated]") || !strings.Contains(bootstrap, "[body omitted: aggregate limit]") {
+		t.Fatalf("bootstrap does not disclose per-item and aggregate body truncation:\n%s", bootstrap)
 	}
 }
 

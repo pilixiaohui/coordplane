@@ -157,6 +157,21 @@ func TestRunControlValidationRejectsFilesystemAndScopeDrift(t *testing.T) {
 	})
 }
 
+func TestRunControlRemovalRevalidatesDurableIdentity(t *testing.T) {
+	root, path, run := newRunControlFixture(t)
+	other := run
+	other.Generation++
+	if err := writeRunControlMarker(path, other); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeRunControl(root, run); !errors.Is(err, containerruntime.ErrOwnership) {
+		t.Fatalf("remove drifted control error = %v, want ownership failure", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("drifted run control was deleted: %v", err)
+	}
+}
+
 func newRunControlFixture(t *testing.T) (string, string, core.Run) {
 	t.Helper()
 	root := t.TempDir()

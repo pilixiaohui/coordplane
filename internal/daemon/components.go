@@ -76,7 +76,7 @@ func buildComponents(ctx context.Context, configPath string) (*components, error
 		return fail(fmt.Errorf("quarantined unowned repository paths %q; inspect the quarantine and restart", quarantined))
 	}
 	service, err := core.NewService(database, projectGitAdapter{initializer: initializer}, core.ServiceOptions{
-		MaxParallelRuns: cfg.MaxParallelRuns,
+		MaxParallelRuns: cfg.MaxParallelRuns, AdapterIDs: adapter.Production().Names(),
 	})
 	if err != nil {
 		return fail(err)
@@ -100,6 +100,11 @@ func buildComponents(ctx context.Context, configPath string) (*components, error
 	result.runtime = newRuntimeController(
 		cfg, service, executor, adapter.Production(), workspaceManager, resolveCoordlinkExecutable(),
 	)
+	service.SetRuntimeStatus(core.RuntimeStatus{
+		WorkspaceQuotaEnabled: false,
+		WorkspaceQuotaReason:  "not enabled: workspace is a host bind mount without an enforced quota",
+		TmpfsLimitBytes:       runtimeTmpfsLimit,
+	})
 	if err := result.runtime.Reconcile(ctx); err != nil {
 		return fail(fmt.Errorf("reconcile runtime: %w", err))
 	}

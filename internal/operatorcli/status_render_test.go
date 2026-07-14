@@ -59,7 +59,12 @@ func TestStatusJSONRenderRemainsCanonical(t *testing.T) {
 
 func TestHumanRenderDisclosesPerItemTruncationAndExactRecoveryCommands(t *testing.T) {
 	status := core.Status{
-		DaemonReady:      true,
+		DaemonReady: true,
+		Runtime: &core.RuntimeStatus{
+			WorkspaceQuotaEnabled: false,
+			WorkspaceQuotaReason:  "not enabled: bind mount",
+			TmpfsLimitBytes:       64 << 20,
+		},
 		SummaryTruncated: true,
 		Tasks: []core.TaskView{
 			{
@@ -83,6 +88,9 @@ func TestHumanRenderDisclosesPerItemTruncationAndExactRecoveryCommands(t *testin
 	}
 	text := output.String()
 	for _, field := range []string{
+		"runtime_workspace_quota_enabled=false",
+		"runtime_tmpfs_limit_bytes=67108864",
+		"runtime_workspace_quota_reason=not enabled: bind mount",
 		"task-title\t\t\tbounded title\trun=run-full",
 		"title_truncated=true\ttask_text_truncated=false\trun_text_truncated=false",
 		"task-text\t\t\tfull title\trun=run-text",

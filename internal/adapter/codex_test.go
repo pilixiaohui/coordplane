@@ -3,6 +3,7 @@ package adapter
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -27,7 +28,7 @@ func TestProductionRegistryContainsOneStaticOneShotAdapter(t *testing.T) {
 func TestCodexBuildsStructuredStartAndResumeCommands(t *testing.T) {
 	entry := Codex{}
 	launch := LaunchSpec{
-		Bootstrap:     "Task input; do not infer completion from exit.",
+		BootstrapPath: ContainerBootstrapPath,
 		ContainerHome: "/home/agent", ContainerWork: "/workspace/project",
 	}
 	start, err := entry.BuildStartCommand(launch)
@@ -36,7 +37,7 @@ func TestCodexBuildsStructuredStartAndResumeCommands(t *testing.T) {
 	}
 	wantStart := []string{
 		"exec", "--json", "--color", "never", "--dangerously-bypass-approvals-and-sandbox",
-		"--", launch.Bootstrap,
+		"--", bootstrapReferencePrompt(),
 	}
 	if start.Executable != "codex" || !reflect.DeepEqual(start.Args, wantStart) {
 		t.Fatalf("start command = %#v", start)
@@ -47,7 +48,7 @@ func TestCodexBuildsStructuredStartAndResumeCommands(t *testing.T) {
 	}
 	wantResume := []string{
 		"exec", "resume", "--json", "--dangerously-bypass-approvals-and-sandbox",
-		"0190a1b2-session", "--", launch.Bootstrap,
+		"0190a1b2-session", "--", bootstrapReferencePrompt(),
 	}
 	if resume.Executable != "codex" || !reflect.DeepEqual(resume.Args, wantResume) {
 		t.Fatalf("resume command = %#v", resume)
@@ -57,6 +58,21 @@ func TestCodexBuildsStructuredStartAndResumeCommands(t *testing.T) {
 			if arg == "sh" || arg == "-c" {
 				t.Fatalf("provider command introduced a shell: %#v", command)
 			}
+		}
+	}
+}
+
+func TestCodexBootstrapDoesNotTravelInArgv(t *testing.T) {
+	bootstrap := strings.Repeat("valid bootstrap input ", 16<<10)
+	command, err := (Codex{}).BuildStartCommand(LaunchSpec{
+		BootstrapPath: ContainerBootstrapPath, ContainerHome: "/home/agent", ContainerWork: "/workspace/project",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, argument := range command.Args {
+		if strings.Contains(argument, bootstrap[:1024]) || len(argument) > 4096 {
+			t.Fatalf("bootstrap leaked into an oversized argv element: %d bytes", len(argument))
 		}
 	}
 }

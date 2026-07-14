@@ -365,7 +365,7 @@ func TestCT07ConversationIsDurableReusedAndKindSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.database = reopened
-	h.service, err = core.NewService(reopened, h.git, core.ServiceOptions{Now: h.clock.Now, NewID: h.ids.New, MaxParallelRuns: 4})
+	h.service, err = core.NewService(reopened, h.git, core.ServiceOptions{Now: h.clock.Now, NewID: h.ids.New, MaxParallelRuns: 4, AdapterIDs: []string{"one-shot"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -765,6 +765,46 @@ type harness struct {
 	ids      *testIDs
 }
 
+func TestUnknownAdapterIsRejectedBeforeDurableMutation(t *testing.T) {
+	h := newHarness(t)
+	before := h.durableSignature(t, "")
+	_, err := h.service.AddAgent(context.Background(), core.AddAgentInput{
+		DisplayName: "Unknown adapter", AdapterID: "not-registered", Image: "agent:latest",
+		InstructionsFile: "/instructions/unknown.md", RequestID: "unknown-adapter",
+	})
+	if !core.IsCode(err, core.CodeInvalidArgument) {
+		t.Fatalf("unknown adapter error = %v, want %s", err, core.CodeInvalidArgument)
+	}
+	if after := h.durableSignature(t, ""); after != before {
+		t.Fatal("unknown adapter changed durable state")
+	}
+}
+
+func TestQueuedTaskWithUnknownPersistedAdapterFailsClosed(t *testing.T) {
+	h := newHarness(t)
+	agent := h.addAgent(t, "persisted-adapter-agent")
+	project := h.addProject(t, "persisted-adapter-project", "")
+	if _, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
+		Title: "must not be silently skipped", RequestID: "persisted-adapter-task",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service, err := core.NewService(h.database, h.git, core.ServiceOptions{
+		Now: h.clock.Now, NewID: h.ids.New, MaxParallelRuns: 4, AdapterIDs: []string{"different-adapter"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := h.durableSignature(t, project.ID)
+	if _, ok, err := service.ClaimNext(context.Background(), project.ID); ok || !core.IsCode(err, core.CodeRuntimeInvariantViolation) {
+		t.Fatalf("claim unknown persisted adapter: ok=%t err=%v", ok, err)
+	}
+	if after := h.durableSignature(t, project.ID); after != before {
+		t.Fatal("unknown persisted adapter changed durable state")
+	}
+}
+
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "coordplane.db")
@@ -775,7 +815,7 @@ func newHarness(t *testing.T) *harness {
 	clock := &testClock{value: time.Date(2026, 7, 12, 1, 2, 3, 0, time.UTC)}
 	idSource := &testIDs{}
 	git := &fakeGit{sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
-	service, err := core.NewService(database, git, core.ServiceOptions{Now: clock.Now, NewID: idSource.New, MaxParallelRuns: 4})
+	service, err := core.NewService(database, git, core.ServiceOptions{Now: clock.Now, NewID: idSource.New, MaxParallelRuns: 4, AdapterIDs: []string{"one-shot"}})
 	if err != nil {
 		t.Fatal(err)
 	}

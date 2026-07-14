@@ -46,6 +46,11 @@ func TestDaemonReadyIsServedOnlyOnOperatorUnixSocket(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	if status.Runtime == nil || status.Runtime.WorkspaceQuotaEnabled ||
+		!strings.Contains(status.Runtime.WorkspaceQuotaReason, "host bind mount") ||
+		status.Runtime.TmpfsLimitBytes != runtimeTmpfsLimit {
+		t.Fatalf("runtime quota status = %#v", status.Runtime)
+	}
 	info, err := os.Stat(socketPath)
 	if err != nil {
 		t.Fatal(err)
@@ -75,7 +80,7 @@ func TestGT00CompositionRegistersAndReconcilesRealProject(t *testing.T) {
 		t.Fatal(err)
 	}
 	agent, err := components.service.AddAgent(ctx, core.AddAgentInput{
-		DisplayName: "Integrator", AdapterID: "one-shot", Image: "agent:latest",
+		DisplayName: "Integrator", AdapterID: "codex", Image: "agent:latest",
 		InstructionsFile: filepath.Join(root, "instructions.md"), RequestID: "add-integrator",
 	})
 	if err != nil {

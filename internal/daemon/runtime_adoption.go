@@ -32,8 +32,7 @@ func (c *runtimeController) validateAdoptedContainer(
 		return err
 	}
 	controlPath := filepath.Join(c.controlRoot, run.ID)
-	bootstrap, err := readAdoptionBootstrap(c.controlRoot, controlPath, run)
-	if err != nil {
+	if err := validateAdoptionBootstrap(c.controlRoot, controlPath, run); err != nil {
 		return err
 	}
 	entry, ok := c.adapters.Lookup(run.AdapterID)
@@ -41,7 +40,7 @@ func (c *runtimeController) validateAdoptedContainer(
 		return errors.New("runtime adapter is unavailable during container adoption")
 	}
 	launch := adapter.LaunchSpec{
-		Bootstrap: bootstrap, Conversation: task.Task.Kind == core.TaskConversation,
+		BootstrapPath: adapter.ContainerBootstrapPath, Conversation: task.Task.Kind == core.TaskConversation,
 		ContainerHome: "/home/agent", ContainerWork: containerWorkingDirectory(task.Task.Kind),
 	}
 	var command adapter.CommandSpec
@@ -70,21 +69,12 @@ func (c *runtimeController) validateAdoptedContainer(
 	return containerruntime.ValidateAdoption(spec, state)
 }
 
-func readAdoptionBootstrap(controlRoot, controlPath string, run core.Run) (string, error) {
-	if err := validateRunControlDirectory(controlRoot, controlPath, run.ID); err != nil {
-		return "", controlOwnershipError(err)
+func validateAdoptionBootstrap(controlRoot, controlPath string, run core.Run) error {
+	if err := validateRunControlIdentity(controlRoot, run); err != nil {
+		return err
 	}
-	markerRaw, err := readOwnedRunControlFile(filepath.Join(controlPath, runControlMarkerName))
-	if err != nil {
-		return "", controlOwnershipError(err)
+	if err := validateOwnedRunControlFile(filepath.Join(controlPath, "bootstrap")); err != nil {
+		return controlOwnershipError(errors.New("run control bootstrap is missing or invalid"))
 	}
-	marker, err := decodeRunControlMarker(markerRaw)
-	if err != nil || marker != markerForRun(run) {
-		return "", controlOwnershipError(errors.New("run control identity does not match the durable Run"))
-	}
-	bootstrapRaw, err := readOwnedRunControlFile(filepath.Join(controlPath, "bootstrap"))
-	if err != nil || len(bootstrapRaw) == 0 {
-		return "", controlOwnershipError(errors.New("run control bootstrap is missing or invalid"))
-	}
-	return string(bootstrapRaw), nil
+	return nil
 }

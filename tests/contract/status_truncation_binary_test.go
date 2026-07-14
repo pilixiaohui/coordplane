@@ -28,11 +28,14 @@ func TestStatusHumanBinaryReportsTruncatedTasksAndAgents(t *testing.T) {
 		raw := runBinaryJSON(t, testBinaries.coordplane,
 			"agent", "add", "--socket", socket,
 			"--display-name", fmt.Sprintf("Status Agent %02d", index),
-			"--adapter", "one-shot", "--image", "agent:latest",
+			"--adapter", "codex", "--image", "agent:latest",
 			"--instructions-file", filepath.Join(root, "agent.md"),
 			"--request-id", fmt.Sprintf("status-agent-%02d", index), "--output", "json")
 		var agent core.Agent
 		decodeJSON(t, raw, &agent)
+		runBinaryJSON(t, testBinaries.coordplane,
+			"agent", "pause", agent.ID, "--socket", socket,
+			"--request-id", fmt.Sprintf("status-agent-pause-%02d", index), "--output", "json")
 		agents = append(agents, agent)
 	}
 
@@ -97,11 +100,14 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"agent", "add", "--socket", socket,
 		"--display-name", "Field truncation agent",
-		"--adapter", "one-shot", "--image", "agent:latest",
+		"--adapter", "codex", "--image", "agent:latest",
 		"--instructions-file", filepath.Join(root, "agent.md"),
 		"--request-id", "field-truncation-agent", "--output", "json")
 	var agent core.Agent
 	decodeJSON(t, agentRaw, &agent)
+	runBinaryJSON(t, testBinaries.coordplane,
+		"agent", "pause", agent.ID, "--socket", socket,
+		"--request-id", "field-truncation-agent-pause", "--output", "json")
 
 	projectRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"project", "add", "--socket", socket, "--name", "field-truncation-project",
@@ -133,8 +139,12 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := core.NewService(database, &contractGit{sha: project.InitialSHA, root: filepath.Join(dataDir, "repos")}, core.ServiceOptions{MaxParallelRuns: 1})
+	service, err := core.NewService(database, &contractGit{sha: project.InitialSHA, root: filepath.Join(dataDir, "repos")}, core.ServiceOptions{MaxParallelRuns: 1, AdapterIDs: []string{"codex"}})
 	if err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	if _, err := service.SetAgentStatus(context.Background(), agent.ID, core.AgentActive, "field-truncation-agent-resume"); err != nil {
 		_ = database.Close()
 		t.Fatal(err)
 	}

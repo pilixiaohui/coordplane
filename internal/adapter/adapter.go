@@ -30,7 +30,7 @@ type CommandSpec struct {
 }
 
 type LaunchSpec struct {
-	Bootstrap     string
+	BootstrapPath string
 	Conversation  bool
 	ContainerHome string
 	ContainerWork string

@@ -23,8 +23,8 @@ import (
 
 const (
 	runtimeContainerUID       = 65532
-	runtimeStopGrace          = 5 * time.Second
 	runtimeLogDrainTimeout    = 10 * time.Second
+	runtimeTmpfsLimit         = 64 << 20
 	runtimeLogLimit           = 8 << 20
 	runtimeLogTruncatedMarker = "[coordplane: runtime log truncated]\n"
 	runtimeLogFailureReason   = "runtime log monitoring failed"
@@ -149,6 +149,13 @@ func newRuntimeController(
 		monitors:    make(map[string]*runMonitor), controls: make(map[string]*runControl),
 		runOperations: make(map[string]*runOperation),
 	}
+}
+
+func (c *runtimeController) shutdownGrace() time.Duration {
+	if c != nil && c.config.Runtime.ShutdownGrace > 0 {
+		return c.config.Runtime.ShutdownGrace
+	}
+	return config.DefaultShutdownGrace
 }
 
 func (c *runtimeController) Start(parent context.Context) {
@@ -331,12 +338,12 @@ func openRuntimeControl(state *runtimePrepareState) error {
 	}
 	state.control = control
 	state.controller.registerControl(state.run.ID, control)
-	return nil
+	return afterRuntimeContractPhase(state.ctx, runtimePhaseIntentBeforeCreate, state.run)
 }
 
 func createRuntimeContainer(state *runtimePrepareState) error {
 	launchSpec := adapter.LaunchSpec{
-		Bootstrap: state.bootstrap, Conversation: state.launch.Task.Kind == core.TaskConversation,
+		BootstrapPath: adapter.ContainerBootstrapPath, Conversation: state.launch.Task.Kind == core.TaskConversation,
 		ContainerHome: "/home/agent", ContainerWork: containerWorkingDirectory(state.launch.Task.Kind),
 	}
 	var command adapter.CommandSpec
@@ -363,7 +370,10 @@ func createRuntimeContainer(state *runtimePrepareState) error {
 		state.ctx,
 		runtimeFactInput(state.run, state.ref, "created"),
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	return afterRuntimeContractPhase(state.ctx, runtimePhaseContainerCreated, state.run)
 }
 
 func attachRuntimeStreams(state *runtimePrepareState) error {
@@ -441,6 +451,9 @@ func verifyRuntimeLive(state *runtimePrepareState) error {
 			RunID: active.ID, MessageIDs: ids, RequestID: runtimeRequest(active, "input"),
 			OperationID: active.LaunchOperationID,
 		})
+	}
+	if err := afterRuntimeContractPhase(state.ctx, runtimePhaseProcessObserved, active); err != nil {
+		return err
 	}
 	state.controller.wg.Add(1)
 	go func() {
@@ -550,7 +563,7 @@ func (c *runtimeController) containerSpec(
 		GroupAdd: []string{gid}, Network: c.config.Runtime.DockerNetwork,
 		Mounts: mounts, ReadOnlyRoot: true,
 		Limits: containerruntime.ResourceLimits{
-			PIDs: 256, MemoryBytes: 1 << 30, NanoCPUs: 1_000_000_000, TmpfsBytes: 64 << 20,
+			PIDs: 256, MemoryBytes: 1 << 30, NanoCPUs: 1_000_000_000, TmpfsBytes: runtimeTmpfsLimit,
 		},
 	}, nil
 }

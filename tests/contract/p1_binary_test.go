@@ -218,6 +218,42 @@ func TestGT00ProductionBinaryHasNoContractFaultControl(t *testing.T) {
 	}
 }
 
+func TestP3ProductionBinaryRejectsUnknownAdapterWithoutDurableWrites(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "data")
+	socket := filepath.Join(dataDir, "operator.sock")
+	configPath := writeConfig(t, root, dataDir, socket, "")
+	daemon := startDaemon(t, configPath, socket)
+
+	command := exec.Command(testBinaries.coordplane,
+		"agent", "add", "--socket", socket, "--display-name", "Unknown Adapter",
+		"--adapter", "not-registered", "--image", "agent:latest",
+		"--instructions-file", filepath.Join(root, "agent.md"),
+		"--request-id", "unknown-adapter", "--output", "json")
+	raw, err := command.CombinedOutput()
+	if err == nil || !bytes.Contains(raw, []byte("adapter_id is not registered")) {
+		t.Fatalf("unknown adapter err=%v output=%s", err, raw)
+	}
+	stopDaemon(t, daemon, socket)
+
+	database, err := store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	snapshot, err := database.Snapshot(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := database.Events(context.Background(), core.EventFilter{EntityType: "agent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Agents) != 0 || len(events) != 0 {
+		t.Fatalf("unknown adapter wrote durable state: agents=%#v events=%#v", snapshot.Agents, events)
+	}
+}
+
 func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 	root := t.TempDir()
 	dataDir := filepath.Join(root, "data")
@@ -234,7 +270,7 @@ func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 
 	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"agent", "add", "--socket", socket, "--display-name", "Developer",
-		"--adapter", "one-shot", "--image", "agent:latest",
+		"--adapter", "codex", "--image", "agent:latest",
 		"--instructions-file", filepath.Join(root, "agent.md"),
 		"--request-id", "binary-agent", "--output", "json")
 	var agent core.Agent
@@ -248,6 +284,9 @@ func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 	if project.Status != core.ProjectActive || project.InitialSHA != strings.TrimSpace(sourceRefBefore) {
 		t.Fatalf("project = %#v", project)
 	}
+	runBinaryJSON(t, testBinaries.coordplane,
+		"agent", "pause", agent.ID, "--socket", socket,
+		"--request-id", "binary-agent-pause", "--output", "json")
 	firstRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"chat", "--socket", socket, "--project", project.ID, "--agent", agent.ID,
 		"--body", "first", "--request-id", "chat-first", "--output", "json")
@@ -442,10 +481,13 @@ func TestP1BinaryReadSurfacesStayBoundedPastTwoMiBLedger(t *testing.T) {
 
 	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"agent", "add", "--socket", socket, "--display-name", "Bounded Agent",
-		"--adapter", "one-shot", "--image", "agent:latest", "--instructions-file", filepath.Join(root, "agent.md"),
+		"--adapter", "codex", "--image", "agent:latest", "--instructions-file", filepath.Join(root, "agent.md"),
 		"--request-id", "bounded-agent", "--output", "json")
 	var agent core.Agent
 	decodeJSON(t, agentRaw, &agent)
+	runBinaryJSON(t, testBinaries.coordplane,
+		"agent", "pause", agent.ID, "--socket", socket,
+		"--request-id", "bounded-agent-pause", "--output", "json")
 	projectRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"project", "add", "--socket", socket, "--name", "bounded-project",
 		"--repo", source, "--ref", "refs/heads/main", "--request-id", "bounded-project", "--output", "json")
@@ -483,8 +525,12 @@ func TestP1BinaryReadSurfacesStayBoundedPastTwoMiBLedger(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := core.NewService(database, &contractGit{sha: project.InitialSHA, root: filepath.Join(dataDir, "repos")}, core.ServiceOptions{MaxParallelRuns: 1})
+	service, err := core.NewService(database, &contractGit{sha: project.InitialSHA, root: filepath.Join(dataDir, "repos")}, core.ServiceOptions{MaxParallelRuns: 1, AdapterIDs: []string{"codex"}})
 	if err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	if _, err := service.SetAgentStatus(context.Background(), agent.ID, core.AgentActive, "bounded-agent-resume"); err != nil {
 		_ = database.Close()
 		t.Fatal(err)
 	}
@@ -666,8 +712,8 @@ func TestCT03CoordlinkBinaryRejectsStaleRunWithoutSideEffects(t *testing.T) {
 	gitFacts := &contractGit{sha: strings.Repeat("a", 40), root: filepath.Join(root, "repos")}
 	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
 	service, err := core.NewService(database, gitFacts, core.ServiceOptions{
-		MaxParallelRuns: 2,
-		Now:             func() time.Time { return now },
+		MaxParallelRuns: 2, AdapterIDs: []string{"one-shot"},
+		Now: func() time.Time { return now },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -783,7 +829,7 @@ func TestP2CoordlinkBinaryPersistsOutcomeIntentBeforeTerminalFact(t *testing.T) 
 			}
 			defer database.Close()
 			gitFacts := &contractGit{sha: strings.Repeat("a", 40), root: filepath.Join(root, "repos")}
-			service, err := core.NewService(database, gitFacts, core.ServiceOptions{MaxParallelRuns: 1})
+			service, err := core.NewService(database, gitFacts, core.ServiceOptions{MaxParallelRuns: 1, AdapterIDs: []string{"one-shot"}})
 			if err != nil {
 				t.Fatal(err)
 			}

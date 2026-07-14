@@ -21,7 +21,7 @@ func TestP2CoordlinkBinaryFixedSurfacePersistsSuccessfulCoordination(t *testing.
 	defer database.Close()
 
 	gitFacts := &contractGit{sha: strings.Repeat("a", 40), root: filepath.Join(root, "repos")}
-	service, err := core.NewService(database, gitFacts, core.ServiceOptions{MaxParallelRuns: 4})
+	service, err := core.NewService(database, gitFacts, core.ServiceOptions{MaxParallelRuns: 4, AdapterIDs: []string{"one-shot"}})
 	if err != nil {
 		t.Fatal(err)
 	}

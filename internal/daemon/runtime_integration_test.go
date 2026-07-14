@@ -94,6 +94,91 @@ func TestRT01RealDockerKeepsTwoAgentsWorkspacesHomesAndMountsPrivate(t *testing.
 	}
 }
 
+func TestRT02RealDockerLaunchPreservesAllMessageIDsWithoutOversizedArgv(t *testing.T) {
+	fixture := newP3DockerFixture(t)
+	if err := os.WriteFile(fixture.instructions, []byte(strings.Repeat("I", 1<<20)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	agent := fixture.addAgent(t, "Bootstrap Boundary Agent")
+	project := fixture.addProject(t, agent.ID)
+	task, err := fixture.components.service.CreateTask(fixture.ctx, core.CreateTaskInput{
+		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
+		Title: "verify all launch messages", Description: strings.Repeat("D", core.MaximumTaskDescriptionBytes),
+		MaxRetries: 0, RequestID: "bootstrap-boundary-task",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMessages := make(map[string]struct{}, core.MessagePageLimit+5)
+	messageBody := strings.Repeat("消息", core.MaximumMessageBodyBytes/len("消息"))
+	for index := 0; index < core.MessagePageLimit+5; index++ {
+		message, err := fixture.components.service.SendBossMessage(fixture.ctx, core.BossMessageInput{
+			ProjectID: project.ID, AgentID: agent.ID, TaskID: task.ID,
+			Body: messageBody, Wake: false, RequestID: fmt.Sprintf("bootstrap-message-%02d", index),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantMessages[message.ID] = struct{}{}
+	}
+	fixture.components.runtime.Start(fixture.ctx)
+	marker := filepath.Join(fixture.components.config.Runtime.WorkspaceRoot, project.ID, task.ID, "bootstrap-message-count")
+	waitForFile(t, fixture.ctx, marker)
+	rawCount, err := os.ReadFile(marker)
+	if err != nil || strings.TrimSpace(string(rawCount)) != fmt.Sprint(len(wantMessages)) {
+		t.Fatalf("container-observed Message count = %q err=%v, want %d", rawCount, err, len(wantMessages))
+	}
+	active := waitForRun(t, fixture, task.ID, func(run core.Run, task core.Task) bool {
+		return run.State == core.RunActive && task.Status == core.TaskRunning
+	})
+	state, err := fixture.executor.Inspect(fixture.ctx, runtimeRef(active))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, argument := range state.CommandArgs {
+		if len(argument) > 4096 || strings.Contains(argument, messageBody[:1024]) || strings.Contains(argument, task.Description[:1024]) {
+			t.Fatalf("container argv contains oversized bootstrap input: %d bytes", len(argument))
+		}
+	}
+	if !strings.Contains(strings.Join(state.CommandArgs, " "), adapter.ContainerBootstrapPath) {
+		t.Fatalf("container argv does not reference mounted bootstrap: %#v", state.CommandArgs)
+	}
+	bootstrapRaw, err := os.ReadFile(filepath.Join(fixture.components.runtime.controlRoot, active.ID, "bootstrap"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap := string(bootstrapRaw)
+	for id := range wantMessages {
+		if strings.Count(bootstrap, "["+id+"]") != 1 {
+			t.Fatalf("bootstrap Message ID %s count = %d", id, strings.Count(bootstrap, "["+id+"]"))
+		}
+	}
+	if !strings.Contains(bootstrap, "[body omitted: aggregate limit]") {
+		t.Fatal("bootstrap did not enforce the aggregate Message body budget")
+	}
+	terminal := waitForRun(t, fixture, task.ID, func(run core.Run, task core.Task) bool {
+		return run.ID == active.ID && core.IsRunTerminal(run.State) &&
+			run.CleanupState == core.CleanupRemoved && task.Status == core.TaskWaiting
+	})
+	snapshot, err := fixture.components.store.Snapshot(fixture.ctx, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := 0
+	for _, message := range snapshot.Messages {
+		if _, wanted := wantMessages[message.ID]; !wanted {
+			continue
+		}
+		seen++
+		if message.State != core.MessageAcknowledged || message.DeliveredRunID != terminal.ID || message.DeliveryCount != 1 {
+			t.Fatalf("Message input did not converge through the real Run: %#v", message)
+		}
+	}
+	if seen != len(wantMessages) {
+		t.Fatalf("durable Message count = %d, want %d", seen, len(wantMessages))
+	}
+}
+
 func TestRT03ResumeUnavailableCreatesMarkedFreshFallbackRun(t *testing.T) {
 	fixture := newP3DockerFixture(t)
 	agent := fixture.addAgent(t, "Resume Agent")
@@ -259,7 +344,7 @@ func TestRT05ReconcileCreatedRunWithStopIntentNeverStartsCLI(t *testing.T) {
 	agent := fixture.addAgent(t, "Reconcile Stop Agent")
 	project := fixture.addProject(t, agent.ID)
 	task := fixture.addTask(t, project.ID, agent.ID, "reconcile stop must not start CLI", 0)
-	claim, ok, err := fixture.components.service.ClaimNextForAdapters(fixture.ctx, project.ID, []string{"codex"})
+	claim, ok, err := fixture.components.service.ClaimNext(fixture.ctx, project.ID)
 	if err != nil || !ok {
 		t.Fatalf("claim created reconcile fixture: ok=%v err=%v", ok, err)
 	}
@@ -310,7 +395,7 @@ func TestRT05ReconcileAdoptsRunningContainerAndRebuildsRunSocket(t *testing.T) {
 	agent := fixture.addAgent(t, "Reconcile Active Agent")
 	project := fixture.addProject(t, agent.ID)
 	fixture.addTask(t, project.ID, agent.ID, "hold until stopped restart adoption", 0)
-	claim, ok, err := fixture.components.service.ClaimNextForAdapters(fixture.ctx, project.ID, []string{"codex"})
+	claim, ok, err := fixture.components.service.ClaimNext(fixture.ctx, project.ID)
 	if err != nil || !ok {
 		t.Fatalf("claim active reconcile fixture: ok=%v err=%v", ok, err)
 	}
@@ -400,7 +485,7 @@ func TestRT05ReconcilePreservesOutcomeRecordedBeforeRestart(t *testing.T) {
 	agent := fixture.addAgent(t, "Reconcile Outcome Agent")
 	project := fixture.addProject(t, agent.ID)
 	fixture.addTask(t, project.ID, agent.ID, "outcome then hold across restart", 0)
-	claim, ok, err := fixture.components.service.ClaimNextForAdapters(fixture.ctx, project.ID, []string{"codex"})
+	claim, ok, err := fixture.components.service.ClaimNext(fixture.ctx, project.ID)
 	if err != nil || !ok {
 		t.Fatalf("claim outcome reconcile fixture: ok=%v err=%v", ok, err)
 	}
@@ -735,7 +820,7 @@ func TestRT02MissingWorkspaceAfterStartIssuedFailsBeforeSecondContainer(t *testi
 	agent := fixture.addAgent(t, "Workspace Fence Agent")
 	project := fixture.addProject(t, agent.ID)
 	fixture.addTask(t, project.ID, agent.ID, "workspace loss must fail loud", 1)
-	claim, ok, err := fixture.components.service.ClaimNextForAdapters(fixture.ctx, project.ID, []string{"codex"})
+	claim, ok, err := fixture.components.service.ClaimNext(fixture.ctx, project.ID)
 	if err != nil || !ok {
 		t.Fatalf("claim first workspace Run: ok=%v err=%v", ok, err)
 	}
@@ -770,7 +855,7 @@ func TestRT02MissingWorkspaceAfterStartIssuedFailsBeforeSecondContainer(t *testi
 	var retry core.Claim
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		retry, ok, err = fixture.components.service.ClaimNextForAdapters(fixture.ctx, project.ID, []string{"codex"})
+		retry, ok, err = fixture.components.service.ClaimNext(fixture.ctx, project.ID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -973,13 +1058,17 @@ type p3DaemonProcess struct {
 }
 
 func startP3DaemonProcess(t *testing.T, binary, configPath, socket, logPath string) *p3DaemonProcess {
+	return startP3DaemonProcessWithEnv(t, binary, configPath, socket, logPath, nil)
+}
+
+func startP3DaemonProcessWithEnv(t *testing.T, binary, configPath, socket, logPath string, environment []string) *p3DaemonProcess {
 	t.Helper()
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
 	command := exec.Command(binary, "serve", "--config", configPath)
-	command.Env = os.Environ()
+	command.Env = append(os.Environ(), environment...)
 	command.Stdout = logFile
 	command.Stderr = logFile
 	if err := command.Start(); err != nil {
@@ -1284,7 +1373,7 @@ func prepareCreatedRunForReconcile(t *testing.T, fixture *p3DockerFixture, claim
 		t.Fatalf("adapter %q is not registered", prepared.AdapterID)
 	}
 	command, err := entry.BuildStartCommand(adapter.LaunchSpec{
-		Bootstrap: bootstrap, ContainerHome: "/home/agent", ContainerWork: "/workspace/project",
+		BootstrapPath: adapter.ContainerBootstrapPath, ContainerHome: "/home/agent", ContainerWork: "/workspace/project",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1417,6 +1506,9 @@ func assertIsolatedContainer(
 		state.PublishedPorts != 0 || !containsDaemonValue(state.CapDrop, "ALL") ||
 		!containsDaemonValue(state.SecurityOpt, "no-new-privileges") {
 		t.Fatalf("container security state = %#v", state)
+	}
+	if options := state.Tmpfs["/tmp"]; !strings.Contains(options, "size=67108864") {
+		t.Fatalf("Run %s tmpfs quota = %q, want 64 MiB", run.ID, options)
 	}
 	destinations := make(map[string]string)
 	readWrite := make(map[string]bool)

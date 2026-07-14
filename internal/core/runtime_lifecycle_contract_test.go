@@ -2,11 +2,57 @@ package core_test
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 
 	"coordplane/internal/core"
 )
+
+func TestP3LaunchContextIncludesEveryEligibleMessage(t *testing.T) {
+	h := newHarness(t)
+	agent := h.addAgent(t, "launch-message-agent")
+	project := h.addProject(t, "launch-message-project", "")
+	task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
+		Title: "launch with all messages", RequestID: "launch-message-task",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := make(map[string]struct{}, core.MessagePageLimit+5)
+	for index := 0; index < core.MessagePageLimit+5; index++ {
+		message, err := h.service.SendBossMessage(context.Background(), core.BossMessageInput{
+			ProjectID: project.ID, AgentID: agent.ID, TaskID: task.ID,
+			Body: fmt.Sprintf("launch message %02d", index), Wake: false,
+			RequestID: fmt.Sprintf("launch-message-%02d", index),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want[message.ID] = struct{}{}
+	}
+	claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
+	if err != nil || !ok || claim.Task.ID != task.ID {
+		t.Fatalf("claim = %#v ok=%t err=%v", claim, ok, err)
+	}
+	launch, err := h.service.RuntimeLaunchContext(context.Background(), claim.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(launch.Messages) != len(want) {
+		t.Fatalf("launch messages = %d, want every %d eligible ID", len(launch.Messages), len(want))
+	}
+	for _, message := range launch.Messages {
+		if _, exists := want[message.ID]; !exists {
+			t.Fatalf("launch included unexpected Message %s", message.ID)
+		}
+		delete(want, message.ID)
+	}
+	if len(want) != 0 {
+		t.Fatalf("launch omitted eligible Message IDs: %v", want)
+	}
+}
 
 func TestP3RuntimeFactsAdvanceMonotonicallyAndFenceEveryExternalFact(t *testing.T) {
 	h := newHarness(t)
@@ -281,7 +327,7 @@ func TestP3TerminalCleanupDoesNotConsumeAnotherAgentsGlobalRunSlot(t *testing.T)
 		t.Fatal(err)
 	}
 	h.service, err = core.NewService(h.database, h.git, core.ServiceOptions{
-		Now: h.clock.Now, NewID: h.ids.New, MaxParallelRuns: 1,
+		Now: h.clock.Now, NewID: h.ids.New, MaxParallelRuns: 1, AdapterIDs: []string{"one-shot"},
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -197,7 +197,7 @@ func TestReconcileSkipsRunOwnedBetweenClaimAndMonitorRegistration(t *testing.T) 
 func TestReconcileRefreshesCanonicalRunAfterOwnershipHandoff(t *testing.T) {
 	service := newRuntimeTestService(t)
 	addRuntimeTestTask(t, service)
-	snapshot, ok, err := service.ClaimNextForAdapters(context.Background(), "", []string{"codex"})
+	snapshot, ok, err := service.ClaimNext(context.Background(), "")
 	if err != nil || !ok {
 		t.Fatalf("claim stale-snapshot Run: ok=%t err=%v", ok, err)
 	}
@@ -233,7 +233,7 @@ func TestReconcileRefreshesCanonicalRunAfterOwnershipHandoff(t *testing.T) {
 func TestShutdownPersistsIntentBeforeCancellingMonitorAndConverges(t *testing.T) {
 	service := newRuntimeTestService(t)
 	addRuntimeTestTask(t, service)
-	claim, ok, err := service.ClaimNextForAdapters(context.Background(), "", []string{"codex"})
+	claim, ok, err := service.ClaimNext(context.Background(), "")
 	if err != nil || !ok {
 		t.Fatalf("claim shutdown Run: ok=%t err=%v", ok, err)
 	}
@@ -283,7 +283,7 @@ func TestShutdownPersistsIntentBeforeCancellingMonitorAndConverges(t *testing.T)
 func TestShutdownConvergesNonceLessRun(t *testing.T) {
 	service := newRuntimeTestService(t)
 	addRuntimeTestTask(t, service)
-	claim, ok, err := service.ClaimNextForAdapters(context.Background(), "", []string{"codex"})
+	claim, ok, err := service.ClaimNext(context.Background(), "")
 	if err != nil || !ok {
 		t.Fatalf("claim unprepared shutdown Run: ok=%t err=%v", ok, err)
 	}
@@ -356,7 +356,7 @@ func TestOutcomeNotificationRequiresSuccessfulResponse(t *testing.T) {
 func TestFalseOutcomeSignalCannotStopHealthyRun(t *testing.T) {
 	service := newRuntimeTestService(t)
 	addRuntimeTestTask(t, service)
-	claim, ok, err := service.ClaimNextForAdapters(context.Background(), "", []string{"codex"})
+	claim, ok, err := service.ClaimNext(context.Background(), "")
 	if err != nil || !ok {
 		t.Fatalf("claim runtime task: ok=%t err=%v", ok, err)
 	}
@@ -412,7 +412,7 @@ func TestSupervisorAbandonmentCancelsAndCollectsMonitor(t *testing.T) {
 func TestSupervisorStopsRunAfterSessionPersistenceFailure(t *testing.T) {
 	service := newRuntimeTestService(t)
 	addRuntimeTestTask(t, service)
-	claim, ok, err := service.ClaimNextForAdapters(context.Background(), "", []string{"codex"})
+	claim, ok, err := service.ClaimNext(context.Background(), "")
 	if err != nil || !ok {
 		t.Fatalf("claim session-failure Run: ok=%t err=%v", ok, err)
 	}
@@ -451,7 +451,7 @@ func TestSupervisorStopsRunAfterSessionPersistenceFailure(t *testing.T) {
 func TestShutdownReplaysTailLogsBeforeTerminalConvergence(t *testing.T) {
 	service := newRuntimeTestService(t)
 	addRuntimeTestTask(t, service)
-	claim, ok, err := service.ClaimNextForAdapters(context.Background(), "", []string{"codex"})
+	claim, ok, err := service.ClaimNext(context.Background(), "")
 	if err != nil || !ok {
 		t.Fatalf("claim shutdown replay Run: ok=%t err=%v", ok, err)
 	}
@@ -464,7 +464,8 @@ func TestShutdownReplaysTailLogsBeforeTerminalConvergence(t *testing.T) {
 		stopped:             make(chan struct{}),
 	}
 	controller := &runtimeController{
-		config: config.Config{MaxParallelRuns: 1}, service: service, executor: executor,
+		config:  config.Config{MaxParallelRuns: 1, Runtime: config.RuntimeConfig{ShutdownGrace: 275 * time.Millisecond}},
+		service: service, executor: executor,
 		adapters: adapter.Production(), controlRoot: t.TempDir(),
 		monitors: make(map[string]*runMonitor), controls: make(map[string]*runControl),
 		runOperations: make(map[string]*runOperation),
@@ -503,12 +504,15 @@ func TestShutdownReplaysTailLogsBeforeTerminalConvergence(t *testing.T) {
 	if executor.logCalls.Load() != 2 {
 		t.Fatalf("shutdown Docker log calls = %d, want initial follow plus offset-zero replay", executor.logCalls.Load())
 	}
+	if grace := time.Duration(executor.stopGrace.Load()); grace != 275*time.Millisecond {
+		t.Fatalf("shutdown Docker stop grace = %s, want configured 275ms", grace)
+	}
 }
 
 func TestDockerUnavailableDegradesWithoutRewritingLiveRun(t *testing.T) {
 	service := newRuntimeTestService(t)
 	addRuntimeTestTask(t, service)
-	claim, ok, err := service.ClaimNextForAdapters(context.Background(), "", []string{"codex"})
+	claim, ok, err := service.ClaimNext(context.Background(), "")
 	if err != nil || !ok {
 		t.Fatalf("claim unavailable-runtime task: ok=%t err=%v", ok, err)
 	}
@@ -538,7 +542,7 @@ func TestDockerUnavailableDegradesWithoutRewritingLiveRun(t *testing.T) {
 func TestUnavailableContainerRemovalKeepsTerminalCleanupBlocked(t *testing.T) {
 	service := newRuntimeTestService(t)
 	addRuntimeTestTask(t, service)
-	claim, ok, err := service.ClaimNextForAdapters(context.Background(), "", []string{"codex"})
+	claim, ok, err := service.ClaimNext(context.Background(), "")
 	if err != nil || !ok {
 		t.Fatalf("claim cleanup task: ok=%t err=%v", ok, err)
 	}
@@ -600,6 +604,7 @@ type shutdownReplayExecutor struct {
 	stopped         chan struct{}
 	stopOnce        sync.Once
 	logCalls        atomic.Int32
+	stopGrace       atomic.Int64
 }
 
 func (e *shutdownReplayExecutor) Logs(
@@ -641,11 +646,12 @@ func (e *shutdownReplayExecutor) Wait(
 }
 
 func (e *shutdownReplayExecutor) Stop(
-	context.Context,
-	containerruntime.RuntimeRef,
-	time.Duration,
+	_ context.Context,
+	_ containerruntime.RuntimeRef,
+	grace time.Duration,
 ) (containerruntime.StopResult, error) {
 	e.stopCalls.Add(1)
+	e.stopGrace.CompareAndSwap(0, int64(grace))
 	e.stopOnce.Do(func() { close(e.stopped) })
 	return containerruntime.StopResult{}, nil
 }
@@ -819,7 +825,7 @@ func newRuntimeTestService(t *testing.T) *core.Service {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	service, err := core.NewService(database, &runtimeTestGit{sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, core.ServiceOptions{MaxParallelRuns: 4})
+	service, err := core.NewService(database, &runtimeTestGit{sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, core.ServiceOptions{MaxParallelRuns: 4, AdapterIDs: []string{"codex"}})
 	if err != nil {
 		t.Fatal(err)
 	}

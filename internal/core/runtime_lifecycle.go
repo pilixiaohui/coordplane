@@ -100,9 +100,6 @@ func (s *Service) RuntimeLaunchContext(ctx context.Context, runID string) (RunLa
 		}
 		now := s.nowText()
 		for _, message := range messages {
-			if len(result.Messages) >= MessagePageLimit {
-				break
-			}
 			if message.ProjectID != result.Run.ProjectID || message.State != MessagePending ||
 				message.NextDeliveryAt == "" || message.NextDeliveryAt > now ||
 				(message.MaxDeliveries > 0 && message.DeliveryCount >= message.MaxDeliveries) {

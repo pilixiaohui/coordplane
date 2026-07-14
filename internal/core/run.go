@@ -7,24 +7,6 @@ import (
 )
 
 func (s *Service) ClaimNext(ctx context.Context, projectID string) (Claim, bool, error) {
-	return s.claimNext(ctx, projectID, nil)
-}
-
-// ClaimNextForAdapters limits daemon admission to the compile-time adapter
-// catalog supplied by composition. A nil catalog is used only by focused Core
-// tests that do not execute a provider process.
-func (s *Service) ClaimNextForAdapters(ctx context.Context, projectID string, adapterIDs []string) (Claim, bool, error) {
-	allowed := make(map[string]struct{}, len(adapterIDs))
-	for _, adapterID := range adapterIDs {
-		adapterID = strings.TrimSpace(adapterID)
-		if adapterID != "" {
-			allowed[adapterID] = struct{}{}
-		}
-	}
-	return s.claimNext(ctx, projectID, allowed)
-}
-
-func (s *Service) claimNext(ctx context.Context, projectID string, allowedAdapters map[string]struct{}) (Claim, bool, error) {
 	var claim Claim
 	claimed := false
 	nowLimit := s.nowText()
@@ -59,10 +41,8 @@ func (s *Service) claimNext(ctx context.Context, projectID string, allowedAdapte
 			if agent.Status != AgentActive {
 				continue
 			}
-			if allowedAdapters != nil {
-				if _, allowed := allowedAdapters[agent.AdapterID]; !allowed {
-					continue
-				}
+			if _, allowed := s.adapters[agent.AdapterID]; !allowed {
+				return NewError(CodeRuntimeInvariantViolation, "queued task references an unregistered adapter", false)
 			}
 			agentRuns, err := tx.AgentRuntimeOccupancy(agent.ID)
 			if err != nil {

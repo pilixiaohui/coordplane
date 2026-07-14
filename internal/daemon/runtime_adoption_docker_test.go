@@ -21,7 +21,7 @@ func TestReconcileRefusesToStartInsecureSameLabelContainer(t *testing.T) {
 	agent := fixture.addAgent(t, "Adoption Fence")
 	project := fixture.addProject(t, agent.ID)
 	task := fixture.addTask(t, project.ID, agent.ID, "reject insecure adoption", 0)
-	claim, ok, err := fixture.components.service.ClaimNextForAdapters(fixture.ctx, project.ID, []string{"codex"})
+	claim, ok, err := fixture.components.service.ClaimNext(fixture.ctx, project.ID)
 	if err != nil || !ok {
 		t.Fatalf("claim = %#v ok=%t err=%v", claim, ok, err)
 	}

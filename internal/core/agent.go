@@ -18,6 +18,9 @@ func (s *Service) AddAgent(ctx context.Context, input AddAgentInput) (Agent, err
 	if err != nil {
 		return Agent{}, err
 	}
+	if _, registered := s.adapters[adapterID]; !registered {
+		return Agent{}, NewError(CodeInvalidArgument, "adapter_id is not registered", false)
+	}
 	image, err := requireText("image", input.Image)
 	if err != nil {
 		return Agent{}, err

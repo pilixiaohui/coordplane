@@ -175,7 +175,7 @@ func (c *runtimeController) stopForDurableIntent(monitor *runMonitor) {
 func (c *runtimeController) stopOwnedContainer(ref containerruntime.RuntimeRef) {
 	stopCtx, cancel := c.runtimeStopContext()
 	defer cancel()
-	if _, err := c.executor.Stop(stopCtx, ref, runtimeStopGrace); errors.Is(err, containerruntime.ErrUnavailable) {
+	if _, err := c.executor.Stop(stopCtx, ref, c.shutdownGrace()); errors.Is(err, containerruntime.ErrUnavailable) {
 		c.setDegraded(err.Error())
 	}
 }
@@ -193,7 +193,7 @@ func (c *runtimeController) runtimeStopContext() (context.Context, context.Cance
 	if shutdownCtx != nil {
 		return context.WithCancel(shutdownCtx)
 	}
-	return context.WithTimeout(context.Background(), runtimeStopGrace+10*time.Second)
+	return context.WithTimeout(context.Background(), c.shutdownGrace()+10*time.Second)
 }
 
 func (c *runtimeController) runtimeConvergenceContext() (context.Context, context.CancelFunc) {
@@ -221,6 +221,9 @@ func (c *runtimeController) finishObservedRunContext(
 	}
 	if core.IsRunTerminal(run.State) {
 		return c.cleanupRun(ctx, run, monitor.ref, monitor.control, monitor)
+	}
+	if err := afterRuntimeContractPhase(ctx, runtimePhaseProcessExited, run); err != nil {
+		return err
 	}
 	state := core.RunExited
 	reason := "CLI process exited"
@@ -270,6 +273,9 @@ func (c *runtimeController) finishObservedRunContext(
 	}))
 	if terminalErr != nil {
 		return terminalErr
+	}
+	if err := afterRuntimeContractPhase(ctx, runtimePhaseTerminalPersisted, terminal.Run); err != nil {
+		return err
 	}
 	return c.cleanupRun(ctx, terminal.Run, monitor.ref, monitor.control, monitor)
 }
@@ -336,7 +342,7 @@ func (c *runtimeController) cleanupRun(
 		}
 		run = pending
 	}
-	cleanupCtx, cancel := context.WithTimeout(ctx, runtimeStopGrace+20*time.Second)
+	cleanupCtx, cancel := context.WithTimeout(ctx, c.shutdownGrace()+20*time.Second)
 	defer cancel()
 	state := &runtimeCleanupState{controller: c, ctx: cleanupCtx, run: run, ref: ref, control: control}
 	for _, step := range runtimeCleanupSteps {
@@ -380,8 +386,7 @@ func closeCleanupControl(state *runtimeCleanupState) error {
 }
 
 func removeCleanupControl(state *runtimeCleanupState) error {
-	path := filepath.Join(state.controller.controlRoot, state.run.ID)
-	return removeRunControl(state.controller.controlRoot, path)
+	return removeRunControl(state.controller.controlRoot, state.run)
 }
 
 func (c *runtimeController) blockCleanup(run core.Run, ref containerruntime.RuntimeRef, cause error) error {
@@ -426,22 +431,22 @@ func (c *runtimeController) closeControlContext(ctx context.Context, runID strin
 	return control.closeErr
 }
 
-func removeRunControl(root, path string) error {
+func removeRunControl(root string, run core.Run) error {
 	root = filepath.Clean(root)
-	path = filepath.Clean(path)
+	path := filepath.Join(root, run.ID)
 	relative, err := filepath.Rel(root, path)
 	if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		return errors.New("run control cleanup path escaped its root")
 	}
-	info, err := os.Lstat(path)
+	_, err = os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return errors.New("run control cleanup target is not an owned directory")
+	if err := validateRunControlIdentity(root, run); err != nil {
+		return err
 	}
 	return os.RemoveAll(path)
 }

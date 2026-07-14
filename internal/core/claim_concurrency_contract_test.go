@@ -28,7 +28,7 @@ func TestCT02ConcurrentClaimAcrossSQLiteConnectionsCreatesOneRun(t *testing.T) {
 	}
 	defer secondStore.Close()
 	secondService, err := core.NewService(secondStore, h.git, core.ServiceOptions{
-		Now: h.clock.Now, NewID: h.ids.New, MaxParallelRuns: 4,
+		Now: h.clock.Now, NewID: h.ids.New, MaxParallelRuns: 4, AdapterIDs: []string{"one-shot"},
 	})
 	if err != nil {
 		t.Fatal(err)

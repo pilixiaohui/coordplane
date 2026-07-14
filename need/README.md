@@ -207,6 +207,7 @@ retention:
 runtime:
   docker_network: coordplane
   run_timeout: 0
+  shutdown_grace: 5s
   workspace_root: /path/to/coordplane-data/workspaces
   agent_home_root: /path/to/coordplane-data/agent-homes
   log_root: /path/to/coordplane-data/logs
@@ -224,6 +225,7 @@ runtime:
 - Agent 指令可以描述 Manager/Developer/Integrator 工作方式，但 Daemon 不解析其语义。
 - Provider credentials 只通过 runtime 明确 allowlist 注入，不写入配置快照、数据库、事件或日志。
 - `runtime.run_timeout` 可省略或设为 `0` 以禁用自动 deadline；正 duration 会在新 Run 启动时固化为 `deadline_at`，不追溯修改既有 Run。
+- `runtime.shutdown_grace` 可省略（默认 `5s`），显式值必须为正 duration；SIGTERM、stop/cancel/timeout 与重启对账统一使用该 grace。
 - Project 通过 Boss 命令注册，不要求写进配置文件。
 - `retention`只接受正duration或`0`；`0`表示资源满足`runtime.md`/`git.md`全部GC fence后立即eligible，不表示跳过clean、task ref、pending action或ownership检查。Boss手动安全清理使用`gc preview`后执行`gc run --confirm`。
 

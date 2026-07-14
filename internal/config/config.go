@@ -12,6 +12,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const DefaultShutdownGrace = 5 * time.Second
+
 // Config is the complete v1 daemon configuration surface.
 type Config struct {
 	DataDir         string          `yaml:"data_dir"`
@@ -35,6 +37,7 @@ type RuntimeConfig struct {
 	DefaultImage         string        `yaml:"default_image"`
 	ProviderEnvAllowlist []string      `yaml:"provider_env_allowlist"`
 	RunTimeout           time.Duration `yaml:"-"`
+	ShutdownGrace        time.Duration `yaml:"-"`
 }
 
 type fileConfig struct {
@@ -59,6 +62,7 @@ type fileRuntimeConfig struct {
 	DefaultImage         string        `yaml:"default_image"`
 	ProviderEnvAllowlist []string      `yaml:"provider_env_allowlist"`
 	RunTimeout           *yamlDuration `yaml:"run_timeout,omitempty"`
+	ShutdownGrace        *yamlDuration `yaml:"shutdown_grace,omitempty"`
 }
 
 type yamlDuration time.Duration
@@ -120,10 +124,14 @@ func Load(path string) (Config, error) {
 			WorkspaceRoot: raw.Runtime.WorkspaceRoot, AgentHomeRoot: raw.Runtime.AgentHomeRoot,
 			LogRoot: raw.Runtime.LogRoot, DefaultImage: raw.Runtime.DefaultImage,
 			ProviderEnvAllowlist: append([]string(nil), raw.Runtime.ProviderEnvAllowlist...),
+			ShutdownGrace:        DefaultShutdownGrace,
 		},
 	}
 	if raw.Runtime.RunTimeout != nil {
 		cfg.Runtime.RunTimeout = time.Duration(*raw.Runtime.RunTimeout)
+	}
+	if raw.Runtime.ShutdownGrace != nil {
+		cfg.Runtime.ShutdownGrace = time.Duration(*raw.Runtime.ShutdownGrace)
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -195,6 +203,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Runtime.RunTimeout < 0 {
 		return errors.New("validate config: runtime.run_timeout must be a positive duration or 0")
+	}
+	if c.Runtime.ShutdownGrace <= 0 {
+		return errors.New("validate config: runtime.shutdown_grace must be a positive duration")
 	}
 
 	seenEnv := make(map[string]struct{}, len(c.Runtime.ProviderEnvAllowlist))

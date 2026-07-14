@@ -74,6 +74,12 @@ func render(writer io.Writer, mode string, value any) error {
 			typed.DaemonReady, len(typed.Snapshot.Projects), len(typed.Snapshot.Agents), len(typed.Tasks), runs, messages, typed.SummaryTruncated); err != nil {
 			return err
 		}
+		if typed.Runtime != nil {
+			if _, err := fmt.Fprintf(writer, "runtime_workspace_quota_enabled=%t\truntime_tmpfs_limit_bytes=%d\truntime_workspace_quota_reason=%s\n",
+				typed.Runtime.WorkspaceQuotaEnabled, typed.Runtime.TmpfsLimitBytes, typed.Runtime.WorkspaceQuotaReason); err != nil {
+				return err
+			}
+		}
 		if typed.SummaryTruncated {
 			if _, err := fmt.Fprintln(writer, `more=for omitted objects, run "coordplane project list", "coordplane agent list", or "coordplane task list" and follow next_cursor until empty; use each item-specific show command for truncated fields`); err != nil {
 				return err
