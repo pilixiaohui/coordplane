@@ -6,6 +6,8 @@ import (
 	"fmt"
 )
 
+var contractCaptureFinalizedHook func(context.Context, GitCaptureIntent) error
+
 // ReconcileGit consumes durable capture/advance intents. Git operations run
 // outside SQLite transactions; every projection transaction repeats the full
 // durable fence before it can change task state.
@@ -159,7 +161,18 @@ func (s *Service) reconcileCapture(ctx context.Context, executor TaskGit, snapsh
 			return WrapError(CodeGitInvariantViolation, "resolve canonical after integration capture", false, err)
 		}
 	}
-	return s.finalizeCapture(ctx, task, run, fact, actualCanonical)
+	if err := s.finalizeCapture(ctx, task, run, fact, actualCanonical); err != nil {
+		return err
+	}
+	if contractCaptureFinalizedHook != nil {
+		if err := contractCaptureFinalizedHook(ctx, intent); err != nil {
+			return err
+		}
+	}
+	if err := executor.CleanupCapture(ctx, intent); err != nil {
+		return WrapError(CodeGitInvariantViolation, "clean finalized capture handoff", false, err)
+	}
+	return nil
 }
 
 func (s *Service) finalizeCapture(ctx context.Context, intent Task, intentRun Run, fact GitCaptureFact, actualCanonical string) error {

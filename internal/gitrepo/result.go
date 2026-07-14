@@ -221,9 +221,6 @@ func (m *WorkspaceManager) Capture(ctx context.Context, spec CaptureSpec) (Captu
 			return CaptureFact{}, m.publicError("capture", err)
 		}
 		unlock()
-		_ = m.capture.Cleanup(context.Background(), CaptureHelperRequest{
-			ProjectID: spec.Workspace.ProjectID, TaskID: spec.Workspace.TaskID, RunID: spec.RunID,
-		})
 		return CaptureFact{HeadSHA: actualRef, TaskRef: taskRef}, nil
 	}
 	unlock()
@@ -239,12 +236,6 @@ func (m *WorkspaceManager) Capture(ctx context.Context, spec CaptureSpec) (Captu
 	if err != nil {
 		return CaptureFact{}, m.publicError("capture", err)
 	}
-	cleanupHandoff := false
-	defer func() {
-		if cleanupHandoff {
-			_ = m.capture.Cleanup(context.Background(), helperRequest)
-		}
-	}()
 	if handoff.HeadSHA != spec.ExpectedHead || handoff.ObjectCount <= 0 || handoff.BundleBytes <= 0 {
 		return CaptureFact{}, m.publicError("capture", &InvariantError{message: "capture helper facts do not match durable intent"})
 	}
@@ -278,7 +269,6 @@ func (m *WorkspaceManager) Capture(ctx context.Context, spec CaptureSpec) (Captu
 		if err := m.cleanupCaptureImportRef(ctx, spec); err != nil {
 			return CaptureFact{}, m.publicError("capture", err)
 		}
-		cleanupHandoff = true
 		return CaptureFact{HeadSHA: actualRef, TaskRef: taskRef}, nil
 	}
 	if _, err := m.git(ctx, "verify capture bundle", "--git-dir="+spec.ControlRepoPath, "bundle", "verify", handoff.ReadyBundle); err != nil {
@@ -331,8 +321,25 @@ func (m *WorkspaceManager) Capture(ctx context.Context, spec CaptureSpec) (Captu
 	if err := runCapturePhaseHook(ctx, capturePhaseIntegrityChecked, spec); err != nil {
 		return CaptureFact{}, m.publicError("capture", err)
 	}
-	cleanupHandoff = true
 	return CaptureFact{HeadSHA: current, TaskRef: taskRef}, nil
+}
+
+// CleanupCapture removes only the per-Run handoff after the caller has
+// durably finalized the captured result.
+func (m *WorkspaceManager) CleanupCapture(ctx context.Context, projectID, taskID, runID string) error {
+	if m == nil || m.capture == nil {
+		return errors.New("gitrepo: trusted capture helper is not configured")
+	}
+	if err := validateID("project", projectID); err != nil {
+		return err
+	}
+	if err := validateID("task", taskID); err != nil {
+		return err
+	}
+	if err := validateID("run", runID); err != nil {
+		return err
+	}
+	return m.capture.Cleanup(ctx, CaptureHelperRequest{ProjectID: projectID, TaskID: taskID, RunID: runID})
 }
 
 func runCapturePhaseHook(ctx context.Context, phase capturePhase, spec CaptureSpec) error {

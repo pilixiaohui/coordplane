@@ -77,6 +77,13 @@ func (a projectGitAdapter) Capture(ctx context.Context, intent core.GitCaptureIn
 	return core.GitCaptureFact{HeadSHA: fact.HeadSHA, TaskRef: fact.TaskRef}, err
 }
 
+func (a projectGitAdapter) CleanupCapture(ctx context.Context, intent core.GitCaptureIntent) error {
+	if a.workspaces == nil {
+		return fmt.Errorf("workspace manager is not configured")
+	}
+	return a.workspaces.CleanupCapture(ctx, intent.ProjectID, intent.TaskID, intent.RunID)
+}
+
 func (a projectGitAdapter) Advance(ctx context.Context, intent core.GitAdvanceIntent) (core.GitAdvanceFact, error) {
 	fact, err := a.initializer.Advance(ctx, gitrepo.AdvanceSpec{
 		ProjectID: intent.ProjectID, ControlRepoPath: intent.ControlRepo,

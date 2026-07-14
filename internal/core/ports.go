@@ -154,6 +154,7 @@ type ProjectGitFact struct {
 // not need to implement result mutation behavior.
 type TaskGit interface {
 	Capture(context.Context, GitCaptureIntent) (GitCaptureFact, error)
+	CleanupCapture(context.Context, GitCaptureIntent) error
 	Advance(context.Context, GitAdvanceIntent) (GitAdvanceFact, error)
 	ResolveTaskRef(context.Context, GitTaskRefIntent) (string, error)
 	UseTaskRef(context.Context, GitTaskRefIntent, func(string) error) error

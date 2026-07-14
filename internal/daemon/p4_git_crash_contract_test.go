@@ -123,7 +123,62 @@ func TestGT03SQLiteTaskRunAndRealGitCaptureRecoverAcrossProcessSIGKILL(t *testin
 		if actual := strings.TrimSpace(gitOutput(t, "--git-dir="+h.project.ControlRepoPath, "rev-parse", taskRef+"^{commit}")); actual != head {
 			t.Fatalf("diagnostic task ref = %s, want %s", actual, head)
 		}
+		recovery := &dockerCaptureHelper{root: filepath.Join(h.root, "handoff")}
+		if err := recovery.Recover(nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := recovery.Recover(nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(h.root, "handoff", task.ProjectID, task.ID, claim.Run.ID)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stale capture handoff survived production recovery: %v", err)
+		}
 	})
+}
+
+func TestGT03ExistingTaskRefReplayIsIdempotentAndRejectsDifferentHead(t *testing.T) {
+	h := newRealP4Harness(t)
+	task, claim, head := prepareGT03Capture(t, h, "existing-ref", true)
+	h.reconcileGit(t)
+	var err error
+	task, err = h.database.Task(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspacePath, err := h.workspaces.Path(task.ProjectID, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := core.GitCaptureIntent{
+		ProjectID: task.ProjectID, TaskID: task.ID, RunID: claim.Run.ID,
+		WorkspacePath: workspacePath, ControlRepo: h.project.ControlRepoPath,
+		BaseSHA: task.BaseSHA, ExpectedHead: head,
+	}
+	adapter := projectGitAdapter{initializer: h.initializer, workspaces: h.workspaces}
+	before := p4DurableSignature(t, h)
+	for _, test := range []struct {
+		name, expectedHead string
+		wantError          bool
+	}{
+		{name: "same_head", expectedHead: head},
+		{name: "different_expected_head", expectedHead: h.project.InitialSHA, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			intent.ExpectedHead = test.expectedHead
+			fact, err := adapter.Capture(context.Background(), intent)
+			if test.wantError {
+				if err == nil || !strings.Contains(err.Error(), "expected head") {
+					t.Fatalf("mismatched existing ref error = %v", err)
+				}
+			} else if err != nil || fact.HeadSHA != head || fact.TaskRef != task.TaskRef {
+				t.Fatalf("same-head replay = %#v err=%v", fact, err)
+			}
+			if got := p4DurableSignature(t, h); got != before {
+				t.Fatal("existing-ref replay changed SQLite or Event state")
+			}
+			assertP4Refs(t, h, h.project.InitialSHA, task.ID, head)
+		})
+	}
 }
 
 func TestGT04RealCASProcessKillThenDescendantReplayCompletesSQLite(t *testing.T) {
@@ -173,7 +228,7 @@ func TestGT04RealCASProcessKillThenDescendantReplayCompletesSQLite(t *testing.T)
 func killGT03CoreGitWorker(t *testing.T, root, taskID, mode, ready string) {
 	t.Helper()
 	worker := exec.Command(os.Args[0], "-test.run=^TestGT03SQLiteTaskRunAndRealGitCaptureRecoverAcrossProcessSIGKILL$", "-test.count=1")
-	worker.Env = append(os.Environ(),
+	environment := append(os.Environ(),
 		"COORDPLANE_GT03_CORE_GIT_WORKER=1",
 		"COORDPLANE_GT03_ROOT="+root,
 		"COORDPLANE_GT03_TASK_ID="+taskID,
@@ -182,6 +237,10 @@ func killGT03CoreGitWorker(t *testing.T, root, taskID, mode, ready string) {
 		"COORDPLANE_CONTRACT_CAPTURE_PHASE="+mode,
 		"COORDPLANE_CONTRACT_CAPTURE_PHASE_READY="+ready,
 	)
+	if mode == "submitted_before_cleanup" {
+		environment = append(environment, "COORDPLANE_CONTRACT_CAPTURE_FINALIZED_READY="+ready)
+	}
+	worker.Env = environment
 	if err := worker.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -206,11 +265,7 @@ func runGT03CoreGitWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	helper := localCaptureHelper{root: filepath.Join(root, "handoff")}
-	var capture gitrepo.CaptureHelper = helper
-	if os.Getenv("COORDPLANE_GT03_MODE") == "submitted_before_cleanup" {
-		capture = preserveCaptureHandoff{localCaptureHelper: helper}
-	}
-	workspaces, err := gitrepo.NewWorkspaceManager(initializer, filepath.Join(root, "workspaces"), capture)
+	workspaces, err := gitrepo.NewWorkspaceManager(initializer, filepath.Join(root, "workspaces"), helper)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,19 +288,6 @@ func runGT03CoreGitWorker(t *testing.T) {
 	case "nonterminal":
 		if err := service.ReconcileGit(context.Background()); err != nil {
 			t.Fatal(err)
-		}
-		publishGT03Ready(t)
-	case "submitted_before_cleanup":
-		if err := service.ReconcileGit(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-		task, err := database.Task(context.Background(), os.Getenv("COORDPLANE_GT03_TASK_ID"))
-		handoff := filepath.Join(root, "handoff", task.ProjectID, task.ID, task.HeadRunID)
-		if err != nil || task.Status != core.TaskSubmitted || task.HeadRunID == "" {
-			t.Fatalf("submitted worker task = %#v err=%v", task, err)
-		}
-		if _, err := os.Stat(handoff); err != nil {
-			t.Fatalf("submitted worker handoff = %v", err)
 		}
 		publishGT03Ready(t)
 	default:
@@ -277,12 +319,6 @@ func (g killAfterAdvanceProjectGit) Advance(ctx context.Context, intent core.Git
 		return core.GitAdvanceFact{}, err
 	}
 	select {}
-}
-
-type preserveCaptureHandoff struct{ localCaptureHelper }
-
-func (preserveCaptureHandoff) Cleanup(context.Context, gitrepo.CaptureHelperRequest) error {
-	return nil
 }
 
 func captureHelperRequest(task core.Task, claim core.Claim) gitrepo.CaptureHelperRequest {

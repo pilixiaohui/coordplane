@@ -582,26 +582,88 @@ func TestGT07FormalOperatorBinaryChecksOutExactControllerTaskRef(t *testing.T) {
 		t.Fatalf("complete checkout task: mutation=%v close=%v", err, closeErr)
 	}
 	daemon = startDaemon(t, configPath, socket)
+	consumerRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"task", "create", "--socket", socket, "--project", project.ID, "--agent", agent.ID,
+		"--title", "source-backed discard", "--source-task", task.ID,
+		"--request-id", "checkout-source-consumer", "--output", "json")
+	var consumer core.Task
+	decodeJSON(t, consumerRaw, &consumer)
+	if consumer.SourceTaskRef != taskRef || consumer.SourceHeadSHA != head {
+		t.Fatalf("formal source-backed consumer = %#v", consumer)
+	}
+	cancelledRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"task", "cancel", consumer.ID, "--socket", socket, "--reason", "discard source review",
+		"--request-id", "checkout-source-consumer-cancel", "--output", "json")
+	decodeJSON(t, cancelledRaw, &consumer)
 	previewRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"gc", "preview", "--socket", socket, "--output", "json")
 	var preview core.GCPreview
 	decodeJSON(t, previewRaw, &preview)
 	var workspaceTarget core.GCWorkspaceTarget
 	for _, candidate := range preview.Workspaces {
-		if candidate.TaskID == task.ID {
+		if candidate.TaskID == consumer.ID {
 			workspaceTarget = candidate
 		}
 	}
-	if workspaceTarget.Fingerprint == "" {
+	if workspaceTarget.Fingerprint == "" || workspaceTarget.Exists {
 		t.Fatalf("formal gc preview omitted workspace identity: %#v", preview)
 	}
-	workspaceDiscardRaw := runBinaryJSON(t, testBinaries.coordplane,
-		"gc", "discard-workspace", "--socket", socket, "--task", task.ID,
-		"--expected-fingerprint", workspaceTarget.Fingerprint, "--request-id", "binary-discard-workspace", "--output", "json")
+	auditStore, err := store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = auditStore.Close() })
+	workspaceArgs := []string{
+		"gc", "discard-workspace", "--socket", socket, "--task", consumer.ID,
+		"--expected-fingerprint", workspaceTarget.Fingerprint,
+		"--request-id", "binary-discard-workspace", "--output", "json",
+	}
+	beforeWorkspaceDiscard := durableSignature(t, auditStore, project.ID)
+	workspaceDiscardRaw := runBinaryJSON(t, testBinaries.coordplane, workspaceArgs...)
 	var workspaceDiscard core.GCDiscardResult
 	decodeJSON(t, workspaceDiscardRaw, &workspaceDiscard)
-	if !workspaceDiscard.Discarded || workspaceDiscard.TaskID != task.ID {
+	if !workspaceDiscard.Discarded || workspaceDiscard.TaskID != consumer.ID {
 		t.Fatalf("formal workspace discard = %#v", workspaceDiscard)
+	}
+	afterWorkspaceDiscard := durableSignature(t, auditStore, project.ID)
+	if afterWorkspaceDiscard == beforeWorkspaceDiscard {
+		t.Fatal("formal workspace discard did not change durable state")
+	}
+	workspaceReplayRaw := runBinaryJSON(t, testBinaries.coordplane, workspaceArgs...)
+	if !bytes.Equal(workspaceReplayRaw, workspaceDiscardRaw) || durableSignature(t, auditStore, project.ID) != afterWorkspaceDiscard {
+		t.Fatal("formal workspace discard replay changed response or durable signature")
+	}
+	released, err := auditStore.Task(context.Background(), consumer.ID)
+	if err != nil || released.SourceRefReleasedAt == "" {
+		t.Fatalf("formal discard source release = %#v err=%v", released, err)
+	}
+	absentArgs := []string{
+		"gc", "discard-workspace", "--socket", socket, "--task", consumer.ID,
+		"--expected-fingerprint", workspaceTarget.Fingerprint,
+		"--request-id", "binary-discard-workspace-absent", "--output", "json",
+	}
+	absentRaw := runBinaryJSON(t, testBinaries.coordplane, absentArgs...)
+	decodeJSON(t, absentRaw, &workspaceDiscard)
+	if !workspaceDiscard.Discarded || workspaceDiscard.TaskID != consumer.ID {
+		t.Fatalf("formal absent workspace discard = %#v", workspaceDiscard)
+	}
+	afterAbsentDiscard := durableSignature(t, auditStore, project.ID)
+	if afterAbsentDiscard == afterWorkspaceDiscard {
+		t.Fatal("formal absent workspace discard did not persist its new request")
+	}
+	absentReplayRaw := runBinaryJSON(t, testBinaries.coordplane, absentArgs...)
+	if !bytes.Equal(absentReplayRaw, absentRaw) || durableSignature(t, auditStore, project.ID) != afterAbsentDiscard {
+		t.Fatal("formal absent workspace discard replay changed response or durable signature")
+	}
+	releasedAgain, err := auditStore.Task(context.Background(), consumer.ID)
+	events, eventErr := auditStore.Events(context.Background(), core.EventFilter{ProjectID: project.ID})
+	counts := map[string]int{}
+	for _, event := range events {
+		counts[event.Kind]++
+	}
+	if err != nil || eventErr != nil || releasedAgain.SourceRefReleasedAt != released.SourceRefReleasedAt ||
+		counts["gc.source_ref_released"] != 1 || counts["gc.workspace_discarded"] != 2 {
+		t.Fatalf("formal discard replay task=%#v events=%#v task_err=%v event_err=%v", releasedAgain, events, err, eventErr)
 	}
 	refArgs := []string{
 		"gc", "discard-task-ref", "--socket", socket, "--task", task.ID, "--run", "run-checkout-contract",
@@ -1495,6 +1557,8 @@ func (g *contractGit) Capture(_ context.Context, intent core.GitCaptureIntent) (
 		TaskRef: "refs/coordplane/tasks/" + intent.TaskID + "/runs/" + intent.RunID,
 	}, nil
 }
+
+func (g *contractGit) CleanupCapture(context.Context, core.GitCaptureIntent) error { return nil }
 
 func (g *contractGit) Advance(_ context.Context, intent core.GitAdvanceIntent) (core.GitAdvanceFact, error) {
 	return core.GitAdvanceFact{Outcome: core.GitAdvanceUpdated, ActualSHA: intent.TargetSHA}, nil

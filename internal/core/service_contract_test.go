@@ -1036,6 +1036,8 @@ func (g *fakeGit) Capture(_ context.Context, intent core.GitCaptureIntent) (core
 	}, nil
 }
 
+func (g *fakeGit) CleanupCapture(context.Context, core.GitCaptureIntent) error { return nil }
+
 func (g *fakeGit) Advance(_ context.Context, intent core.GitAdvanceIntent) (core.GitAdvanceFact, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
