@@ -39,15 +39,15 @@ func runScheduler(ctx context.Context, controller *runtimeController) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			healthy, _ := controller.Healthy()
-			if !healthy {
+			if !controller.schedulerHealthy() {
 				continue
 			}
 			claim, operation, ok, err := controller.claimNext(ctx)
 			if err != nil {
-				controller.setDegraded(err.Error())
+				controller.setSchedulerDegraded(err.Error())
 				continue
 			}
+			controller.clearSchedulerDegraded()
 			if !ok {
 				continue
 			}
@@ -561,13 +561,13 @@ func (c *runtimeController) runtimeNaturalShutdownGrace(ctx context.Context) tim
 	if !ok {
 		return c.shutdownGrace()
 	}
-	remaining := time.Until(deadline)
+	remaining := time.Until(deadline) - runtimeShutdownOverhead
 	if remaining <= 0 {
 		return 0
 	}
-	grace := remaining / 4
-	if grace > c.shutdownGrace() {
-		grace = c.shutdownGrace()
+	grace := c.shutdownGrace()
+	if grace > remaining {
+		grace = remaining
 	}
 	return grace
 }

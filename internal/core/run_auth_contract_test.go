@@ -46,6 +46,57 @@ func TestRunScopeAuthorizationAllowsStartingAndRejectsCrossScopeWithoutWrites(t 
 	}
 }
 
+func TestStartingOutcomeDoesNotConsumeRequestIDBeforeActiveRetry(t *testing.T) {
+	h := newHarness(t)
+	agent := h.addAgent(t, "starting-outcome-agent")
+	project := h.addProject(t, "starting-outcome-project", "")
+	task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
+		Title: "retry outcome after active", RequestID: "starting-outcome-task",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := h.service.SendBossMessage(context.Background(), core.BossMessageInput{
+		ProjectID: project.ID, AgentID: agent.ID, TaskID: task.ID,
+		Body: "ack only after outcome admission", Wake: true, RequestID: "starting-outcome-message",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
+	if err != nil || !ok {
+		t.Fatalf("claim starting outcome Run: ok=%t err=%v", ok, err)
+	}
+	input := core.OutcomeInput{
+		Token: claim.Token, Outcome: core.OutcomeWait, Reason: "retry after active",
+		AckMessageIDs: []string{message.ID}, RequestID: "starting-outcome-request",
+	}
+	before := h.durableSignature(t, project.ID)
+	if _, err := h.service.RequestOutcome(context.Background(), input); !core.IsCode(err, core.CodeRunStarting) {
+		t.Fatalf("starting outcome error = %v, want %s", err, core.CodeRunStarting)
+	} else if typed := core.AsError(err); !typed.Retryable || typed.State != string(core.RunStarting) || typed.Version != claim.Run.Version {
+		t.Fatalf("starting outcome error fields = %#v", typed)
+	}
+	if after := h.durableSignature(t, project.ID); after != before {
+		t.Fatal("RUN_STARTING outcome changed durable state or consumed its request ID")
+	}
+
+	active, err := activateRun(t, h, context.Background(), claim.Run.ID, "starting-outcome-active")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := h.service.RequestOutcome(context.Background(), input)
+	if err != nil {
+		t.Fatalf("retry same outcome request after active: %v", err)
+	}
+	if result.Run.ID != active.ID || result.Run.RequestedOutcome != string(core.OutcomeWait) ||
+		result.Task.Status != core.TaskFinishing || len(result.Acknowledged) != 1 ||
+		result.Acknowledged[0].ID != message.ID || result.Acknowledged[0].State != core.MessageAcknowledged {
+		t.Fatalf("active outcome retry result = %#v", result)
+	}
+}
+
 func runScope(run core.Run) core.RunScope {
 	return core.RunScope{
 		ProjectID:  run.ProjectID,

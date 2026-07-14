@@ -46,18 +46,19 @@ type runtimeController struct {
 	coordlink   string
 	controlRoot string
 
-	mu             sync.Mutex
-	claimMu        sync.Mutex
-	ctx            context.Context
-	cancel         context.CancelFunc
-	shutdownCtx    context.Context
-	started        bool
-	shuttingDown   bool
-	degradedReason string
-	monitors       map[string]*runMonitor
-	controls       map[string]*runControl
-	runOperations  map[string]*runOperation
-	wg             sync.WaitGroup
+	mu                      sync.Mutex
+	claimMu                 sync.Mutex
+	ctx                     context.Context
+	cancel                  context.CancelFunc
+	shutdownCtx             context.Context
+	started                 bool
+	shuttingDown            bool
+	degradedReason          string
+	schedulerDegradedReason string
+	monitors                map[string]*runMonitor
+	controls                map[string]*runControl
+	runOperations           map[string]*runOperation
+	wg                      sync.WaitGroup
 }
 
 type runOperation struct{ _ byte }
@@ -185,25 +186,69 @@ func (c *runtimeController) Start(parent context.Context) {
 func (c *runtimeController) Healthy() (bool, string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.degradedReason == "", c.degradedReason
+	reason := c.currentDegradedReasonLocked()
+	return reason == "", reason
 }
 
 func (c *runtimeController) setDegraded(reason string) {
-	reason = strings.TrimSpace(c.runtimeRedaction(core.Run{}).Text(reason))
-	if reason == "" {
-		reason = "Docker runtime unavailable"
-	}
 	c.mu.Lock()
-	c.degradedReason = reason
-	c.mu.Unlock()
-	c.service.SetReady(false, reason)
+	defer c.mu.Unlock()
+	c.degradedReason = c.normalizedDegradedReason(reason)
+	c.publishDegradedStateLocked()
 }
 
 func (c *runtimeController) clearDegraded() {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.degradedReason = ""
-	c.mu.Unlock()
-	c.service.SetReady(true, "")
+	c.publishDegradedStateLocked()
+}
+
+func (c *runtimeController) setSchedulerDegraded(reason string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.schedulerDegradedReason = c.normalizedDegradedReason(reason)
+	c.publishDegradedStateLocked()
+}
+
+func (c *runtimeController) clearSchedulerDegraded() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.schedulerDegradedReason == "" {
+		return
+	}
+	c.schedulerDegradedReason = ""
+	c.publishDegradedStateLocked()
+}
+
+func (c *runtimeController) schedulerHealthy() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.shuttingDown && c.degradedReason == ""
+}
+
+func (c *runtimeController) normalizedDegradedReason(reason string) string {
+	reason = strings.TrimSpace(c.runtimeRedaction(core.Run{}).Text(reason))
+	if reason == "" {
+		return "Docker runtime unavailable"
+	}
+	return reason
+}
+
+func (c *runtimeController) currentDegradedReasonLocked() string {
+	if c.degradedReason != "" {
+		return c.degradedReason
+	}
+	return c.schedulerDegradedReason
+}
+
+func (c *runtimeController) publishDegradedStateLocked() {
+	if c.shuttingDown {
+		c.service.SetReady(false, "daemon shutting down")
+		return
+	}
+	reason := c.currentDegradedReasonLocked()
+	c.service.SetReady(reason == "", reason)
 }
 
 func (c *runtimeController) launch(ctx context.Context, claim core.Claim) error {

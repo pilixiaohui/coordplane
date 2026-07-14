@@ -539,6 +539,42 @@ func TestDockerUnavailableDegradesWithoutRewritingLiveRun(t *testing.T) {
 	}
 }
 
+func TestRuntimeNaturalShutdownGracePreservesConfiguredLargeGrace(t *testing.T) {
+	controller := &runtimeController{config: config.Config{Runtime: config.RuntimeConfig{ShutdownGrace: 60 * time.Second}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second+runtimeShutdownOverhead)
+	defer cancel()
+
+	grace := controller.runtimeNaturalShutdownGrace(ctx)
+	if grace < 59*time.Second || grace > 60*time.Second {
+		t.Fatalf("natural shutdown grace = %s, want configured 60s with only fixed cleanup overhead reserved", grace)
+	}
+}
+
+func TestSuccessfulReconcileDoesNotClearSchedulerInvariantDegradedState(t *testing.T) {
+	service := newRuntimeTestService(t)
+	controller := &runtimeController{
+		service: service, executor: &healthyReconcileExecutor{},
+		monitors: make(map[string]*runMonitor), controls: make(map[string]*runControl),
+		runOperations: make(map[string]*runOperation),
+	}
+	controller.setSchedulerDegraded(`adapter "removed-adapter" is not registered`)
+
+	if err := controller.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	healthy, reason := controller.Healthy()
+	if healthy || !strings.Contains(reason, "removed-adapter") {
+		t.Fatalf("reconcile cleared scheduler invariant degradation: healthy=%t reason=%q", healthy, reason)
+	}
+	status, err := service.Status(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.DaemonReady || !strings.Contains(status.Reason, "removed-adapter") {
+		t.Fatalf("status cleared scheduler invariant degradation: %#v", status)
+	}
+}
+
 func TestUnavailableContainerRemovalKeepsTerminalCleanupBlocked(t *testing.T) {
 	service := newRuntimeTestService(t)
 	addRuntimeTestTask(t, service)
@@ -660,6 +696,14 @@ type unavailableRuntimeExecutor struct{ containerruntime.Executor }
 
 func (*unavailableRuntimeExecutor) Ping(context.Context) error {
 	return containerruntime.ErrUnavailable
+}
+
+type healthyReconcileExecutor struct{ containerruntime.Executor }
+
+func (*healthyReconcileExecutor) Ping(context.Context) error { return nil }
+
+func (*healthyReconcileExecutor) Managed(context.Context) ([]containerruntime.LiveState, error) {
+	return nil, nil
 }
 
 type cleanupBlockingExecutor struct {

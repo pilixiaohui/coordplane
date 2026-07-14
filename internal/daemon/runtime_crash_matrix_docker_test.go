@@ -4,6 +4,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -38,14 +39,23 @@ func TestRT05DaemonSIGKILLCrashPointIntentMatrix(t *testing.T) {
 		runtimePhaseProcessExited,
 		runtimePhaseTerminalPersisted,
 	}
-	intents := []string{"outcome", "stop", "cancel", "timeout"}
 	for _, phase := range phases {
+		intents := []string{"stop", "cancel", "timeout"}
+		if phase == runtimePhaseProcessObserved || phase == runtimePhaseProcessExited || phase == runtimePhaseTerminalPersisted {
+			intents = append([]string{"outcome"}, intents...)
+		}
 		for _, intent := range intents {
 			phase, intent := phase, intent
-			t.Run(string(phase)+"/"+intent, func(t *testing.T) {
+			t.Run("reachable_recovery/"+string(phase)+"/"+intent, func(t *testing.T) {
 				runRT05ProcessCase(t, ctx, executor, artifacts, phase, intent)
 			})
 		}
+	}
+	for _, phase := range phases[:2] {
+		phase := phase
+		t.Run("pre_active_outcome_NA/"+string(phase), func(t *testing.T) {
+			runRT05ProcessCase(t, ctx, executor, artifacts, phase, "outcome")
+		})
 	}
 }
 
@@ -167,13 +177,9 @@ func runRT05ProcessCase(
 	if phase == runtimePhaseProcessExited {
 		title = "exit after active for crash matrix"
 	}
-	maxRetries := 0
-	if phase == runtimePhaseIntentBeforeCreate && intent == "outcome" {
-		maxRetries = 1
-	}
 	task, err := seed.service.CreateTask(ctx, core.CreateTaskInput{
 		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
-		Title: title, MaxRetries: maxRetries, RequestID: "rt05-task-" + string(phase) + "-" + intent,
+		Title: title, MaxRetries: 0, RequestID: "rt05-task-" + string(phase) + "-" + intent,
 	})
 	if err != nil {
 		_ = seed.Close()
@@ -233,10 +239,18 @@ func runRT05ProcessCase(
 		t.Fatal(err)
 	}
 	if intent == "outcome" && !intentDurable {
-		active := waitForOperatorRun(t, client, task.ID, func(run core.Run) bool { return run.State == core.RunActive })
-		if !applyRT05Intent(t, ctx, client, root, task, active, intent, true) {
-			t.Fatal("outcome was not durable after the legally active recovery boundary")
+		if phase == runtimePhaseContainerCreated {
+			active := waitForOperatorRun(t, client, task.ID, func(run core.Run) bool { return run.State == core.RunActive })
+			if !applyRT05Intent(t, ctx, client, root, task, active, "stop", true) {
+				t.Fatal("failed to stop the recovered N/A admission case")
+			}
 		}
+		final := waitForOperatorRun(t, client, task.ID, func(run core.Run) bool {
+			return core.IsRunTerminal(run.State) && run.CleanupState == core.CleanupRemoved
+		})
+		stopP3DaemonProcess(t, second)
+		assertRT05Converged(t, ctx, executor, root, project.ID, task.ID, final.ID, "outcome_NA", 1)
+		return
 	}
 	final := waitForOperatorRun(t, client, task.ID, func(run core.Run) bool {
 		if !core.IsRunTerminal(run.State) || run.CleanupState != core.CleanupRemoved {
@@ -245,11 +259,7 @@ func runRT05ProcessCase(
 		return intent != "outcome" || run.RequestedOutcome == string(core.OutcomeWait)
 	})
 	stopP3DaemonProcess(t, second)
-	wantRuns := 1
-	if phase == runtimePhaseIntentBeforeCreate && intent == "outcome" {
-		wantRuns = 2
-	}
-	assertRT05Converged(t, ctx, executor, root, project.ID, task.ID, final.ID, intent, wantRuns)
+	assertRT05Converged(t, ctx, executor, root, project.ID, task.ID, final.ID, intent, 1)
 }
 
 func applyRT05Intent(
@@ -265,6 +275,11 @@ func applyRT05Intent(
 	t.Helper()
 	switch intent {
 	case "outcome":
+		requestID := "rt05-outcome-" + run.ID
+		before := ""
+		if !outcomeAllowed {
+			before = rt05DurableSignature(t, ctx, root, task.ProjectID, run.ID, requestID)
+		}
 		token, err := os.ReadFile(filepath.Join(root, "data", "run-control", run.ID, "token"))
 		if err != nil {
 			t.Fatal(err)
@@ -278,17 +293,22 @@ func applyRT05Intent(
 		}
 		var result core.OutcomeResult
 		err = runClient.JSON(ctx, http.MethodPost, "/v1/task/outcome", core.OutcomeInput{
-			Outcome: core.OutcomeWait, Reason: "RT-05 durable outcome", RequestID: "rt05-outcome-" + run.ID,
+			Outcome: core.OutcomeWait, Reason: "RT-05 durable outcome", RequestID: requestID,
 		}, &result)
 		if !outcomeAllowed {
-			if err == nil || !strings.Contains(err.Error(), string(core.CodeRunStarting)) {
-				t.Fatalf("pre-active outcome error = %v, want %s and zero mutation", err, core.CodeRunStarting)
+			typed := core.AsError(err)
+			if !core.IsCode(err, core.CodeRunStarting) || !typed.Retryable || typed.State != string(core.RunStarting) || typed.Version != run.Version {
+				t.Fatalf("pre-active outcome error = %#v, want retryable %s at Run version %d", typed, core.CodeRunStarting, run.Version)
+			}
+			if after := rt05DurableSignature(t, ctx, root, task.ProjectID, run.ID, requestID); after != before {
+				t.Fatal("pre-active outcome changed Task/Run/Message/Event/dedupe durable state")
 			}
 			return false
 		}
 		if err != nil || result.Run.RequestedOutcome != string(core.OutcomeWait) {
 			t.Fatalf("persist outcome: result=%#v err=%v", result, err)
 		}
+		assertRT05OutcomeDurable(t, ctx, root, task.ID, run.ID, requestID)
 		return true
 	case "stop":
 		var updated core.Run
@@ -439,6 +459,10 @@ func assertRT05Converged(
 		if run.State != core.RunExited || run.RequestedOutcome != string(core.OutcomeWait) || task.Status != core.TaskWaiting {
 			t.Fatalf("outcome recovery = Run %#v Task %#v", run, task)
 		}
+	case "outcome_NA":
+		if run.RequestedOutcome != "" || run.RequestedAt != "" || task.Status != core.TaskFailed {
+			t.Fatalf("pre-active outcome N/A admitted durable outcome: Run %#v Task %#v", run, task)
+		}
 	case "stop":
 		if run.State != core.RunInterrupted || run.StopRequestedAt == "" || task.Status != core.TaskFailed {
 			t.Fatalf("stop recovery = Run %#v Task %#v", run, task)
@@ -457,5 +481,69 @@ func assertRT05Converged(
 	}
 	if _, err := os.Stat(filepath.Join(root, "data", "run-control", run.ID)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("RT-05 run-control survived cleanup: %v", err)
+	}
+}
+
+func rt05DurableSignature(
+	t *testing.T,
+	ctx context.Context,
+	root, projectID, runID, requestID string,
+) string {
+	t.Helper()
+	database, err := store.Open(ctx, filepath.Join(root, "data", "coordplane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	snapshot, err := database.Snapshot(ctx, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dedupeExists := false
+	if err := database.Transact(ctx, func(tx core.Transaction) error {
+		_, dedupeExists, err = tx.Dedupe("run:"+runID, "task.outcome", requestID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(struct {
+		Snapshot     core.Snapshot `json:"snapshot"`
+		DedupeExists bool          `json:"dedupe_exists"`
+	}{Snapshot: snapshot, DedupeExists: dedupeExists})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+func assertRT05OutcomeDurable(t *testing.T, ctx context.Context, root, taskID, runID, requestID string) {
+	t.Helper()
+	database, err := store.Open(ctx, filepath.Join(root, "data", "coordplane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	run, err := database.Run(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := database.Task(ctx, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dedupeExists := false
+	if err := database.Transact(ctx, func(tx core.Transaction) error {
+		_, dedupeExists, err = tx.Dedupe("run:"+runID, "task.outcome", requestID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	events, err := database.Events(ctx, core.EventFilter{ProjectID: run.ProjectID, RunID: run.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.RequestedOutcome != string(core.OutcomeWait) || run.RequestedAt == "" || run.TokenRevokedAt == "" ||
+		task.Status != core.TaskFinishing || !dedupeExists || countDaemonEvent(events, "run.outcome_requested") != 1 {
+		t.Fatalf("outcome was not durable before SIGKILL: Run=%#v Task=%#v dedupe=%t Events=%#v", run, task, dedupeExists, events)
 	}
 }
