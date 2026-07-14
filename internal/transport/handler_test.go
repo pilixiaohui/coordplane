@@ -111,10 +111,10 @@ func TestOperatorHandlerMapsBodiesPathsAndQueriesWithoutGenericDispatch(t *testi
 		t.Fatalf("chat input = %+v", chat)
 	}
 
-	createBody := `{"project_id":"prj-1","assignee_agent_id":"agt-1","title":"follow-up","ack_message_ids":["msg-2"],"request_id":"req-create"}`
+	createBody := `{"project_id":"prj-1","assignee_agent_id":"agt-1","title":"follow-up","retry_of_task_id":"tsk-closed","ack_message_ids":["msg-2"],"request_id":"req-create"}`
 	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/tasks", createBody, ""))
 	create := operations.calls[len(operations.calls)-1].value.(core.CreateTaskInput)
-	if create.ProjectID != "prj-1" || create.RequestID != "req-create" || !reflect.DeepEqual(create.AckMessageIDs, []string{"msg-2"}) {
+	if create.ProjectID != "prj-1" || create.RetryOfTaskID != "tsk-closed" || create.RequestID != "req-create" || !reflect.DeepEqual(create.AckMessageIDs, []string{"msg-2"}) {
 		t.Fatalf("create task input = %+v", create)
 	}
 

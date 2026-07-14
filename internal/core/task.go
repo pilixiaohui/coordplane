@@ -36,14 +36,15 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (Task, 
 		return Task{}, NewError(CodeInvalidArgument, "max_retries cannot be negative", false)
 	}
 	sourceTaskID := strings.TrimSpace(input.SourceTaskID)
+	retryOfTaskID := strings.TrimSpace(input.RetryOfTaskID)
 	ackIDs, err := canonicalMessageIDs(input.AckMessageIDs)
 	if err != nil {
 		return Task{}, err
 	}
 	inputHash, err := inputFingerprint(struct {
-		ProjectID, AgentID, Kind, Title, Description, SourceTaskID, AckIDs string
-		Priority, MaxRetries                                               int
-	}{projectID, agentID, string(input.Kind), title, description, sourceTaskID, strings.Join(ackIDs, "\x00"), input.Priority, input.MaxRetries})
+		ProjectID, AgentID, Kind, Title, Description, SourceTaskID, RetryOfTaskID, AckIDs string
+		Priority, MaxRetries                                                              int
+	}{projectID, agentID, string(input.Kind), title, description, sourceTaskID, retryOfTaskID, strings.Join(ackIDs, "\x00"), input.Priority, input.MaxRetries})
 	if err != nil {
 		return Task{}, err
 	}
@@ -79,6 +80,7 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (Task, 
 		return Task{}, WrapError(CodeGitInvariantViolation, "resolve canonical ref", false, err)
 	}
 	var sourceSnapshot Task
+	var retrySnapshot Task
 	var executor TaskGit
 	if sourceTaskID != "" {
 		var ok bool
@@ -91,6 +93,15 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (Task, 
 			return Task{}, err
 		}
 		if err := validateSourceTask(projectID, sourceSnapshot); err != nil {
+			return Task{}, err
+		}
+	}
+	if retryOfTaskID != "" {
+		retrySnapshot, err = s.repository.Task(ctx, retryOfTaskID)
+		if err != nil {
+			return Task{}, err
+		}
+		if err := validateRetryTarget(projectID, retrySnapshot); err != nil {
 			return Task{}, err
 		}
 	}
@@ -128,6 +139,19 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (Task, 
 					return err
 				}
 			}
+			var retryTarget Task
+			if retryOfTaskID != "" {
+				retryTarget, err = tx.Task(retryOfTaskID)
+				if err != nil {
+					return err
+				}
+				if retryTarget.Version != retrySnapshot.Version || retryTarget.Status != retrySnapshot.Status {
+					return Conflict(CodeVersionConflict, "retry target changed while creating task", string(retryTarget.Status), retryTarget.Version)
+				}
+				if err := validateRetryTarget(projectID, retryTarget); err != nil {
+					return err
+				}
+			}
 			agent, err := tx.Agent(agentID)
 			if err != nil {
 				return err
@@ -150,6 +174,9 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (Task, 
 				MaxRetries: input.MaxRetries, BaseSHA: baseSHA, Version: 1,
 				CreatedAt: now, UpdatedAt: now,
 			}
+			if retryOfTaskID != "" {
+				task.RetryOfTaskID = retryTarget.ID
+			}
 			if sourceTaskID != "" {
 				task.SourceTaskID = source.ID
 				task.SourceRunID = source.HeadRunID
@@ -159,7 +186,10 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (Task, 
 			if err := tx.InsertTask(task); err != nil {
 				return err
 			}
-			payload := eventPayload(map[string]any{"kind": task.Kind, "base_sha": task.BaseSHA})
+			payload := eventPayload(map[string]any{
+				"kind": task.Kind, "base_sha": task.BaseSHA,
+				"source_task_id": task.SourceTaskID, "retry_of_task_id": task.RetryOfTaskID,
+			})
 			if _, err := tx.AppendEvent(event(projectID, "task", task.ID, "task.created", "boss", "", "", requestID, "", payload, now)); err != nil {
 				return err
 			}
@@ -198,6 +228,16 @@ func validateSourceTask(projectID string, source Task) error {
 	}
 	if source.HeadSHA == "" || source.HeadRunID == "" || source.TaskRef == "" {
 		return NewError(CodeGitInvariantViolation, "source task has no complete captured result", false)
+	}
+	return nil
+}
+
+func validateRetryTarget(projectID string, target Task) error {
+	if target.ProjectID != projectID {
+		return NewError(CodeScopeDenied, "retry target is outside the target project", false)
+	}
+	if target.Status != TaskCompleted && target.Status != TaskCancelled {
+		return Conflict(CodeInvalidState, "retry target must be completed or cancelled", string(target.Status), target.Version)
 	}
 	return nil
 }

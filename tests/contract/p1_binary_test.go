@@ -467,6 +467,15 @@ func TestGT07FormalOperatorBinaryChecksOutExactControllerTaskRef(t *testing.T) {
 	dataDir := filepath.Join(root, "data")
 	socket := filepath.Join(dataDir, "operator.sock")
 	configPath := writeConfig(t, root, dataDir, socket, "")
+	configRaw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configRaw = bytes.ReplaceAll(configRaw, []byte("completed_workspace: 24h"), []byte("completed_workspace: 0"))
+	configRaw = bytes.ReplaceAll(configRaw, []byte("terminal_task_ref: 168h"), []byte("terminal_task_ref: 0"))
+	if err := os.WriteFile(configPath, configRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	source := createRepository(t, root)
 	daemon := startDaemon(t, configPath, socket)
 	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
@@ -609,6 +618,113 @@ func TestGT07FormalOperatorBinaryChecksOutExactControllerTaskRef(t *testing.T) {
 	decodeJSON(t, runRaw, &runResult)
 	if !runResult.Completed {
 		t.Fatalf("formal gc run = %#v", runResult)
+	}
+}
+
+func TestGT07FormalOperatorBinaryCreatesRetryLineageFromClosedSameProjectTask(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "data")
+	socket := filepath.Join(dataDir, "operator.sock")
+	configPath := writeConfig(t, root, dataDir, socket, "")
+	source := createRepository(t, root)
+	daemon := startDaemon(t, configPath, socket)
+	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"agent", "add", "--socket", socket, "--display-name", "Retry worker",
+		"--adapter", "codex", "--image", "agent:latest", "--instructions-file", filepath.Join(root, "agent.md"),
+		"--request-id", "retry-agent", "--output", "json")
+	var agent core.Agent
+	decodeJSON(t, agentRaw, &agent)
+	runBinaryJSON(t, testBinaries.coordplane,
+		"agent", "pause", agent.ID, "--socket", socket, "--request-id", "retry-pause", "--output", "json")
+	projectRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"project", "add", "--socket", socket, "--name", "retry-project",
+		"--repo", source, "--ref", "refs/heads/main", "--request-id", "retry-project", "--output", "json")
+	var project core.Project
+	decodeJSON(t, projectRaw, &project)
+	otherRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"project", "add", "--socket", socket, "--name", "retry-other-project",
+		"--repo", source, "--ref", "refs/heads/main", "--request-id", "retry-other-project", "--output", "json")
+	var other core.Project
+	decodeJSON(t, otherRaw, &other)
+
+	createTarget := func(projectID, title, requestID string) core.Task {
+		t.Helper()
+		raw := runBinaryJSON(t, testBinaries.coordplane,
+			"task", "create", "--socket", socket, "--project", projectID, "--agent", agent.ID,
+			"--title", title, "--request-id", requestID, "--output", "json")
+		var task core.Task
+		decodeJSON(t, raw, &task)
+		return task
+	}
+	closed := createTarget(project.ID, "closed retry target", "retry-closed-create")
+	closedRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"task", "cancel", closed.ID, "--socket", socket, "--reason", "retry elsewhere",
+		"--request-id", "retry-closed-cancel", "--output", "json")
+	decodeJSON(t, closedRaw, &closed)
+	open := createTarget(project.ID, "open retry target", "retry-open-create")
+	cross := createTarget(other.ID, "cross-project retry target", "retry-cross-create")
+	crossRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"task", "cancel", cross.ID, "--socket", socket, "--reason", "closed",
+		"--request-id", "retry-cross-cancel", "--output", "json")
+	decodeJSON(t, crossRaw, &cross)
+
+	stopDaemon(t, daemon, socket)
+	if err := os.WriteFile(filepath.Join(source, "retry-canonical.txt"), []byte("advanced\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, source, "add", "retry-canonical.txt")
+	git(t, source, "commit", "-m", "advance canonical for retry")
+	advanced := strings.TrimSpace(git(t, source, "rev-parse", "refs/heads/main^{commit}"))
+	controlRepo := filepath.Join(dataDir, "repos", project.ID+".git")
+	oldCanonical := strings.TrimSpace(git(t, controlRepo, "rev-parse", project.CanonicalRef+"^{commit}"))
+	git(t, controlRepo, "fetch", "--no-tags", source, advanced)
+	git(t, controlRepo, "update-ref", project.CanonicalRef, advanced, oldCanonical)
+	daemon = startDaemon(t, configPath, socket)
+	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
+
+	retryArgs := []string{
+		"task", "create", "--socket", socket, "--project", project.ID, "--agent", agent.ID,
+		"--title", "new retry task", "--retry-of", closed.ID,
+		"--request-id", "retry-create", "--output", "json",
+	}
+	retryRaw := runBinaryJSON(t, testBinaries.coordplane, retryArgs...)
+	var retry core.Task
+	decodeJSON(t, retryRaw, &retry)
+	if retry.RetryOfTaskID != closed.ID || retry.BaseSHA != advanced || retry.SourceTaskID != "" {
+		t.Fatalf("formal retry task = %#v", retry)
+	}
+	replayRaw := runBinaryJSON(t, testBinaries.coordplane, retryArgs...)
+	var replay core.Task
+	decodeJSON(t, replayRaw, &replay)
+	if replay.ID != retry.ID {
+		t.Fatalf("formal retry replay = %s, want %s", replay.ID, retry.ID)
+	}
+	beforeRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"task", "list", "--socket", socket, "--project", project.ID, "--output", "json")
+	var before core.TaskPage
+	decodeJSON(t, beforeRaw, &before)
+	for _, invalid := range []struct {
+		name, target, requestID string
+		code                    core.ErrorCode
+	}{
+		{name: "open", target: open.ID, requestID: "retry-invalid-open", code: core.CodeInvalidState},
+		{name: "cross", target: cross.ID, requestID: "retry-invalid-cross", code: core.CodeScopeDenied},
+	} {
+		command := exec.Command(testBinaries.coordplane,
+			"task", "create", "--socket", socket, "--project", project.ID, "--agent", agent.ID,
+			"--title", "invalid retry", "--retry-of", invalid.target,
+			"--request-id", invalid.requestID, "--output", "json")
+		raw, err := command.CombinedOutput()
+		if err == nil || !bytes.Contains(raw, []byte(invalid.code)) {
+			t.Fatalf("%s retry err=%v output=%s", invalid.name, err, raw)
+		}
+	}
+	afterRaw := runBinaryJSON(t, testBinaries.coordplane,
+		"task", "list", "--socket", socket, "--project", project.ID, "--output", "json")
+	var after core.TaskPage
+	decodeJSON(t, afterRaw, &after)
+	if len(after.Items) != len(before.Items) {
+		t.Fatalf("rejected retry changed task count: before=%d after=%d", len(before.Items), len(after.Items))
 	}
 }
 

@@ -272,47 +272,87 @@ func TestGT04ConcurrentExpectedOldCASBarrierUpdatesCanonicalExactlyOnce(t *testi
 	}
 	left := capture("task-cas-left", "run-cas-left", "left.txt")
 	right := capture("task-cas-right", "run-cas-right", "right.txt")
-	start := make(chan struct{})
 	type result struct {
 		fact AdvanceFact
 		err  error
 	}
-	results := make(chan result, 2)
-	for _, captured := range []CaptureFact{left, right} {
-		captured := captured
-		go func() {
-			<-start
-			fact, err := initializer.Advance(ctx, AdvanceSpec{
-				ProjectID: project.ID, ControlRepoPath: project.ControlRepoPath,
-				CanonicalRef: project.CanonicalRef, TaskRef: captured.TaskRef,
-				ExpectedOldSHA: initial, TargetSHA: captured.HeadSHA,
-			})
-			results <- result{fact: fact, err: err}
-		}()
-	}
-	close(start)
-	updated, stale := 0, 0
-	for range 2 {
-		result := <-results
-		if result.err != nil {
-			t.Fatal(result.err)
+	var winner CaptureFact
+	for iteration := 0; iteration < 8; iteration++ {
+		start := make(chan struct{})
+		results := make(chan result, 2)
+		for _, captured := range []CaptureFact{left, right} {
+			captured := captured
+			go func() {
+				<-start
+				fact, err := initializer.Advance(ctx, AdvanceSpec{
+					ProjectID: project.ID, ControlRepoPath: project.ControlRepoPath,
+					CanonicalRef: project.CanonicalRef, TaskRef: captured.TaskRef,
+					ExpectedOldSHA: initial, TargetSHA: captured.HeadSHA,
+				})
+				results <- result{fact: fact, err: err}
+			}()
 		}
-		switch result.fact.Outcome {
-		case AdvanceUpdated:
-			updated++
-		case AdvanceStale:
-			stale++
+		close(start)
+		updated, stale := 0, 0
+		for range 2 {
+			result := <-results
+			if result.err != nil {
+				t.Fatal(result.err)
+			}
+			switch result.fact.Outcome {
+			case AdvanceUpdated:
+				updated++
+			case AdvanceStale:
+				stale++
+			default:
+				t.Fatalf("iteration %d concurrent advance = %#v", iteration, result.fact)
+			}
+		}
+		if updated != 1 || stale != 1 {
+			t.Fatalf("iteration %d outcomes updated=%d stale=%d", iteration, updated, stale)
+		}
+		canonical := gitDirOutput(t, project.ControlRepoPath, "rev-parse", project.CanonicalRef+"^{commit}")
+		switch canonical {
+		case left.HeadSHA:
+			winner = left
+		case right.HeadSHA:
+			winner = right
 		default:
-			t.Fatalf("concurrent advance = %#v", result.fact)
+			t.Fatalf("iteration %d canonical = %s, want one captured head", iteration, canonical)
+		}
+		if iteration < 7 {
+			gitDirOutput(t, project.ControlRepoPath, "update-ref", project.CanonicalRef, initial, canonical)
 		}
 	}
-	if updated != 1 || stale != 1 {
-		t.Fatalf("concurrent outcomes updated=%d stale=%d", updated, stale)
+
+	descendantSpec := WorkspaceSpec{ProjectID: project.ID, TaskID: "task-cas-descendant", BaseSHA: winner.HeadSHA}
+	descendantWorkspace, err := manager.Materialize(ctx, descendantSpec)
+	if err != nil {
+		t.Fatal(err)
 	}
-	canonical := gitDirOutput(t, project.ControlRepoPath, "rev-parse", project.CanonicalRef+"^{commit}")
-	if canonical != left.HeadSHA && canonical != right.HeadSHA {
-		t.Fatalf("canonical = %s, want one captured head", canonical)
+	gitOutput(t, descendantWorkspace.Path, "config", "user.name", "CAS Descendant")
+	gitOutput(t, descendantWorkspace.Path, "config", "user.email", "cas-descendant@example.invalid")
+	descendantHead := commitFile(t, descendantWorkspace.Path, "descendant.txt", "descendant\n", "canonical descendant")
+	descendant, err := manager.Capture(ctx, CaptureSpec{
+		Workspace: descendantSpec, RunID: "run-cas-descendant", ExpectedHead: descendantHead,
+		ControlRepoPath: project.ControlRepoPath,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
+	if advanced, err := initializer.Advance(ctx, AdvanceSpec{
+		ProjectID: project.ID, ControlRepoPath: project.ControlRepoPath, CanonicalRef: project.CanonicalRef,
+		TaskRef: descendant.TaskRef, ExpectedOldSHA: winner.HeadSHA, TargetSHA: descendant.HeadSHA,
+	}); err != nil || advanced.Outcome != AdvanceUpdated {
+		t.Fatalf("advance winner descendant = %#v err=%v", advanced, err)
+	}
+	if replay, err := initializer.Advance(ctx, AdvanceSpec{
+		ProjectID: project.ID, ControlRepoPath: project.ControlRepoPath, CanonicalRef: project.CanonicalRef,
+		TaskRef: winner.TaskRef, ExpectedOldSHA: initial, TargetSHA: winner.HeadSHA,
+	}); err != nil || replay.Outcome != AdvanceIncluded || replay.ActualSHA != descendant.HeadSHA {
+		t.Fatalf("post-CAS descendant replay = %#v err=%v", replay, err)
+	}
+	gitDirOutput(t, project.ControlRepoPath, "fsck", "--full", "--strict")
 }
 
 func TestGT06RealSameLineConflictIsResolvedByIntegrationWorkspace(t *testing.T) {

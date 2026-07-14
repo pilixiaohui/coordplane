@@ -4,9 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"time"
 )
-
-const gcFarFuture = "9999-12-31T23:59:59.999999999Z"
 
 type gcDedupeRecord struct {
 	InputHash string          `json:"input_hash"`
@@ -26,8 +25,8 @@ func (s *Service) GCPreview(ctx context.Context) (GCPreview, error) {
 	for _, project := range snapshot.Projects {
 		projects[project.ID] = project
 	}
-	workspaceCutoff := s.now().UTC().Add(-s.completedWorkspaceRetention).Format("2006-01-02T15:04:05.000000000Z")
-	refCutoff := s.now().UTC().Add(-s.terminalTaskRefRetention).Format("2006-01-02T15:04:05.000000000Z")
+	workspaceCutoff := s.workspaceRetentionCutoff()
+	refCutoff := s.taskRefRetentionCutoff()
 	preview := GCPreview{GeneratedAt: s.nowText(), Workspaces: []GCWorkspaceTarget{}, TaskRefs: []GCTaskRefTarget{}}
 	for _, task := range snapshot.Tasks {
 		if task.Kind != TaskWork && task.Kind != TaskIntegration {
@@ -97,9 +96,9 @@ func (s *Service) GCRun(ctx context.Context, input GCRunInput) (GCRunResult, err
 	if _, ok, err := s.gcDedupe(ctx, "gc.run", requestID, inputHash); err != nil || ok {
 		return GCRunResult{Completed: ok}, err
 	}
-	workspaceCutoff := s.now().UTC().Add(-s.completedWorkspaceRetention).Format("2006-01-02T15:04:05.000000000Z")
-	refCutoff := s.now().UTC().Add(-s.terminalTaskRefRetention).Format("2006-01-02T15:04:05.000000000Z")
-	if err := s.reconcileWorkspaceGC(ctx, workspaceCutoff, true, requestID); err != nil {
+	workspaceCutoff := s.workspaceRetentionCutoff()
+	refCutoff := s.taskRefRetentionCutoff()
+	if err := s.reconcileWorkspaceGC(ctx, workspaceCutoff, requestID); err != nil {
 		return GCRunResult{}, err
 	}
 	if err := s.ReconcileGitGC(ctx, refCutoff); err != nil {
@@ -156,7 +155,7 @@ func (s *Service) GCDiscardWorkspace(ctx context.Context, input GCDiscardWorkspa
 		if err := validateDiscardTask(currentProject, current); err != nil {
 			return false, nil
 		}
-		return s.repository.WorkspaceEligible(ctx, current.ID, gcFarFuture)
+		return s.repository.WorkspaceEligible(ctx, current.ID, s.workspaceRetentionCutoff())
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "fingerprint changed") {
@@ -240,7 +239,7 @@ func (s *Service) GCDiscardTaskRef(ctx context.Context, input GCDiscardTaskRefIn
 			current.TaskRef != task.TaskRef || current.HeadSHA != expectedSHA {
 			return false, err
 		}
-		return s.repository.TaskRefEligible(ctx, current.ID, current.TaskRef, gcFarFuture)
+		return s.repository.TaskRefEligible(ctx, current.ID, current.TaskRef, s.taskRefRetentionCutoff())
 	})
 	if err != nil {
 		return GCDiscardResult{}, WrapError(CodeGitInvariantViolation, "discard task ref", false, err)
@@ -282,6 +281,18 @@ func validateDiscardTask(project Project, task Task) error {
 		return Conflict(CodeActionInProgress, "discard cannot override current Run or pending action", string(task.Status), task.Version)
 	}
 	return nil
+}
+
+func (s *Service) workspaceRetentionCutoff() string {
+	return s.retentionCutoff(s.completedWorkspaceRetention)
+}
+
+func (s *Service) taskRefRetentionCutoff() string {
+	return s.retentionCutoff(s.terminalTaskRefRetention)
+}
+
+func (s *Service) retentionCutoff(retention time.Duration) string {
+	return s.now().UTC().Add(-retention).Format("2006-01-02T15:04:05.000000000Z")
 }
 
 func gitWorkspaceIntent(task Task, expectedHead string) GitWorkspaceStateIntent {

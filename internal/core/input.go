@@ -54,6 +54,7 @@ type CreateTaskInput struct {
 	Priority        int      `json:"priority"`
 	MaxRetries      int      `json:"max_retries"`
 	SourceTaskID    string   `json:"source_task_id,omitempty"`
+	RetryOfTaskID   string   `json:"retry_of_task_id,omitempty"`
 	AckMessageIDs   []string `json:"ack_message_ids,omitempty"`
 	RequestID       string   `json:"request_id"`
 }

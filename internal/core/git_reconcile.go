@@ -72,10 +72,10 @@ func (s *Service) ReconcileGitGC(ctx context.Context, closedBefore string) error
 }
 
 func (s *Service) ReconcileWorkspaceGC(ctx context.Context, closedBefore string) error {
-	return s.reconcileWorkspaceGC(ctx, closedBefore, false, "")
+	return s.reconcileWorkspaceGC(ctx, closedBefore, "")
 }
 
-func (s *Service) reconcileWorkspaceGC(ctx context.Context, closedBefore string, releaseSource bool, requestID string) error {
+func (s *Service) reconcileWorkspaceGC(ctx context.Context, closedBefore, requestID string) error {
 	candidates, err := s.repository.WorkspaceCandidates(ctx, closedBefore)
 	if err != nil {
 		return err
@@ -109,7 +109,7 @@ func (s *Service) reconcileWorkspaceGC(ctx context.Context, closedBefore string,
 			result = errors.Join(result, fmt.Errorf("GC workspace %s: %w", task.ID, err))
 			continue
 		}
-		if releaseSource && deleted {
+		if deleted {
 			if err := s.releaseSourceReference(ctx, task.ID, requestID); err != nil {
 				result = errors.Join(result, fmt.Errorf("release source ref for %s: %w", task.ID, err))
 			}

@@ -54,7 +54,7 @@ func TestCT08AcceptIntentFreezesDecisionWithoutAdvancingGit(t *testing.T) {
 	}
 }
 
-func TestCT08AcceptRacesConvergeWithReworkAndCancel(t *testing.T) {
+func TestGT04CT08AcceptRacesConvergeWithReworkAndCancel(t *testing.T) {
 	for _, competitor := range []struct {
 		name string
 		run  func(*harness, string) error

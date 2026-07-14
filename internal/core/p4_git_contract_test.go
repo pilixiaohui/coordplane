@@ -4,9 +4,246 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"coordplane/internal/core"
 )
+
+func TestGT07DiscardRespectsRetentionBeforeAndAtBoundary(t *testing.T) {
+	const retention = 24 * time.Hour
+	h := newHarness(t)
+	worker := h.addAgent(t, "retention-worker")
+	integrator := h.addAgent(t, "retention-integrator")
+	project := h.addProject(t, "retention-project", integrator.ID)
+	task := createAndSubmitCodeTask(t, h, project, worker, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "retention")
+	if err := h.service.ReconcileGit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.RequestAccept(context.Background(), core.AcceptInput{
+		TaskID: task.ID, IntegrationAgentID: integrator.ID, RequestID: "retention-accept",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.ReconcileGit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	task, err := h.database.Task(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedAt, err := time.Parse(time.RFC3339Nano, task.ClosedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := core.NewService(h.database, h.git, core.ServiceOptions{
+		Now: h.clock.Now, NewID: h.ids.New, MaxParallelRuns: 4, AdapterIDs: []string{"one-shot"},
+		CompletedWorkspaceRetention: retention, TerminalTaskRefRetention: retention,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	setNextClock := func(next time.Time) {
+		h.clock.mu.Lock()
+		h.clock.value = next.Add(-time.Microsecond)
+		h.clock.mu.Unlock()
+	}
+
+	setNextClock(closedAt.Add(retention).Add(-time.Microsecond))
+	if result, err := service.GCDiscardWorkspace(context.Background(), core.GCDiscardWorkspaceInput{
+		TaskID: task.ID, ExpectedFingerprint: "workspace-fingerprint", RequestID: "retention-workspace-early",
+	}); err == nil || result.Discarded {
+		t.Fatalf("workspace age < retention discarded: result=%#v err=%v", result, err)
+	}
+	h.git.mu.Lock()
+	workspaceCalls := h.git.discardWorkspaceCalls
+	h.git.mu.Unlock()
+	if workspaceCalls != 0 {
+		t.Fatalf("early workspace discard calls = %d", workspaceCalls)
+	}
+	setNextClock(closedAt.Add(retention))
+	if result, err := service.GCDiscardWorkspace(context.Background(), core.GCDiscardWorkspaceInput{
+		TaskID: task.ID, ExpectedFingerprint: "workspace-fingerprint", RequestID: "retention-workspace-boundary",
+	}); err != nil || !result.Discarded {
+		t.Fatalf("workspace age == retention result=%#v err=%v", result, err)
+	}
+
+	setNextClock(closedAt.Add(retention).Add(-time.Microsecond))
+	if result, err := service.GCDiscardTaskRef(context.Background(), core.GCDiscardTaskRefInput{
+		TaskID: task.ID, RunID: task.HeadRunID, ExpectedSHA: task.HeadSHA, RequestID: "retention-ref-early",
+	}); err == nil || result.Discarded {
+		t.Fatalf("task ref age < retention discarded: result=%#v err=%v", result, err)
+	}
+	setNextClock(closedAt.Add(retention))
+	if result, err := service.GCDiscardTaskRef(context.Background(), core.GCDiscardTaskRefInput{
+		TaskID: task.ID, RunID: task.HeadRunID, ExpectedSHA: task.HeadSHA, RequestID: "retention-ref-boundary",
+	}); err != nil || !result.Discarded {
+		t.Fatalf("task ref age == retention result=%#v err=%v", result, err)
+	}
+}
+
+func TestGT07PeriodicWorkspaceGCReleasesSourceRefAfterAbsentReplay(t *testing.T) {
+	h := newHarness(t)
+	worker := h.addAgent(t, "periodic-release-worker")
+	integrator := h.addAgent(t, "periodic-release-integrator")
+	project := h.addProject(t, "periodic-release-project", integrator.ID)
+	source := createAndSubmitCodeTask(t, h, project, worker, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "periodic-release-source")
+	if err := h.service.ReconcileGit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.RequestAccept(context.Background(), core.AcceptInput{
+		TaskID: source.ID, IntegrationAgentID: integrator.ID, RequestID: "periodic-release-accept",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.ReconcileGit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	source, err := h.database.Task(context.Background(), source.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+		ProjectID: project.ID, AssigneeAgentID: integrator.ID, Kind: core.TaskWork,
+		Title: "periodic source consumer", SourceTaskID: source.ID, RequestID: "periodic-release-consumer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer, err = h.service.CancelTask(context.Background(), core.TaskActionInput{
+		TaskID: consumer.ID, Reason: "closed", RequestID: "periodic-release-cancel",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := h.git.DeleteWorkspace(context.Background(), core.GitDeleteWorkspaceIntent{
+		ProjectID: consumer.ProjectID, TaskID: consumer.ID, BaseSHA: consumer.BaseSHA, ExpectedHead: consumer.BaseSHA,
+	}, func() (bool, error) {
+		return h.database.WorkspaceEligible(context.Background(), consumer.ID, "9999-12-31T23:59:59.999999999Z")
+	})
+	if err != nil || !deleted {
+		t.Fatalf("pre-crash workspace delete deleted=%t err=%v", deleted, err)
+	}
+	before, err := h.database.Task(context.Background(), consumer.ID)
+	if err != nil || before.SourceRefReleasedAt != "" {
+		t.Fatalf("pre-replay consumer = %#v err=%v", before, err)
+	}
+	if err := h.service.ReconcileWorkspaceGC(context.Background(), "9999-12-31T23:59:59.999999999Z"); err != nil {
+		t.Fatal(err)
+	}
+	released, err := h.database.Task(context.Background(), consumer.ID)
+	if err != nil || released.SourceRefReleasedAt == "" {
+		t.Fatalf("periodic replay consumer = %#v err=%v", released, err)
+	}
+	if err := h.service.ReconcileWorkspaceGC(context.Background(), "9999-12-31T23:59:59.999999999Z"); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := h.database.Task(context.Background(), consumer.ID)
+	if err != nil || replayed.Version != released.Version || replayed.SourceRefReleasedAt != released.SourceRefReleasedAt {
+		t.Fatalf("periodic release replay = %#v err=%v, want %#v", replayed, err, released)
+	}
+	events, err := h.database.Events(context.Background(), core.EventFilter{EntityType: "task", EntityID: consumer.ID})
+	if err != nil || countEvent(events, "gc.source_ref_released") != 1 {
+		t.Fatalf("source release events=%d err=%v", countEvent(events, "gc.source_ref_released"), err)
+	}
+}
+
+func TestGT07RetryOfRequiresClosedSameProjectAndUsesCurrentCanonical(t *testing.T) {
+	h := newHarness(t)
+	worker := h.addAgent(t, "retry-lineage-worker")
+	integrator := h.addAgent(t, "retry-lineage-integrator")
+	project := h.addProject(t, "retry-lineage-project", integrator.ID)
+	completed := createAndSubmitCodeTask(t, h, project, worker, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "retry-lineage-completed")
+	if err := h.service.ReconcileGit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.RequestAccept(context.Background(), core.AcceptInput{
+		TaskID: completed.ID, IntegrationAgentID: integrator.ID, RequestID: "retry-lineage-accept",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.ReconcileGit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	completed, _ = h.database.Task(context.Background(), completed.ID)
+	cancelled, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+		ProjectID: project.ID, AssigneeAgentID: worker.ID, Title: "cancelled retry target", RequestID: "retry-lineage-cancelled-create",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err = h.service.CancelTask(context.Background(), core.TaskActionInput{
+		TaskID: cancelled.ID, Reason: "retry in a new task", RequestID: "retry-lineage-cancelled-close",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentCanonical := "cccccccccccccccccccccccccccccccccccccccc"
+	h.git.mu.Lock()
+	h.git.sha = currentCanonical
+	h.git.mu.Unlock()
+
+	for _, target := range []core.Task{completed, cancelled} {
+		t.Run(string(target.Status), func(t *testing.T) {
+			requestID := "retry-lineage-create-" + string(target.Status)
+			input := core.CreateTaskInput{
+				ProjectID: project.ID, AssigneeAgentID: worker.ID, Title: "retry " + target.ID,
+				RetryOfTaskID: target.ID, RequestID: requestID,
+			}
+			created, err := h.service.CreateTask(context.Background(), input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if created.RetryOfTaskID != target.ID || created.BaseSHA != currentCanonical || created.SourceTaskID != "" {
+				t.Fatalf("retry task = %#v", created)
+			}
+			replay, err := h.service.CreateTask(context.Background(), input)
+			if err != nil || replay.ID != created.ID {
+				t.Fatalf("retry dedupe replay = %#v err=%v, want %s", replay, err, created.ID)
+			}
+		})
+	}
+
+	open, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+		ProjectID: project.ID, AssigneeAgentID: worker.ID, Title: "open retry target", RequestID: "retry-lineage-open",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := h.addProject(t, "retry-lineage-other-project", "")
+	cross, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+		ProjectID: other.ID, AssigneeAgentID: worker.ID, Title: "cross retry target", RequestID: "retry-lineage-cross-create",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cross, err = h.service.CancelTask(context.Background(), core.TaskActionInput{
+		TaskID: cross.ID, Reason: "closed", RequestID: "retry-lineage-cross-close",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, invalid := range []struct {
+		name, target string
+		code         core.ErrorCode
+	}{
+		{name: "open", target: open.ID, code: core.CodeInvalidState},
+		{name: "cross_project", target: cross.ID, code: core.CodeScopeDenied},
+	} {
+		t.Run(invalid.name, func(t *testing.T) {
+			before := h.durableSignature(t, "")
+			_, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+				ProjectID: project.ID, AssigneeAgentID: worker.ID, Title: "invalid retry",
+				RetryOfTaskID: invalid.target, RequestID: "retry-lineage-invalid-" + invalid.name,
+			})
+			if !core.IsCode(err, invalid.code) {
+				t.Fatalf("invalid retry error = %v, want %s", err, invalid.code)
+			}
+			if after := h.durableSignature(t, ""); after != before {
+				t.Fatal("rejected retry changed durable state")
+			}
+		})
+	}
+}
 
 func TestGT02ToGT04CaptureAndDirectAdvanceConvergeFromDurableIntents(t *testing.T) {
 	h := newHarness(t)
