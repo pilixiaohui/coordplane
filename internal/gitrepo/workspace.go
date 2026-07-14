@@ -154,6 +154,161 @@ func (m *WorkspaceManager) Verify(ctx context.Context, spec WorkspaceSpec) (Work
 	return fact, nil
 }
 
+// RefreshCanonical imports the current controller canonical commit into a
+// movable workspace-only convenience ref before an integration Run starts.
+func (m *WorkspaceManager) RefreshCanonical(ctx context.Context, spec WorkspaceSpec, controlPath, canonicalRef, expectedHead string) (string, error) {
+	if spec.Source == nil {
+		return "", m.publicError("refresh canonical", errors.New("canonical refresh is only valid for a source-backed workspace"))
+	}
+	if _, err := m.Verify(ctx, spec); err != nil {
+		return "", err
+	}
+	if err := m.initializer.validateFinalPath(controlPath); err != nil {
+		return "", m.publicError("refresh canonical", err)
+	}
+	if controlPath != filepath.Join(m.initializer.root, spec.ProjectID+".git") {
+		return "", m.publicError("refresh canonical", errors.New("control repository does not match workspace project"))
+	}
+	if err := m.initializer.validateBranchRef(ctx, canonicalRef); err != nil {
+		return "", m.publicError("refresh canonical", err)
+	}
+	if err := validateObjectID(expectedHead); err != nil {
+		return "", m.publicError("refresh canonical", err)
+	}
+	path, err := m.Path(spec.ProjectID, spec.TaskID)
+	if err != nil {
+		return "", m.publicError("refresh canonical", err)
+	}
+	unlock, err := m.initializer.maintenance.lock(ctx, spec.ProjectID)
+	if err != nil {
+		return "", m.publicError("refresh canonical", err)
+	}
+	defer unlock()
+	actual, exists, err := m.initializer.resolveRef(ctx, controlPath, canonicalRef)
+	if err != nil || !exists || actual != expectedHead {
+		return "", m.publicError("refresh canonical", &InvariantError{message: "actual canonical does not match saved refresh head", cause: err})
+	}
+	handoffRoot := filepath.Join(m.initializer.root, ".handoff")
+	if err := m.initializer.ensureDirectSubdirectories(handoffRoot); err != nil {
+		return "", m.publicError("refresh canonical", err)
+	}
+	bundle, err := os.CreateTemp(handoffRoot, ".canonical-*.bundle")
+	if err != nil {
+		return "", m.publicError("refresh canonical", err)
+	}
+	bundlePath := bundle.Name()
+	if err := bundle.Close(); err != nil {
+		_ = os.Remove(bundlePath)
+		return "", m.publicError("refresh canonical", err)
+	}
+	if err := os.Remove(bundlePath); err != nil {
+		return "", m.publicError("refresh canonical", err)
+	}
+	defer os.Remove(bundlePath)
+	if _, err := m.initializer.git(ctx, "--git-dir="+controlPath, "bundle", "create", bundlePath, canonicalRef); err != nil {
+		return "", m.publicError("refresh canonical", err)
+	}
+	const convenience = "refs/heads/coordplane/canonical"
+	if _, err := m.git(ctx, "import actual canonical", "-C", path, "fetch", "--force", "--no-tags", "--no-write-fetch-head", bundlePath, canonicalRef+":"+convenience); err != nil {
+		return "", m.publicError("refresh canonical", err)
+	}
+	imported, err := m.workspaceRef(ctx, path, convenience)
+	if err != nil || imported != actual {
+		return "", m.publicError("refresh canonical", &InvariantError{message: "canonical convenience ref mismatch", cause: err})
+	}
+	return convenience, nil
+}
+
+// Delete safely removes a terminal task workspace after the caller repeats
+// its durable GC predicate under the project maintenance lock.
+func (m *WorkspaceManager) Delete(ctx context.Context, spec WorkspaceSpec, expectedHead string, authorize func() (bool, error)) (bool, error) {
+	if m == nil || m.initializer == nil {
+		return false, errors.New("gitrepo: nil workspace manager")
+	}
+	if err := validateID("project", spec.ProjectID); err != nil {
+		return false, err
+	}
+	if err := validateID("task", spec.TaskID); err != nil {
+		return false, err
+	}
+	if err := validateObjectID(spec.BaseSHA); err != nil {
+		return false, err
+	}
+	if err := validateObjectID(expectedHead); err != nil {
+		return false, err
+	}
+	if authorize == nil {
+		return false, errors.New("gitrepo: workspace GC authorization is required")
+	}
+	unlock, err := m.initializer.maintenance.lock(ctx, spec.ProjectID)
+	if err != nil {
+		return false, m.publicError("delete", err)
+	}
+	defer unlock()
+	allowed, err := authorize()
+	if err != nil || !allowed {
+		return false, err
+	}
+	path, err := m.Path(spec.ProjectID, spec.TaskID)
+	if err != nil {
+		return false, err
+	}
+	exists, err := pathExists(path)
+	if err != nil {
+		return false, m.publicError("delete", err)
+	}
+	markerPath, err := m.markerPath(spec.ProjectID, spec.TaskID)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		if markerExists, markerErr := pathExists(markerPath); markerErr != nil {
+			return false, m.publicError("delete", markerErr)
+		} else if markerExists {
+			marker, markerErr := readWorkspaceMarker(markerPath)
+			if markerErr != nil || marker != markerForSpec(spec) {
+				return false, m.publicError("delete", errors.New("orphan workspace marker does not match task identity"))
+			}
+			if err := os.Remove(markerPath); err != nil {
+				return false, m.publicError("delete", err)
+			}
+		}
+		return true, nil
+	}
+	if err := m.validateFinalWorkspacePath(path, spec); err != nil {
+		return false, m.publicError("delete", err)
+	}
+	fact, err := m.inspect(ctx, path, spec, false)
+	if err != nil {
+		return false, m.publicError("delete", err)
+	}
+	if fact.HeadSHA != expectedHead {
+		return false, nil
+	}
+	status, err := m.git(ctx, "inspect workspace GC status", "-C", path, "status", "--porcelain=v1", "--untracked-files=all")
+	if err != nil || strings.TrimSpace(status) != "" {
+		return false, nil
+	}
+	gitDir := filepath.Join(path, ".git")
+	for _, name := range []string{"MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-apply", "rebase-merge"} {
+		if operationExists, operationErr := pathExists(filepath.Join(gitDir, name)); operationErr != nil {
+			return false, m.publicError("delete", operationErr)
+		} else if operationExists {
+			return false, nil
+		}
+	}
+	if err := os.RemoveAll(path); err != nil {
+		return false, m.publicError("delete", err)
+	}
+	if err := os.Remove(markerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, m.publicError("delete", err)
+	}
+	if err := syncDirectory(filepath.Dir(path)); err != nil {
+		return false, m.publicError("delete", err)
+	}
+	return true, nil
+}
+
 func (m *WorkspaceManager) materializeLocked(ctx context.Context, spec WorkspaceSpec) (fact WorkspaceFact, resultErr error) {
 	path, err := m.Path(spec.ProjectID, spec.TaskID)
 	if err != nil {
@@ -730,14 +885,16 @@ func (m *WorkspaceManager) git(ctx context.Context, operation string, args ...st
 }
 
 type workspacePublicError struct {
-	message string
-	cause   error
+	message   string
+	cause     error
+	invariant bool
 }
 
 func (e *workspacePublicError) Error() string { return e.message }
 func (e *workspacePublicError) Is(target error) bool {
 	return errors.Is(e.cause, target)
 }
+func (e *workspacePublicError) GitInvariant() bool { return e.invariant }
 
 func (m *WorkspaceManager) publicError(operation string, cause error) error {
 	if cause == nil {
@@ -760,6 +917,11 @@ func (m *WorkspaceManager) publicError(operation string, cause error) error {
 		}
 	}
 	var safeCause error
+	invariant := false
+	var invariantCause interface{ GitInvariant() bool }
+	if errors.As(cause, &invariantCause) {
+		invariant = invariantCause.GitInvariant()
+	}
 	switch {
 	case errors.Is(cause, context.Canceled):
 		safeCause = context.Canceled
@@ -767,8 +929,9 @@ func (m *WorkspaceManager) publicError(operation string, cause error) error {
 		safeCause = context.DeadlineExceeded
 	}
 	return &workspacePublicError{
-		message: "gitrepo: workspace " + operation + ": " + message,
-		cause:   safeCause,
+		message:   "gitrepo: workspace " + operation + ": " + message,
+		cause:     safeCause,
+		invariant: invariant,
 	}
 }
 

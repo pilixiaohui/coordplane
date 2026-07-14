@@ -75,7 +75,11 @@ func buildComponents(ctx context.Context, configPath string) (*components, error
 	if len(quarantined) > 0 {
 		return fail(fmt.Errorf("quarantined unowned repository paths %q; inspect the quarantine and restart", quarantined))
 	}
-	service, err := core.NewService(database, projectGitAdapter{initializer: initializer}, core.ServiceOptions{
+	workspaceManager, err := gitrepo.NewWorkspaceManager(initializer, cfg.Runtime.WorkspaceRoot)
+	if err != nil {
+		return fail(err)
+	}
+	service, err := core.NewService(database, projectGitAdapter{initializer: initializer, workspaces: workspaceManager}, core.ServiceOptions{
 		MaxParallelRuns: cfg.MaxParallelRuns, AdapterIDs: adapter.Production().Names(),
 	})
 	if err != nil {
@@ -85,10 +89,6 @@ func buildComponents(ctx context.Context, configPath string) (*components, error
 	service.SetReady(false, "startup reconciliation")
 	if err := service.ReconcileProjects(ctx); err != nil {
 		return fail(fmt.Errorf("reconcile projects: %w", err))
-	}
-	workspaceManager, err := gitrepo.NewWorkspaceManager(initializer, cfg.Runtime.WorkspaceRoot)
-	if err != nil {
-		return fail(err)
 	}
 	if err := validateRuntimeContainerIdentity(); err != nil {
 		return fail(err)

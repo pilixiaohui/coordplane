@@ -53,6 +53,7 @@ type CreateTaskInput struct {
 	Description     string   `json:"description"`
 	Priority        int      `json:"priority"`
 	MaxRetries      int      `json:"max_retries"`
+	SourceTaskID    string   `json:"source_task_id,omitempty"`
 	AckMessageIDs   []string `json:"ack_message_ids,omitempty"`
 	RequestID       string   `json:"request_id"`
 }
@@ -64,6 +65,7 @@ type CreateChildTaskInput struct {
 	Description     string   `json:"description"`
 	Priority        int      `json:"priority"`
 	MaxRetries      int      `json:"max_retries"`
+	SourceTaskID    string   `json:"source_task_id,omitempty"`
 	AckMessageIDs   []string `json:"ack_message_ids,omitempty"`
 	RequestID       string   `json:"request_id"`
 }
@@ -187,4 +189,9 @@ type AcceptInput struct {
 	IntegrationAgentID string   `json:"integration_agent_id,omitempty"`
 	AckMessageIDs      []string `json:"ack_message_ids,omitempty"`
 	RequestID          string   `json:"request_id"`
+}
+
+type TaskCheckoutInput struct {
+	TaskID      string `json:"task_id"`
+	Destination string `json:"destination"`
 }

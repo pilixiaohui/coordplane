@@ -982,6 +982,10 @@ type fakeGit struct {
 	initializeErr   error
 	initializeCalls int
 	exists          bool
+	captureErr      error
+	advanceErr      error
+	advanceOutcome  core.GitAdvanceOutcome
+	advanceActual   string
 }
 
 func (g *fakeGit) Preflight(context.Context, string, string) (core.ProjectGitFact, error) {
@@ -1018,6 +1022,60 @@ func (g *fakeGit) Exists(string) bool {
 }
 
 func (g *fakeGit) Resolve(context.Context, string, string) (string, error) { return g.sha, nil }
+
+func (g *fakeGit) Capture(_ context.Context, intent core.GitCaptureIntent) (core.GitCaptureFact, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.captureErr != nil {
+		return core.GitCaptureFact{}, g.captureErr
+	}
+	return core.GitCaptureFact{
+		HeadSHA: intent.ExpectedHead,
+		TaskRef: "refs/coordplane/tasks/" + intent.TaskID + "/runs/" + intent.RunID,
+	}, nil
+}
+
+func (g *fakeGit) Advance(_ context.Context, intent core.GitAdvanceIntent) (core.GitAdvanceFact, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.advanceErr != nil {
+		return core.GitAdvanceFact{}, g.advanceErr
+	}
+	outcome := g.advanceOutcome
+	if outcome == "" {
+		outcome = core.GitAdvanceUpdated
+	}
+	actual := g.advanceActual
+	if outcome != core.GitAdvanceStale {
+		actual = intent.TargetSHA
+		g.sha = actual
+	} else if actual == "" {
+		actual = g.sha
+	}
+	return core.GitAdvanceFact{Outcome: outcome, ActualSHA: actual}, nil
+}
+
+func (g *fakeGit) ResolveTaskRef(_ context.Context, intent core.GitTaskRefIntent) (string, error) {
+	return intent.ExpectedSHA, nil
+}
+
+func (g *fakeGit) UseTaskRef(_ context.Context, intent core.GitTaskRefIntent, use func(string) error) error {
+	return use(intent.ExpectedSHA)
+}
+
+func (g *fakeGit) Checkout(_ context.Context, intent core.GitCheckoutIntent) (core.GitCheckoutFact, error) {
+	return core.GitCheckoutFact{Destination: intent.Destination, HeadSHA: intent.ExpectedSHA}, nil
+}
+
+func (g *fakeGit) DeleteTaskRef(_ context.Context, _ core.GitDeleteRefIntent, authorize func() (bool, error)) (bool, error) {
+	return authorize()
+}
+
+func (g *fakeGit) DeleteWorkspace(_ context.Context, _ core.GitDeleteWorkspaceIntent, authorize func() (bool, error)) (bool, error) {
+	return authorize()
+}
+
+func (g *fakeGit) Prune(context.Context, string, string) error { return nil }
 
 func countEvent(events []core.Event, kind string) int {
 	count := 0

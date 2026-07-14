@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 
 	"coordplane/internal/core"
 	"coordplane/internal/gitrepo"
@@ -9,6 +10,7 @@ import (
 
 type projectGitAdapter struct {
 	initializer *gitrepo.Initializer
+	workspaces  *gitrepo.WorkspaceManager
 }
 
 func (a projectGitAdapter) Preflight(ctx context.Context, source, sourceRef string) (core.ProjectGitFact, error) {
@@ -48,6 +50,85 @@ func (a projectGitAdapter) Resolve(ctx context.Context, path, ref string) (strin
 	return a.initializer.Resolve(ctx, path, ref)
 }
 
+func (a projectGitAdapter) Capture(ctx context.Context, intent core.GitCaptureIntent) (core.GitCaptureFact, error) {
+	if a.workspaces == nil {
+		return core.GitCaptureFact{}, fmt.Errorf("workspace manager is not configured")
+	}
+	wantPath, err := a.workspaces.Path(intent.ProjectID, intent.TaskID)
+	if err != nil {
+		return core.GitCaptureFact{}, err
+	}
+	if intent.WorkspacePath != wantPath {
+		return core.GitCaptureFact{}, fmt.Errorf("workspace path does not match task identity")
+	}
+	workspace := gitrepo.WorkspaceSpec{
+		ProjectID: intent.ProjectID, TaskID: intent.TaskID, BaseSHA: intent.BaseSHA,
+	}
+	if intent.Source != nil {
+		workspace.Source = &gitrepo.WorkspaceSource{
+			TaskID: intent.Source.TaskID, RunID: intent.Source.RunID,
+			TaskRef: intent.Source.TaskRef, HeadSHA: intent.Source.HeadSHA,
+		}
+	}
+	fact, err := a.workspaces.Capture(ctx, gitrepo.CaptureSpec{
+		Workspace: workspace, RunID: intent.RunID, ExpectedHead: intent.ExpectedHead,
+		ControlRepoPath: intent.ControlRepo,
+	})
+	return core.GitCaptureFact{HeadSHA: fact.HeadSHA, TaskRef: fact.TaskRef}, err
+}
+
+func (a projectGitAdapter) Advance(ctx context.Context, intent core.GitAdvanceIntent) (core.GitAdvanceFact, error) {
+	fact, err := a.initializer.Advance(ctx, gitrepo.AdvanceSpec{
+		ProjectID: intent.ProjectID, ControlRepoPath: intent.ControlRepo,
+		CanonicalRef: intent.CanonicalRef, TaskRef: intent.TaskRef,
+		ExpectedOldSHA: intent.ExpectedOldSHA, TargetSHA: intent.TargetSHA,
+	})
+	return core.GitAdvanceFact{Outcome: core.GitAdvanceOutcome(fact.Outcome), ActualSHA: fact.ActualSHA}, err
+}
+
+func (a projectGitAdapter) ResolveTaskRef(ctx context.Context, intent core.GitTaskRefIntent) (string, error) {
+	return a.initializer.ResolveTaskRef(ctx, intent.ProjectID, intent.ControlRepo, intent.TaskRef, intent.ExpectedSHA)
+}
+
+func (a projectGitAdapter) UseTaskRef(ctx context.Context, intent core.GitTaskRefIntent, use func(string) error) error {
+	return a.initializer.UseTaskRef(ctx, intent.ProjectID, intent.ControlRepo, intent.TaskRef, intent.ExpectedSHA, use)
+}
+
+func (a projectGitAdapter) Checkout(ctx context.Context, intent core.GitCheckoutIntent) (core.GitCheckoutFact, error) {
+	fact, err := a.initializer.Checkout(ctx, gitrepo.CheckoutSpec{
+		ProjectID: intent.ProjectID, ControlRepoPath: intent.ControlRepo,
+		TaskRef: intent.TaskRef, ExpectedHead: intent.ExpectedSHA,
+		Destination: intent.Destination,
+	})
+	return core.GitCheckoutFact{Destination: fact.Destination, HeadSHA: fact.HeadSHA}, err
+}
+
+func (a projectGitAdapter) DeleteTaskRef(ctx context.Context, intent core.GitDeleteRefIntent, authorize func() (bool, error)) (bool, error) {
+	return a.initializer.DeleteTaskRef(ctx, gitrepo.DeleteTaskRefSpec{
+		ProjectID: intent.ProjectID, ControlRepoPath: intent.ControlRepo,
+		CanonicalRef: intent.CanonicalRef, TaskRef: intent.TaskRef,
+		ExpectedHead: intent.ExpectedSHA,
+	}, authorize)
+}
+
+func (a projectGitAdapter) DeleteWorkspace(ctx context.Context, intent core.GitDeleteWorkspaceIntent, authorize func() (bool, error)) (bool, error) {
+	if a.workspaces == nil {
+		return false, fmt.Errorf("workspace manager is not configured")
+	}
+	spec := gitrepo.WorkspaceSpec{ProjectID: intent.ProjectID, TaskID: intent.TaskID, BaseSHA: intent.BaseSHA}
+	if intent.Source != nil {
+		spec.Source = &gitrepo.WorkspaceSource{
+			TaskID: intent.Source.TaskID, RunID: intent.Source.RunID,
+			TaskRef: intent.Source.TaskRef, HeadSHA: intent.Source.HeadSHA,
+		}
+	}
+	return a.workspaces.Delete(ctx, spec, intent.ExpectedHead, authorize)
+}
+
+func (a projectGitAdapter) Prune(ctx context.Context, projectID, controlPath string) error {
+	return a.initializer.Prune(ctx, projectID, controlPath)
+}
+
 func gitProject(intent core.ProjectGitIntent) gitrepo.Project {
 	return gitrepo.Project{
 		ID: intent.ProjectID, OperationID: intent.OperationID, SourcePath: intent.Source,
@@ -64,3 +145,4 @@ func coreGitFact(intent core.ProjectGitIntent, fact gitrepo.Fact) core.ProjectGi
 }
 
 var _ core.ProjectGit = projectGitAdapter{}
+var _ core.TaskGit = projectGitAdapter{}

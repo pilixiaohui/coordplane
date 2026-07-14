@@ -114,11 +114,25 @@ func runRuntimeGC(ctx context.Context, controller *runtimeController) {
 			return
 		case <-ticker.C:
 			controller.cleanupTerminalRuns(ctx)
+			workspaceBefore := time.Now().UTC().Add(-controller.config.Retention.CompletedWorkspace).Format("2006-01-02T15:04:05.000000000Z")
+			if err := controller.service.ReconcileWorkspaceGC(ctx, workspaceBefore); err != nil {
+				controller.setDegraded(err.Error())
+				continue
+			}
+			closedBefore := time.Now().UTC().Add(-controller.config.Retention.TerminalTaskRef).Format("2006-01-02T15:04:05.000000000Z")
+			if err := controller.service.ReconcileGitGC(ctx, closedBefore); err != nil {
+				controller.setDegraded(err.Error())
+			}
 		}
 	}
 }
 
 func (c *runtimeController) Reconcile(ctx context.Context) error {
+	// Git intent recovery is independent of Docker availability and must
+	// converge before any new scheduler admission.
+	if err := c.service.ReconcileGit(ctx); err != nil {
+		return fmt.Errorf("reconcile Git intents: %w", err)
+	}
 	if err := c.executor.Ping(ctx); err != nil {
 		if errors.Is(err, containerruntime.ErrUnavailable) {
 			c.setDegraded(err.Error())

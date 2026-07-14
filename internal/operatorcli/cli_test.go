@@ -144,9 +144,9 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 		},
 		{
 			name:   "task create",
-			args:   []string{"task", "create", "--project", "project-1", "--kind", "work", "--agent", "agent-1", "--title", "Implement", "--description", "Do the work", "--priority", "7", "--max-retries", "3", "--ack-message", "message-1", "--request-id", "req-task-create", "--output", "json"},
+			args:   []string{"task", "create", "--project", "project-1", "--kind", "work", "--agent", "agent-1", "--title", "Implement", "--description", "Do the work", "--priority", "7", "--max-retries", "3", "--source-task", "task-source", "--ack-message", "message-1", "--request-id", "req-task-create", "--output", "json"},
 			method: http.MethodPost, path: "/v1/tasks",
-			input:     core.CreateTaskInput{ProjectID: "project-1", Kind: core.TaskWork, AssigneeAgentID: "agent-1", Title: "Implement", Description: "Do the work", Priority: 7, MaxRetries: 3, AckMessageIDs: []string{"message-1"}, RequestID: "req-task-create"},
+			input:     core.CreateTaskInput{ProjectID: "project-1", Kind: core.TaskWork, AssigneeAgentID: "agent-1", Title: "Implement", Description: "Do the work", Priority: 7, MaxRetries: 3, SourceTaskID: "task-source", AckMessageIDs: []string{"message-1"}, RequestID: "req-task-create"},
 			outputHas: `"id":"task-1"`,
 		},
 		{
@@ -160,6 +160,13 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 			args:   []string{"task", "show", "task-1", "--output", "json"},
 			method: http.MethodGet, path: "/v1/tasks/task-1",
 			outputHas: `"id":"task-1"`, outputLacks: `"id":"task-2"`,
+		},
+		{
+			name:   "task checkout",
+			args:   []string{"task", "checkout", "task-1", "--dest", "/tmp/review-task-1", "--output", "json"},
+			method: http.MethodPost, path: "/v1/tasks/task-1/checkout",
+			input: core.TaskCheckoutInput{TaskID: "task-1", Destination: "/tmp/review-task-1"},
+			outputHas: `"head_sha":"captured-head"`,
 		},
 		{
 			name:   "task close",
@@ -518,6 +525,8 @@ func (c *recordingClient) JSON(_ context.Context, method, path string, input, ou
 			detail.CurrentRun = &core.Run{ID: view.CurrentRun.ID, State: view.CurrentRun.State}
 		}
 		*target = detail
+	case *core.GitCheckoutFact:
+		*target = core.GitCheckoutFact{Destination: "/tmp/review-task-1", HeadSHA: "captured-head"}
 	case *core.RunPage:
 		*target = core.RunPage{Items: []core.RunSummary{{ID: "run-1", ProjectID: "project-1", TaskID: "task-1", AgentID: "agent-1", State: core.RunExited}}}
 	case *core.Run:

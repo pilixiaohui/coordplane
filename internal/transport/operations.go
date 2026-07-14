@@ -22,6 +22,7 @@ type OperatorOperations interface {
 	Chat(context.Context, core.ChatInput) (core.ChatResult, error)
 	CreateTask(context.Context, core.CreateTaskInput) (core.Task, error)
 	Task(context.Context, string) (core.TaskDetail, error)
+	CheckoutTask(context.Context, core.TaskCheckoutInput) (core.GitCheckoutFact, error)
 	Run(context.Context, string) (core.Run, error)
 	CloseConversation(context.Context, string, string) (core.Task, error)
 	WakeTask(context.Context, core.TaskActionInput) (core.Task, error)

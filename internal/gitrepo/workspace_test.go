@@ -250,6 +250,17 @@ func TestGT01MaterializeImportsExactSourceThroughMovableConvenienceRef(t *testin
 		t.Fatalf("source import persisted remote %q", got)
 	}
 	assertPrivateWorkspace(t, initializer, manager, spec, fact.Path)
+	gitDirOutput(t, project.ControlRepoPath, "update-ref", project.CanonicalRef, sourceHead, initial)
+	canonicalRef, err := manager.RefreshCanonical(ctx, spec, project.ControlRepoPath, project.CanonicalRef, sourceHead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gitOutput(t, fact.Path, "rev-parse", canonicalRef+"^{commit}"); got != sourceHead {
+		t.Fatalf("canonical convenience ref = %s, want %s", got, sourceHead)
+	}
+	if got := gitOutput(t, fact.Path, "remote"); got != "" {
+		t.Fatalf("canonical refresh persisted remote %q", got)
+	}
 
 	gitOutput(t, fact.Path, "update-ref", fact.SourceRef, initial, sourceHead)
 	if _, err := manager.Verify(ctx, spec); err != nil {

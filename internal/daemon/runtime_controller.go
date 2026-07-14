@@ -345,7 +345,17 @@ func prepareRuntimeWorkspace(state *runtimePrepareState) error {
 	if state.launch.Task.Kind == core.TaskConversation {
 		return nil
 	}
-	return state.controller.prepareWorkspace(state.ctx, state.run, state.workspaceSpec)
+	if err := state.controller.prepareWorkspace(state.ctx, state.run, state.workspaceSpec); err != nil {
+		return err
+	}
+	if state.launch.Task.Kind == core.TaskIntegration {
+		_, err := state.controller.workspaces.RefreshCanonical(
+			state.ctx, state.workspaceSpec, state.launch.Project.ControlRepoPath,
+			state.launch.Project.CanonicalRef, state.launch.Project.CanonicalSHA,
+		)
+		return err
+	}
+	return nil
 }
 
 func prepareRuntimeDirectories(state *runtimePrepareState) error {

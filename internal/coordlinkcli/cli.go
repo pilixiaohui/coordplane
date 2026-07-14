@@ -192,6 +192,7 @@ func runTask(ctx context.Context, client jsonClient, args []string, stdout, stde
 		flags.StringVar(&input.Description, "description", "", "task description")
 		flags.IntVar(&input.Priority, "priority", 0, "task priority")
 		flags.IntVar(&input.MaxRetries, "max-retries", 0, "runtime retry limit")
+		flags.StringVar(&input.SourceTaskID, "source-task", "", "captured source task ID")
 		flags.StringVar(&input.RequestID, "request-id", "", "idempotency key")
 		flags.Var(&ackMessageIDs, "ack-message", "message ID to acknowledge atomically (repeatable)")
 		if err := flags.Parse(args[1:]); err != nil {

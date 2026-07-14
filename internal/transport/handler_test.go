@@ -448,6 +448,10 @@ func (f *operatorFake) Task(_ context.Context, id string) (core.TaskDetail, erro
 	return core.TaskDetail{}, f.record("task", id)
 }
 
+func (f *operatorFake) CheckoutTask(_ context.Context, input core.TaskCheckoutInput) (core.GitCheckoutFact, error) {
+	return core.GitCheckoutFact{}, f.record("checkout_task", input)
+}
+
 func (f *operatorFake) Run(_ context.Context, id string) (core.Run, error) {
 	return core.Run{}, f.record("run", id)
 }

@@ -196,12 +196,12 @@ func TestP2CommandsUseOnlyTheFixedPerRunSurface(t *testing.T) {
 		{name: "task show", args: []string{"task", "show", "task/child", "--output", "json"}, method: http.MethodGet, path: "/v1/task/task%2Fchild"},
 		{
 			name:   "task create",
-			args:   []string{"task", "create", "--agent", "agent-b", "--title", "review", "--description", "inspect", "--priority", "7", "--max-retries", "2", "--request-id", "req-create", "--ack-message", "msg-1", "--ack-message", "msg-2", "--output", "json"},
+			args:   []string{"task", "create", "--agent", "agent-b", "--title", "review", "--description", "inspect", "--priority", "7", "--max-retries", "2", "--source-task", "task-source", "--request-id", "req-create", "--ack-message", "msg-1", "--ack-message", "msg-2", "--output", "json"},
 			method: http.MethodPost,
 			path:   "/v1/task/create",
 			bodyValues: map[string]any{
 				"assignee_agent_id": "agent-b", "title": "review", "description": "inspect",
-				"priority": float64(7), "max_retries": float64(2), "request_id": "req-create", "ack_message_ids": []any{"msg-1", "msg-2"},
+				"priority": float64(7), "max_retries": float64(2), "source_task_id": "task-source", "request_id": "req-create", "ack_message_ids": []any{"msg-1", "msg-2"},
 			},
 		},
 		{

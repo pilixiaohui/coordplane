@@ -58,6 +58,114 @@ func (s *Store) Task(ctx context.Context, id string) (core.Task, error) {
 	return task, mapNotFound("task", id, err)
 }
 
+func (s *Store) PendingGitTasks(ctx context.Context) ([]core.Task, error) {
+	rows, err := s.db.QueryContext(ctx, taskSelect+` WHERE pending_action IN ('capture','advance') ORDER BY pending_started_at,id`)
+	if err != nil {
+		return nil, err
+	}
+	return collectTasks(rows)
+}
+
+func (s *Store) TaskRefCandidates(ctx context.Context, closedBefore string) ([]core.Task, error) {
+	rows, err := s.db.QueryContext(ctx, taskSelect+`
+WHERE task_ref<>'' AND status IN ('completed','cancelled') AND closed_at<>'' AND closed_at<=?
+ORDER BY closed_at,id`, closedBefore)
+	if err != nil {
+		return nil, err
+	}
+	return collectTasks(rows)
+}
+
+func (s *Store) TaskRefEligible(ctx context.Context, taskID, taskRef, closedBefore string) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	task, err := scanTask(tx.QueryRowContext(ctx, taskSelect+` WHERE id=?`, taskID))
+	if err != nil {
+		return false, mapNotFound("task", taskID, err)
+	}
+	eligible := task.TaskRef == taskRef && (task.Status == core.TaskCompleted || task.Status == core.TaskCancelled) &&
+		task.PendingAction == "" && task.ClosedAt != "" && task.ClosedAt <= closedBefore
+	if eligible && task.IntegrationTaskID != "" {
+		integration, integrationErr := scanTask(tx.QueryRowContext(ctx, taskSelect+` WHERE id=?`, task.IntegrationTaskID))
+		if integrationErr != nil {
+			return false, mapNotFound("integration task", task.IntegrationTaskID, integrationErr)
+		}
+		eligible = (integration.Status == core.TaskCompleted || integration.Status == core.TaskCancelled) &&
+			integration.PendingAction == "" && integration.ClosedAt != "" && integration.ClosedAt <= closedBefore
+	}
+	if eligible {
+		var blockers int
+		err = tx.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM tasks
+WHERE (pending_action<>'' AND (task_ref=? OR source_task_ref=?))
+   OR (status NOT IN ('completed','cancelled') AND source_task_ref=?)`, taskRef, taskRef, taskRef).Scan(&blockers)
+		if err != nil {
+			return false, err
+		}
+		eligible = blockers == 0
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return eligible, nil
+}
+
+func (s *Store) WorkspaceCandidates(ctx context.Context, closedBefore string) ([]core.Task, error) {
+	rows, err := s.db.QueryContext(ctx, taskSelect+`
+WHERE kind IN ('work','integration') AND status IN ('completed','cancelled')
+  AND closed_at<>'' AND closed_at<=? ORDER BY closed_at,id`, closedBefore)
+	if err != nil {
+		return nil, err
+	}
+	return collectTasks(rows)
+}
+
+func (s *Store) WorkspaceEligible(ctx context.Context, taskID, closedBefore string) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	task, err := scanTask(tx.QueryRowContext(ctx, taskSelect+` WHERE id=?`, taskID))
+	if err != nil {
+		return false, mapNotFound("task", taskID, err)
+	}
+	eligible := (task.Kind == core.TaskWork || task.Kind == core.TaskIntegration) &&
+		(task.Status == core.TaskCompleted || task.Status == core.TaskCancelled) &&
+		task.CurrentRunID == "" && task.PendingAction == "" && task.ClosedAt != "" && task.ClosedAt <= closedBefore
+	if eligible && task.HeadSHA != "" {
+		eligible = task.TaskRef != "" && task.HeadRunID != ""
+	}
+	if eligible && task.HeadSHA == "" {
+		var startedWriters int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE task_id=? AND launch_phase IN ('start_issued','process_observed')`, task.ID).Scan(&startedWriters); err != nil {
+			return false, err
+		}
+		eligible = startedWriters == 0
+	}
+	if eligible {
+		var liveRuns int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE task_id=? AND state IN ('starting','active')`, task.ID).Scan(&liveRuns); err != nil {
+			return false, err
+		}
+		eligible = liveRuns == 0
+	}
+	if eligible && task.IntegrationTaskID != "" {
+		integration, integrationErr := scanTask(tx.QueryRowContext(ctx, taskSelect+` WHERE id=?`, task.IntegrationTaskID))
+		if integrationErr != nil {
+			return false, mapNotFound("integration task", task.IntegrationTaskID, integrationErr)
+		}
+		eligible = (integration.Status == core.TaskCompleted || integration.Status == core.TaskCancelled) && integration.PendingAction == ""
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return eligible, nil
+}
+
 func (s *Store) Run(ctx context.Context, id string) (core.Run, error) {
 	run, err := scanRun(s.db.QueryRowContext(ctx, runSelect+` WHERE id=?`, id))
 	return run, mapNotFound("run", id, err)

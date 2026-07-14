@@ -102,6 +102,33 @@ func (s *Service) CancelTask(ctx context.Context, input TaskActionInput) (Task, 
 		if err := ValidateTaskTransition(task.Kind, task.Status, TaskCancelled); err != nil {
 			return Conflict(CodeInvalidState, "task cannot be cancelled", string(task.Status), task.Version)
 		}
+		if task.Kind == TaskIntegration && task.SourceTaskID != "" {
+			source, err := tx.Task(task.SourceTaskID)
+			if err != nil {
+				return err
+			}
+			if source.PendingAction != "" {
+				return Conflict(CodeActionInProgress, "source task action is in progress", string(source.Status), source.Version)
+			}
+			if err := integrationSourceFence(source, *task); err != nil {
+				return err
+			}
+			expectedSourceVersion := source.Version
+			source.IntegrationTaskID = ""
+			source.AcceptedByKind = ""
+			source.AcceptedByID = ""
+			source.AcceptedAt = ""
+			source.AcceptedIntegrationAgentID = ""
+			source.Version++
+			source.UpdatedAt = now
+			if err := tx.UpdateTask(source, expectedSourceVersion, TaskSubmitted); err != nil {
+				return err
+			}
+			payload := eventPayload(map[string]any{"integration_task_id": task.ID})
+			if _, err := tx.AppendEvent(event(source.ProjectID, "task", source.ID, "git.integration_released", actor.kind, actor.id, actor.runID, requestID, "", payload, now)); err != nil {
+				return err
+			}
+		}
 		preserveCurrentRun := false
 		if task.CurrentRunID != "" {
 			run, err := tx.Run(task.CurrentRunID)

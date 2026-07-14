@@ -35,16 +35,37 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (Task, 
 	if input.MaxRetries < 0 {
 		return Task{}, NewError(CodeInvalidArgument, "max_retries cannot be negative", false)
 	}
+	sourceTaskID := strings.TrimSpace(input.SourceTaskID)
 	ackIDs, err := canonicalMessageIDs(input.AckMessageIDs)
 	if err != nil {
 		return Task{}, err
 	}
 	inputHash, err := inputFingerprint(struct {
-		ProjectID, AgentID, Kind, Title, Description, AckIDs string
-		Priority, MaxRetries                                 int
-	}{projectID, agentID, string(input.Kind), title, description, strings.Join(ackIDs, "\x00"), input.Priority, input.MaxRetries})
+		ProjectID, AgentID, Kind, Title, Description, SourceTaskID, AckIDs string
+		Priority, MaxRetries                                               int
+	}{projectID, agentID, string(input.Kind), title, description, sourceTaskID, strings.Join(ackIDs, "\x00"), input.Priority, input.MaxRetries})
 	if err != nil {
 		return Task{}, err
+	}
+	var replay Task
+	var replayed bool
+	if err := s.repository.Transact(ctx, func(tx Transaction) error {
+		raw, ok, err := tx.Dedupe("boss", "task.create", requestID)
+		if err != nil || !ok {
+			return err
+		}
+		result, err := decodeDedupe(raw, inputHash)
+		if err != nil {
+			return err
+		}
+		replay, err = tx.Task(result.ID)
+		replayed = err == nil
+		return err
+	}); err != nil {
+		return Task{}, err
+	}
+	if replayed {
+		return replay, nil
 	}
 	project, err := s.repository.Project(ctx, projectID)
 	if err != nil {
@@ -57,62 +78,128 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (Task, 
 	if err != nil {
 		return Task{}, WrapError(CodeGitInvariantViolation, "resolve canonical ref", false, err)
 	}
+	var sourceSnapshot Task
+	var executor TaskGit
+	if sourceTaskID != "" {
+		var ok bool
+		executor, ok = s.projectGit.(TaskGit)
+		if !ok {
+			return Task{}, NewError(CodeGitInvariantViolation, "task Git executor is not configured", false)
+		}
+		sourceSnapshot, err = s.repository.Task(ctx, sourceTaskID)
+		if err != nil {
+			return Task{}, err
+		}
+		if err := validateSourceTask(projectID, sourceSnapshot); err != nil {
+			return Task{}, err
+		}
+	}
 
 	var task Task
-	err = s.repository.Transact(ctx, func(tx Transaction) error {
-		if raw, ok, err := tx.Dedupe("boss", "task.create", requestID); err != nil {
-			return err
-		} else if ok {
-			result, err := decodeDedupe(raw, inputHash)
+	create := func() error {
+		return s.repository.Transact(ctx, func(tx Transaction) error {
+			if raw, ok, err := tx.Dedupe("boss", "task.create", requestID); err != nil {
+				return err
+			} else if ok {
+				result, err := decodeDedupe(raw, inputHash)
+				if err != nil {
+					return err
+				}
+				task, err = tx.Task(result.ID)
+				return err
+			}
+			currentProject, err := tx.Project(projectID)
 			if err != nil {
 				return err
 			}
-			task, err = tx.Task(result.ID)
-			return err
-		}
-		currentProject, err := tx.Project(projectID)
-		if err != nil {
-			return err
-		}
-		if currentProject.Status != ProjectActive {
-			return Conflict(CodeInvalidState, "project is not active", string(currentProject.Status), currentProject.Version)
-		}
-		agent, err := tx.Agent(agentID)
-		if err != nil {
-			return err
-		}
-		if agent.Status == AgentArchived {
-			return Conflict(CodeInvalidState, "archived agent cannot receive a task", string(agent.Status), agent.Version)
-		}
-		now := s.nowText()
-		if err := s.acknowledgeForActor(tx, ackIDs, projectID, taskMutationActor{kind: "boss"}, requestID, now); err != nil {
-			return err
-		}
-		taskID, err := s.requiredID("tsk")
-		if err != nil {
-			return err
-		}
-		task = Task{
-			ID: taskID, ProjectID: projectID, Kind: TaskWork, CreatedByKind: "boss",
-			AssigneeAgentID: agentID, Title: title, Description: description,
-			Priority: input.Priority, Status: TaskQueued, Generation: 0, NextRunAt: now,
-			MaxRetries: input.MaxRetries, BaseSHA: baseSHA, Version: 1,
-			CreatedAt: now, UpdatedAt: now,
-		}
-		if err := tx.InsertTask(task); err != nil {
-			return err
-		}
-		payload := eventPayload(map[string]any{"kind": task.Kind, "base_sha": task.BaseSHA})
-		if _, err := tx.AppendEvent(event(projectID, "task", task.ID, "task.created", "boss", "", "", requestID, "", payload, now)); err != nil {
-			return err
-		}
-		raw, err := encodeDedupe(task.ID, "", inputHash)
-		if err != nil {
-			return err
-		}
-		return tx.PutDedupe("boss", "task.create", requestID, raw, now)
-	})
+			if currentProject.Status != ProjectActive {
+				return Conflict(CodeInvalidState, "project is not active", string(currentProject.Status), currentProject.Version)
+			}
+			var source Task
+			if sourceTaskID != "" {
+				source, err = tx.Task(sourceTaskID)
+				if err != nil {
+					return err
+				}
+				if source.Version != sourceSnapshot.Version || source.TaskRef != sourceSnapshot.TaskRef || source.HeadSHA != sourceSnapshot.HeadSHA {
+					return Conflict(CodeVersionConflict, "source task changed while creating task", string(source.Status), source.Version)
+				}
+				if err := validateSourceTask(projectID, source); err != nil {
+					return err
+				}
+			}
+			agent, err := tx.Agent(agentID)
+			if err != nil {
+				return err
+			}
+			if agent.Status == AgentArchived {
+				return Conflict(CodeInvalidState, "archived agent cannot receive a task", string(agent.Status), agent.Version)
+			}
+			now := s.nowText()
+			if err := s.acknowledgeForActor(tx, ackIDs, projectID, taskMutationActor{kind: "boss"}, requestID, now); err != nil {
+				return err
+			}
+			taskID, err := s.requiredID("tsk")
+			if err != nil {
+				return err
+			}
+			task = Task{
+				ID: taskID, ProjectID: projectID, Kind: TaskWork, CreatedByKind: "boss",
+				AssigneeAgentID: agentID, Title: title, Description: description,
+				Priority: input.Priority, Status: TaskQueued, Generation: 0, NextRunAt: now,
+				MaxRetries: input.MaxRetries, BaseSHA: baseSHA, Version: 1,
+				CreatedAt: now, UpdatedAt: now,
+			}
+			if sourceTaskID != "" {
+				task.SourceTaskID = source.ID
+				task.SourceRunID = source.HeadRunID
+				task.SourceTaskRef = source.TaskRef
+				task.SourceHeadSHA = source.HeadSHA
+			}
+			if err := tx.InsertTask(task); err != nil {
+				return err
+			}
+			payload := eventPayload(map[string]any{"kind": task.Kind, "base_sha": task.BaseSHA})
+			if _, err := tx.AppendEvent(event(projectID, "task", task.ID, "task.created", "boss", "", "", requestID, "", payload, now)); err != nil {
+				return err
+			}
+			raw, err := encodeDedupe(task.ID, "", inputHash)
+			if err != nil {
+				return err
+			}
+			return tx.PutDedupe("boss", "task.create", requestID, raw, now)
+		})
+	}
+	if sourceTaskID == "" {
+		err = create()
+	} else {
+		err = executor.UseTaskRef(ctx, GitTaskRefIntent{
+			ProjectID: projectID, ControlRepo: project.ControlRepoPath,
+			TaskRef: sourceSnapshot.TaskRef, ExpectedSHA: sourceSnapshot.HeadSHA,
+		}, func(actual string) error {
+			if actual != sourceSnapshot.HeadSHA {
+				return NewError(CodeGitInvariantViolation, "source task ref changed", false)
+			}
+			return create()
+		})
+	}
+	if err != nil && isGitInvariant(err) {
+		err = WrapError(CodeGitInvariantViolation, "use source task ref", false, err)
+	}
 	return task, err
+}
+
+func validateSourceTask(projectID string, source Task) error {
+	if source.ProjectID != projectID {
+		return NewError(CodeScopeDenied, "source task is outside the target project", false)
+	}
+	if source.Status != TaskSubmitted && source.Status != TaskCompleted {
+		return Conflict(CodeInvalidState, "source task must be submitted or completed", string(source.Status), source.Version)
+	}
+	if source.HeadSHA == "" || source.HeadRunID == "" || source.TaskRef == "" {
+		return NewError(CodeGitInvariantViolation, "source task has no complete captured result", false)
+	}
+	return nil
 }
 
 func (s *Service) CloseConversation(ctx context.Context, taskID, requestID string) (Task, error) {

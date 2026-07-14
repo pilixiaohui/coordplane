@@ -10,6 +10,11 @@ type Repository interface {
 	Projects(context.Context, ProjectFilter) (ProjectPage, error)
 	Agents(context.Context, AgentFilter) (AgentPage, error)
 	Task(context.Context, string) (Task, error)
+	PendingGitTasks(context.Context) ([]Task, error)
+	TaskRefCandidates(context.Context, string) ([]Task, error)
+	TaskRefEligible(context.Context, string, string, string) (bool, error)
+	WorkspaceCandidates(context.Context, string) ([]Task, error)
+	WorkspaceEligible(context.Context, string, string) (bool, error)
 	Run(context.Context, string) (Run, error)
 	LiveRuns(context.Context) ([]Run, error)
 	RunsNeedingCleanup(context.Context) ([]Run, error)
@@ -142,4 +147,96 @@ type ProjectGitFact struct {
 	InitialSHA   string
 	CanonicalRef string
 	CanonicalSHA string
+}
+
+// TaskGit is the trusted Git boundary used by the daemon-owned intent
+// reconciler. It is separate from ProjectGit so project registration fakes do
+// not need to implement result mutation behavior.
+type TaskGit interface {
+	Capture(context.Context, GitCaptureIntent) (GitCaptureFact, error)
+	Advance(context.Context, GitAdvanceIntent) (GitAdvanceFact, error)
+	ResolveTaskRef(context.Context, GitTaskRefIntent) (string, error)
+	UseTaskRef(context.Context, GitTaskRefIntent, func(string) error) error
+	Checkout(context.Context, GitCheckoutIntent) (GitCheckoutFact, error)
+	DeleteTaskRef(context.Context, GitDeleteRefIntent, func() (bool, error)) (bool, error)
+	DeleteWorkspace(context.Context, GitDeleteWorkspaceIntent, func() (bool, error)) (bool, error)
+	Prune(context.Context, string, string) error
+}
+
+type GitSource struct {
+	TaskID  string
+	RunID   string
+	TaskRef string
+	HeadSHA string
+}
+
+type GitCaptureIntent struct {
+	ProjectID     string
+	TaskID        string
+	RunID         string
+	WorkspacePath string
+	ControlRepo   string
+	BaseSHA       string
+	ExpectedHead  string
+	Source        *GitSource
+}
+
+type GitCaptureFact struct {
+	HeadSHA string
+	TaskRef string
+}
+
+type GitAdvanceIntent struct {
+	ProjectID      string
+	ControlRepo    string
+	CanonicalRef   string
+	TaskRef        string
+	ExpectedOldSHA string
+	TargetSHA      string
+}
+
+type GitAdvanceOutcome string
+
+const (
+	GitAdvanceUpdated  GitAdvanceOutcome = "updated"
+	GitAdvanceIncluded GitAdvanceOutcome = "included"
+	GitAdvanceStale    GitAdvanceOutcome = "stale"
+)
+
+type GitAdvanceFact struct {
+	Outcome   GitAdvanceOutcome
+	ActualSHA string
+}
+
+type GitTaskRefIntent struct {
+	ProjectID   string
+	ControlRepo string
+	TaskRef     string
+	ExpectedSHA string
+}
+
+type GitCheckoutIntent struct {
+	GitTaskRefIntent
+	Destination string
+}
+
+type GitCheckoutFact struct {
+	Destination string `json:"destination"`
+	HeadSHA     string `json:"head_sha"`
+}
+
+type GitDeleteRefIntent struct {
+	ProjectID    string
+	ControlRepo  string
+	CanonicalRef string
+	TaskRef      string
+	ExpectedSHA  string
+}
+
+type GitDeleteWorkspaceIntent struct {
+	ProjectID    string
+	TaskID       string
+	BaseSHA      string
+	ExpectedHead string
+	Source       *GitSource
 }

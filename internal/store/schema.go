@@ -195,6 +195,9 @@ CREATE UNIQUE INDEX tasks_one_open_conversation
   WHERE kind = 'conversation' AND status NOT IN ('completed','cancelled');
 CREATE UNIQUE INDEX tasks_current_run_unique
   ON tasks(current_run_id) WHERE current_run_id <> '';
+CREATE UNIQUE INDEX tasks_one_open_integration_source
+  ON tasks(project_id,source_task_ref)
+  WHERE kind='integration' AND source_task_ref<>'' AND status NOT IN ('completed','cancelled');
 CREATE INDEX tasks_schedule
   ON tasks(status, next_run_at, priority DESC, created_at, id);
 CREATE INDEX tasks_assignee_status

@@ -1200,3 +1200,36 @@ func (g *contractGit) Verify(context.Context, core.ProjectGitIntent) (core.Proje
 }
 func (g *contractGit) Exists(string) bool                                      { return true }
 func (g *contractGit) Resolve(context.Context, string, string) (string, error) { return g.sha, nil }
+
+func (g *contractGit) Capture(_ context.Context, intent core.GitCaptureIntent) (core.GitCaptureFact, error) {
+	return core.GitCaptureFact{
+		HeadSHA: intent.ExpectedHead,
+		TaskRef: "refs/coordplane/tasks/" + intent.TaskID + "/runs/" + intent.RunID,
+	}, nil
+}
+
+func (g *contractGit) Advance(_ context.Context, intent core.GitAdvanceIntent) (core.GitAdvanceFact, error) {
+	return core.GitAdvanceFact{Outcome: core.GitAdvanceUpdated, ActualSHA: intent.TargetSHA}, nil
+}
+
+func (g *contractGit) ResolveTaskRef(_ context.Context, intent core.GitTaskRefIntent) (string, error) {
+	return intent.ExpectedSHA, nil
+}
+
+func (g *contractGit) UseTaskRef(_ context.Context, intent core.GitTaskRefIntent, use func(string) error) error {
+	return use(intent.ExpectedSHA)
+}
+
+func (g *contractGit) Checkout(_ context.Context, intent core.GitCheckoutIntent) (core.GitCheckoutFact, error) {
+	return core.GitCheckoutFact{Destination: intent.Destination, HeadSHA: intent.ExpectedSHA}, nil
+}
+
+func (g *contractGit) DeleteTaskRef(_ context.Context, _ core.GitDeleteRefIntent, authorize func() (bool, error)) (bool, error) {
+	return authorize()
+}
+
+func (g *contractGit) DeleteWorkspace(_ context.Context, _ core.GitDeleteWorkspaceIntent, authorize func() (bool, error)) (bool, error) {
+	return authorize()
+}
+
+func (g *contractGit) Prune(context.Context, string, string) error { return nil }

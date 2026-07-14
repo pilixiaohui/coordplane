@@ -119,6 +119,10 @@ func NewOperatorHandler(operations OperatorOperations) http.Handler {
 		result, err := operations.Task(r.Context(), strings.TrimSpace(r.PathValue("id")))
 		writeResult(w, result, err)
 	}))
+	mux.HandleFunc("/v1/tasks/{id}/checkout", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.TaskCheckoutInput) (any, error) {
+		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
+		return operations.CheckoutTask(ctx.Context, input)
+	})))
 	mux.HandleFunc("/v1/tasks/{id}/close", requireMethod(http.MethodPost, actionCall(func(ctx requestContext, id, requestID string) (any, error) {
 		return operations.CloseConversation(ctx.Context, id, requestID)
 	})))

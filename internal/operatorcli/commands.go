@@ -151,6 +151,7 @@ func runTask(ctx context.Context, args []string, getenv environment, stdout, std
 		flags.StringVar(&input.Description, "description", "", "task description")
 		flags.IntVar(&input.Priority, "priority", 0, "task priority")
 		flags.IntVar(&input.MaxRetries, "max-retries", 0, "runtime retry limit")
+		flags.StringVar(&input.SourceTaskID, "source-task", "", "captured source task ID")
 		flags.Var(&acknowledged, "ack-message", "message ID to acknowledge atomically; repeat for multiple messages")
 		flags.StringVar(&input.RequestID, "request-id", "", "idempotency key")
 		if err := parseNoPositionals(flags, args[1:]); err != nil {
@@ -214,9 +215,27 @@ func runTask(ctx context.Context, args []string, getenv environment, stdout, std
 		return runTaskAction(ctx, args[0], args[1:], getenv, stdout, stderr, clients)
 	case "accept":
 		return runTaskAccept(ctx, args[1:], getenv, stdout, stderr, clients)
+	case "checkout":
+		return runTaskCheckout(ctx, args[1:], getenv, stdout, stderr, clients)
 	default:
 		return fmt.Errorf("unknown task subcommand %q", args[0])
 	}
+}
+
+func runTaskCheckout(ctx context.Context, args []string, getenv environment, stdout, stderr io.Writer, clients clientFactory) error {
+	flags, cfg := clientFlags("task checkout", getenv, stderr)
+	destination := flags.String("dest", "", "absolute checkout destination")
+	id, err := parseID(flags, args)
+	if err != nil {
+		return err
+	}
+	var fact core.GitCheckoutFact
+	path := "/v1/tasks/" + url.PathEscape(id) + "/checkout"
+	input := core.TaskCheckoutInput{TaskID: id, Destination: strings.TrimSpace(*destination)}
+	if err := request(ctx, *cfg, clients, http.MethodPost, path, input, &fact); err != nil {
+		return err
+	}
+	return render(stdout, cfg.output, fact)
 }
 
 func runTaskAccept(ctx context.Context, args []string, getenv environment, stdout, stderr io.Writer, clients clientFactory) error {
