@@ -17,6 +17,11 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$output" ] || { echo "loc-budget: --output is required" >&2; exit 2; }
 
+case "$output" in
+  /*) ;;
+  *) output=$PWD/$output ;;
+esac
+
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 manifest=scripts/loc-manifest.tsv

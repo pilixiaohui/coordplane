@@ -66,26 +66,70 @@ elif [ "$kind" = "integration" ]; then
 		--request-id "p5-integration-submit-$run_id" --output json >/dev/null
 	sleep 30
 else
-	role=$(printf '%s\n' "$description" | sed -n 's/.*p5_role=\([AB]\).*/\1/p')
+	role=$(printf '%s\n' "$description" | sed -n 's/.*p5_role=\([ABCD]\).*/\1/p')
 	[ -n "$role" ]
 	configure_git "$role"
-	wait_for_body "P5-GO" >/dev/null
-	if [ "$role" = "A" ]; then
-		peer_agent=$(printf '%s\n' "$description" | sed -n 's/.*peer_agent_id=\([^ ;]*\).*/\1/p')
-		[ -n "$peer_agent" ]
-		/usr/local/bin/coordlink message send --to-agent "$peer_agent" --wake \
-			--body "P5-DIRECT from $run_id" --request-id "p5-direct-$run_id" --output json >/dev/null
-		ack_all
-	else
-		wait_for_body "P5-DIRECT" >/dev/null
+	go_message=$(wait_for_body "P5-GO")
+	is_pf01=false
+	if printf '%s\n' "$description" | grep -F 'pf01=true' >/dev/null 2>&1; then
+		is_pf01=true
 	fi
-	printf 'agent-%s\n' "$role" > "agent-$role.txt"
+	progress_count=$(printf '%s\n' "$description" | sed -n 's/.*progress_count=\([0-9][0-9]*\).*/\1/p')
+	progress_count=${progress_count:-1}
+	progress_index=1
+	while [ "$progress_index" -le "$progress_count" ]; do
+		/usr/local/bin/coordlink progress --summary "P5-$role progress $progress_index" \
+			--request-id "p5-progress-$role-$run_id-$progress_index" --output json >/dev/null
+		progress_index=$((progress_index + 1))
+	done
+	if [ "$is_pf01" = true ]; then
+		d_agent=$(printf '%s\n' "$go_message" | sed -n 's/.*d_agent=\([^ ]*\).*/\1/p' | head -1)
+		d_task=$(printf '%s\n' "$go_message" | sed -n 's/.*d_task=\([^ ]*\).*/\1/p' | head -1)
+		if [ "$role" != D ]; then
+			case "$role" in A) peer_count=4 ;; B|C) peer_count=3 ;; esac
+			peer_index=1
+			while [ "$peer_index" -le "$peer_count" ]; do
+				/usr/local/bin/coordlink message send --to-agent "$d_agent" --task "$d_task" \
+					--body "PF01-PEER $role $peer_index" --request-id "pf01-peer-$run_id-$peer_index" --output json >/dev/null
+				peer_index=$((peer_index + 1))
+			done
+			ack_all
+		else
+			attempt=0
+			while [ "$attempt" -lt 600 ]; do
+				messages=$(inbox)
+				[ "$(printf '%s\n' "$messages" | grep -c 'PF01-PEER' || true)" -ge 10 ] && break
+				attempt=$((attempt + 1))
+				sleep 0.05
+			done
+			[ "$attempt" -lt 600 ]
+			ack_all
+		fi
+		wave=$(printf '%s\n' "$go_message" | sed -n 's/.*wave=\([^ ]*\).*/\1/p' | head -1)
+		[ -n "$wave" ]
+		file="bench/$(printf '%s' "$role" | tr '[:upper:]' '[:lower:]').txt"
+		printf 'wave-%s-agent-%s\n' "$wave" "$role" >"$file"
+	else
+		if [ "$role" = "A" ]; then
+			peer_agent=$(printf '%s\n' "$description" | sed -n 's/.*peer_agent_id=\([^ ;]*\).*/\1/p')
+			[ -n "$peer_agent" ]
+			/usr/local/bin/coordlink message send --to-agent "$peer_agent" --wake \
+				--body "P5-DIRECT from $run_id" --request-id "p5-direct-$run_id" --output json >/dev/null
+			ack_all
+		else
+			wait_for_body "P5-DIRECT" >/dev/null
+		fi
+		file="agent-$role.txt"
+		printf 'agent-%s\n' "$role" >"$file"
+	fi
 	./fixture-test.sh
-	git add "agent-$role.txt"
+	git add "$file"
 	git commit -m "P5 Agent $role result"
 	head=$(git rev-parse HEAD)
-	/usr/local/bin/coordlink progress --summary "P5-$role tested" \
-		--request-id "p5-progress-$role-$run_id" --output json >/dev/null
+	if [ "$is_pf01" = false ]; then
+		/usr/local/bin/coordlink progress --summary "P5-$role tested" \
+			--request-id "p5-progress-$role-$run_id" --output json >/dev/null
+	fi
 	/usr/local/bin/coordlink task submit --summary "P5 Agent $role result" --expected-head "$head" \
 		--request-id "p5-submit-$role-$run_id" --output json >/dev/null
 	sleep 30
