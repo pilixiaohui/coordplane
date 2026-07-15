@@ -31,6 +31,7 @@ type RunLaunchInput struct {
 	ResumedFromRunID      string
 	ResumeNativeSessionID string
 	CleanupOperationID    string
+	IsolationSpecVersion  int64
 	DeadlineAt            string
 	RequestID             string
 }
@@ -128,12 +129,18 @@ func (s *Service) BeginRunLaunch(ctx context.Context, input RunLaunchInput) (Run
 	input.InstructionsHash = strings.TrimSpace(input.InstructionsHash)
 	input.ResumedFromRunID = strings.TrimSpace(input.ResumedFromRunID)
 	input.ResumeNativeSessionID = strings.TrimSpace(input.ResumeNativeSessionID)
+	if input.IsolationSpecVersion == 0 {
+		input.IsolationSpecVersion = RunIsolationSpecCurrent
+	}
 	requestID, err := s.requestID(input.RequestID)
 	if err != nil {
 		return Run{}, err
 	}
 	if input.RunID == "" || input.Generation < 1 || input.LaunchNonce == "" || input.CleanupOperationID == "" {
 		return Run{}, NewError(CodeInvalidArgument, "run launch identity is incomplete", false)
+	}
+	if input.IsolationSpecVersion != RunIsolationSpecV1 && input.IsolationSpecVersion != RunIsolationSpecCurrent {
+		return Run{}, NewError(CodeInvalidArgument, "isolation_spec_version is unsupported", false)
 	}
 	if input.LaunchMode != "start" && input.LaunchMode != "resume" {
 		return Run{}, NewError(CodeInvalidArgument, "launch_mode must be start or resume", false)
@@ -207,6 +214,7 @@ func (s *Service) BeginRunLaunch(ctx context.Context, input RunLaunchInput) (Run
 		run.ResumedFromRunID = input.ResumedFromRunID
 		run.ResumeNativeSessionID = input.ResumeNativeSessionID
 		run.CleanupOperationID = input.CleanupOperationID
+		run.IsolationSpecVersion = input.IsolationSpecVersion
 		run.CleanupState = CleanupPending
 		run.DeadlineAt = input.DeadlineAt
 		run.Version++
@@ -231,7 +239,8 @@ func sameLaunchIntent(run Run, input RunLaunchInput) bool {
 		run.WorkspacePath == input.WorkspacePath && run.HomePath == input.HomePath && run.LogPath == input.LogPath &&
 		run.InstructionsHash == input.InstructionsHash && run.LaunchMode == input.LaunchMode &&
 		run.ResumedFromRunID == input.ResumedFromRunID && run.ResumeNativeSessionID == input.ResumeNativeSessionID &&
-		run.CleanupOperationID == input.CleanupOperationID && run.DeadlineAt == input.DeadlineAt
+		run.CleanupOperationID == input.CleanupOperationID && run.DeadlineAt == input.DeadlineAt &&
+		run.IsolationSpecVersion == input.IsolationSpecVersion
 }
 
 func (s *Service) RecordContainerCreated(ctx context.Context, input RunRuntimeFactInput) (Run, error) {

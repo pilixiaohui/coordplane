@@ -14,10 +14,17 @@ import (
 const (
 	contractRuntimePhaseEnv = "COORDPLANE_CONTRACT_RUNTIME_PHASE"
 	contractRuntimeReadyEnv = "COORDPLANE_CONTRACT_RUNTIME_PHASE_READY"
+	contractLegacyIsolation = "COORDPLANE_CONTRACT_RUNTIME_ISOLATION_V1"
 )
 
 func init() {
 	runtimeContractPhaseHook = waitAtRuntimeContractPhase
+	runtimeIsolationSpecVersionHook = func() int64 {
+		if os.Getenv(contractLegacyIsolation) == "1" {
+			return core.RunIsolationSpecV1
+		}
+		return core.RunIsolationSpecCurrent
+	}
 }
 
 func waitAtRuntimeContractPhase(ctx context.Context, phase runtimeContractPhase, _ core.Run) error {

@@ -1,7 +1,9 @@
 package store
 
-const schemaVersion = 1
-const schemaName = "coordplane_v1_six_objects"
+const schemaVersion = 2
+const schemaName = "coordplane_v2_run_isolation_spec"
+const initialSchemaName = "coordplane_v1_six_objects"
+const isolationSpecMigrationSQL = `ALTER TABLE runs ADD COLUMN isolation_spec_version INTEGER NOT NULL DEFAULT 1 CHECK (isolation_spec_version IN (1,2))`
 
 const schemaSQL = `
 CREATE TABLE schema_migrations (

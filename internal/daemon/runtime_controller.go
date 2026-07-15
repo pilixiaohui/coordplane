@@ -310,7 +310,7 @@ func (c *runtimeController) launchOwned(ctx context.Context, claim core.Claim, o
 		WorkspacePath: workspacePath, HomePath: homePath, LogPath: logPath,
 		InstructionsHash: instructionsHash, LaunchMode: mode,
 		ResumedFromRunID: resumedFrom, ResumeNativeSessionID: resumeSession,
-		CleanupOperationID: cleanupOperation, DeadlineAt: deadline,
+		CleanupOperationID: cleanupOperation, IsolationSpecVersion: runtimeIsolationSpecVersion(), DeadlineAt: deadline,
 		RequestID: runtimeRequest(launch.Run, "prepare"),
 	})
 	if err != nil {
@@ -599,6 +599,14 @@ func (c *runtimeController) containerSpec(
 	command adapter.CommandSpec,
 	controlPath string,
 ) (containerruntime.ContainerSpec, error) {
+	memoryBytes := int64(512 << 20)
+	switch run.IsolationSpecVersion {
+	case 0, core.RunIsolationSpecCurrent:
+	case core.RunIsolationSpecV1:
+		memoryBytes = 1 << 30
+	default:
+		return containerruntime.ContainerSpec{}, fmt.Errorf("unsupported Run isolation spec version %d", run.IsolationSpecVersion)
+	}
 	coordlink, err := canonicalExecutable(c.coordlink)
 	if err != nil {
 		return containerruntime.ContainerSpec{}, err
@@ -631,7 +639,7 @@ func (c *runtimeController) containerSpec(
 		GroupAdd: []string{gid}, Network: c.config.Runtime.DockerNetwork,
 		Mounts: mounts, ReadOnlyRoot: true,
 		Limits: containerruntime.ResourceLimits{
-			PIDs: 256, MemoryBytes: 512 << 20, NanoCPUs: 1_000_000_000, TmpfsBytes: runtimeTmpfsLimit,
+			PIDs: 256, MemoryBytes: memoryBytes, NanoCPUs: 1_000_000_000, TmpfsBytes: runtimeTmpfsLimit,
 		},
 	}, nil
 }

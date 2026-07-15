@@ -63,6 +63,9 @@ func TestCT02ConcurrentClaimCreatesExactlyOneRun(t *testing.T) {
 	if len(snapshot.Runs) != 1 || snapshot.Tasks[0].Generation != 1 {
 		t.Fatalf("snapshot after claim = %#v", snapshot)
 	}
+	if snapshot.Runs[0].IsolationSpecVersion != core.RunIsolationSpecCurrent {
+		t.Fatalf("new Run isolation spec = %d, want current v%d", snapshot.Runs[0].IsolationSpecVersion, core.RunIsolationSpecCurrent)
+	}
 	if snapshot.Tasks[0].ID != chat.Task.ID || snapshot.Tasks[0].CurrentRunID != snapshot.Runs[0].ID {
 		t.Fatalf("task/run claim fence mismatch: task=%#v run=%#v", snapshot.Tasks[0], snapshot.Runs[0])
 	}

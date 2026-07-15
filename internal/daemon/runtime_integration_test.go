@@ -587,7 +587,7 @@ func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
 		t.Fatalf("build coordlink: %v\n%s", err, raw)
 	}
 	daemonBinary := filepath.Join(root, "coordplane")
-	buildDaemon := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-o", daemonBinary, "./cmd/coordplane")
+	buildDaemon := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-tags=contract", "-o", daemonBinary, "./cmd/coordplane")
 	buildDaemon.Dir = repositoryRoot
 	if raw, err := buildDaemon.CombinedOutput(); err != nil {
 		t.Fatalf("build coordplane: %v\n%s", err, raw)
@@ -670,7 +670,9 @@ func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
 	}
 
 	socket := filepath.Join(root, "data", "operator.sock")
-	first := startP3DaemonProcess(t, daemonBinary, configPath, socket, filepath.Join(root, "daemon-first.log"))
+	first := startP3DaemonProcessWithEnv(t, daemonBinary, configPath, socket, filepath.Join(root, "daemon-first.log"), []string{
+		"COORDPLANE_CONTRACT_RUNTIME_ISOLATION_V1=1",
+	})
 	t.Cleanup(func() { stopP3DaemonProcess(t, first) })
 	client, err := transport.NewUnixClient(socket)
 	if err != nil {
@@ -679,6 +681,13 @@ func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
 	active := waitForOperatorRun(t, client, task.ID, func(run core.Run) bool {
 		return run.State == core.RunActive && run.ContainerID != ""
 	})
+	if active.IsolationSpecVersion != core.RunIsolationSpecV1 {
+		t.Fatalf("legacy Run identity/spec changed before upgrade: %#v", active)
+	}
+	legacyState, err := executor.Inspect(ctx, runtimeRef(active))
+	if err != nil || legacyState.MemoryBytes != 1<<30 {
+		t.Fatalf("legacy container memory = %d, want 1 GiB: %v", legacyState.MemoryBytes, err)
+	}
 	runSocket := filepath.Join(root, "data", "run-control", active.ID, "api.sock")
 	if info, err := os.Lstat(runSocket); err != nil || info.Mode()&os.ModeSocket == 0 {
 		t.Fatalf("active Run socket: info=%v err=%v", info, err)
@@ -709,6 +718,10 @@ func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
 	adopted := waitForOperatorRun(t, client, task.ID, func(run core.Run) bool {
 		return run.ID == active.ID && run.State == core.RunActive && run.ContainerID == active.ContainerID
 	})
+	adoptedState, err := executor.Inspect(ctx, runtimeRef(adopted))
+	if err != nil || adopted.IsolationSpecVersion != core.RunIsolationSpecV1 || adoptedState.MemoryBytes != 1<<30 {
+		t.Fatalf("upgrade did not adopt legacy isolation: Run=%#v memory=%d err=%v", adopted, adoptedState.MemoryBytes, err)
+	}
 	newSocketInfo, err := os.Lstat(runSocket)
 	if err != nil || newSocketInfo.Mode()&os.ModeSocket == 0 {
 		t.Fatalf("restart did not replace the dead Run socket: info=%v err=%v", newSocketInfo, err)
@@ -735,6 +748,10 @@ func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
 	outcomeRun := waitForOperatorRun(t, client, outcomeTask.ID, func(run core.Run) bool {
 		return run.State == core.RunActive && run.ContainerID != ""
 	})
+	newState, err := executor.Inspect(ctx, runtimeRef(outcomeRun))
+	if err != nil || outcomeRun.IsolationSpecVersion != core.RunIsolationSpecCurrent || newState.MemoryBytes != 512<<20 {
+		t.Fatalf("post-upgrade Run did not use v2/512 MiB: Run=%#v memory=%d err=%v", outcomeRun, newState.MemoryBytes, err)
+	}
 	outcomeToken, err := os.ReadFile(filepath.Join(root, "data", "run-control", outcomeRun.ID, "token"))
 	if err != nil {
 		t.Fatal(err)

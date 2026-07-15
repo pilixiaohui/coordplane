@@ -18,8 +18,8 @@ type schemaObject struct {
 	SQL       string
 }
 
-func (s *Store) validateCanonicalDatabase(ctx context.Context) error {
-	expected, err := canonicalSchemaObjects(ctx)
+func (s *Store) validateCanonicalDatabase(ctx context.Context, version int) error {
+	expected, err := canonicalSchemaObjects(ctx, version)
 	if err != nil {
 		return core.WrapError(core.CodeInternal, "build canonical SQLite schema", false, err)
 	}
@@ -30,7 +30,7 @@ func (s *Store) validateCanonicalDatabase(ctx context.Context) error {
 	if err := compareSchemaObjects(expected, actual); err != nil {
 		return err
 	}
-	if err := s.validateMigrationHistory(ctx); err != nil {
+	if err := s.validateMigrationHistory(ctx, version); err != nil {
 		return err
 	}
 	if err := s.validateIntegrity(ctx); err != nil {
@@ -39,7 +39,7 @@ func (s *Store) validateCanonicalDatabase(ctx context.Context) error {
 	return s.validateForeignKeys(ctx)
 }
 
-func canonicalSchemaObjects(ctx context.Context) (map[string]schemaObject, error) {
+func canonicalSchemaObjects(ctx context.Context, version int) (map[string]schemaObject, error) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		return nil, err
@@ -48,6 +48,11 @@ func canonicalSchemaObjects(ctx context.Context) (map[string]schemaObject, error
 	db.SetMaxOpenConns(1)
 	for _, statement := range splitStatements(schemaSQL) {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
+			return nil, err
+		}
+	}
+	if version >= 2 {
+		if _, err := db.ExecContext(ctx, isolationSpecMigrationSQL); err != nil {
 			return nil, err
 		}
 	}
@@ -97,7 +102,7 @@ func compareSchemaObjects(expected, actual map[string]schemaObject) error {
 			return legacySchemaError(fmt.Sprintf("SQLite schema is missing %s %q", want.Type, want.Name), nil)
 		}
 		if got.TableName != want.TableName || got.SQL != want.SQL {
-			return legacySchemaError(fmt.Sprintf("SQLite %s %q does not match the canonical v1 schema", want.Type, want.Name), nil)
+			return legacySchemaError(fmt.Sprintf("SQLite %s %q does not match the canonical schema", want.Type, want.Name), nil)
 		}
 	}
 	return nil
@@ -107,7 +112,7 @@ func schemaObjectKey(object schemaObject) string {
 	return object.Type + "\x00" + object.Name
 }
 
-func (s *Store) validateMigrationHistory(ctx context.Context) error {
+func (s *Store) validateMigrationHistory(ctx context.Context, version int) error {
 	rows, err := s.db.QueryContext(ctx, `SELECT version,name,applied_at FROM schema_migrations ORDER BY version`)
 	if err != nil {
 		return legacySchemaError("read SQLite migration history", err)
@@ -129,11 +134,26 @@ func (s *Store) validateMigrationHistory(ctx context.Context) error {
 	if err := rows.Err(); err != nil {
 		return legacySchemaError("read SQLite migration history", err)
 	}
-	if len(history) != 1 || history[0].version != schemaVersion || history[0].name != schemaName {
+	want := []struct {
+		version int
+		name    string
+	}{{1, initialSchemaName}}
+	if version >= 2 {
+		want = append(want, struct {
+			version int
+			name    string
+		}{schemaVersion, schemaName})
+	}
+	if len(history) != len(want) {
 		return legacySchemaError("legacy database migration history requires backup and a new data_dir", nil)
 	}
-	if _, err := time.Parse(time.RFC3339Nano, history[0].appliedAt); err != nil {
-		return legacySchemaError("SQLite migration timestamp is invalid", err)
+	for index, record := range history {
+		if record.version != want[index].version || record.name != want[index].name {
+			return legacySchemaError("legacy database migration history requires backup and a new data_dir", nil)
+		}
+		if _, err := time.Parse(time.RFC3339Nano, record.appliedAt); err != nil {
+			return legacySchemaError("SQLite migration timestamp is invalid", err)
+		}
 	}
 	return nil
 }

@@ -184,11 +184,17 @@ type Run struct {
 	ResumeNativeSessionID string   `json:"resume_native_session_id,omitempty"`
 	RuntimeErrorCode      string   `json:"runtime_error_code,omitempty"`
 	CleanupOperationID    string   `json:"cleanup_operation_id,omitempty"`
+	IsolationSpecVersion  int64    `json:"isolation_spec_version"`
 	Version               int64    `json:"version"`
 	CreatedAt             string   `json:"created_at"`
 	StartedAt             string   `json:"started_at,omitempty"`
 	EndedAt               string   `json:"ended_at,omitempty"`
 }
+
+const (
+	RunIsolationSpecV1      int64 = 1
+	RunIsolationSpecCurrent int64 = 2
+)
 
 type Message struct {
 	ID                string       `json:"id"`

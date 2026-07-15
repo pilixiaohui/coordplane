@@ -22,6 +22,14 @@ type runtimePhaseHook func(context.Context, runtimeContractPhase, core.Run) erro
 // implementation installs a process-level crash observer without adding a
 // product fault-control surface.
 var runtimeContractPhaseHook runtimePhaseHook
+var runtimeIsolationSpecVersionHook func() int64
+
+func runtimeIsolationSpecVersion() int64 {
+	if runtimeIsolationSpecVersionHook != nil {
+		return runtimeIsolationSpecVersionHook()
+	}
+	return core.RunIsolationSpecCurrent
+}
 
 func afterRuntimeContractPhase(ctx context.Context, phase runtimeContractPhase, run core.Run) error {
 	if runtimeContractPhaseHook == nil {

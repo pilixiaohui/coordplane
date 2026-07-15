@@ -168,4 +168,12 @@ func TestContainerSpecKeepsTrustedRuntimeEnvironmentOverProviderAllowlist(t *tes
 	if spec.Limits.PIDs != 256 || spec.Limits.MemoryBytes != 512<<20 || spec.Limits.NanoCPUs != 1_000_000_000 {
 		t.Fatalf("Agent resource contract = %#v, want 1 CPU / 512 MiB / 256 PIDs", spec.Limits)
 	}
+	run.IsolationSpecVersion = core.RunIsolationSpecV1
+	legacy, err := controller.containerSpec(run, core.TaskConversation, adapter.CommandSpec{Executable: "codex"}, "/runtime/run-control/run-env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Limits.MemoryBytes != 1<<30 || legacy.Limits.PIDs != spec.Limits.PIDs || legacy.Limits.NanoCPUs != spec.Limits.NanoCPUs {
+		t.Fatalf("legacy isolation spec = %#v, want 1 GiB with unchanged CPU/PID limits", legacy.Limits)
+	}
 }

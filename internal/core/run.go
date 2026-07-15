@@ -80,7 +80,8 @@ func (s *Service) ClaimNext(ctx context.Context, projectID string) (Claim, bool,
 				Generation: task.Generation, AdapterID: agent.AdapterID, Image: agent.Image,
 				State: RunStarting, TokenHash: hashToken(token), CleanupState: "not_needed",
 				LaunchOperationID: operationID, LaunchPhase: "intent", LaunchMode: "start",
-				ContainerName: "coordplane-run-" + runID, Version: 1, CreatedAt: now,
+				ContainerName: "coordplane-run-" + runID, IsolationSpecVersion: RunIsolationSpecCurrent,
+				Version: 1, CreatedAt: now,
 			}
 			if err := tx.InsertRun(run); err != nil {
 				return err

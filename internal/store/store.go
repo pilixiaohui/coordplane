@@ -116,21 +116,57 @@ func (s *Store) Migrate(ctx context.Context) (MigrationResult, error) {
 			}
 		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, schemaVersion, schemaName, now); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, 1, initialSchemaName, now); err != nil {
 			return MigrationResult{}, core.WrapError(core.CodeInternal, "record schema migration", false, err)
 		}
 		if err := tx.Commit(); err != nil {
 			return MigrationResult{}, core.WrapError(core.CodeInternal, "commit schema migration", false, err)
 		}
-		result.Applied = []int{schemaVersion}
+		result.Applied = []int{1}
 	}
 	if len(tables) > 0 && len(tables) != len(allowedTables) {
 		return MigrationResult{}, core.NewError(core.CodeLegacySchemaRebuildRequired, "incomplete CoordPlane v1 schema requires backup and a new data_dir", false)
 	}
-	if err := s.validateCanonicalDatabase(ctx); err != nil {
+	version, err := s.migrationVersion(ctx)
+	if err != nil {
+		return MigrationResult{}, err
+	}
+	if version == 1 {
+		if err := s.validateCanonicalDatabase(ctx, 1); err != nil {
+			return MigrationResult{}, err
+		}
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return MigrationResult{}, core.WrapError(core.CodeInternal, "begin isolation-spec migration", false, err)
+		}
+		defer tx.Rollback()
+		if _, err := tx.ExecContext(ctx, isolationSpecMigrationSQL); err != nil {
+			return MigrationResult{}, core.WrapError(core.CodeInternal, "persist Run isolation spec version", false, err)
+		}
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, schemaVersion, schemaName, now); err != nil {
+			return MigrationResult{}, core.WrapError(core.CodeInternal, "record isolation-spec migration", false, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return MigrationResult{}, core.WrapError(core.CodeInternal, "commit isolation-spec migration", false, err)
+		}
+		result.Applied = append(result.Applied, schemaVersion)
+	}
+	if err := s.validateCanonicalDatabase(ctx, schemaVersion); err != nil {
 		return MigrationResult{}, err
 	}
 	return result, nil
+}
+
+func (s *Store) migrationVersion(ctx context.Context) (int, error) {
+	var version int
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil {
+		return 0, legacySchemaError("read SQLite migration version", err)
+	}
+	if version != 1 && version != schemaVersion {
+		return 0, legacySchemaError("legacy database migration history requires backup and a new data_dir", nil)
+	}
+	return version, nil
 }
 
 func (s *Store) SchemaInfo(ctx context.Context) (SchemaInfo, error) {
