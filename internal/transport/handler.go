@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"coordplane/internal/core"
+	"coordplane/internal/perfobs"
 )
 
 const maxRequestBytes = 1 << 20
@@ -25,6 +26,36 @@ func NewOperatorHandler(operations OperatorOperations) http.Handler {
 		return unavailableHandler("operator operations are required")
 	}
 	mux := http.NewServeMux()
+	registerProjectAgentRoutes(mux, operations)
+	registerTaskRoutes(mux, operations)
+
+	mux.HandleFunc("/v1/runs", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		limit, err := queryInt(query.Get("limit"), "limit")
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		result, err := operations.ListRuns(r.Context(), core.RunFilter{
+			ProjectID: strings.TrimSpace(query.Get("project_id")), TaskID: strings.TrimSpace(query.Get("task_id")),
+			AgentID: strings.TrimSpace(query.Get("agent_id")), Cursor: strings.TrimSpace(query.Get("cursor")), Limit: limit,
+		})
+		writeResult(w, result, err)
+	}))
+	mux.HandleFunc("/v1/runs/{id}", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		result, err := operations.Run(r.Context(), strings.TrimSpace(r.PathValue("id")))
+		writeResult(w, result, err)
+	}))
+	mux.HandleFunc("/v1/runs/{id}/stop", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.RunStopInput) (any, error) {
+		input.RunID = strings.TrimSpace(ctx.PathValue("id"))
+		return operations.RequestRunStop(ctx.Context, input)
+	})))
+	registerMessageEventGCRoutes(mux, operations)
+	mux.HandleFunc("/", notFound)
+	return mux
+}
+
+func registerProjectAgentRoutes(mux *http.ServeMux, operations OperatorOperations) {
 	mux.HandleFunc("/v1/status", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
 		result, err := operations.Status(r.Context(), strings.TrimSpace(r.URL.Query().Get("project_id")))
 		writeResult(w, result, err)
@@ -90,6 +121,9 @@ func NewOperatorHandler(operations OperatorOperations) http.Handler {
 	mux.HandleFunc("/v1/agents/{id}/archive", requireMethod(http.MethodPost, actionCall(func(ctx requestContext, id, requestID string) (any, error) {
 		return operations.ArchiveAgent(ctx.Context, id, requestID)
 	})))
+}
+
+func registerTaskRoutes(mux *http.ServeMux, operations OperatorOperations) {
 	mux.HandleFunc("/v1/chat", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.ChatInput) (any, error) {
 		return operations.Chat(ctx.Context, input)
 	})))
@@ -146,27 +180,9 @@ func NewOperatorHandler(operations OperatorOperations) http.Handler {
 		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
 		return operations.ReworkTask(ctx.Context, input)
 	})))
-	mux.HandleFunc("/v1/runs", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
-		query := r.URL.Query()
-		limit, err := queryInt(query.Get("limit"), "limit")
-		if err != nil {
-			writeError(w, err)
-			return
-		}
-		result, err := operations.ListRuns(r.Context(), core.RunFilter{
-			ProjectID: strings.TrimSpace(query.Get("project_id")), TaskID: strings.TrimSpace(query.Get("task_id")),
-			AgentID: strings.TrimSpace(query.Get("agent_id")), Cursor: strings.TrimSpace(query.Get("cursor")), Limit: limit,
-		})
-		writeResult(w, result, err)
-	}))
-	mux.HandleFunc("/v1/runs/{id}", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
-		result, err := operations.Run(r.Context(), strings.TrimSpace(r.PathValue("id")))
-		writeResult(w, result, err)
-	}))
-	mux.HandleFunc("/v1/runs/{id}/stop", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.RunStopInput) (any, error) {
-		input.RunID = strings.TrimSpace(ctx.PathValue("id"))
-		return operations.RequestRunStop(ctx.Context, input)
-	})))
+}
+
+func registerMessageEventGCRoutes(mux *http.ServeMux, operations OperatorOperations) {
 	sendBossMessage := decodeCall(func(ctx requestContext, input core.BossMessageInput) (any, error) {
 		return operations.SendBossMessage(ctx.Context, input)
 	})
@@ -233,8 +249,6 @@ func NewOperatorHandler(operations OperatorOperations) http.Handler {
 	mux.HandleFunc("/v1/gc/discard-task-ref", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.GCDiscardTaskRefInput) (any, error) {
 		return operations.GCDiscardTaskRef(ctx.Context, input)
 	})))
-	mux.HandleFunc("/", notFound)
-	return mux
 }
 
 // NewRunHandler returns the complete fixed per-Run HTTP surface.
@@ -283,7 +297,13 @@ func NewRunHandler(operations RunOperations) http.Handler {
 	})))
 	mux.HandleFunc("/v1/progress", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.ProgressInput) (any, error) {
 		input.Token = ctx.Token
-		return operations.Progress(ctx.Context, input)
+		fields := perfobs.Fields{RequestID: input.RequestID}
+		perfobs.Received("api.progress.received", fields, "received")
+		result, err := operations.Progress(ctx.Context, input)
+		if err != nil {
+			perfobs.FailedReceived("api.progress.received", fields)
+		}
+		return result, err
 	})))
 	mux.HandleFunc("/v1/message", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.SendMessageInput) (any, error) {
 		input.Token = ctx.Token

@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"time"
+
+	"coordplane/internal/perfobs"
 )
 
 func (s *Service) ClaimNext(ctx context.Context, projectID string) (Claim, bool, error) {
@@ -206,6 +208,11 @@ func (s *Service) Progress(ctx context.Context, input ProgressInput) (Event, err
 		progress, err = tx.AppendEvent(event(task.ProjectID, "task", task.ID, "task.progress", "agent", run.AgentID, run.ID, requestID, "", eventPayload(map[string]any{"summary": summary}), s.nowText()))
 		return err
 	})
+	if err == nil {
+		perfobs.Point("core.progress.committed", perfobs.Fields{
+			RequestID: requestID, ProjectID: progress.ProjectID, TaskID: progress.EntityID, RunID: progress.RunID,
+		}, "success")
+	}
 	return progress, err
 }
 

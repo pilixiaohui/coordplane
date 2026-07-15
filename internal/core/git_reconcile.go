@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	"coordplane/internal/perfobs"
 )
 
 var contractCaptureFinalizedHook func(context.Context, GitCaptureIntent) error
@@ -140,6 +142,7 @@ func (s *Service) reconcileCapture(ctx context.Context, executor TaskGit, snapsh
 		ProjectID: task.ProjectID, TaskID: task.ID, RunID: run.ID,
 		WorkspacePath: run.WorkspacePath, ControlRepo: project.ControlRepoPath,
 		BaseSHA: task.BaseSHA, ExpectedHead: task.PendingExpectedSHA,
+		OperationID: task.PendingActionID,
 	}
 	if task.SourceTaskID != "" {
 		intent.Source = &GitSource{
@@ -164,6 +167,9 @@ func (s *Service) reconcileCapture(ctx context.Context, executor TaskGit, snapsh
 	if err := s.finalizeCapture(ctx, task, run, fact, actualCanonical); err != nil {
 		return err
 	}
+	perfobs.Point("git.capture.submitted_commit", perfobs.Fields{
+		OperationID: task.PendingActionID, ProjectID: task.ProjectID, TaskID: task.ID, RunID: run.ID,
+	}, "success")
 	if contractCaptureFinalizedHook != nil {
 		if err := contractCaptureFinalizedHook(ctx, intent); err != nil {
 			return err
@@ -335,7 +341,8 @@ func (s *Service) reconcileAdvance(ctx context.Context, executor TaskGit, snapsh
 		return err
 	}
 	fact, advanceErr := executor.Advance(ctx, GitAdvanceIntent{
-		ProjectID: task.ProjectID, ControlRepo: project.ControlRepoPath,
+		ProjectID: task.ProjectID, TaskID: task.ID, RunID: task.HeadRunID,
+		OperationID: task.PendingActionID, ControlRepo: project.ControlRepoPath,
 		CanonicalRef: project.CanonicalRef, TaskRef: task.TaskRef,
 		ExpectedOldSHA: task.PendingExpectedSHA, TargetSHA: task.PendingTargetSHA,
 	})

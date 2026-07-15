@@ -3,10 +3,13 @@
 package e2e_test
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -30,51 +33,90 @@ type pfSample struct {
 	WaveNS             int64    `json:"t_wave_ns"`
 	WorkNS             int64    `json:"t_work_ns"`
 	CleanupNS          int64    `json:"t_cleanup_ns"`
+	ContainerAbsentNS  int64    `json:"t_container_absent_ns"`
 	ProgressOperations int      `json:"progress_operations"`
 	PeerMessages       int      `json:"peer_messages"`
 	IntegrationTasks   int      `json:"integration_tasks"`
 	FinalSHA           string   `json:"final_sha"`
 	TaskHeads          []string `json:"task_heads"`
+	TaskIDs            []string `json:"task_ids"`
+	RunIDs             []string `json:"run_ids"`
+	IntegrationTaskIDs []string `json:"integration_task_ids,omitempty"`
+	IntegrationRunIDs  []string `json:"integration_run_ids,omitempty"`
+	QueueNS            []int64  `json:"t_queue_ns"`
+	FanoutNS           int64    `json:"t_fanout4_ns"`
+	DirectCASNS        int64    `json:"t_cas_ns"`
+	IntegrationNS      []int64  `json:"t_integration_ns"`
+	Integrations3NS    int64    `json:"t_integrations3_ns"`
+	StatusNS           []int64  `json:"status_ns,omitempty"`
+	DiskBytes          int64    `json:"data_dir_bytes"`
+	StableRSSBytes     int64    `json:"stable_rss_bytes,omitempty"`
+	StableGoroutines   int64    `json:"stable_goroutines,omitempty"`
+	StableFDs          int64    `json:"stable_open_fds,omitempty"`
+}
+
+type pfObjectCounts struct {
+	SampleID         string `json:"sample_id"`
+	ProjectID        string `json:"project_id"`
+	Tasks            int    `json:"tasks"`
+	Runs             int    `json:"runs"`
+	Messages         int    `json:"messages"`
+	Events           int    `json:"events"`
+	PeerMessages     int    `json:"peer_messages"`
+	PeerAcknowledged int    `json:"peer_acknowledged"`
+	PeerAckEvent     int    `json:"peer_ack_events"`
+	OpenRuns         int    `json:"open_runs"`
+	OwnedResidue     int    `json:"owned_residue"`
 }
 
 type pfReport struct {
-	SchemaVersion int               `json:"schema_version"`
-	Scenario      string            `json:"scenario"`
-	Profile       string            `json:"profile"`
-	Result        string            `json:"result"`
-	Reason        string            `json:"reason,omitempty"`
-	Revision      string            `json:"revision"`
-	Environment   map[string]string `json:"environment"`
-	Fixture       map[string]any    `json:"fixture"`
-	Samples       []pfSample        `json:"samples"`
-	Statistics    map[string]int64  `json:"nearest_rank_ns"`
-	Thresholds    map[string]int64  `json:"thresholds_ns"`
-	SerialRatio   float64           `json:"median_t4_over_median_t1"`
+	SchemaVersion int                `json:"schema_version"`
+	Scenario      string             `json:"scenario"`
+	Profile       string             `json:"profile"`
+	Result        string             `json:"result"`
+	Reason        string             `json:"reason,omitempty"`
+	Revision      string             `json:"revision"`
+	Environment   map[string]string  `json:"environment"`
+	Fixture       map[string]any     `json:"fixture"`
+	Samples       []pfSample         `json:"samples"`
+	Statistics    map[string]int64   `json:"nearest_rank_ns"`
+	Thresholds    map[string]int64   `json:"thresholds_ns"`
+	SerialRatio   float64            `json:"median_t4_over_median_t1"`
+	Observer      []map[string]any   `json:"observer_raw_records"`
+	ObjectCounts  []pfObjectCounts   `json:"durable_object_counts"`
+	Faults        []pfFaultRow       `json:"fault_recovery_raw_table"`
+	RawMetrics    map[string][]int64 `json:"raw_metrics_ns"`
+	Resources     map[string]int64   `json:"resource_facts"`
+	Baseline      map[string]string  `json:"baseline"`
+	Idle          []pfIdleSample     `json:"idle_resource_samples"`
 }
 
 type pfProfile struct {
-	concurrentBatches int
-	concurrentWaves   int
-	soakWaves         int
-	serialBatches     int
-	serialWaves       int
-	timeout           time.Duration
+	concurrentBatches, concurrentWaves, soakWaves int
+	serialBatches, serialWaves                    int
+	liveFaults, captureFaults, casFaults          int
+	timeout                                       time.Duration
 }
 
 type pfBatch struct {
-	t          *testing.T
-	ctx        context.Context
-	binary     string
-	image      string
-	id         string
-	root       string
-	dataDir    string
-	socket     string
-	daemon     *daemonProcess
-	agents     []core.Agent
-	project    core.Project
-	initialSHA string
-	parallel   int
+	t                     *testing.T
+	ctx                   context.Context
+	binary, image, id     string
+	root, dataDir, socket string
+	daemon                *daemonProcess
+	agents                []core.Agent
+	project               core.Project
+	initialSHA, observer  string
+	parallel              int
+	trackSoak             bool
+}
+
+var pfRoles = [...]string{"A", "B", "C", "D"}
+
+func TestPFDirectorySampleTreatsRemovedTreeAsAbsent(t *testing.T) {
+	if size := directoryBytesExcept(t, filepath.Join(t.TempDir(), "removed"), ""); size != 0 {
+		t.Fatalf("removed tree size = %d, want 0", size)
+	}
 }
 
 func TestPF01FourAgentPerformance(t *testing.T) {
@@ -88,12 +130,14 @@ func TestPF01FourAgentPerformance(t *testing.T) {
 	}
 	settings := pfProfile{
 		concurrentBatches: 1, concurrentWaves: 3,
-		serialBatches: 1, serialWaves: 1, timeout: 25 * time.Minute,
+		serialBatches: 1, serialWaves: 1, liveFaults: 1, captureFaults: 1, casFaults: 1,
+		timeout: 25 * time.Minute,
 	}
 	if profile == "release" {
 		settings = pfProfile{
 			concurrentBatches: 4, concurrentWaves: 5, soakWaves: 15,
-			serialBatches: 2, serialWaves: 5, timeout: 2 * time.Hour,
+			serialBatches: 2, serialWaves: 5, liveFaults: 5, captureFaults: 3, casFaults: 3,
+			timeout: 2 * time.Hour,
 		}
 	}
 	release, err := testsupport.AcquireSerialResource(testsupport.DockerResource, "tests/e2e-pf01", settings.timeout)
@@ -105,13 +149,20 @@ func TestPF01FourAgentPerformance(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), settings.timeout)
 	defer cancel()
 	root := t.TempDir()
-	source, initial, manifest := createPerfRepository(t, ctx, root)
 	report := pfReport{
 		SchemaVersion: 1, Scenario: "PF-01", Profile: profile, Revision: commandText(ctx, "git", "rev-parse", "HEAD"),
-		Environment: perfEnvironment(ctx, image), Fixture: manifest,
-		Thresholds: map[string]int64{"t_wave_p50": int64(60 * time.Second), "t_wave_p90": int64(90 * time.Second), "t_wave_max": int64(180 * time.Second)},
+		Environment: perfEnvironment(ctx, image),
+		Thresholds:  map[string]int64{"t_wave_p50": int64(60 * time.Second), "t_wave_p90": int64(90 * time.Second), "t_wave_max": int64(180 * time.Second)},
 	}
 	defer writePerfReport(t, output, &report)
+	if profile == "release" {
+		if reason := validateReferenceEnvironment(ctx, root, image, report.Revision, report.Environment); reason != "" {
+			report.Result, report.Reason = "INVALID_ENVIRONMENT", reason
+			return
+		}
+	}
+	source, initial, manifest := createPerfRepository(t, ctx, root)
+	report.Fixture = manifest
 	if reason := invalidPerfFixture(manifest); reason != "" {
 		report.Result = "INVALID_ENVIRONMENT"
 		report.Reason = reason
@@ -120,6 +171,10 @@ func TestPF01FourAgentPerformance(t *testing.T) {
 	for batchIndex := 0; batchIndex < settings.concurrentBatches; batchIndex++ {
 		batchID := fmt.Sprintf("concurrent-%02d", batchIndex+1)
 		batch := newPFBatch(t, ctx, coordplane, image, source, initial, filepath.Join(root, batchID), batchID, 4)
+		batch.trackSoak = profile == "release" && batchIndex == 0
+		if profile == "release" {
+			report.Idle = append(report.Idle, measurePFIdle(t, batch))
+		}
 		report.Samples = append(report.Samples, batch.runWave("warmup", true, false))
 		for wave := 0; wave < settings.concurrentWaves; wave++ {
 			report.Samples = append(report.Samples, batch.runWave(fmt.Sprintf("wave-%02d", wave+1), false, false))
@@ -130,7 +185,13 @@ func TestPF01FourAgentPerformance(t *testing.T) {
 			}
 		}
 		batch.close()
+		report.Observer = append(report.Observer, readObserverRecords(t, batch.observer)...)
+		report.ObjectCounts = append(report.ObjectCounts, batch.objectCounts())
 	}
+	faults, records, counts := runPFFaultTable(t, ctx, coordplane, image, source, initial, root, settings)
+	report.Faults = faults
+	report.Observer = append(report.Observer, records...)
+	report.ObjectCounts = append(report.ObjectCounts, counts...)
 	for batchIndex := 0; batchIndex < settings.serialBatches; batchIndex++ {
 		batchID := fmt.Sprintf("serial-%02d", batchIndex+1)
 		batch := newPFBatch(t, ctx, coordplane, image, source, initial, filepath.Join(root, batchID), batchID, 1)
@@ -141,6 +202,8 @@ func TestPF01FourAgentPerformance(t *testing.T) {
 			report.Samples = append(report.Samples, batch.runWave(fmt.Sprintf("wave-%02d", wave+1), false, false))
 		}
 		batch.close()
+		report.Observer = append(report.Observer, readObserverRecords(t, batch.observer)...)
+		report.ObjectCounts = append(report.ObjectCounts, batch.objectCounts())
 	}
 	var scored, concurrentWork, serialWork []int64
 	for _, sample := range report.Samples {
@@ -156,13 +219,24 @@ func TestPF01FourAgentPerformance(t *testing.T) {
 	if serialMedian := nearestRank(serialWork, 50); serialMedian > 0 {
 		report.SerialRatio = float64(nearestRank(concurrentWork, 50)) / float64(serialMedian)
 	}
-	if os.Getenv("PF01_REFERENCE_RUNNER") != "1" {
-		report.Result = "INVALID_ENVIRONMENT"
-		report.Reason = "PF01_REFERENCE_RUNNER=1 and registered cgroup/storage fingerprint are required for a release PASS"
+	if err := validateObserver(&report); err != nil {
+		report.Result, report.Reason = "FAIL", err.Error()
 		return
 	}
-	report.Result = "INVALID_ENVIRONMENT"
-	report.Reason = "PF-01 client/point/stage/resource records and the 5/3/3 crash table are not complete"
+	if profile == "release" {
+		if err := validateReleaseThresholds(&report); err != nil {
+			report.Result, report.Reason = "FAIL", err.Error()
+			return
+		}
+	}
+	if profile == "smoke" {
+		report.Result = "PASS"
+		return
+	}
+	report.Result = releasePFResult(&report)
+	if report.Result != "PASS" {
+		report.Reason = "release thresholds or approved baseline did not pass"
+	}
 }
 
 func newPFBatch(
@@ -170,6 +244,16 @@ func newPFBatch(
 	ctx context.Context,
 	binary, image, source, initial, root, id string,
 	parallel int,
+) *pfBatch {
+	return newPFBatchWithEnv(t, ctx, binary, image, source, initial, root, id, parallel, nil)
+}
+
+func newPFBatchWithEnv(
+	t *testing.T,
+	ctx context.Context,
+	binary, image, source, initial, root, id string,
+	parallel int,
+	extraEnvironment []string,
 ) *pfBatch {
 	t.Helper()
 	if err := os.MkdirAll(root, 0o700); err != nil {
@@ -180,23 +264,28 @@ func newPFBatch(
 	instructions := filepath.Join(root, "instructions.md")
 	writeFile(t, instructions, []byte("Execute the deterministic PF-01 bootstrap contract.\n"), 0o600)
 	config := writePerfConfig(t, root, dataDir, socket, image, parallel)
-	daemon := startDaemon(t, binary, config, socket)
+	observer := filepath.Join(root, "observer.jsonl")
+	environment := append([]string{
+		"COORDPLANE_PERF_OBSERVER_OUTPUT=" + observer,
+		"COORDPLANE_PERF_SAMPLE_ID=" + id,
+	}, extraEnvironment...)
+	daemon := startDaemonWithEnv(t, binary, config, socket, environment)
 	registerLiveHomeCleanup(t, image, dataDir)
 	waitForReady(t, ctx, binary, socket, id+" startup")
-	roles := []string{"A", "B", "C", "D"}
-	agents := make([]core.Agent, 4)
-	for index, role := range roles {
-		agents[index] = runJSON[core.Agent](t, ctx, binary, "agent", "add", "--socket", socket, "--display-name", "PF01 "+role, "--adapter", "codex", "--image", image, "--instructions-file", instructions, "--request-id", id+"-agent-"+role, "--output", "json")
-	}
-	project := runJSON[core.Project](t, ctx, binary, "project", "add", "--socket", socket, "--name", "PF01 "+id, "--repo", source, "--ref", "refs/heads/main", "--integration-agent", agents[0].ID, "--request-id", id+"-project", "--output", "json")
-	if project.InitialSHA != initial || project.CanonicalSHA != initial {
-		t.Fatalf("PF-01 batch %s started at %s/%s, want %s", id, project.InitialSHA, project.CanonicalSHA, initial)
-	}
-	return &pfBatch{
+	batch := &pfBatch{
 		t: t, ctx: ctx, binary: binary, image: image, id: id,
 		root: root, dataDir: dataDir, socket: socket, daemon: daemon,
-		agents: agents, project: project, initialSHA: initial, parallel: parallel,
+		initialSHA: initial, parallel: parallel, observer: observer,
 	}
+	batch.agents = make([]core.Agent, len(pfRoles))
+	for index, role := range pfRoles {
+		batch.agents[index] = pfJSON[core.Agent](batch, "agent", "add", "--socket", socket, "--display-name", "PF01 "+role, "--adapter", "codex", "--image", image, "--instructions-file", instructions, "--request-id", id+"-agent-"+role, "--output", "json")
+	}
+	batch.project = pfJSON[core.Project](batch, "project", "add", "--socket", socket, "--name", "PF01 "+id, "--repo", source, "--ref", "refs/heads/main", "--integration-agent", batch.agents[0].ID, "--request-id", id+"-project", "--output", "json")
+	if batch.project.InitialSHA != initial || batch.project.CanonicalSHA != initial {
+		t.Fatalf("PF-01 batch %s started at %s/%s, want %s", id, batch.project.InitialSHA, batch.project.CanonicalSHA, initial)
+	}
+	return batch
 }
 
 func (b *pfBatch) close() {
@@ -208,51 +297,81 @@ func (b *pfBatch) close() {
 
 func (b *pfBatch) runWave(name string, warmup, soak bool) pfSample {
 	b.t.Helper()
-	roles := []string{"A", "B", "C", "D"}
 	waveID := b.id + "-" + name
 	waveStart := time.Now()
 	base := projectDetail(b.t, b.ctx, b.binary, b.socket, b.project.ID).ActualCanonicalSHA
-	tasks := make([]core.Task, len(roles))
-	for index, role := range roles {
-		tasks[index] = runJSON[core.Task](b.t, b.ctx, b.binary, "task", "create", "--socket", b.socket, "--project", b.project.ID, "--agent", b.agents[index].ID, "--title", "PF01 "+waveID+" "+role, "--description", "p5_role="+role+";pf01=true;progress_count=50", "--request-id", waveID+"-task-"+role, "--output", "json")
+	tasks := make([]core.Task, len(pfRoles))
+	createStarted := make([]time.Time, len(pfRoles))
+	for index, role := range pfRoles {
+		createStarted[index] = time.Now()
+		tasks[index] = pfJSON[core.Task](b, "task", "create", "--socket", b.socket, "--project", b.project.ID, "--agent", b.agents[index].ID, "--title", "PF01 "+waveID+" "+role, "--description", "p5_role="+role+";pf01=true;progress_count=50", "--request-id", waveID+"-task-"+role, "--output", "json")
 		if tasks[index].BaseSHA != base {
 			b.t.Fatalf("PF01 %s task base = %s want %s", waveID, tasks[index].BaseSHA, base)
 		}
 	}
 	goBody := fmt.Sprintf("P5-GO wave=%s d_agent=%s d_task=%s", waveID, b.agents[3].ID, tasks[3].ID)
 	var workStart time.Time
-	if b.parallelism() == 4 {
-		waitForTaskRuns(b.t, b.ctx, b.binary, b.socket, tasks)
+	var statusNS []int64
+	queueNS := make([]int64, len(tasks))
+	var fanoutNS int64
+	if b.parallel == 4 {
+		for index, task := range tasks {
+			b.waitRunRow(task.ID)
+			queueNS[index] = time.Since(createStarted[index]).Nanoseconds()
+		}
+		for _, task := range tasks {
+			b.waitRun(task.ID, "PF01 READY")
+		}
+		fanoutNS = time.Since(createStarted[len(createStarted)-1]).Nanoseconds()
 		time.Sleep(time.Second)
-		workStart = sendPFGo(b.t, b.ctx, b.binary, b.socket, b.project.ID, b.agents, tasks, goBody, waveID)
+		if soakStatusHold(name) {
+			statusNS = samplePFStatus(b.t, b.ctx, b.binary, b.socket)
+		}
+		workStart = b.sendGO(tasks, goBody, waveID)
 	} else {
-		for index, role := range roles {
-			waitForPFRun(b.t, b.ctx, b.binary, b.socket, tasks[index].ID, role+" serial READY")
+		for index, role := range pfRoles {
+			b.waitRunRow(tasks[index].ID)
+			queueNS[index] = time.Since(createStarted[index]).Nanoseconds()
+			b.waitRun(tasks[index].ID, role+" serial READY")
 			started := time.Now()
 			if workStart.IsZero() {
 				workStart = started
 			}
 			sendBossMessage(b.t, b.ctx, b.binary, b.socket, b.project.ID, b.agents[index].ID, tasks[index].ID, goBody, waveID+"-go-"+role)
-			tasks[index] = waitForPFTask(b.t, b.ctx, b.binary, b.socket, tasks[index].ID, role+" serial submit", capturedTask)
+			tasks[index] = b.waitTask(tasks[index].ID, role+" serial submit", capturedTask)
 		}
 	}
 	for index := range tasks {
-		tasks[index] = waitForPFTask(b.t, b.ctx, b.binary, b.socket, tasks[index].ID, roles[index]+" submitted", capturedTask)
+		tasks[index] = b.waitTask(tasks[index].ID, pfRoles[index]+" submitted", capturedTask)
 	}
 	workDuration := time.Since(workStart)
-	if b.parallelism() == 4 {
+	var directCASNS, integrations3NS int64
+	var integrationNS []int64
+	if b.parallel == 4 {
+		var integrationsStarted time.Time
 		for index := range tasks {
-			runJSON[core.Task](b.t, b.ctx, b.binary, "task", "accept", tasks[index].ID, "--socket", b.socket, "--integration-agent", b.agents[0].ID, "--request-id", waveID+"-accept-"+roles[index], "--output", "json")
-			tasks[index] = waitForPFTask(b.t, b.ctx, b.binary, b.socket, tasks[index].ID, roles[index]+" integrated", func(task core.Task) bool { return task.Status == core.TaskCompleted })
+			acceptStarted := time.Now()
+			pfJSON[core.Task](b, "task", "accept", tasks[index].ID, "--socket", b.socket, "--integration-agent", b.agents[0].ID, "--request-id", waveID+"-accept-"+pfRoles[index], "--output", "json")
+			integrationStarted := time.Now()
+			if index == 1 {
+				integrationsStarted = acceptStarted
+			}
+			tasks[index] = b.waitTask(tasks[index].ID, pfRoles[index]+" integrated", func(task core.Task) bool { return task.Status == core.TaskCompleted })
+			if index == 0 {
+				directCASNS = time.Since(acceptStarted).Nanoseconds()
+			} else {
+				integrationNS = append(integrationNS, time.Since(integrationStarted).Nanoseconds())
+			}
 		}
+		integrations3NS = time.Since(integrationsStarted).Nanoseconds()
 	} else {
 		for index := range tasks {
-			tasks[index] = runJSON[core.Task](b.t, b.ctx, b.binary, "task", "cancel", tasks[index].ID, "--socket", b.socket, "--reason", "PF-01 serial comparison complete", "--request-id", waveID+"-cancel-"+roles[index], "--output", "json")
+			tasks[index] = pfJSON[core.Task](b, "task", "cancel", tasks[index].ID, "--socket", b.socket, "--reason", "PF-01 serial comparison complete", "--request-id", waveID+"-cancel-"+pfRoles[index], "--output", "json")
 		}
 	}
 	final := projectDetail(b.t, b.ctx, b.binary, b.socket, b.project.ID).ActualCanonicalSHA
 	control := filepath.Join(b.dataDir, "repos", b.project.ID+".git")
-	if b.parallelism() == 4 {
+	if b.parallel == 4 {
 		for _, task := range tasks {
 			gitDirSucceeds(b.t, b.ctx, control, "merge-base", "--is-ancestor", task.HeadSHA, final)
 		}
@@ -260,46 +379,176 @@ func (b *pfBatch) runWave(name string, warmup, soak bool) pfSample {
 		b.t.Fatalf("serial comparison moved canonical from %s to %s", base, final)
 	}
 	gitDirSucceeds(b.t, b.ctx, control, "fsck", "--full", "--strict")
+	diskBytes := directoryBytesExcept(b.t, b.dataDir, "")
 	waveDuration := time.Since(waveStart)
 	cleanupStart := time.Now()
 	waitForNoProjectContainers(b.t, b.ctx, b.project.ID)
-	runJSON[core.GCPreview](b.t, b.ctx, b.binary, "gc", "preview", "--socket", b.socket, "--output", "json")
-	runJSON[core.GCRunResult](b.t, b.ctx, b.binary, "gc", "run", "--socket", b.socket, "--confirm", "--request-id", waveID+"-gc", "--output", "json")
+	containerAbsentNS := time.Since(cleanupStart).Nanoseconds()
+	pfJSON[core.GCPreview](b, "gc", "preview", "--socket", b.socket, "--output", "json")
+	pfJSON[core.GCRunResult](b, "gc", "run", "--socket", b.socket, "--confirm", "--request-id", waveID+"-gc", "--output", "json")
 	waitForWorkspacesRemoved(b.t, b.ctx, b.dataDir, b.project.ID, tasks[0].ID, tasks[1].ID, tasks[2].ID, tasks[3].ID)
 	cleanupDuration := time.Since(cleanupStart)
+	var stableRSS, stableGoroutines, stableFDs int64
+	if b.trackSoak && !warmup {
+		time.Sleep(5 * time.Second)
+		stableRSS, stableGoroutines, stableFDs = latestPFResource(b.t, b.observer)
+	}
 	heads := make([]string, 4)
+	taskIDs := make([]string, 4)
+	runIDs := make([]string, 4)
+	var integrationTaskIDs, integrationRunIDs []string
 	for index := range tasks {
 		heads[index] = tasks[index].HeadSHA
+		taskIDs[index] = tasks[index].ID
+		runIDs[index] = tasks[index].HeadRunID
+		if tasks[index].IntegrationTaskID != "" {
+			integration := taskDetail(b.t, b.ctx, b.binary, b.socket, tasks[index].IntegrationTaskID).Task
+			integrationTaskIDs = append(integrationTaskIDs, integration.ID)
+			integrationRunIDs = append(integrationRunIDs, integration.HeadRunID)
+		}
 	}
 	integrationTasks := 0
-	if b.parallelism() == 4 {
+	if b.parallel == 4 {
 		integrationTasks = 3
 	}
 	return pfSample{
-		ID: waveID, BatchID: b.id, Parallelism: b.parallelism(), Warmup: warmup, Soak: soak,
+		ID: waveID, BatchID: b.id, Parallelism: b.parallel, Warmup: warmup, Soak: soak,
 		WaveNS: waveDuration.Nanoseconds(), WorkNS: workDuration.Nanoseconds(), CleanupNS: cleanupDuration.Nanoseconds(),
+		ContainerAbsentNS:  containerAbsentNS,
 		ProgressOperations: 200, PeerMessages: 10, IntegrationTasks: integrationTasks,
-		FinalSHA: final, TaskHeads: heads,
+		FinalSHA: final, TaskHeads: heads, TaskIDs: taskIDs, RunIDs: runIDs,
+		IntegrationTaskIDs: integrationTaskIDs, IntegrationRunIDs: integrationRunIDs,
+		QueueNS: queueNS, FanoutNS: fanoutNS, DirectCASNS: directCASNS,
+		IntegrationNS: integrationNS, Integrations3NS: integrations3NS, StatusNS: statusNS,
+		DiskBytes:      diskBytes,
+		StableRSSBytes: stableRSS, StableGoroutines: stableGoroutines, StableFDs: stableFDs,
 	}
 }
 
-func (b *pfBatch) parallelism() int {
-	return b.parallel
+func (b *pfBatch) waitRunRow(taskID string) core.Run {
+	b.t.Helper()
+	return eventually(b.t, b.ctx, 30*time.Second, "PF-01 Run row", func() (core.Run, bool, string) {
+		detail, err := commandJSON[core.TaskDetail](b.ctx, b.binary, "task", "show", taskID, "--socket", b.socket, "--output", "json")
+		if err != nil {
+			return core.Run{}, false, err.Error()
+		}
+		if detail.CurrentRun == nil {
+			return core.Run{}, false, string(detail.Task.Status)
+		}
+		return *detail.CurrentRun, true, ""
+	})
+}
+
+func soakStatusHold(name string) bool {
+	var index int
+	_, _ = fmt.Sscanf(name, "soak-%02d", &index)
+	return index > 10
+}
+
+func samplePFStatus(t *testing.T, ctx context.Context, binary, socket string) []int64 {
+	t.Helper()
+	values := make([]int64, 200)
+	for index := range values {
+		started := time.Now()
+		status := runJSON[core.Status](t, ctx, binary, "status", "--socket", socket, "--output", "json")
+		if !status.DaemonReady {
+			t.Fatal("status sample observed daemon_ready=false")
+		}
+		values[index] = time.Since(started).Nanoseconds()
+	}
+	return values
+}
+
+func latestPFResource(t *testing.T, path string) (int64, int64, int64) {
+	t.Helper()
+	var rss, goroutines, fds int64
+	for _, record := range readObserverRecords(t, path) {
+		if record["record_type"] == "resource" {
+			rss = int64(record["rss_bytes"].(float64))
+			goroutines = int64(record["goroutines"].(float64))
+			fds = int64(record["open_fds"].(float64))
+		}
+	}
+	if rss == 0 {
+		t.Fatal("observer has no resource record")
+	}
+	return rss, goroutines, fds
+}
+
+func (b *pfBatch) objectCounts() pfObjectCounts {
+	b.t.Helper()
+	database, err := sql.Open("sqlite", filepath.Join(b.dataDir, "coordplane.db"))
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	defer database.Close()
+	counts := pfObjectCounts{SampleID: b.id, ProjectID: b.project.ID}
+	query := `WITH selected(id) AS (VALUES (?)) SELECT
+		(SELECT count(*) FROM tasks WHERE project_id=selected.id),
+		(SELECT count(*) FROM runs WHERE project_id=selected.id),
+		(SELECT count(*) FROM messages WHERE project_id=selected.id),
+		(SELECT count(*) FROM events WHERE project_id=selected.id),
+		(SELECT count(*) FROM messages WHERE project_id=selected.id AND body LIKE 'PF01-PEER %'),
+		(SELECT count(*) FROM messages WHERE project_id=selected.id AND body LIKE 'PF01-PEER %' AND state='acknowledged'),
+		(SELECT count(*) FROM events WHERE project_id=selected.id AND kind='message.acknowledged' AND entity_id IN (SELECT id FROM messages WHERE body LIKE 'PF01-PEER %')),
+		(SELECT count(*) FROM runs WHERE project_id=selected.id AND state IN ('starting','active')) FROM selected`
+	if err := database.QueryRow(query, b.project.ID).Scan(
+		&counts.Tasks, &counts.Runs, &counts.Messages, &counts.Events,
+		&counts.PeerMessages, &counts.PeerAcknowledged, &counts.PeerAckEvent, &counts.OpenRuns,
+	); err != nil {
+		b.t.Fatal(err)
+	}
+	counts.OwnedResidue = ownedResidue(b.t, b.dataDir)
+	if counts.OpenRuns != 0 || counts.OwnedResidue != 0 || counts.PeerMessages != counts.PeerAcknowledged || counts.PeerMessages != counts.PeerAckEvent {
+		b.t.Fatalf("%s durable counts or cleanup differ: %#v", b.id, counts)
+	}
+	return counts
+}
+
+func readObserverRecords(t *testing.T, path string) []map[string]any {
+	t.Helper()
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	var records []map[string]any
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		var record map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
+			t.Fatalf("decode PF-01 observer record: %v", err)
+		}
+		records = append(records, record)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return records
+}
+
+func ownedResidue(t *testing.T, dataDir string) int {
+	t.Helper()
+	count := 0
+	for _, root := range []string{"workspaces", "handoff", "run-control"} {
+		_ = filepath.Walk(filepath.Join(dataDir, root), func(path string, info os.FileInfo, err error) error {
+			if err == nil && info.Mode().IsRegular() {
+				count++
+			}
+			return nil
+		})
+	}
+	return count
 }
 
 func capturedTask(task core.Task) bool {
 	return task.Status == core.TaskSubmitted && task.HeadSHA != "" && task.TaskRef != ""
 }
 
-func waitForPFTask(
-	t *testing.T,
-	ctx context.Context,
-	binary, socket, taskID, reason string,
-	predicate func(core.Task) bool,
-) core.Task {
-	t.Helper()
-	return eventually(t, ctx, 3*time.Minute, reason, func() (core.Task, bool, string) {
-		detail, err := commandJSON[core.TaskDetail](ctx, binary, "task", "show", taskID, "--socket", socket, "--output", "json")
+func (b *pfBatch) waitTask(taskID, reason string, predicate func(core.Task) bool) core.Task {
+	b.t.Helper()
+	return eventually(b.t, b.ctx, 3*time.Minute, reason, func() (core.Task, bool, string) {
+		detail, err := commandJSON[core.TaskDetail](b.ctx, b.binary, "task", "show", taskID, "--socket", b.socket, "--output", "json")
 		if err != nil {
 			return core.Task{}, false, err.Error()
 		}
@@ -310,16 +559,10 @@ func waitForPFTask(
 	})
 }
 
-func waitForTaskRuns(t *testing.T, ctx context.Context, binary, socket string, tasks []core.Task) {
-	for _, task := range tasks {
-		waitForPFRun(t, ctx, binary, socket, task.ID, "PF01 READY")
-	}
-}
-
-func waitForPFRun(t *testing.T, ctx context.Context, binary, socket, taskID, reason string) core.Run {
-	t.Helper()
-	run := eventually(t, ctx, 60*time.Second, reason, func() (core.Run, bool, string) {
-		detail, err := commandJSON[core.TaskDetail](ctx, binary, "task", "show", taskID, "--socket", socket, "--output", "json")
+func (b *pfBatch) waitRun(taskID, reason string) core.Run {
+	b.t.Helper()
+	run := eventually(b.t, b.ctx, 60*time.Second, reason, func() (core.Run, bool, string) {
+		detail, err := commandJSON[core.TaskDetail](b.ctx, b.binary, "task", "show", taskID, "--socket", b.socket, "--output", "json")
 		if err != nil {
 			return core.Run{}, false, err.Error()
 		}
@@ -331,21 +574,14 @@ func waitForPFRun(t *testing.T, ctx context.Context, binary, socket, taskID, rea
 		}
 		return *detail.CurrentRun, true, ""
 	})
-	if inspect := inspectContainer(t, ctx, run.ContainerID); !inspect.State.Running {
-		t.Fatalf("PF-01 READY Run %s is not live in Docker", run.ID)
+	if inspect := inspectContainer(b.t, b.ctx, run.ContainerID); !inspect.State.Running {
+		b.t.Fatalf("PF-01 READY Run %s is not live in Docker", run.ID)
 	}
 	return run
 }
 
-func sendPFGo(
-	t *testing.T,
-	ctx context.Context,
-	binary, socket, projectID string,
-	agents []core.Agent,
-	tasks []core.Task,
-	body, waveID string,
-) time.Time {
-	t.Helper()
+func (b *pfBatch) sendGO(tasks []core.Task, body, waveID string) time.Time {
+	b.t.Helper()
 	type result struct {
 		started time.Time
 		err     error
@@ -356,8 +592,8 @@ func sendPFGo(
 		go func(index int) {
 			<-barrier
 			started := time.Now()
-			_, err := commandJSON[core.Message](ctx, binary, "message", "send", "--socket", socket,
-				"--project", projectID, "--agent", agents[index].ID, "--task", tasks[index].ID,
+			_, err := commandJSON[core.Message](b.ctx, b.binary, "message", "send", "--socket", b.socket,
+				"--project", b.project.ID, "--agent", b.agents[index].ID, "--task", tasks[index].ID,
 				"--body", body, "--request-id", waveID+"-go-"+string(rune('A'+index)), "--output", "json")
 			results <- result{started: started, err: err}
 		}(index)
@@ -367,13 +603,17 @@ func sendPFGo(
 	for range tasks {
 		result := <-results
 		if result.err != nil {
-			t.Fatalf("send PF-01 GO: %v", result.err)
+			b.t.Fatalf("send PF-01 GO: %v", result.err)
 		}
 		if earliest.IsZero() || result.started.Before(earliest) {
 			earliest = result.started
 		}
 	}
 	return earliest
+}
+
+func pfJSON[T any](batch *pfBatch, args ...string) T {
+	return runJSON[T](batch.t, batch.ctx, batch.binary, args...)
 }
 
 func writePerfConfig(t *testing.T, root, dataDir, socket, image string, parallel int) string {
@@ -450,13 +690,19 @@ func directoryBytesExcept(t *testing.T, root, excluded string) int64 {
 	t.Helper()
 	var total int64
 	if err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 		if path == excluded {
 			return filepath.SkipDir
 		}
-		if err == nil && info.Mode().IsRegular() {
+		if info.Mode().IsRegular() {
 			total += info.Size()
 		}
-		return err
+		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}

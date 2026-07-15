@@ -177,25 +177,30 @@ func (s *Service) createWorkTask(ctx context.Context, input workTaskRequest) (Ta
 			return err
 		})
 	}
-	if input.sourceTaskID == "" {
-		err = mutate()
-	} else if executor, ok := s.projectGit.(TaskGit); !ok {
-		err = NewError(CodeGitInvariantViolation, "task Git executor is not configured", false)
-	} else {
-		err = executor.UseTaskRef(ctx, GitTaskRefIntent{
-			ProjectID: input.projectID, ControlRepo: snapshot.project.ControlRepoPath,
-			TaskRef: snapshot.source.TaskRef, ExpectedSHA: snapshot.source.HeadSHA,
-		}, func(actual string) error {
-			if actual != snapshot.source.HeadSHA {
-				return NewError(CodeGitInvariantViolation, "source task ref changed", false)
-			}
-			return mutate()
-		})
-	}
+	err = s.useSourceTaskRef(ctx, input, snapshot, mutate)
 	if err != nil && isGitInvariant(err) {
 		err = WrapError(CodeGitInvariantViolation, "use source task ref", false, err)
 	}
 	return task, err
+}
+
+func (s *Service) useSourceTaskRef(ctx context.Context, input workTaskRequest, snapshot taskCreationSnapshot, mutate func() error) error {
+	if input.sourceTaskID == "" {
+		return mutate()
+	}
+	executor, ok := s.projectGit.(TaskGit)
+	if !ok {
+		return NewError(CodeGitInvariantViolation, "task Git executor is not configured", false)
+	}
+	return executor.UseTaskRef(ctx, GitTaskRefIntent{
+		ProjectID: input.projectID, ControlRepo: snapshot.project.ControlRepoPath,
+		TaskRef: snapshot.source.TaskRef, ExpectedSHA: snapshot.source.HeadSHA,
+	}, func(actual string) error {
+		if actual != snapshot.source.HeadSHA {
+			return NewError(CodeGitInvariantViolation, "source task ref changed", false)
+		}
+		return mutate()
+	})
 }
 
 func (s *Service) insertWorkTask(

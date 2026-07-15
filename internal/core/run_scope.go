@@ -3,6 +3,8 @@ package core
 import (
 	"context"
 	"strings"
+
+	"coordplane/internal/perfobs"
 )
 
 func (s *Service) TaskForRun(ctx context.Context, token, taskID string) (Task, error) {
@@ -97,11 +99,13 @@ func (s *Service) AcknowledgeAgentMessages(ctx context.Context, input Acknowledg
 	}
 	dedupe := requestDedupe{"", "message.ack", requestID, inputHash}
 	var acknowledged []Message
+	var observerRunID string
 	err = s.repository.Transact(ctx, func(tx Transaction) error {
 		scope, err := scopedRun(tx, input.Token)
 		if err != nil {
 			return err
 		}
+		observerRunID = scope.ID
 		actorScope := "run:" + scope.ID
 		dedupe.scope = actorScope
 		if _, ok, err := dedupe.replay(tx); err != nil {
@@ -121,5 +125,13 @@ func (s *Service) AcknowledgeAgentMessages(ctx context.Context, input Acknowledg
 		}
 		return dedupe.record(tx, scope.ID, "", now)
 	})
+	if err == nil {
+		for _, message := range acknowledged {
+			perfobs.Point("core.message.acknowledged_commit", perfobs.Fields{
+				RequestID: requestID, ProjectID: message.ProjectID, TaskID: message.TaskID,
+				RunID: observerRunID, MessageID: message.ID,
+			}, "success")
+		}
+	}
 	return acknowledged, err
 }

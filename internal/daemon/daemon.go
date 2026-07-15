@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 
+	"coordplane/internal/perfobs"
 	"coordplane/internal/transport"
 )
 
@@ -36,6 +37,10 @@ func Open(ctx context.Context, configPath string) (*Daemon, error) {
 }
 
 func Run(ctx context.Context, configPath string) error {
+	if err := perfobs.Start(ctx); err != nil {
+		return err
+	}
+	defer perfobs.Stop()
 	daemon, err := Open(ctx, configPath)
 	if err != nil {
 		return err

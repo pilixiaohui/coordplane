@@ -3,6 +3,8 @@ package core
 import (
 	"context"
 	"strings"
+
+	"coordplane/internal/perfobs"
 )
 
 type bossAgentMessage struct {
@@ -102,6 +104,11 @@ func (s *Service) sendBossAgentMessage(ctx context.Context, input bossAgentMessa
 		}
 		return recordBossAgentMessage(dedupe, tx, input.operation, task, message, now)
 	})
+	if err == nil {
+		perfobs.Point("core.message.created_commit", perfobs.Fields{
+			RequestID: input.requestID, ProjectID: message.ProjectID, TaskID: message.TaskID, MessageID: message.ID,
+		}, "success")
+	}
 	return task, message, err
 }
 

@@ -3,6 +3,8 @@ package core
 import (
 	"context"
 	"strings"
+
+	"coordplane/internal/perfobs"
 )
 
 func (s *Service) RequestOutcome(ctx context.Context, input OutcomeInput) (OutcomeResult, error) {
@@ -22,23 +24,8 @@ func (s *Service) RequestOutcome(ctx context.Context, input OutcomeInput) (Outco
 	if err != nil {
 		return OutcomeResult{}, err
 	}
-	switch input.Outcome {
-	case OutcomeWait, OutcomeFail:
-		if reason == "" {
-			return OutcomeResult{}, NewError(CodeInvalidArgument, "reason is required", false)
-		}
-		if summary != "" || expectedHead != "" {
-			return OutcomeResult{}, NewError(CodeInvalidArgument, "summary and expected_head are only valid for submit", false)
-		}
-	case OutcomeSubmit:
-		if summary == "" || expectedHead == "" {
-			return OutcomeResult{}, NewError(CodeInvalidArgument, "summary and expected_head are required for submit", false)
-		}
-		if reason != "" {
-			return OutcomeResult{}, NewError(CodeInvalidArgument, "reason is not valid for submit", false)
-		}
-	default:
-		return OutcomeResult{}, NewError(CodeInvalidArgument, "outcome must be wait, submit, or fail", false)
+	if err := validateOutcomeFields(input.Outcome, reason, summary, expectedHead); err != nil {
+		return OutcomeResult{}, err
 	}
 	requestID, err := s.requestID(input.RequestID)
 	if err != nil {
@@ -146,5 +133,37 @@ func (s *Service) RequestOutcome(ctx context.Context, input OutcomeInput) (Outco
 		result = OutcomeResult{Task: task, Run: run, Acknowledged: acknowledged}
 		return nil
 	})
+	if err == nil {
+		fields := perfobs.Fields{
+			RequestID: requestID, OperationID: result.Task.PendingActionID,
+			ProjectID: result.Task.ProjectID, TaskID: result.Task.ID, RunID: result.Run.ID,
+		}
+		perfobs.Point("core.outcome.accepted_commit", fields, "success")
+		if result.Task.PendingActionID != "" {
+			perfobs.StartStage("git.capture.freeze", result.Run.ID, fields)
+		}
+	}
 	return result, err
+}
+
+func validateOutcomeFields(outcome Outcome, reason, summary, expectedHead string) error {
+	switch outcome {
+	case OutcomeWait, OutcomeFail:
+		if reason == "" {
+			return NewError(CodeInvalidArgument, "reason is required", false)
+		}
+		if summary != "" || expectedHead != "" {
+			return NewError(CodeInvalidArgument, "summary and expected_head are only valid for submit", false)
+		}
+	case OutcomeSubmit:
+		if summary == "" || expectedHead == "" {
+			return NewError(CodeInvalidArgument, "summary and expected_head are required for submit", false)
+		}
+		if reason != "" {
+			return NewError(CodeInvalidArgument, "reason is not valid for submit", false)
+		}
+	default:
+		return NewError(CodeInvalidArgument, "outcome must be wait, submit, or fail", false)
+	}
+	return nil
 }

@@ -230,6 +230,10 @@ type daemonProcess struct {
 }
 
 func startDaemon(t *testing.T, binary, configPath, socket string) *daemonProcess {
+	return startDaemonWithEnv(t, binary, configPath, socket, nil)
+}
+
+func startDaemonWithEnv(t *testing.T, binary, configPath, socket string, environment []string) *daemonProcess {
 	t.Helper()
 	logPath := filepath.Join(filepath.Dir(configPath), fmt.Sprintf("daemon-%d.log", time.Now().UnixNano()))
 	logFile, err := os.Create(logPath)
@@ -237,6 +241,7 @@ func startDaemon(t *testing.T, binary, configPath, socket string) *daemonProcess
 		t.Fatal(err)
 	}
 	command := exec.Command(binary, "serve", "--config", configPath)
+	command.Env = append(os.Environ(), environment...)
 	command.Stdout, command.Stderr = logFile, logFile
 	if err := command.Start(); err != nil {
 		_ = logFile.Close()
@@ -261,6 +266,26 @@ func startDaemon(t *testing.T, binary, configPath, socket string) *daemonProcess
 	}
 	t.Fatalf("daemon socket did not appear\n%s", readLog(logPath))
 	return nil
+}
+
+func (p *daemonProcess) Kill() error {
+	if p == nil {
+		return nil
+	}
+	p.stopOnce.Do(func() {
+		if p.command.Process == nil {
+			p.stopErr = errors.New("daemon process was not started")
+			return
+		}
+		if err := p.command.Process.Kill(); err != nil {
+			p.stopErr = err
+			return
+		}
+		if err := <-p.done; err == nil {
+			p.stopErr = errors.New("daemon exited successfully after SIGKILL")
+		}
+	})
+	return p.stopErr
 }
 
 func (p *daemonProcess) Stop() error {

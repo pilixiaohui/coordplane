@@ -165,4 +165,7 @@ func TestContainerSpecKeepsTrustedRuntimeEnvironmentOverProviderAllowlist(t *tes
 			t.Errorf("container %s = %q, want trusted %q", name, spec.Command.Env[name], value)
 		}
 	}
+	if spec.Limits.PIDs != 256 || spec.Limits.MemoryBytes != 512<<20 || spec.Limits.NanoCPUs != 1_000_000_000 {
+		t.Fatalf("Agent resource contract = %#v, want 1 CPU / 512 MiB / 256 PIDs", spec.Limits)
+	}
 }

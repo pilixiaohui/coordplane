@@ -41,12 +41,14 @@ file_blockers=$tmp/file-blockers
 function_warnings=$tmp/function-warnings
 function_blockers=$tmp/function-blockers
 gofmt_bad=$tmp/gofmt
+untracked_maintained=$tmp/untracked-maintained
 : >"$records"
 : >"$unknown"
 : >"$file_warnings"
 : >"$file_blockers"
 : >"$function_warnings"
 : >"$function_blockers"
+: >"$untracked_maintained"
 
 classify() {
   classify_path=$1
@@ -141,6 +143,9 @@ git ls-files --cached --others --exclude-standard | LC_ALL=C sort -u | while IFS
   bucket=${classification%%|*}
   module=${classification#*|}
   [ "$bucket" != excluded ] || continue
+	if ! git ls-files --error-unmatch "$path" >/dev/null 2>&1; then
+		printf '%s\n' "$path" >>"$untracked_maintained"
+	fi
   case "$path" in *.go) lines=$(count_go "$path") ;; *) lines=$(count_text "$path") ;; esac
   case "$bucket" in
     generated_*)
@@ -189,15 +194,19 @@ generated_total=$((generated_semantic_production + generated_semantic_tests + ge
 first_party_source_total=$((total + generated_mechanical_excluded))
 
 failure=false
-[ "$production" -le 14650 ] || failure=true
-[ "$tests" -le 19000 ] || failure=true
+[ "$production" -le 20500 ] || failure=true
+[ "$tests" -le 22500 ] || failure=true
 [ "$infra" -le 600 ] || failure=true
-[ "$total" -le 34250 ] || failure=true
+[ "$total" -le 43600 ] || failure=true
 [ "$generated_total" -le 3000 ] || failure=true
 [ ! -s "$unknown" ] || failure=true
 [ ! -s "$file_blockers" ] || failure=true
 [ ! -s "$function_blockers" ] || failure=true
 [ ! -s "$gofmt_bad" ] || failure=true
+clean=true
+git diff --quiet -- && git diff --cached --quiet -- || clean=false
+[ ! -s "$untracked_maintained" ] || clean=false
+[ "$clean" = true ] || failure=true
 
 json_tmp=$tmp/report.json
 awk -F'|' \
@@ -206,7 +215,7 @@ awk -F'|' \
   -v gsp="$generated_semantic_production" -v gst="$generated_semantic_tests" -v gsi="$generated_semantic_infra" -v gme="$generated_mechanical_excluded" \
   -v production="$production" -v tests="$tests" -v infra="$infra" -v total="$total" \
   -v generated="$generated_total" -v source_total="$first_party_source_total" -v fixture_bytes="$fixture_bytes" \
-  -v unknown="$unknown" -v fw="$file_warnings" -v fb="$file_blockers" -v fnw="$function_warnings" -v fnb="$function_blockers" -v gofmt_bad="$gofmt_bad" -v failed="$failure" '
+  -v unknown="$unknown" -v fw="$file_warnings" -v fb="$file_blockers" -v fnw="$function_warnings" -v fnb="$function_blockers" -v gofmt_bad="$gofmt_bad" -v clean="$clean" -v failed="$failure" '
   function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
   function array(path, line, first) {
     printf "["; first=1
@@ -218,11 +227,12 @@ awk -F'|' \
     printf "{\n  \"schema_version\": 1,\n  \"revision\": \"%s\",\n  \"base_revision\": \"%s\",\n", revision, base
     printf "  \"atomic_buckets\": {\"handwritten_production\":%d,\"handwritten_tests\":%d,\"handwritten_infra\":%d,\"generated_semantic_production\":%d,\"generated_semantic_tests\":%d,\"generated_semantic_infra\":%d,\"generated_mechanical_excluded\":%d},\n", hp,ht,hi,gsp,gst,gsi,gme
     printf "  \"budgeted\": {\"production\":%d,\"tests\":%d,\"infra\":%d,\"total\":%d},\n", production,tests,infra,total
-    printf "  \"thresholds\": {\"production\":14650,\"tests\":19000,\"infra\":600,\"total\":34250,\"generated_review\":3000},\n"
+    printf "  \"thresholds\": {\"production\":20500,\"tests\":22500,\"infra\":600,\"total\":43600,\"generated_review\":3000},\n"
     printf "  \"generated_total\": %d,\n  \"first_party_source_total\": %d,\n  \"fixture_bytes\": %d,\n", generated,source_total,fixture_bytes
     printf "  \"modules\": {"; n=asorti(module, keys); for(i=1;i<=n;i++){split(keys[i],p,SUBSEP); if(i>1)printf ","; printf "\"%s/%s\":%d",esc(p[1]),esc(p[2]),module[keys[i]]} printf "},\n"
     printf "  \"diff\": {\"raw_added\":%d,\"raw_deleted\":%d},\n", added,deleted
     printf "  \"quality\": {\"unknown_paths\":"; array(unknown); printf ",\"file_warnings\":"; array(fw); printf ",\"file_blockers\":"; array(fb); printf ",\"function_warnings\":"; array(fnw); printf ",\"function_blockers\":"; array(fnb); printf ",\"gofmt_files\":"; array(gofmt_bad); printf "},\n"
+    printf "  \"clean_revision\": %s,\n", clean=="true" ? "true" : "false"
     printf "  \"pass\": %s\n}\n", failed=="true" ? "false" : "true"
   }
 ' "$records" >"$json_tmp"

@@ -120,6 +120,7 @@ func Run(ctx context.Context, args []string, getenv environment, stdin io.Reader
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
+	client = withPerfObserver(client, stdout)
 	defer client.CloseIdleConnections()
 
 	var runErr error

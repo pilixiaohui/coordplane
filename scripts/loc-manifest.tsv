@@ -1,5 +1,9 @@
 # pattern|atomic bucket|owner module
 internal/architecture/*|handwritten_tests|static_fsm
+internal/perfobs/hooks_perf.go|handwritten_tests|perf
+internal/perfobs/hooks_perf_test.go|handwritten_tests|perf
+internal/coordlinkcli/perf_observer.go|handwritten_tests|perf
+internal/perfobs/*|handwritten_production|daemon_config_shared
 internal/buildinfo/*_test.go|handwritten_tests|static_fsm
 internal/core/fsm*_test.go|handwritten_tests|static_fsm
 internal/core/bounds_contract_test.go|handwritten_tests|static_fsm

@@ -193,6 +193,7 @@ type GitCaptureIntent struct {
 	BaseSHA       string
 	ExpectedHead  string
 	Source        *GitSource
+	OperationID   string
 }
 
 type GitCaptureFact struct {
@@ -202,6 +203,9 @@ type GitCaptureFact struct {
 
 type GitAdvanceIntent struct {
 	ProjectID      string
+	TaskID         string
+	RunID          string
+	OperationID    string
 	ControlRepo    string
 	CanonicalRef   string
 	TaskRef        string
