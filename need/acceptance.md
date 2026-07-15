@@ -700,6 +700,17 @@ Reference绝对阈值是发布硬Gate，任何一项失败都不能被baseline�
 
 SLOC是规划和架构漂移信号，不是质量分数。低于预算仍必须满足全部不变量；超过预算先检查重复边界和范围偏移，不能删除错误处理、recovery或测试来换取数字。
 
+Owner已批准保留上述完整产品范围和本节非空、非纯注释物理行统计口径，并用以下envelope透明替换旧预算；本次重基线不构成范围删除、统计排除或测试豁免：
+
+| bucket | 旧目标/软阈值/发布或审查阈值 | 批准的目标/软阈值/发布或审查阈值 | 逐项增量 |
+| --- | ---: | ---: | ---: |
+| Production | `10,500 / 12,550 / 14,650` | `18,500 / 19,500 / 20,500` | `+8,000 / +6,950 / +5,850` |
+| Tests | `12,300 / 15,450 / 19,000` | `20,000 / 21,500 / 22,500` | `+7,700 / +6,050 / +3,500` |
+| Build/test infra | `250 / 400 / 600` | `250 / 400 / 600` | `0 / 0 / 0` |
+| Budgeted total | `23,050 / 28,400 / 34,250` | `38,750 / 41,400 / 43,600` | `+15,700 / +13,000 / +9,350` |
+
+Production和Tests新增空间先以透明、未分配的重基线reserve列入下表，保留原模块/测试边界审查值以持续暴露重复和owner漂移。PF-01完整落地后按12.6节在同一revision报告实际模块分布；reserve不是忽略模块超限或弱化合同的授权。
+
 ### 12.2 Budgeted maintained production预算
 
 | 所有边界 | 目标 | 软阈值 | 模块审查阈值 |
@@ -712,11 +723,12 @@ SLOC是规划和架构漂移信号，不是质量分数。低于预算仍必须�
 | `git`：Project、private clone、capture、task ref、CAS、integration/GC | 1,900 | 2,250 | 2,600 |
 | `adapter`：静态接口/registry和一个production adapter | 550 | 700 | 850 |
 | `daemon/config/shared`：wiring、file lock、worker registry、config、clock/ID/error/redaction | 700 | 850 | 1,000 |
-| **Production合计** | **10,500** | **12,550** | **14,650** |
+| Owner批准的未分配重基线reserve | 8,000 | 6,950 | 5,850 |
+| **Production合计** | **18,500** | **19,500** | **20,500** |
 
-模块超过软阈值可以在production总软阈值内小幅调剂，但必须在变更说明中列出净增量、所属不变量和删除/合并计划。任一模块超过模块审查阈值时必须复核owner边界和重复实现，不能靠把语义搬到其他目录消除命中；只要production总量仍`<=14,650`且复核未发现范围漂移，模块命中本身不阻断发布。Production总量严格`>14,650`时阻断第一版发布，直到删除旧/重复路径，或owner先显式修改需求和预算。
+模块超过软阈值可以在production总软阈值内小幅调剂，但必须在变更说明中列出净增量、所属不变量和删除/合并计划。任一模块超过模块审查阈值时必须复核owner边界和重复实现，不能靠把语义搬到其他目录消除命中；只要production总量仍`<=20,500`、12.6节同revision最终批准已完成且复核未发现范围漂移，模块命中本身不阻断发布。Production总量严格`>20,500`时阻断第一版发布，直到删除旧/重复路径，或owner先显式修改需求和预算。
 
-第二个production adapter不在基线内。确需第一版加入时，规划增量为adapter production目标/软/审查`+450/+550/+650` SLOC、adapter tests`+500/+650/+800` SLOC；完整预算将变为Production `10,950/13,100/15,300`、Tests `12,800/16,100/19,800`、budgeted总计`24,000/29,600/35,700`。必须先把完整表和README改成新基线，再实现并说明为什么一个adapter不能完成产品验收；只有更新后的完整表可作为`loc-budget`输入。
+第二个production adapter不在基线内。确需第一版加入时，规划增量为adapter production目标/软/审查`+450/+550/+650` SLOC、adapter tests`+500/+650/+800` SLOC；完整预算将变为Production `18,950/20,050/21,150`、Tests `20,500/22,150/23,300`、budgeted总计`39,700/42,600/45,050`。必须先把完整表和README改成新基线，再实现并说明为什么一个adapter不能完成产品验收；只有更新后的完整表可作为`loc-budget`输入。
 
 ### 12.3 测试和基础设施预算
 
@@ -729,13 +741,14 @@ SLOC是规划和架构漂移信号，不是质量分数。低于预算仍必须�
 | 真实Docker runtime/fault matrix | 2,200 | 2,800 | 3,500 |
 | Deterministic + real CLI E2E harness | 1,500 | 1,900 | 2,300 |
 | PF-01 harness、fixture generator、phase observer和报告 | 800 | 1,100 | 1,500 |
-| **Tests合计** | **12,300** | **15,450** | **19,000** |
+| Owner批准的未分配重基线reserve | 7,700 | 6,050 | 3,500 |
+| **Tests合计** | **20,000** | **21,500** | **22,500** |
 
 测试超过审查阈值只触发重复fixture/helper和边界重叠审查，不得仅因LOC删除测试。测试能否删除只由对应不变量已删除或已由更低、更真实边界完整替代决定。
 
 PF-01必须复用既有public CLI、Docker/Git fixture helper、静态stage wrapper和状态断言；它只新增负载编排、采样和报告，不得复制Core/Runtime/Git实现到benchmark harness。
 
-Budgeted build/test infrastructure（shell、Dockerfile、Makefile、手写YAML及语义型generated输入/输出）目标250、软阈值400、审查阈值600 SLOC。Budgeted maintained surface目标/软/审查为`23,050/28,400/34,250`；该总数包含语义型generated SLOC，不含机械generated输出和静态fixture，不能覆盖production超限，也不是减少测试的理由。
+Budgeted build/test infrastructure（shell、Dockerfile、Makefile、手写YAML及语义型generated输入/输出）目标250、软阈值400、审查阈值600 SLOC。Budgeted maintained surface目标/软/审查为`38,750/41,400/43,600`；该总数包含语义型generated SLOC，不含机械generated输出和静态fixture，不能覆盖production超限，也不是减少测试的理由。
 
 ### 12.4 统一统计口径
 
@@ -776,6 +789,16 @@ first_party_source_total = 所有上述源码物理行集合去重后的总数
 
 禁止通过一行多个语句、超长函数、大switch、删除有价值错误上下文或把逻辑搬进脚本/generated/test helper降LOC。Production单文件500/800 SLOC、单函数80/140 SLOC分别触发warning/阻断审查；拆分仍必须按静态注册和owner边界，不得制造无意义薄文件。
 
+### 12.6 PF-01落地后的同revision最终批准
+
+上述envelope已获准用于继续实现和审查，但第一版完成仍要求owner对PF-01落地后的精确revision作最终批准：
+
+1. PF-01 client/point/stage/resource observer、5+3+3 fault raw table、smoke/release profile、环境preflight、全部阈值和fail-closed报告完成后，冻结一个clean implementation revision `R`。
+2. 在不修改源码、测试、脚本、manifest或需求的情况下，对同一`R`运行`scripts/perf-v1.sh --profile release --output perf-v1.json`和`scripts/loc-budget.sh --check --output loc-budget.json`。两份JSON必须记录并匹配`R`；worktree dirty、revision缺失/不一致或任一报告来自其他revision时结果无效。
+3. LOC最终报告必须保留全部原子桶、`budgeted_production/tests/infra/total`、每模块实际值、generated/fixture可见性、Git diff以及unknown path、file/function和gofmt质量blocker；不得只报告四个合计数。PF-01最终报告必须保留环境/fixture/image/baseline指纹、全部raw样本、nearest-rank、11个故障行、对象计数、资源/cleanup事实和PASS/FAIL/INVALID原因。
+4. 只有PF-01 reference绝对Gate通过、LOC四个发布值分别`<=20,500/22,500/600/43,600`、质量blocker清零且owner明确记录对revision `R`和首个`BASELINE_BOOTSTRAP`的批准，预算Gate才完成。报告生成后任何tracked或untracked maintained source变化都必须生成新revision并重跑两份报告；失败或INVALID报告不能获批或更新baseline。
+5. 最终批准只确认同一revision的实际分布，没有改变12.4统计口径或12.5禁止规避条款。若要扩大envelope、排除源码或删减产品/测试合同，必须在实现前再次显式修改五份need；不得在脚本、manifest或批准评论中暗改。
+
 ## 13. 验证命令和Gate
 
 实现仓库必须提供等价命令；推荐：
@@ -799,7 +822,7 @@ Gate顺序：
 4. Full Go和race。
 5. Docker integration。
 6. Deterministic双Agent E2E。
-7. PF-01性能和LOC预算gate。
+7. 同一clean revision的PF-01性能、LOC预算gate和12.6节owner最终批准。
 8. Real CLI E2E。
 
 E2E失败后不得直接反复改E2E脚本或prompt。必须先分类到Core、Runtime、Git、环境/provider或Task spec，并增加最低层可复现测试。
@@ -817,8 +840,8 @@ E2E失败后不得直接反复改E2E脚本或prompt。必须先分类到Core、R
 - 真实Git capture/CAS/crash/GC测试通过且`git fsck`成功。
 - 真实Docker隔离、取消、resume、reconcile和cleanup通过。
 - Deterministic双Agent E2E通过。
-- PF-01 reference性能场景通过，原始样本和环境信息完整；没有用provider时间或删除失败样本美化结果。
-- `budgeted_production <= 14,650`，或owner已先修改需求/预算；测试未因LOC被弱化。
+- PF-01 reference性能场景通过，原始样本和环境信息完整；没有用provider时间或删除失败样本美化结果；PF-01和LOC报告来自同一clean revision。
+- `budgeted_production/tests/infra/total <= 20,500/22,500/600/43,600`，质量blocker清零，且owner已按12.6节最终批准该revision和首个固定baseline；测试未因LOC被弱化。
 - 两个真实CLI Agent E2E通过且未SKIP。
 - 验收结束后没有starting/active Run、owned orphan container、未解释capture/CAS intent或误删的task ref。
 - Boss能从正式命令读取最终Task、Run、Message、base/head和canonical SHA。

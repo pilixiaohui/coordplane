@@ -18,6 +18,8 @@ Git 模块只负责让多个隔离 Task 的真实 commit 安全收敛到一个 c
 
 它不得代理 Agent 日常 Git命令，不建设 ChangeSet/GitOperation/ConflictSet/rollback 平台，不理解 diff，不执行后台 merge/rebase/cherry-pick，也不把 SQLite 当代码真相。
 
+Owner批准的预算重基线不改变本文件的private clone、actual HEAD capture、task ref、expected-old CAS、integration、recovery或GC合同。全库production/tests/infra/total envelope固定为`18,500/19,500/20,500`、`20,000/21,500/22,500`、`250/400/600`和`38,750/41,400/43,600`；统计仍按`acceptance.md`的非空、非纯注释物理行口径。PF-01完整落地后，Git模块和test-only stage/fault surface的实际SLOC、质量blocker和diff必须进入同一clean revision的LOC JSON，并与该revision的PF-01 release报告一起由owner最终批准；不得用重基线reserve删除真实Git crash/fence证据。
+
 ## 2. 代码真相和仓库布局
 
 每个 Project 有一个 Daemon 私有 bare repo：
