@@ -437,12 +437,9 @@ func (b *pfBatch) runWave(name string, warmup, soak bool) pfSample {
 				}
 				directCASNS = time.Since(acceptStarted).Nanoseconds()
 			} else {
-				if accepted.IntegrationTaskID == "" {
-					b.t.Fatalf("%s accept did not expose integration Task", pfRoles[index])
-				}
-				completed := b.waitIntegrationPair(accepted, accepted.IntegrationTaskID, responseObserved, pfRoles[index])
+				completed := b.waitIntegrationPair(accepted, responseObserved, pfRoles[index])
 				tasks[index] = completed.source
-				integrationNS = append(integrationNS, completed.finished.Sub(responseObserved).Nanoseconds())
+				integrationNS = append(integrationNS, completed.finished.Sub(completed.integrationFirst).Nanoseconds())
 				if index == len(tasks)-1 {
 					integrations3NS = completed.sourceObserved.Sub(integrationsStarted).Nanoseconds()
 				}
@@ -720,17 +717,22 @@ func ownedResidue(t *testing.T, dataDir, projectID string) []string {
 }
 
 type pfIntegrationCompletion struct {
-	source         core.Task
-	sourceObserved time.Time
-	finished       time.Time
+	source           core.Task
+	sourceObserved   time.Time
+	integrationFirst time.Time
+	finished         time.Time
 }
 
-func (b *pfBatch) waitIntegrationPair(source core.Task, integrationID string, firstObserved time.Time, role string) pfIntegrationCompletion {
+func (b *pfBatch) waitIntegrationPair(source core.Task, responseObserved time.Time, role string) pfIntegrationCompletion {
 	b.t.Helper()
 	result := pfIntegrationCompletion{source: source}
 	if source.Status == core.TaskCompleted {
-		result.sourceObserved = firstObserved
+		result.sourceObserved = responseObserved
 		b.observeTerminal(source.HeadRunID)
+	}
+	integrationID := source.IntegrationTaskID
+	if integrationID != "" {
+		result.integrationFirst = responseObserved
 	}
 	var integrationObserved time.Time
 	return eventually(b.t, b.ctx, 3*time.Minute, role+" source/integration completed", func() (pfIntegrationCompletion, bool, string) {
@@ -738,9 +740,17 @@ func (b *pfBatch) waitIntegrationPair(source core.Task, integrationID string, fi
 		if sourceErr != nil {
 			return result, false, sourceErr.Error()
 		}
+		sourceNow := time.Now()
 		b.observeTerminal(sourceDetail.Task.HeadRunID)
 		if result.sourceObserved.IsZero() && sourceDetail.Task.Status == core.TaskCompleted {
-			result.source, result.sourceObserved = sourceDetail.Task, time.Now()
+			result.source, result.sourceObserved = sourceDetail.Task, sourceNow
+		}
+		if integrationID == "" && sourceDetail.Task.IntegrationTaskID != "" {
+			integrationID = sourceDetail.Task.IntegrationTaskID
+			result.integrationFirst = sourceNow
+		}
+		if integrationID == "" {
+			return result, false, fmt.Sprintf("source=%s integration=not_observed", sourceDetail.Task.Status)
 		}
 		integration, integrationErr := commandJSON[core.TaskDetail](b.ctx, b.binary, "task", "show", integrationID, "--socket", b.socket, "--output", "json")
 		if integrationErr != nil {
