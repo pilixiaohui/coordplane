@@ -1,0 +1,94 @@
+#!/bin/sh
+set -eu
+
+bootstrap=/run/coordplane/bootstrap
+run_id=$(sed -n 's/^Run: //p' "$bootstrap")
+kind=$(sed -n 's/^Kind: //p' "$bootstrap")
+description=$(sed -n 's/^Description: //p' "$bootstrap")
+
+echo "{\"type\":\"thread.started\",\"thread_id\":\"p5-$run_id\"}"
+/usr/local/bin/coordlink progress --summary "P5-READY" --request-id "p5-ready-$run_id" --output json >/dev/null
+
+inbox() {
+	/usr/local/bin/coordlink inbox list --output human
+}
+
+wait_for_body() {
+	wanted=$1
+	attempt=0
+	while [ "$attempt" -lt 600 ]; do
+		messages=$(inbox)
+		if printf '%s\n' "$messages" | grep -F "$wanted" >/dev/null 2>&1; then
+			printf '%s\n' "$messages"
+			return 0
+		fi
+		attempt=$((attempt + 1))
+		sleep 0.05
+	done
+	echo "timed out waiting for inbox body: $wanted" >&2
+	return 1
+}
+
+ack_all() {
+	messages=$(inbox)
+	set -- inbox ack
+	for message_id in $(printf '%s\n' "$messages" | awk 'NF { print $1 }'); do
+		set -- "$@" --ack-message "$message_id"
+	done
+	if [ "$#" -gt 2 ]; then
+		/usr/local/bin/coordlink "$@" --request-id "p5-ack-$run_id" --output json >/dev/null
+	fi
+}
+
+configure_git() {
+	git config --global --add safe.directory /workspace/project
+	git config user.name "CoordPlane P5 $1"
+	git config user.email "p5-$1@coordplane.local"
+}
+
+if [ "$kind" = "conversation" ]; then
+	wait_for_body "P5-DIRECT" >/dev/null
+	wait_for_body "P5-BOOT" >/dev/null
+	wait_for_body "P5-GO" >/dev/null
+	ack_all
+	/usr/local/bin/coordlink task wait --reason "P5 messages acknowledged after redelivery" \
+		--request-id "p5-conversation-wait-$run_id" --output json >/dev/null
+	sleep 30
+elif [ "$kind" = "integration" ]; then
+	configure_git integration
+	source_head=$(sed -n 's/^Source head: //p' "$bootstrap")
+	git merge --no-ff "$source_head" -m "P5 integrate stale source"
+	./fixture-test.sh
+	head=$(git rev-parse HEAD)
+	/usr/local/bin/coordlink progress --summary "P5 integration tested" \
+		--request-id "p5-integration-progress-$run_id" --output json >/dev/null
+	/usr/local/bin/coordlink task submit --summary "P5 integration complete" --expected-head "$head" \
+		--request-id "p5-integration-submit-$run_id" --output json >/dev/null
+	sleep 30
+else
+	role=$(printf '%s\n' "$description" | sed -n 's/.*p5_role=\([AB]\).*/\1/p')
+	[ -n "$role" ]
+	configure_git "$role"
+	wait_for_body "P5-GO" >/dev/null
+	if [ "$role" = "A" ]; then
+		peer_agent=$(printf '%s\n' "$description" | sed -n 's/.*peer_agent_id=\([^ ;]*\).*/\1/p')
+		[ -n "$peer_agent" ]
+		/usr/local/bin/coordlink message send --to-agent "$peer_agent" --wake \
+			--body "P5-DIRECT from $run_id" --request-id "p5-direct-$run_id" --output json >/dev/null
+		ack_all
+	else
+		wait_for_body "P5-DIRECT" >/dev/null
+	fi
+	printf 'agent-%s\n' "$role" > "agent-$role.txt"
+	./fixture-test.sh
+	git add "agent-$role.txt"
+	git commit -m "P5 Agent $role result"
+	head=$(git rev-parse HEAD)
+	/usr/local/bin/coordlink progress --summary "P5-$role tested" \
+		--request-id "p5-progress-$role-$run_id" --output json >/dev/null
+	/usr/local/bin/coordlink task submit --summary "P5 Agent $role result" --expected-head "$head" \
+		--request-id "p5-submit-$role-$run_id" --output json >/dev/null
+	sleep 30
+fi
+
+echo '{"type":"turn.completed"}'
