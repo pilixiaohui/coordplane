@@ -439,6 +439,14 @@ type GCPreview struct {
 	GeneratedAt string              `json:"generated_at"`
 	Workspaces  []GCWorkspaceTarget `json:"workspaces"`
 	TaskRefs    []GCTaskRefTarget   `json:"task_refs"`
+	AgentHomes  []GCAgentHomeTarget `json:"agent_homes"`
+}
+
+type GCAgentHomeTarget struct {
+	AgentID  string   `json:"agent_id"`
+	Exists   bool     `json:"exists"`
+	Eligible bool     `json:"eligible"`
+	Reasons  []string `json:"reasons,omitempty"`
 }
 
 type GCWorkspaceTarget struct {

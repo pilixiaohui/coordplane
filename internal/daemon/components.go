@@ -89,6 +89,10 @@ func buildComponents(ctx context.Context, configPath string) (*components, error
 	if err != nil {
 		return fail(err)
 	}
+	agentHomes, err := newAgentHomeGC(cfg.Runtime.AgentHomeRoot)
+	if err != nil {
+		return fail(err)
+	}
 	finalized, err := database.FinalizedCaptureTasks(ctx)
 	if err != nil {
 		return fail(fmt.Errorf("list finalized Git captures: %w", err))
@@ -127,6 +131,7 @@ func buildComponents(ctx context.Context, configPath string) (*components, error
 		MaxParallelRuns: cfg.MaxParallelRuns, AdapterIDs: adapter.Production().Names(),
 		CompletedWorkspaceRetention: cfg.Retention.CompletedWorkspace,
 		TerminalTaskRefRetention:    cfg.Retention.TerminalTaskRef,
+		AgentHomes:                  agentHomes,
 	})
 	if err != nil {
 		return fail(err)

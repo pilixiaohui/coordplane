@@ -27,7 +27,10 @@ func (s *Service) GCPreview(ctx context.Context) (GCPreview, error) {
 	}
 	workspaceCutoff := s.workspaceRetentionCutoff()
 	refCutoff := s.taskRefRetentionCutoff()
-	preview := GCPreview{GeneratedAt: s.nowText(), Workspaces: []GCWorkspaceTarget{}, TaskRefs: []GCTaskRefTarget{}}
+	preview := GCPreview{
+		GeneratedAt: s.nowText(), Workspaces: []GCWorkspaceTarget{},
+		TaskRefs: []GCTaskRefTarget{}, AgentHomes: []GCAgentHomeTarget{},
+	}
 	for _, task := range snapshot.Tasks {
 		if task.Kind != TaskWork && task.Kind != TaskIntegration {
 			continue
@@ -76,6 +79,22 @@ func (s *Service) GCPreview(ctx context.Context) (GCPreview, error) {
 			Exists: refState.Exists, Eligible: refState.Exists && len(refReasons) == 0, Reasons: refReasons,
 		})
 	}
+	if s.agentHomes != nil {
+		for _, agent := range snapshot.Agents {
+			state, err := s.agentHomes.State(ctx, agent.ID)
+			if err != nil {
+				return GCPreview{}, WrapError(CodeRuntimeInvariantViolation, "inspect Agent home for GC preview", false, err)
+			}
+			reasons := agentHomeReasons(snapshot, agent)
+			if !state.Exists {
+				reasons = append(reasons, "absent")
+			}
+			preview.AgentHomes = append(preview.AgentHomes, GCAgentHomeTarget{
+				AgentID: agent.ID, Exists: state.Exists,
+				Eligible: state.Exists && len(reasons) == 0, Reasons: reasons,
+			})
+		}
+	}
 	return preview, nil
 }
 
@@ -104,11 +123,84 @@ func (s *Service) GCRun(ctx context.Context, input GCRunInput) (GCRunResult, err
 	if err := s.ReconcileGitGC(ctx, refCutoff); err != nil {
 		return GCRunResult{}, err
 	}
+	if err := s.reconcileAgentHomeGC(ctx); err != nil {
+		return GCRunResult{}, err
+	}
 	result := GCDiscardResult{TaskID: "gc", Discarded: true}
 	if err := s.putGCDedupe(ctx, "gc.run", requestID, inputHash, result, "", "gc.run.completed"); err != nil {
 		return GCRunResult{}, err
 	}
 	return GCRunResult{Completed: true}, nil
+}
+
+func (s *Service) reconcileAgentHomeGC(ctx context.Context) error {
+	if s.agentHomes == nil {
+		return nil
+	}
+	snapshot, err := s.repository.Snapshot(ctx, "")
+	if err != nil {
+		return err
+	}
+	for _, agent := range snapshot.Agents {
+		if len(agentHomeReasons(snapshot, agent)) != 0 {
+			continue
+		}
+		state, err := s.agentHomes.State(ctx, agent.ID)
+		if err != nil {
+			return WrapError(CodeRuntimeInvariantViolation, "inspect archived Agent home", false, err)
+		}
+		if !state.Exists {
+			continue
+		}
+		deleted, err := s.agentHomes.Delete(ctx, agent.ID, func() (bool, error) {
+			current, err := s.repository.Snapshot(ctx, "")
+			if err != nil {
+				return false, err
+			}
+			for _, candidate := range current.Agents {
+				if candidate.ID == agent.ID {
+					return len(agentHomeReasons(current, candidate)) == 0, nil
+				}
+			}
+			return false, nil
+		})
+		if err != nil {
+			return WrapError(CodeRuntimeInvariantViolation, "delete archived Agent home", false, err)
+		}
+		if !deleted {
+			continue
+		}
+	}
+	return nil
+}
+
+func agentHomeReasons(snapshot Snapshot, agent Agent) []string {
+	var liveRun, recoverableTask, pendingMessage bool
+	for _, run := range snapshot.Runs {
+		liveRun = liveRun || run.AgentID == agent.ID && IsRunLive(run.State)
+	}
+	for _, task := range snapshot.Tasks {
+		recoverableTask = recoverableTask || IsTaskOpen(task.Status) &&
+			(task.AssigneeAgentID == agent.ID || task.AcceptedIntegrationAgentID == agent.ID)
+	}
+	for _, message := range snapshot.Messages {
+		pendingMessage = pendingMessage || message.RecipientKind == "agent" && message.RecipientID == agent.ID &&
+			(message.State == MessagePending || message.State == MessageDelivered)
+	}
+	reasons := make([]string, 0, 4)
+	if agent.Status != AgentArchived {
+		reasons = append(reasons, "agent_not_archived")
+	}
+	if liveRun {
+		reasons = append(reasons, "live_run")
+	}
+	if recoverableTask {
+		reasons = append(reasons, "active_or_recoverable_task")
+	}
+	if pendingMessage {
+		reasons = append(reasons, "pending_message")
+	}
+	return reasons
 }
 
 func (s *Service) GCDiscardWorkspace(ctx context.Context, input GCDiscardWorkspaceInput) (GCDiscardResult, error) {

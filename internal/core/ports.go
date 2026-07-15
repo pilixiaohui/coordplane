@@ -149,6 +149,17 @@ type ProjectGitFact struct {
 	CanonicalSHA string
 }
 
+// AgentHomeGC owns the narrow filesystem boundary for archived Agent homes.
+// Core supplies the final durable authorization immediately before deletion.
+type AgentHomeGC interface {
+	State(context.Context, string) (AgentHomeStateFact, error)
+	Delete(context.Context, string, func() (bool, error)) (bool, error)
+}
+
+type AgentHomeStateFact struct {
+	Exists bool `json:"exists"`
+}
+
 // TaskGit is the trusted Git boundary used by the daemon-owned intent
 // reconciler. It is separate from ProjectGit so project registration fakes do
 // not need to implement result mutation behavior.

@@ -22,6 +22,7 @@ type ServiceOptions struct {
 	AdapterIDs                  []string
 	CompletedWorkspaceRetention time.Duration
 	TerminalTaskRefRetention    time.Duration
+	AgentHomes                  AgentHomeGC
 }
 
 type Service struct {
@@ -33,6 +34,7 @@ type Service struct {
 	adapters                    map[string]struct{}
 	completedWorkspaceRetention time.Duration
 	terminalTaskRefRetention    time.Duration
+	agentHomes                  AgentHomeGC
 
 	readyMu       sync.RWMutex
 	ready         bool
@@ -82,6 +84,7 @@ func NewService(repository Repository, projectGit ProjectGit, options ServiceOpt
 		adapters:                    adapters,
 		completedWorkspaceRetention: options.CompletedWorkspaceRetention,
 		terminalTaskRefRetention:    options.TerminalTaskRefRetention,
+		agentHomes:                  options.AgentHomes,
 	}, nil
 }
 
