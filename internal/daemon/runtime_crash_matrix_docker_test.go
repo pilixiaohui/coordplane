@@ -59,6 +59,114 @@ func TestRT05DaemonSIGKILLCrashPointIntentMatrix(t *testing.T) {
 	}
 }
 
+func TestRT05EarlyOwnerFallbackIsSoleContainerCleanup(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	executor, err := containerruntime.NewDockerExecutorFromEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.Ping(ctx); err != nil {
+		t.Fatalf("real Docker is required for RT-05: %v", err)
+	}
+	artifacts := buildRT05ProcessArtifacts(t, ctx)
+	root, err := os.MkdirTemp("/tmp", "cp-rt05-owner-fallback-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	databasePath := filepath.Join(root, "data", "coordplane.db")
+	disableFallback := os.Getenv("COORDPLANE_CONTRACT_DISABLE_RT05_OWNER_FALLBACK") == "1"
+	var taskID string
+
+	t.Run("container_created_sigkill", func(t *testing.T) {
+		configPath := writeTestConfig(t, root)
+		rawConfig, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rawConfig = []byte(strings.ReplaceAll(string(rawConfig), "  docker_network: coordplane\n", "  docker_network: none\n"))
+		if err := os.WriteFile(configPath, rawConfig, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		instructions := filepath.Join(root, "instructions.md")
+		if err := os.WriteFile(instructions, []byte("Execute only the owner-fallback crash task."), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		seed, err := buildComponents(ctx, configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		agent, err := seed.service.AddAgent(ctx, core.AddAgentInput{
+			DisplayName: "RT-05 owner fallback", AdapterID: "codex", Image: artifacts.image,
+			InstructionsFile: instructions, RequestID: "rt05-owner-fallback-agent",
+		})
+		if err != nil {
+			_ = seed.Close()
+			t.Fatal(err)
+		}
+		project, err := seed.service.AddProject(ctx, core.AddProjectInput{
+			Name: "RT-05 owner fallback", Source: createSourceRepository(t, root),
+			SourceRef: "refs/heads/main", IntegrationAgentID: agent.ID,
+			RequestID: "rt05-owner-fallback-project",
+		})
+		if err != nil {
+			_ = seed.Close()
+			t.Fatal(err)
+		}
+		task, err := seed.service.CreateTask(ctx, core.CreateTaskInput{
+			ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
+			Title: "crash before immutable cleanup registration", MaxRetries: 0,
+			RequestID: "rt05-owner-fallback-task",
+		})
+		if err != nil {
+			_ = seed.Close()
+			t.Fatal(err)
+		}
+		taskID = task.ID
+		if err := seed.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if !disableFallback {
+			registerRT05OwnerFallback(t, executor, databasePath, task.ID)
+		}
+
+		socket := filepath.Join(root, "data", "operator.sock")
+		readyPath := filepath.Join(root, "runtime-phase-ready")
+		first := startP3DaemonProcessWithEnv(t, artifacts.daemon, configPath, socket, filepath.Join(root, "daemon-first.log"), []string{
+			"COORDPLANE_CONTRACT_RUNTIME_PHASE=" + string(runtimePhaseContainerCreated),
+			"COORDPLANE_CONTRACT_RUNTIME_PHASE_READY=" + readyPath,
+		})
+		t.Cleanup(func() { killP3DaemonProcess(t, first) })
+		client, err := transport.NewUnixClient(socket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitForRT05Phase(t, first, readyPath, runtimePhaseContainerCreated)
+		created := waitForOperatorRun(t, client, task.ID, func(run core.Run) bool {
+			return run.State == core.RunStarting && run.ContainerID != ""
+		})
+		killP3DaemonProcess(t, first)
+		database, err := store.Open(ctx, databasePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		persisted, readErr := database.Run(ctx, created.ID)
+		closeErr := database.Close()
+		if readErr != nil || closeErr != nil {
+			t.Fatalf("read durable container_created Run: read=%v close=%v", readErr, closeErr)
+		}
+		if persisted.ContainerID == "" || persisted.ContainerID != created.ContainerID {
+			t.Fatalf("durable container identity = %q, want %q", persisted.ContainerID, created.ContainerID)
+		}
+	})
+
+	if disableFallback {
+		t.Cleanup(func() { cleanupRT05OwnedRuns(t, executor, databasePath, taskID) })
+	}
+	assertRT05NoOwnedContainers(t, executor, taskID)
+}
+
 type rt05ProcessArtifacts struct {
 	root       string
 	daemon     string
@@ -274,55 +382,66 @@ func runRT05ProcessCase(
 func registerRT05OwnerFallback(t *testing.T, executor *containerruntime.DockerExecutor, databasePath, taskID string) {
 	t.Helper()
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		database, err := store.Open(ctx, databasePath)
-		if err != nil {
-			t.Errorf("RT-05 owner fallback open database: %v", err)
-			return
-		}
-		defer database.Close()
-		cursor := ""
-		for {
-			page, err := database.Runs(ctx, core.RunFilter{TaskID: taskID, Cursor: cursor, Limit: core.MaximumCompactPageLimit})
-			if err != nil {
-				t.Errorf("RT-05 owner fallback list Runs: %v", err)
-				return
-			}
-			for _, summary := range page.Items {
-				run, err := database.Run(ctx, summary.ID)
-				if err != nil {
-					t.Errorf("RT-05 owner fallback load Run %s: %v", summary.ID, err)
-					continue
-				}
-				if run.ContainerID == "" {
-					continue
-				}
-				ref := runtimeRef(run)
-				if _, err := executor.Stop(ctx, ref, 0); err != nil {
-					t.Errorf("RT-05 owner fallback stop Run %s: %v", run.ID, err)
-					continue
-				}
-				if _, err := executor.Remove(ctx, ref); err != nil {
-					t.Errorf("RT-05 owner fallback remove Run %s: %v", run.ID, err)
-				}
-			}
-			if page.NextCursor == "" {
-				break
-			}
-			cursor = page.NextCursor
-		}
-		managed, err := executor.Managed(ctx)
-		if err != nil {
-			t.Errorf("RT-05 owner fallback list managed containers: %v", err)
-			return
-		}
-		for _, state := range managed {
-			if state.Ref.TaskID == taskID {
-				t.Errorf("RT-05 owned container residue after cleanup: task=%s run=%s container=%s", taskID, state.Ref.RunID, state.Ref.ContainerID)
-			}
-		}
+		cleanupRT05OwnedRuns(t, executor, databasePath, taskID)
+		assertRT05NoOwnedContainers(t, executor, taskID)
 	})
+}
+
+func cleanupRT05OwnedRuns(t *testing.T, executor *containerruntime.DockerExecutor, databasePath, taskID string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	database, err := store.Open(ctx, databasePath)
+	if err != nil {
+		t.Errorf("RT-05 owner fallback open database: %v", err)
+		return
+	}
+	defer database.Close()
+	cursor := ""
+	for {
+		page, err := database.Runs(ctx, core.RunFilter{TaskID: taskID, Cursor: cursor, Limit: core.MaximumCompactPageLimit})
+		if err != nil {
+			t.Errorf("RT-05 owner fallback list Runs: %v", err)
+			return
+		}
+		for _, summary := range page.Items {
+			run, err := database.Run(ctx, summary.ID)
+			if err != nil {
+				t.Errorf("RT-05 owner fallback load Run %s: %v", summary.ID, err)
+				continue
+			}
+			if run.ContainerID == "" {
+				continue
+			}
+			ref := runtimeRef(run)
+			if _, err := executor.Stop(ctx, ref, 0); err != nil {
+				t.Errorf("RT-05 owner fallback stop Run %s: %v", run.ID, err)
+				continue
+			}
+			if _, err := executor.Remove(ctx, ref); err != nil {
+				t.Errorf("RT-05 owner fallback remove Run %s: %v", run.ID, err)
+			}
+		}
+		if page.NextCursor == "" {
+			return
+		}
+		cursor = page.NextCursor
+	}
+}
+
+func assertRT05NoOwnedContainers(t *testing.T, executor *containerruntime.DockerExecutor, taskID string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	managed, err := executor.Managed(ctx)
+	if err != nil {
+		t.Fatalf("RT-05 list managed containers: %v", err)
+	}
+	for _, state := range managed {
+		if state.Ref.TaskID == taskID {
+			t.Errorf("RT-05 owned container residue after cleanup: task=%s run=%s container=%s", taskID, state.Ref.RunID, state.Ref.ContainerID)
+		}
+	}
 }
 
 func registerRT05ImmutableCleanup(t *testing.T, executor *containerruntime.DockerExecutor, run core.Run) {
