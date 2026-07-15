@@ -9,10 +9,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,10 +26,12 @@ const (
 	sampleEnvironment = "COORDPLANE_PERF_SAMPLE_ID"
 	faultEnvironment  = "COORDPLANE_PERF_FAULT"
 	readyEnvironment  = "COORDPLANE_PERF_FAULT_READY"
+	diskEnvironment   = "COORDPLANE_PERF_DATA_DIR"
 )
 
 type stageStart struct {
 	offset, attempt, unixNS int64
+	origin                  string
 	fields                  Fields
 }
 
@@ -98,8 +102,9 @@ func Start(ctx context.Context) error {
 	observer.samplerDone = make(chan struct{})
 	observer.Unlock()
 	emitResource()
+	emitProcessLimit()
 	for stageKey, started := range interrupted {
-		emitStage(stageKey, started, "interrupted")
+		emitInterruptedStage(stageKey, started)
 	}
 	go sampleResources(sampleCtx, observer.samplerDone)
 	return nil
@@ -195,7 +200,7 @@ func StartStage(id, key string, fields Fields) {
 	_, duplicate := observer.stages[stageKey]
 	attempt := observer.attempts[stageKey]
 	observer.attempts[stageKey]++
-	started := stageStart{time.Since(observer.start).Nanoseconds(), attempt, time.Now().UnixNano(), fields}
+	started := stageStart{time.Since(observer.start).Nanoseconds(), attempt, time.Now().UnixNano(), observer.origin, fields}
 	observer.stages[stageKey] = started
 	observer.Unlock()
 	if duplicate {
@@ -205,6 +210,7 @@ func StartStage(id, key string, fields Fields) {
 	record["stage_id"], record["stage_key_sha256"], record["attempt_index"] = id, strings.Split(stageKey, "\x00")[1], attempt
 	record["start_offset_ns"], record["start_unix_ns"] = started.offset, started.unixNS
 	emit(record)
+	emitDiskBoundary(id, "start", fields)
 	emitResource()
 }
 
@@ -212,13 +218,10 @@ func EndStage(id, key, result string) {
 	stageKey := observedStageKey(id, key)
 	observer.Lock()
 	started, ok := observer.stages[stageKey]
-	completed := observer.attempts[stageKey] > 0
 	delete(observer.stages, stageKey)
 	observer.Unlock()
 	if !ok {
-		if !completed {
-			emitInvalid("stage end without start", stageKey)
-		}
+		emitInvalid("stage end without start", stageKey)
 		return
 	}
 	emitStage(stageKey, started, result)
@@ -228,10 +231,21 @@ func emitStage(stageKey string, started stageStart, result string) {
 	identity := strings.SplitN(stageKey, "\x00", 2)
 	record := baseRecord("stage", started.fields)
 	record["stage_id"], record["stage_key_sha256"], record["attempt_index"] = identity[0], identity[1], started.attempt
-	duration := time.Now().UnixNano() - started.unixNS
+	duration := offset() - started.offset
 	record["start_offset_ns"], record["start_unix_ns"], record["duration_ns"], record["result"] = started.offset, started.unixNS, duration, result
 	emit(record)
+	emitDiskBoundary(identity[0], "end", started.fields)
 	emitResource()
+}
+
+func emitInterruptedStage(stageKey string, started stageStart) {
+	identity := strings.SplitN(stageKey, "\x00", 2)
+	record := baseRecord("stage_interrupted", started.fields)
+	record["daemon_origin_id"] = started.origin
+	record["interrupted_by_origin_id"] = observer.origin
+	record["stage_id"], record["stage_key_sha256"], record["attempt_index"] = identity[0], identity[1], started.attempt
+	record["start_offset_ns"], record["start_unix_ns"], record["result"] = started.offset, started.unixNS, "interrupted"
+	emit(record)
 }
 
 func EndOpenStages(key, result string, ids ...string) {
@@ -246,9 +260,46 @@ func EndOpenStages(key, result string, ids ...string) {
 	}
 }
 
-func RuntimeLimit(fields Fields, memoryBytes, nanoCPUs, pids int64) {
+func RuntimeLimit(fields Fields, role string, memoryBytes, nanoCPUs, pids int64) {
 	record := baseRecord("runtime_limit", fields)
+	record["runtime_role"] = role
 	record["memory_bytes"], record["nano_cpus"], record["pids_limit"] = memoryBytes, nanoCPUs, pids
+	emit(record)
+}
+
+func emitProcessLimit() {
+	record := baseRecord("process_limit", Fields{})
+	record["gomaxprocs"] = runtime.GOMAXPROCS(0)
+	record["memory_limit_bytes"] = debug.SetMemoryLimit(-1)
+	emit(record)
+}
+
+func emitDiskBoundary(stageID, boundary string, fields Fields) {
+	if stageID != "git.capture.freeze" && stageID != "git.capture.handoff" && stageID != "git.capture.import" {
+		return
+	}
+	root := strings.TrimSpace(os.Getenv(diskEnvironment))
+	if root == "" {
+		return
+	}
+	var bytes int64
+	err := filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() {
+			bytes += info.Size()
+		}
+		return nil
+	})
+	record := baseRecord("disk_boundary", fields)
+	record["stage_id"], record["boundary"], record["observed_unix_ns"], record["bytes"] = stageID, boundary, time.Now().UnixNano(), bytes
+	if err != nil {
+		record["error"] = err.Error()
+	}
 	emit(record)
 }
 
@@ -378,17 +429,18 @@ func loadObserverState(file *os.File) (map[string]string, map[string]int64, map[
 				clients[clientKey(sample, request, operation)] = fmt.Sprintf("%d\x00%s", int64(duration), result)
 			}
 		}
-		if record["record_type"] == "stage_start" || record["record_type"] == "stage" {
+		if record["record_type"] == "stage_start" || record["record_type"] == "stage" || record["record_type"] == "stage_interrupted" {
 			id, idOK := record["stage_id"].(string)
 			key, keyOK := record["stage_key_sha256"].(string)
 			attempt, attemptOK := record["attempt_index"].(float64)
 			stageKey := id + "\x00" + key
 			if idOK && keyOK && attemptOK {
 				attempts[stageKey] = max(attempts[stageKey], int64(attempt)+1)
-				if record["record_type"] == "stage" {
+				if record["record_type"] != "stage_start" {
 					delete(stages, stageKey)
 				} else {
-					stages[stageKey] = stageStart{intRecord(record, "start_offset_ns"), int64(attempt), intRecord(record, "start_unix_ns"), fieldsRecord(record)}
+					origin, _ := record["daemon_origin_id"].(string)
+					stages[stageKey] = stageStart{intRecord(record, "start_offset_ns"), int64(attempt), intRecord(record, "start_unix_ns"), origin, fieldsRecord(record)}
 				}
 			}
 		}

@@ -22,6 +22,13 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+func requireNoError(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 const e2eTimeout = 3 * time.Minute
 
 func TestDeterministicTwoAgentConvergence(t *testing.T) {
@@ -32,9 +39,7 @@ func TestDeterministicTwoAgentConvergence(t *testing.T) {
 		t.Fatal("E2E_RUNTIME_IMAGE is required")
 	}
 	release, err := testsupport.AcquireSerialResource(testsupport.DockerResource, "tests/e2e", e2eTimeout)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer func() {
 		if err := release(); err != nil {
 			t.Errorf("release Docker test resource: %v", err)
@@ -237,9 +242,7 @@ func startDaemonWithEnv(t *testing.T, binary, configPath, socket string, environ
 	t.Helper()
 	logPath := filepath.Join(filepath.Dir(configPath), fmt.Sprintf("daemon-%d.log", time.Now().UnixNano()))
 	logFile, err := os.Create(logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	command := exec.Command(binary, "serve", "--config", configPath)
 	command.Env = append(os.Environ(), environment...)
 	command.Stdout, command.Stderr = logFile, logFile
@@ -577,36 +580,26 @@ func waitForWorkspacesRemoved(t *testing.T, ctx context.Context, dataDir, projec
 func assertSQLiteTruth(t *testing.T, path, taskA, taskB, integrationID, finalSHA string) {
 	t.Helper()
 	database, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer database.Close()
 	rows, err := database.Query(`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	var tables []string
 	for rows.Next() {
 		var name string
-		if err := rows.Scan(&name); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, rows.Scan(&name))
 		if !strings.HasPrefix(name, "sqlite_") {
 			tables = append(tables, name)
 		}
 	}
-	if err := rows.Close(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, rows.Close())
 	wantTables := []string{"agents", "events", "messages", "projects", "request_dedupes", "runs", "schema_migrations", "tasks"}
 	if strings.Join(tables, ",") != strings.Join(wantTables, ",") {
 		t.Fatalf("SQLite tables = %v, want six objects plus infrastructure %v", tables, wantTables)
 	}
 	for _, taskID := range []string{taskA, taskB, integrationID} {
 		var status, final string
-		if err := database.QueryRow(`SELECT status, final_canonical_sha FROM tasks WHERE id=?`, taskID).Scan(&status, &final); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, database.QueryRow(`SELECT status, final_canonical_sha FROM tasks WHERE id=?`, taskID).Scan(&status, &final))
 		if status != string(core.TaskCompleted) || final == "" {
 			t.Fatalf("SQLite Task %s = status %s final %s", taskID, status, final)
 		}
@@ -615,12 +608,8 @@ func assertSQLiteTruth(t *testing.T, path, taskA, taskB, integrationID, finalSHA
 		}
 	}
 	var liveRuns, messages int
-	if err := database.QueryRow(`SELECT COUNT(*) FROM runs WHERE state IN ('starting','active')`).Scan(&liveRuns); err != nil {
-		t.Fatal(err)
-	}
-	if err := database.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&messages); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, database.QueryRow(`SELECT COUNT(*) FROM runs WHERE state IN ('starting','active')`).Scan(&liveRuns))
+	requireNoError(t, database.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&messages))
 	if liveRuns != 0 || messages < 5 {
 		t.Fatalf("SQLite terminal truth: live Runs=%d Messages=%d", liveRuns, messages)
 	}
@@ -629,9 +618,7 @@ func assertSQLiteTruth(t *testing.T, path, taskA, taskB, integrationID, finalSHA
 func createSourceRepository(t *testing.T, ctx context.Context, root string) (string, string) {
 	t.Helper()
 	source := filepath.Join(root, "source")
-	if err := os.MkdirAll(source, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.MkdirAll(source, 0o755))
 	run(t, ctx, "git", "init", "--quiet", "--initial-branch", "main", source)
 	git(t, ctx, source, "config", "user.name", "CoordPlane P5 Fixture")
 	git(t, ctx, source, "config", "user.email", "p5-fixture@coordplane.local")
@@ -725,9 +712,7 @@ func requireExecutable(t *testing.T, name string) string {
 
 func writeFile(t *testing.T, path string, content []byte, mode os.FileMode) {
 	t.Helper()
-	if err := os.WriteFile(path, content, mode); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(path, content, mode))
 }
 
 func assertFile(t *testing.T, path, want string) {
@@ -766,9 +751,7 @@ func runIn(t *testing.T, ctx context.Context, directory, command string, args ..
 func runOutput(t *testing.T, ctx context.Context, directory, command string, args ...string) []byte {
 	t.Helper()
 	raw, err := commandOutput(ctx, directory, command, args...)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	return raw
 }
 

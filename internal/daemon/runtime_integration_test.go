@@ -4,6 +4,7 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
@@ -45,13 +46,9 @@ func TestRT01RealDockerKeepsTwoAgentsWorkspacesHomesAndMountsPrivate(t *testing.
 		t.Fatalf("Run isolation collapsed: A=%#v B=%#v", runA, runB)
 	}
 	stateA, err := fixture.executor.Inspect(ctx, runtimeRef(runA))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	stateB, err := fixture.executor.Inspect(ctx, runtimeRef(runB))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	assertIsolatedContainer(t, fixture, project, runA, runB, stateA)
 	assertIsolatedContainer(t, fixture, project, runB, runA, stateB)
 	waitForFile(t, fixture.ctx, filepath.Join(runA.WorkspacePath, "dirty-runtime.txt"))
@@ -96,9 +93,7 @@ func TestRT01RealDockerKeepsTwoAgentsWorkspacesHomesAndMountsPrivate(t *testing.
 
 func TestRT02RealDockerLaunchPreservesAllMessageIDsWithoutOversizedArgv(t *testing.T) {
 	fixture := newP3DockerFixture(t)
-	if err := os.WriteFile(fixture.instructions, []byte(strings.Repeat("I", 1<<20)), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(fixture.instructions, []byte(strings.Repeat("I", 1<<20)), 0o600))
 	agent := fixture.addAgent(t, "Bootstrap Boundary Agent")
 	project := fixture.addProject(t, agent.ID)
 	task, err := fixture.components.service.CreateTask(fixture.ctx, core.CreateTaskInput{
@@ -106,9 +101,7 @@ func TestRT02RealDockerLaunchPreservesAllMessageIDsWithoutOversizedArgv(t *testi
 		Title: "verify all launch messages", Description: strings.Repeat("D", core.MaximumTaskDescriptionBytes),
 		MaxRetries: 0, RequestID: "bootstrap-boundary-task",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	wantMessages := make(map[string]struct{}, core.MessagePageLimit+5)
 	messageBody := strings.Repeat("消息", core.MaximumMessageBodyBytes/len("消息"))
 	for index := 0; index < core.MessagePageLimit+5; index++ {
@@ -116,9 +109,7 @@ func TestRT02RealDockerLaunchPreservesAllMessageIDsWithoutOversizedArgv(t *testi
 			ProjectID: project.ID, AgentID: agent.ID, TaskID: task.ID,
 			Body: messageBody, Wake: false, RequestID: fmt.Sprintf("bootstrap-message-%02d", index),
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		wantMessages[message.ID] = struct{}{}
 	}
 	fixture.components.runtime.Start(fixture.ctx)
@@ -132,9 +123,7 @@ func TestRT02RealDockerLaunchPreservesAllMessageIDsWithoutOversizedArgv(t *testi
 		return run.State == core.RunActive && task.Status == core.TaskRunning
 	})
 	state, err := fixture.executor.Inspect(fixture.ctx, runtimeRef(active))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	for _, argument := range state.CommandArgs {
 		if len(argument) > 4096 || strings.Contains(argument, messageBody[:1024]) || strings.Contains(argument, task.Description[:1024]) {
 			t.Fatalf("container argv contains oversized bootstrap input: %d bytes", len(argument))
@@ -144,9 +133,7 @@ func TestRT02RealDockerLaunchPreservesAllMessageIDsWithoutOversizedArgv(t *testi
 		t.Fatalf("container argv does not reference mounted bootstrap: %#v", state.CommandArgs)
 	}
 	bootstrapRaw, err := os.ReadFile(filepath.Join(fixture.components.runtime.controlRoot, active.ID, "bootstrap"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	bootstrap := string(bootstrapRaw)
 	for id := range wantMessages {
 		if strings.Count(bootstrap, "["+id+"]") != 1 {
@@ -161,9 +148,7 @@ func TestRT02RealDockerLaunchPreservesAllMessageIDsWithoutOversizedArgv(t *testi
 			run.CleanupState == core.CleanupRemoved && task.Status == core.TaskWaiting
 	})
 	snapshot, err := fixture.components.store.Snapshot(fixture.ctx, project.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	seen := 0
 	for _, message := range snapshot.Messages {
 		if _, wanted := wantMessages[message.ID]; !wanted {
@@ -188,18 +173,14 @@ func TestRT03ResumeUnavailableCreatesMarkedFreshFallbackRun(t *testing.T) {
 	deadline := time.Now().Add(35 * time.Second)
 	for time.Now().Before(deadline) {
 		persisted, err := fixture.components.store.Task(fixture.ctx, task.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		if persisted.Status == core.TaskWaiting {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	snapshot, err := fixture.components.store.Snapshot(fixture.ctx, project.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	var runs []core.Run
 	for _, run := range snapshot.Runs {
 		if run.TaskID == task.ID {
@@ -234,9 +215,7 @@ func TestRT03ResumeUnavailableCreatesMarkedFreshFallbackRun(t *testing.T) {
 		t.Fatalf("fallback Task = %#v err=%v", persisted, err)
 	}
 	events, err := fixture.components.store.Events(fixture.ctx, core.EventFilter{ProjectID: project.ID, RunID: fallback.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if countDaemonEvent(events, "run.resume_fallback") != 1 {
 		t.Fatalf("fallback Events = %#v", events)
 	}
@@ -293,9 +272,7 @@ func TestRT04RunStopInterruptsOnlyTheRunAndPreservesDirtyWorkspace(t *testing.T)
 			run.CleanupState == core.CleanupRemoved && task.Status == core.TaskFailed
 	})
 	persistedTask, err := fixture.components.store.Task(fixture.ctx, task.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if terminal.StopOperationID == "" || terminal.TokenRevokedAt == "" ||
 		persistedTask.Status == core.TaskCancelled || persistedTask.Status == core.TaskCompleted ||
 		!strings.HasPrefix(persistedTask.FailureReason, "RUN_INTERRUPTED") {
@@ -324,9 +301,7 @@ func TestRT04DeadlineTimesOutRunWithoutCompletingTaskOrCleaningWorkspace(t *test
 		return run.State == core.RunTimedOut && run.CleanupState == core.CleanupRemoved && task.Status == core.TaskFailed
 	})
 	persistedTask, err := fixture.components.store.Task(fixture.ctx, task.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if terminal.StopRequestedAt == "" || terminal.StopOperationID == "" || terminal.TokenRevokedAt == "" ||
 		persistedTask.Status == core.TaskCompleted || !strings.HasPrefix(persistedTask.FailureReason, "RUN_TIMED_OUT") {
 		t.Fatalf("timeout did not preserve durable intent/projection: Run=%#v Task=%#v", terminal, persistedTask)
@@ -353,32 +328,22 @@ func TestRT05ReconcileCreatedRunWithStopIntentNeverStartsCLI(t *testing.T) {
 		RunID: created.ID, Reason: "operator stop before daemon restart", OperationID: "rt05-stop-operation",
 		RequestID: "rt05-stop-request",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if stopped.LaunchPhase != core.LaunchCreated || stopped.StopRequestedAt == "" {
 		t.Fatalf("created Run stop intent = %#v", stopped)
 	}
-	if err := fixture.components.runtime.Reconcile(fixture.ctx); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, fixture.components.runtime.Reconcile(fixture.ctx))
 	terminal, err := fixture.components.store.Run(fixture.ctx, created.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	persistedTask, err := fixture.components.store.Task(fixture.ctx, task.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if terminal.State != core.RunInterrupted || terminal.LaunchPhase != core.LaunchCreated ||
 		terminal.StartedAt != "" || terminal.NativeSessionID != "" || terminal.CleanupState != core.CleanupRemoved ||
 		persistedTask.Status == core.TaskCompleted {
 		t.Fatalf("reconciled stop started or completed work: Run=%#v Task=%#v", terminal, persistedTask)
 	}
 	events, err := fixture.components.store.Events(fixture.ctx, core.EventFilter{ProjectID: project.ID, RunID: created.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if countDaemonEvent(events, "run.start_issued") != 0 || countDaemonEvent(events, "run.active") != 0 {
 		t.Fatalf("reconcile crossed Start/active boundary despite stop intent: %#v", events)
 	}
@@ -402,9 +367,7 @@ func TestRT05ReconcileAdoptsRunningContainerAndRebuildsRunSocket(t *testing.T) {
 	created := prepareCreatedRunForReconcile(t, fixture, claim)
 	controlPath := filepath.Join(fixture.components.runtime.controlRoot, created.ID)
 	control, err := fixture.components.runtime.openRunControl(created, controlPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	fixture.components.runtime.registerControl(created.ID, control)
 	if _, err := fixture.executor.Attach(fixture.ctx, runtimeRef(created)); err != nil {
 		t.Fatal(err)
@@ -413,29 +376,21 @@ func TestRT05ReconcileAdoptsRunningContainerAndRebuildsRunSocket(t *testing.T) {
 		fixture.ctx,
 		runtimeFactInput(created, runtimeRef(created), "rt05-active-start"),
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	startedRef, err := fixture.executor.Start(fixture.ctx, runtimeRef(started))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	active, err := fixture.components.service.ObserveProcessAndActivateRun(
 		fixture.ctx,
 		runtimeFactInput(started, startedRef, "rt05-active-observed"),
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	fixture.components.runtime.mu.Lock()
 	oldControl := fixture.components.runtime.controls[active.ID]
 	fixture.components.runtime.mu.Unlock()
 	if oldControl == nil {
 		t.Fatal("fault fixture has no original Run control")
 	}
-	if err := fixture.components.runtime.closeControl(active.ID, oldControl); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, fixture.components.runtime.closeControl(active.ID, oldControl))
 
 	restarted := newRuntimeController(
 		fixture.components.config,
@@ -446,13 +401,9 @@ func TestRT05ReconcileAdoptsRunningContainerAndRebuildsRunSocket(t *testing.T) {
 		fixture.components.runtime.coordlink,
 	)
 	t.Cleanup(func() { _ = restarted.Close() })
-	if err := restarted.Reconcile(fixture.ctx); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, restarted.Reconcile(fixture.ctx))
 	adopted, err := fixture.components.store.Run(fixture.ctx, active.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if adopted.State != core.RunActive || adopted.ContainerID != active.ContainerID ||
 		adopted.Generation != active.Generation || restarted.monitor(active.ID) == nil {
 		t.Fatalf("restart did not adopt the durable active Run: before=%#v after=%#v", active, adopted)
@@ -492,9 +443,7 @@ func TestRT05ReconcilePreservesOutcomeRecordedBeforeRestart(t *testing.T) {
 	created := prepareCreatedRunForReconcile(t, fixture, claim)
 	controlPath := filepath.Join(fixture.components.runtime.controlRoot, created.ID)
 	control, err := fixture.components.runtime.openRunControl(created, controlPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	fixture.components.runtime.registerControl(created.ID, control)
 	if _, err := fixture.executor.Attach(fixture.ctx, runtimeRef(created)); err != nil {
 		t.Fatal(err)
@@ -503,13 +452,9 @@ func TestRT05ReconcilePreservesOutcomeRecordedBeforeRestart(t *testing.T) {
 		fixture.ctx,
 		runtimeFactInput(created, runtimeRef(created), "rt05-outcome-start"),
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	startedRef, err := fixture.executor.Start(fixture.ctx, runtimeRef(started))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if _, err := fixture.components.service.ObserveProcessAndActivateRun(
 		fixture.ctx,
 		runtimeFactInput(started, startedRef, "rt05-outcome-active"),
@@ -521,9 +466,7 @@ func TestRT05ReconcilePreservesOutcomeRecordedBeforeRestart(t *testing.T) {
 	var outcome core.Run
 	for time.Now().Before(deadline) {
 		outcome, err = fixture.components.store.Run(fixture.ctx, started.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		if outcome.RequestedOutcome == string(core.OutcomeWait) {
 			break
 		}
@@ -532,9 +475,7 @@ func TestRT05ReconcilePreservesOutcomeRecordedBeforeRestart(t *testing.T) {
 	if outcome.RequestedOutcome != string(core.OutcomeWait) {
 		t.Fatalf("provider did not persist outcome before restart: %#v", outcome)
 	}
-	if err := fixture.components.runtime.closeControl(outcome.ID, control); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, fixture.components.runtime.closeControl(outcome.ID, control))
 
 	restarted := newRuntimeController(
 		fixture.components.config,
@@ -545,17 +486,11 @@ func TestRT05ReconcilePreservesOutcomeRecordedBeforeRestart(t *testing.T) {
 		fixture.components.runtime.coordlink,
 	)
 	t.Cleanup(func() { _ = restarted.Close() })
-	if err := restarted.Reconcile(fixture.ctx); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, restarted.Reconcile(fixture.ctx))
 	terminal, err := fixture.components.store.Run(fixture.ctx, outcome.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	persistedTask, err := fixture.components.store.Task(fixture.ctx, claim.Task.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if terminal.State != core.RunExited || terminal.RequestedOutcome != string(core.OutcomeWait) ||
 		terminal.StopRequestedAt == "" || terminal.CleanupState != core.CleanupRemoved ||
 		persistedTask.Status != core.TaskWaiting || persistedTask.WaitReason != "durable before restart" {
@@ -564,39 +499,56 @@ func TestRT05ReconcilePreservesOutcomeRecordedBeforeRestart(t *testing.T) {
 }
 
 func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 	executor, err := containerruntime.NewDockerExecutorFromEnvironment()
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if err := executor.Ping(ctx); err != nil {
 		t.Skipf("SKIP(Docker unavailable): %v", err)
 	}
 	root, err := os.MkdirTemp("/tmp", "cp3-process-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	repositoryRoot := daemonRepositoryRoot(t)
-	coordlinkPath := filepath.Join(root, "coordlink")
-	buildCoordlink := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-o", coordlinkPath, "./cmd/coordlink")
-	buildCoordlink.Dir = repositoryRoot
-	buildCoordlink.Env = append(os.Environ(), "CGO_ENABLED=0")
-	if raw, err := buildCoordlink.CombinedOutput(); err != nil {
-		t.Fatalf("build coordlink: %v\n%s", err, raw)
+	legacySource := filepath.Join(root, "legacy-source")
+	requireNoError(t, os.MkdirAll(legacySource, 0o700))
+	archive := filepath.Join(root, "legacy.tar")
+	archiveCommand := exec.CommandContext(ctx, "git", "archive", "--format=tar", "--output", archive, "c8b1a3a")
+	archiveCommand.Dir = repositoryRoot
+	if raw, err := archiveCommand.CombinedOutput(); err != nil {
+		t.Fatalf("archive legacy revision c8b1a3a: %v\n%s", err, raw)
 	}
-	daemonBinary := filepath.Join(root, "coordplane")
-	buildDaemon := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-tags=contract", "-o", daemonBinary, "./cmd/coordplane")
-	buildDaemon.Dir = repositoryRoot
-	if raw, err := buildDaemon.CombinedOutput(); err != nil {
-		t.Fatalf("build coordplane: %v\n%s", err, raw)
+	extract := exec.CommandContext(ctx, "tar", "-xf", archive, "-C", legacySource)
+	if raw, err := extract.CombinedOutput(); err != nil {
+		t.Fatalf("extract legacy revision: %v\n%s", err, raw)
 	}
+	legacyBin := filepath.Join(root, "bin")
+	currentBin := filepath.Join(root, "current-bin")
+	for _, directory := range []string{legacyBin, currentBin} {
+		requireNoError(t, os.MkdirAll(directory, 0o700))
+	}
+	for _, build := range []struct {
+		source, output, command string
+	}{
+		{legacySource, filepath.Join(legacyBin, "coordplane"), "./cmd/coordplane"},
+		{legacySource, filepath.Join(legacyBin, "coordlink"), "./cmd/coordlink"},
+		{repositoryRoot, filepath.Join(currentBin, "coordplane"), "./cmd/coordplane"},
+		{repositoryRoot, filepath.Join(currentBin, "coordlink"), "./cmd/coordlink"},
+	} {
+		command := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-o", build.output, build.command)
+		command.Dir = build.source
+		if strings.HasSuffix(build.output, "coordlink") {
+			command.Env = append(os.Environ(), "CGO_ENABLED=0")
+		}
+		if raw, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("build %s from %s: %v\n%s", build.command, build.source, err, raw)
+		}
+	}
+	legacyDaemon := filepath.Join(legacyBin, "coordplane")
+	daemonBinary := legacyDaemon
 	image := "coordplane-p3-process-test:" + fmt.Sprintf("%x", time.Now().UnixNano())
 	dockerConfig := filepath.Join(root, "docker-config")
-	if err := os.MkdirAll(dockerConfig, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.MkdirAll(dockerConfig, 0o700))
 	buildImage := exec.CommandContext(ctx, "docker", "build", "-q", "-t", image,
 		filepath.Join(repositoryRoot, "internal", "daemon", "testdata", "codex-runtime"))
 	buildImage.Env = append(os.Environ(), "DOCKER_CONFIG="+dockerConfig)
@@ -606,84 +558,67 @@ func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
 	t.Cleanup(func() {
 		cleanup, stop := context.WithTimeout(context.Background(), 20*time.Second)
 		defer stop()
+		list := exec.CommandContext(cleanup, "docker", "ps", "-aq", "--filter", "ancestor="+image)
+		list.Env = append(os.Environ(), "DOCKER_CONFIG="+dockerConfig)
+		if raw, err := list.Output(); err == nil {
+			for _, containerID := range strings.Fields(string(raw)) {
+				remove := exec.CommandContext(cleanup, "docker", "rm", "-f", containerID)
+				remove.Env = append(os.Environ(), "DOCKER_CONFIG="+dockerConfig)
+				_ = remove.Run()
+			}
+		}
 		remove := exec.CommandContext(cleanup, "docker", "image", "rm", "-f", image)
 		remove.Env = append(os.Environ(), "DOCKER_CONFIG="+dockerConfig)
 		_ = remove.Run()
 	})
 	configPath := writeTestConfig(t, root)
 	rawConfig, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	rawConfig = []byte(strings.ReplaceAll(string(rawConfig),
 		"  docker_network: coordplane\n",
 		"  docker_network: none\n",
 	))
-	if err := os.WriteFile(configPath, rawConfig, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(configPath, rawConfig, 0o600))
 	instructions := filepath.Join(root, "instructions.md")
-	if err := os.WriteFile(instructions, []byte("Work only on the assigned Task."), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	seed, err := buildComponents(ctx, configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	agent, err := seed.service.AddAgent(ctx, core.AddAgentInput{
-		DisplayName: "Process Recovery Agent", AdapterID: "codex", Image: image,
-		InstructionsFile: instructions, RequestID: "process-recovery-agent",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	outcomeAgent, err := seed.service.AddAgent(ctx, core.AddAgentInput{
-		DisplayName: "Shutdown Outcome Agent", AdapterID: "codex", Image: image,
-		InstructionsFile: instructions, RequestID: "shutdown-outcome-agent",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	queuedAgent, err := seed.service.AddAgent(ctx, core.AddAgentInput{
-		DisplayName: "Shutdown Claim Fence Agent", AdapterID: "codex", Image: image,
-		InstructionsFile: instructions, RequestID: "shutdown-claim-fence-agent",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	project, err := seed.service.AddProject(ctx, core.AddProjectInput{
-		Name: "Process Recovery Project", Source: createSourceRepository(t, root), SourceRef: "refs/heads/main",
-		IntegrationAgentID: agent.ID, RequestID: "process-recovery-project",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	task, err := seed.service.CreateTask(ctx, core.CreateTaskInput{
-		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
-		Title: "hold until stopped process recovery", MaxRetries: 0, RequestID: "process-recovery-task",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := seed.Close(); err != nil {
-		t.Fatal(err)
-	}
-
+	requireNoError(t, os.WriteFile(instructions, []byte("Work only on the assigned Task."), 0o600))
 	socket := filepath.Join(root, "data", "operator.sock")
-	first := startP3DaemonProcessWithEnv(t, daemonBinary, configPath, socket, filepath.Join(root, "daemon-first.log"), []string{
-		"COORDPLANE_CONTRACT_RUNTIME_ISOLATION_V1=1",
-	})
+	first := startP3DaemonProcess(t, legacyDaemon, configPath, socket, filepath.Join(root, "daemon-first.log"))
 	t.Cleanup(func() { stopP3DaemonProcess(t, first) })
 	client, err := transport.NewUnixClient(socket)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
+	var agent core.Agent
+	err = client.JSON(ctx, http.MethodPost, "/v1/agents", core.AddAgentInput{
+		DisplayName: "Process Recovery Agent", AdapterID: "codex", Image: image,
+		InstructionsFile: instructions, RequestID: "process-recovery-agent",
+	}, &agent)
+	requireNoError(t, err)
+	var outcomeAgent core.Agent
+	err = client.JSON(ctx, http.MethodPost, "/v1/agents", core.AddAgentInput{
+		DisplayName: "Shutdown Outcome Agent", AdapterID: "codex", Image: image,
+		InstructionsFile: instructions, RequestID: "shutdown-outcome-agent",
+	}, &outcomeAgent)
+	requireNoError(t, err)
+	var queuedAgent core.Agent
+	err = client.JSON(ctx, http.MethodPost, "/v1/agents", core.AddAgentInput{
+		DisplayName: "Shutdown Claim Fence Agent", AdapterID: "codex", Image: image,
+		InstructionsFile: instructions, RequestID: "shutdown-claim-fence-agent",
+	}, &queuedAgent)
+	requireNoError(t, err)
+	var project core.Project
+	err = client.JSON(ctx, http.MethodPost, "/v1/projects", core.AddProjectInput{
+		Name: "Process Recovery Project", Source: createSourceRepository(t, root), SourceRef: "refs/heads/main",
+		IntegrationAgentID: agent.ID, RequestID: "process-recovery-project",
+	}, &project)
+	requireNoError(t, err)
+	var task core.Task
+	err = client.JSON(ctx, http.MethodPost, "/v1/tasks", core.CreateTaskInput{
+		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
+		Title: "hold until stopped process recovery", MaxRetries: 0, RequestID: "process-recovery-task",
+	}, &task)
+	requireNoError(t, err)
 	active := waitForOperatorRun(t, client, task.ID, func(run core.Run) bool {
 		return run.State == core.RunActive && run.ContainerID != ""
 	})
-	if active.IsolationSpecVersion != core.RunIsolationSpecV1 {
-		t.Fatalf("legacy Run identity/spec changed before upgrade: %#v", active)
-	}
 	legacyState, err := executor.Inspect(ctx, runtimeRef(active))
 	if err != nil || legacyState.MemoryBytes != 1<<30 {
 		t.Fatalf("legacy container memory = %d, want 1 GiB: %v", legacyState.MemoryBytes, err)
@@ -693,28 +628,28 @@ func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
 		t.Fatalf("active Run socket: info=%v err=%v", info, err)
 	}
 	killP3DaemonProcess(t, first)
-	persistedStore, err := store.Open(ctx, filepath.Join(root, "data", "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
+	database, err := sql.Open("sqlite", filepath.Join(root, "data", "coordplane.db"))
+	requireNoError(t, err)
+	var schemaVersion int
+	requireNoError(t, database.QueryRowContext(ctx, `SELECT max(version) FROM schema_migrations`).Scan(&schemaVersion))
+	requireNoError(t, database.Close())
+	if schemaVersion != 1 {
+		t.Fatalf("legacy daemon created schema version %d, want 1", schemaVersion)
 	}
-	persisted, err := persistedStore.Run(ctx, active.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := persistedStore.Close(); err != nil {
-		t.Fatal(err)
-	}
-	state, err := executor.Inspect(ctx, runtimeRef(persisted))
+	state, err := executor.Inspect(ctx, runtimeRef(active))
 	if err != nil || !state.Running || state.Ref.ContainerID != active.ContainerID {
 		t.Fatalf("SIGKILL did not preserve the owned container: state=%#v err=%v", state, err)
+	}
+	for _, name := range []string{"coordplane", "coordlink"} {
+		if err := os.Rename(filepath.Join(currentBin, name), filepath.Join(legacyBin, name)); err != nil {
+			t.Fatalf("install current %s over legacy binary: %v", name, err)
+		}
 	}
 
 	second := startP3DaemonProcess(t, daemonBinary, configPath, socket, filepath.Join(root, "daemon-second.log"))
 	t.Cleanup(func() { stopP3DaemonProcess(t, second) })
 	client, err = transport.NewUnixClient(socket)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	adopted := waitForOperatorRun(t, client, task.ID, func(run core.Run) bool {
 		return run.ID == active.ID && run.State == core.RunActive && run.ContainerID == active.ContainerID
 	})
@@ -727,13 +662,9 @@ func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
 		t.Fatalf("restart did not replace the dead Run socket: info=%v err=%v", newSocketInfo, err)
 	}
 	token, err := os.ReadFile(filepath.Join(root, "data", "run-control", adopted.ID, "token"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	runClient, err := transport.NewUnixClient(runSocket, transport.WithBearerToken(strings.TrimSpace(string(token))))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	var current core.CurrentTaskResult
 	if err := runClient.JSON(ctx, http.MethodGet, "/v1/task/current", nil, &current); err != nil || current.Run.ID != adopted.ID {
 		t.Fatalf("rebuilt Run socket is not serving the adopted scope: result=%#v err=%v", current, err)
@@ -753,16 +684,12 @@ func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
 		t.Fatalf("post-upgrade Run did not use v2/512 MiB: Run=%#v memory=%d err=%v", outcomeRun, newState.MemoryBytes, err)
 	}
 	outcomeToken, err := os.ReadFile(filepath.Join(root, "data", "run-control", outcomeRun.ID, "token"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	outcomeClient, err := transport.NewUnixClient(
 		filepath.Join(root, "data", "run-control", outcomeRun.ID, "api.sock"),
 		transport.WithBearerToken(strings.TrimSpace(string(outcomeToken))),
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 
 	signalP3DaemonProcess(t, second)
 	waitForP3DaemonNotReady(t, second, client)
@@ -785,32 +712,18 @@ func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
 	assertTaskUnclaimedDuringShutdown(t, second, client, queuedTask.ID)
 	waitP3DaemonProcess(t, second)
 	terminalStore, err := store.Open(ctx, filepath.Join(root, "data", "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	terminal, err := terminalStore.Run(ctx, adopted.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	outcomeTerminal, err := terminalStore.Run(ctx, outcomeRun.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	outcomeTaskPersisted, err := terminalStore.Task(ctx, outcomeTask.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	queuedTaskPersisted, err := terminalStore.Task(ctx, queuedTask.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	queuedRuns, err := terminalStore.Runs(ctx, core.RunFilter{TaskID: queuedTask.ID, Limit: 10})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := terminalStore.Close(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
+	requireNoError(t, terminalStore.Close())
 	if terminal.State != core.RunInterrupted || terminal.ContainerID != active.ContainerID ||
 		terminal.StopReason != runtimeShutdownReason || terminal.StopRequestedAt == "" ||
 		terminal.CleanupState != core.CleanupRemoved {
@@ -846,16 +759,12 @@ func TestRT02MissingWorkspaceAfterStartIssuedFailsBeforeSecondContainer(t *testi
 		fixture.ctx,
 		runtimeFactInput(created, runtimeRef(created), "rt02-start-issued"),
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	terminal, err := fixture.components.service.RecordRuntimeRunTerminal(fixture.ctx, runtimeTerminalInput(started, core.RunTerminalInput{
 		State: core.RunInterrupted, TerminalReason: "fault injected after start intent",
 		RequestID: "rt02-first-terminal", OperationID: started.LaunchOperationID,
 	}))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if err := fixture.components.runtime.cleanupRun(
 		fixture.ctx,
 		terminal.Run,
@@ -865,17 +774,13 @@ func TestRT02MissingWorkspaceAfterStartIssuedFailsBeforeSecondContainer(t *testi
 	); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.RemoveAll(started.WorkspacePath); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.RemoveAll(started.WorkspacePath))
 
 	var retry core.Claim
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		retry, ok, err = fixture.components.service.ClaimNext(fixture.ctx, project.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		if ok {
 			break
 		}
@@ -888,9 +793,7 @@ func TestRT02MissingWorkspaceAfterStartIssuedFailsBeforeSecondContainer(t *testi
 		t.Fatal("retry unexpectedly recreated the missing writable workspace")
 	}
 	persisted, err := fixture.components.store.Run(fixture.ctx, retry.Run.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if persisted.State != core.RunFailed || persisted.LaunchPhase != core.LaunchIntent ||
 		persisted.ContainerID != "" || persisted.RuntimeErrorCode != "WORKSPACE_PREPARE_FAILED" ||
 		persisted.CleanupState != core.CleanupRemoved {
@@ -905,18 +808,14 @@ func TestCT04RealDockerExitZeroAndDoneTextCannotCompleteTask(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	executor, err := containerruntime.NewDockerExecutorFromEnvironment()
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if err := executor.Ping(ctx); err != nil {
 		t.Skipf("SKIP(Docker unavailable): %v", err)
 	}
 
 	repositoryRoot := daemonRepositoryRoot(t)
 	root, err := os.MkdirTemp("/tmp", "cp3-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	coordlinkPath := filepath.Join(root, "coordlink")
 	build := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-o", coordlinkPath, "./cmd/coordlink")
@@ -928,9 +827,7 @@ func TestCT04RealDockerExitZeroAndDoneTextCannotCompleteTask(t *testing.T) {
 	image := "coordplane-p3-test:" + fmt.Sprintf("%x", time.Now().UnixNano())
 	imageRoot := filepath.Join(repositoryRoot, "internal", "daemon", "testdata", "codex-runtime")
 	dockerConfig := filepath.Join(root, "docker-config")
-	if err := os.MkdirAll(dockerConfig, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.MkdirAll(dockerConfig, 0o700))
 	buildImage := exec.CommandContext(ctx, "docker", "build", "-q", "-t", image, imageRoot)
 	buildImage.Env = append(os.Environ(), "DOCKER_CONFIG="+dockerConfig)
 	if raw, err := buildImage.CombinedOutput(); err != nil {
@@ -946,48 +843,34 @@ func TestCT04RealDockerExitZeroAndDoneTextCannotCompleteTask(t *testing.T) {
 
 	configPath := writeTestConfig(t, root)
 	rawConfig, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	rawConfig = []byte(strings.ReplaceAll(string(rawConfig),
 		"  docker_network: coordplane\n",
 		"  docker_network: none\n",
 	))
-	if err := os.WriteFile(configPath, rawConfig, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(configPath, rawConfig, 0o600))
 	instructions := filepath.Join(root, "instructions.md")
-	if err := os.WriteFile(instructions, []byte("Work only on the assigned Task."), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(instructions, []byte("Work only on the assigned Task."), 0o600))
 	source := createSourceRepository(t, root)
 	components, err := buildComponents(ctx, configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	components.runtime.coordlink = coordlinkPath
 	t.Cleanup(func() { _ = components.Close() })
 	agent, err := components.service.AddAgent(ctx, core.AddAgentInput{
 		DisplayName: "P3 Docker Agent", AdapterID: "codex", Image: image,
 		InstructionsFile: instructions, RequestID: "p3-agent",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	project, err := components.service.AddProject(ctx, core.AddProjectInput{
 		Name: "p3-project", Source: source, SourceRef: "refs/heads/main",
 		IntegrationAgentID: agent.ID, RequestID: "p3-project",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	task, err := components.service.CreateTask(ctx, core.CreateTaskInput{
 		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
 		Title: "exit zero after saying done completed", MaxRetries: 0, RequestID: "p3-task",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	components.runtime.Start(ctx)
 
 	var persistedTask core.Task
@@ -995,18 +878,14 @@ func TestCT04RealDockerExitZeroAndDoneTextCannotCompleteTask(t *testing.T) {
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		persistedTask, err = components.store.Task(ctx, task.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		runs, readErr := components.store.Runs(ctx, core.RunFilter{TaskID: task.ID, Limit: 10})
 		if readErr != nil {
 			t.Fatal(readErr)
 		}
 		if len(runs.Items) == 1 {
 			run, err = components.store.Run(ctx, runs.Items[0].ID)
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			if persistedTask.Status == core.TaskFailed && core.IsRunTerminal(run.State) && run.CleanupState == core.CleanupRemoved {
 				break
 			}
@@ -1026,9 +905,7 @@ func TestCT04RealDockerExitZeroAndDoneTextCannotCompleteTask(t *testing.T) {
 		t.Fatalf("real Docker Run exit=%d value=%#v", exit, run)
 	}
 	logRaw, err := os.ReadFile(run.LogPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if !strings.Contains(string(logRaw), "done completed") {
 		t.Fatalf("Run log omitted provider output: %q", logRaw)
 	}
@@ -1081,9 +958,7 @@ func startP3DaemonProcess(t *testing.T, binary, configPath, socket, logPath stri
 func startP3DaemonProcessWithEnv(t *testing.T, binary, configPath, socket, logPath string, environment []string) *p3DaemonProcess {
 	t.Helper()
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	command := exec.Command(binary, "serve", "--config", configPath)
 	command.Env = append(os.Environ(), environment...)
 	command.Stdout = logFile
@@ -1095,13 +970,15 @@ func startP3DaemonProcessWithEnv(t *testing.T, binary, configPath, socket, logPa
 	process := &p3DaemonProcess{command: command, done: make(chan error, 1), log: logFile, logPath: logPath}
 	go func() { process.done <- command.Wait() }()
 	client, err := transport.NewUnixClient(socket)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	deadline := time.Now().Add(15 * time.Second)
+	var lastStatus core.Status
+	var lastStatusErr error
 	for time.Now().Before(deadline) {
 		var status core.Status
-		if err := client.JSON(context.Background(), http.MethodGet, "/v1/status", nil, &status); err == nil && status.DaemonReady {
+		lastStatusErr = client.JSON(context.Background(), http.MethodGet, "/v1/status", nil, &status)
+		lastStatus = status
+		if lastStatusErr == nil && status.DaemonReady {
 			return process
 		}
 		select {
@@ -1114,7 +991,7 @@ func startP3DaemonProcessWithEnv(t *testing.T, binary, configPath, socket, logPa
 		time.Sleep(20 * time.Millisecond)
 	}
 	killP3DaemonProcess(t, process)
-	t.Fatalf("daemon readiness timeout:\n%s", readP3DaemonLog(logPath))
+	t.Fatalf("daemon readiness timeout: status=%#v err=%v\n%s", lastStatus, lastStatusErr, readP3DaemonLog(logPath))
 	return nil
 }
 
@@ -1260,16 +1137,12 @@ func newP3DockerFixtureWithRunTimeout(t *testing.T, runTimeout time.Duration) *p
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	t.Cleanup(cancel)
 	executor, err := containerruntime.NewDockerExecutorFromEnvironment()
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if err := executor.Ping(ctx); err != nil {
 		t.Skipf("SKIP(Docker unavailable): %v", err)
 	}
 	root, err := os.MkdirTemp("/tmp", "cp3-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	repositoryRoot := daemonRepositoryRoot(t)
 	coordlinkPath := filepath.Join(root, "coordlink")
 	build := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-o", coordlinkPath, "./cmd/coordlink")
@@ -1280,9 +1153,7 @@ func newP3DockerFixtureWithRunTimeout(t *testing.T, runTimeout time.Duration) *p
 	}
 	image := "coordplane-p3-test:" + fmt.Sprintf("%x", time.Now().UnixNano())
 	dockerConfig := filepath.Join(root, "docker-config")
-	if err := os.MkdirAll(dockerConfig, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.MkdirAll(dockerConfig, 0o700))
 	imageRoot := filepath.Join(repositoryRoot, "internal", "daemon", "testdata", "codex-runtime")
 	buildImage := exec.CommandContext(ctx, "docker", "build", "-q", "-t", image, imageRoot)
 	buildImage.Env = append(os.Environ(), "DOCKER_CONFIG="+dockerConfig)
@@ -1291,9 +1162,7 @@ func newP3DockerFixtureWithRunTimeout(t *testing.T, runTimeout time.Duration) *p
 	}
 	configPath := writeTestConfig(t, root)
 	rawConfig, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	rawConfig = []byte(strings.ReplaceAll(string(rawConfig),
 		"  docker_network: coordplane\n",
 		"  docker_network: none\n",
@@ -1302,18 +1171,12 @@ func newP3DockerFixtureWithRunTimeout(t *testing.T, runTimeout time.Duration) *p
 		rawConfig = []byte(strings.Replace(string(rawConfig),
 			"  default_image:", "  run_timeout: "+runTimeout.String()+"\n  default_image:", 1))
 	}
-	if err := os.WriteFile(configPath, rawConfig, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(configPath, rawConfig, 0o600))
 	instructions := filepath.Join(root, "instructions.md")
-	if err := os.WriteFile(instructions, []byte("Work only on the assigned Task."), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(instructions, []byte("Work only on the assigned Task."), 0o600))
 	source := createSourceRepository(t, root)
 	assembled, err := buildComponents(ctx, configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	assembled.runtime.coordlink = coordlinkPath
 	fixture := &p3DockerFixture{
 		ctx: ctx, root: root, image: image, instructions: instructions,
@@ -1335,21 +1198,13 @@ func newP3DockerFixtureWithRunTimeout(t *testing.T, runTimeout time.Duration) *p
 func prepareCreatedRunForReconcile(t *testing.T, fixture *p3DockerFixture, claim core.Claim) core.Run {
 	t.Helper()
 	launch, err := fixture.components.service.RuntimeLaunchContext(fixture.ctx, claim.Run.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	instructions, instructionsHash, err := readInstructions(launch.Agent.InstructionsFile)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	workspaceSpec, err := gitWorkspaceSpec(launch.Task)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	workspacePath, err := fixture.components.runtime.workspaces.Path(launch.Project.ID, launch.Task.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	homePath := filepath.Join(fixture.components.config.Runtime.AgentHomeRoot, launch.Agent.ID)
 	logPath := filepath.Join(fixture.components.config.Runtime.LogRoot, launch.Run.ID, "run.log")
 	controlPath := filepath.Join(fixture.components.runtime.controlRoot, launch.Run.ID)
@@ -1359,32 +1214,20 @@ func prepareCreatedRunForReconcile(t *testing.T, fixture *p3DockerFixture, claim
 		InstructionsHash: instructionsHash, LaunchMode: "start", CleanupOperationID: "rt05-cleanup-operation",
 		RequestID: "rt05-prepare",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := fixture.components.runtime.prepareWorkspace(fixture.ctx, prepared, workspaceSpec); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
+	requireNoError(t, fixture.components.runtime.prepareWorkspace(fixture.ctx, prepared, workspaceSpec))
 	for _, directory := range []struct {
 		path string
 		mode os.FileMode
 	}{
 		{homePath, 0o2770}, {filepath.Dir(logPath), 0o700}, {controlPath, 0o750},
 	} {
-		if err := ensureRuntimeDirectory(directory.path, directory.mode); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, ensureRuntimeDirectory(directory.path, directory.mode))
 	}
 	bootstrap := buildBootstrap(launch, prepared, instructions, workspacePath, workspaceSpec)
-	if err := writeRunControlMarker(controlPath, prepared); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeRuntimeFile(filepath.Join(controlPath, "token"), []byte(claim.Token+"\n"), 0o440); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeRuntimeFile(filepath.Join(controlPath, "bootstrap"), []byte(bootstrap), 0o440); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, writeRunControlMarker(controlPath, prepared))
+	requireNoError(t, writeRuntimeFile(filepath.Join(controlPath, "token"), []byte(claim.Token+"\n"), 0o440))
+	requireNoError(t, writeRuntimeFile(filepath.Join(controlPath, "bootstrap"), []byte(bootstrap), 0o440))
 	entry, ok := fixture.components.runtime.adapters.Lookup(prepared.AdapterID)
 	if !ok {
 		t.Fatalf("adapter %q is not registered", prepared.AdapterID)
@@ -1392,17 +1235,11 @@ func prepareCreatedRunForReconcile(t *testing.T, fixture *p3DockerFixture, claim
 	command, err := entry.BuildStartCommand(adapter.LaunchSpec{
 		BootstrapPath: adapter.ContainerBootstrapPath, ContainerHome: "/home/agent", ContainerWork: "/workspace/project",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	containerSpec, err := fixture.components.runtime.containerSpec(prepared, launch.Task.Kind, command, controlPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	ref, err := fixture.executor.Create(fixture.ctx, containerSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() {
 		cleanup, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -1413,9 +1250,7 @@ func prepareCreatedRunForReconcile(t *testing.T, fixture *p3DockerFixture, claim
 		fixture.ctx,
 		runtimeFactInput(prepared, ref, "rt05-created"),
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	return created
 }
 
@@ -1425,9 +1260,7 @@ func (f *p3DockerFixture) addAgent(t *testing.T, name string) core.Agent {
 		DisplayName: name, AdapterID: "codex", Image: f.image,
 		InstructionsFile: f.instructions, RequestID: "agent-" + strings.ReplaceAll(name, " ", "-"),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	return agent
 }
 
@@ -1437,9 +1270,7 @@ func (f *p3DockerFixture) addProject(t *testing.T, integrationAgentID string) co
 		Name: "project-" + integrationAgentID, Source: f.source, SourceRef: "refs/heads/main",
 		IntegrationAgentID: integrationAgentID, RequestID: "project-" + integrationAgentID,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	return project
 }
 
@@ -1449,9 +1280,7 @@ func (f *p3DockerFixture) addTask(t *testing.T, projectID, agentID, title string
 		ProjectID: projectID, AssigneeAgentID: agentID, Kind: core.TaskWork,
 		Title: title, MaxRetries: retries, RequestID: "task-" + strings.ReplaceAll(title, " ", "-"),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	return task
 }
 
@@ -1466,18 +1295,12 @@ func waitForRun(
 	var latest core.Run
 	for time.Now().Before(deadline) {
 		task, err := fixture.components.store.Task(fixture.ctx, taskID)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		runs, err := fixture.components.store.Runs(fixture.ctx, core.RunFilter{TaskID: taskID, Limit: 20})
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		if len(runs.Items) > 0 {
 			latest, err = fixture.components.store.Run(fixture.ctx, runs.Items[len(runs.Items)-1].ID)
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			if predicate(latest, task) {
 				return latest
 			}
@@ -1572,13 +1395,9 @@ func assertRunIdentityIsPrivate(t *testing.T, fixture *p3DockerFixture, run, pee
 	tokenPath := filepath.Join(controlPath, "token")
 	peerTokenPath := filepath.Join(peerControlPath, "token")
 	token, err := os.ReadFile(tokenPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	peerToken, err := os.ReadFile(peerTokenPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if strings.TrimSpace(string(token)) == "" || strings.TrimSpace(string(token)) == strings.TrimSpace(string(peerToken)) {
 		t.Fatalf("Run %s token is empty or shared with peer", run.ID)
 	}
@@ -1593,9 +1412,7 @@ func assertContainerCannotAccessPeer(t *testing.T, fixture *p3DockerFixture, run
 	peerWorkspaceCanary := filepath.Join(peer.WorkspacePath, ".rt01-peer-workspace")
 	peerHomeCanary := filepath.Join(peer.HomePath, ".rt01-peer-home")
 	for _, canary := range []string{peerWorkspaceCanary, peerHomeCanary} {
-		if err := os.WriteFile(canary, []byte("peer-only"), 0o660); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, os.WriteFile(canary, []byte("peer-only"), 0o660))
 	}
 	peerControl := filepath.Join(fixture.components.config.DataDir, "run-control", peer.ID)
 	forbidden := []string{
@@ -1644,9 +1461,7 @@ func mutatePrivateMainFromContainer(
 	label string,
 ) string {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(run.WorkspacePath, label+"-private.txt"), []byte(label+"\n"), 0o660); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(filepath.Join(run.WorkspacePath, label+"-private.txt"), []byte(label+"\n"), 0o660))
 	gitIn(t, run.WorkspacePath, "config", "user.email", label+"@coordplane.local")
 	gitIn(t, run.WorkspacePath, "config", "user.name", label)
 	gitIn(t, run.WorkspacePath, "add", label+"-private.txt")

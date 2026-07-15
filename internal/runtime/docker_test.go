@@ -11,6 +11,13 @@ import (
 	"testing"
 )
 
+func requireNoError(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -37,12 +44,8 @@ func TestContainerSpecRejectsRootAndSymlinkMounts(t *testing.T) {
 	root := t.TempDir()
 	real := filepath.Join(root, "real")
 	link := filepath.Join(root, "link")
-	if err := os.Mkdir(real, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(real, link); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Mkdir(real, 0o700))
+	requireNoError(t, os.Symlink(real, link))
 	spec := validTestSpec(real)
 	spec.User = "0:0"
 	if err := validateContainerSpec(&spec); err == nil {
@@ -133,9 +136,7 @@ func TestValidateAdoptionRejectsIsolationDrift(t *testing.T) {
 			"PROVIDER_TOKEN=provider-secret",
 			"IMAGE_DEFAULT=allowed",
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		return LiveState{
 			Ref: spec.Ref, Image: spec.Image,
 			Entrypoint: []string{spec.Command.Executable}, CommandArgs: append([]string(nil), spec.Command.Args...),

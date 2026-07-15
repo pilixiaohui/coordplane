@@ -127,9 +127,7 @@ func TestContainerSpecKeepsTrustedRuntimeEnvironmentOverProviderAllowlist(t *tes
 		t.Setenv(name, "/untrusted/provider-value")
 	}
 	coordlink, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	controller := &runtimeController{
 		config: config.Config{Runtime: config.RuntimeConfig{
 			DockerNetwork: "none",
@@ -151,9 +149,7 @@ func TestContainerSpecKeepsTrustedRuntimeEnvironmentOverProviderAllowlist(t *tes
 			"CODEX_HOME": "/home/agent",
 		},
 	}, "/runtime/run-control/run-env")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	want := map[string]string{
 		"HOME":                      "/home/agent",
 		"CODEX_HOME":                "/home/agent",
@@ -167,13 +163,5 @@ func TestContainerSpecKeepsTrustedRuntimeEnvironmentOverProviderAllowlist(t *tes
 	}
 	if spec.Limits.PIDs != 256 || spec.Limits.MemoryBytes != 512<<20 || spec.Limits.NanoCPUs != 1_000_000_000 {
 		t.Fatalf("Agent resource contract = %#v, want 1 CPU / 512 MiB / 256 PIDs", spec.Limits)
-	}
-	run.IsolationSpecVersion = core.RunIsolationSpecV1
-	legacy, err := controller.containerSpec(run, core.TaskConversation, adapter.CommandSpec{Executable: "codex"}, "/runtime/run-control/run-env")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if legacy.Limits.MemoryBytes != 1<<30 || legacy.Limits.PIDs != spec.Limits.PIDs || legacy.Limits.NanoCPUs != spec.Limits.NanoCPUs {
-		t.Fatalf("legacy isolation spec = %#v, want 1 GiB with unchanged CPU/PID limits", legacy.Limits)
 	}
 }

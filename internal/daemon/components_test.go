@@ -13,17 +13,20 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+func requireNoError(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestGT00CompositionQuarantinesRepositoryWithoutProjectRow(t *testing.T) {
 	root := t.TempDir()
 	configPath := writeTestConfig(t, root)
 	reposRoot := filepath.Join(root, "data", "repos")
 	orphan := filepath.Join(reposRoot, "orphan.git")
-	if err := os.MkdirAll(orphan, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(orphan, "sentinel"), []byte("unowned\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.MkdirAll(orphan, 0o700))
+	requireNoError(t, os.WriteFile(filepath.Join(orphan, "sentinel"), []byte("unowned\n"), 0o600))
 
 	components, err := buildComponents(context.Background(), configPath)
 	if components != nil {
@@ -46,9 +49,7 @@ func TestGT00CompositionQuarantinesRepositoryWithoutProjectRow(t *testing.T) {
 	}
 	defer components.Close()
 	snapshot, err := components.store.Snapshot(context.Background(), "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(snapshot.Projects) != 0 {
 		t.Fatalf("unowned repository was adopted: %#v", snapshot.Projects)
 	}
@@ -70,17 +71,11 @@ func TestCompositionRejectsUnsafeDataDirectoriesBeforeStoreOpen(t *testing.T) {
 			root := t.TempDir()
 			configPath := writeTestConfig(t, root)
 			path := filepath.Join(root, "data", test.path)
-			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
 			if test.symlink {
 				outside := filepath.Join(root, "outside-"+test.path)
-				if err := os.MkdirAll(outside, 0o700); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Symlink(outside, path); err != nil {
-					t.Fatal(err)
-				}
+				requireNoError(t, os.MkdirAll(outside, 0o700))
+				requireNoError(t, os.Symlink(outside, path))
 			} else if err := os.Mkdir(path, 0o700); err != nil {
 				t.Fatal(err)
 			} else if err := os.Chmod(path, test.mode); err != nil {
@@ -126,24 +121,18 @@ runtime:
   default_image: coordplane-agent:latest
   provider_env_allowlist: []
 `, dataDir, filepath.Join(dataDir, "operator.sock"), filepath.Join(dataDir, "workspaces"), filepath.Join(dataDir, "agent-homes"), filepath.Join(dataDir, "logs"))
-	if err := os.WriteFile(configPath, []byte(raw), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(configPath, []byte(raw), 0o600))
 	return configPath
 }
 
 func createSourceRepository(t *testing.T, root string) string {
 	t.Helper()
 	repository := filepath.Join(root, "source")
-	if err := os.MkdirAll(repository, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.MkdirAll(repository, 0o700))
 	gitIn(t, repository, "init", "-b", "main")
 	gitIn(t, repository, "config", "user.email", "tests@coordplane.local")
 	gitIn(t, repository, "config", "user.name", "CoordPlane Tests")
-	if err := os.WriteFile(filepath.Join(repository, "README.md"), []byte("initial\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(filepath.Join(repository, "README.md"), []byte("initial\n"), 0o600))
 	gitIn(t, repository, "add", "README.md")
 	gitIn(t, repository, "commit", "-m", "initial")
 	return repository

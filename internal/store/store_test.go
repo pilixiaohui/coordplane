@@ -14,17 +14,20 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+func requireNoError(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCT01FileMigrationIsExactAndIdempotent(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "coordplane.db")
 	store, err := Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	info, err := store.SchemaInfo(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	wantTables := []string{"agents", "events", "messages", "projects", "request_dedupes", "runs", "schema_migrations", "tasks"}
 	if !reflect.DeepEqual(info.Tables, wantTables) {
 		t.Fatalf("tables = %v, want %v", info.Tables, wantTables)
@@ -33,87 +36,32 @@ func TestCT01FileMigrationIsExactAndIdempotent(t *testing.T) {
 		t.Fatalf("SQLite pragmas = %#v", info)
 	}
 	result, err := store.Migrate(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(result.Applied) != 0 {
 		t.Fatalf("second migration applied %v", result.Applied)
 	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, store.Close())
 	reopened, err := Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() { _ = reopened.Close() })
 	info, err = reopened.SchemaInfo(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if !reflect.DeepEqual(info.Tables, wantTables) {
 		t.Fatalf("reopened tables = %v", info.Tables)
-	}
-}
-
-func TestCT01V1RunMigrationPreservesLegacyIsolationSpec(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "coordplane-v1.db")
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, statement := range splitStatements(schemaSQL) {
-		if _, err := db.ExecContext(ctx, statement); err != nil {
-			t.Fatal(err)
-		}
-	}
-	const now = "2026-07-12T00:00:00Z"
-	statements := []string{
-		`INSERT INTO schema_migrations VALUES(1,'coordplane_v1_six_objects','2026-07-12T00:00:00Z')`,
-		`INSERT INTO projects(id,name,source,source_ref,initial_sha,control_repo_path,canonical_ref,canonical_sha,status,version,created_at,updated_at) VALUES('prj_v1','v1','/source','main','abc','/control','refs/heads/main','abc','active',1,'` + now + `','` + now + `')`,
-		`INSERT INTO agents(id,display_name,adapter_id,image,instructions_file,status,version,created_at,updated_at) VALUES('agt_v1','v1','codex','image','/instructions','active',1,'` + now + `','` + now + `')`,
-		`INSERT INTO tasks(id,project_id,kind,created_by_kind,assignee_agent_id,title,description,status,current_run_id,generation,next_run_at,version,created_at,updated_at) VALUES('tsk_v1','prj_v1','work','boss','agt_v1','v1','','running','run_v1',1,'` + now + `',1,'` + now + `','` + now + `')`,
-		`INSERT INTO runs(id,project_id,task_id,agent_id,generation,adapter_id,image,state,token_hash,cleanup_state,container_name,launch_mode,version,created_at) VALUES('run_v1','prj_v1','tsk_v1','agt_v1',1,'codex','image','active','token-v1','not_needed','coordplane-run-v1','start',1,'` + now + `')`,
-	}
-	for _, statement := range statements {
-		if _, err := db.ExecContext(ctx, statement); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	database, err := Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
-	run, err := database.Run(ctx, "run_v1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if run.IsolationSpecVersion != core.RunIsolationSpecV1 {
-		t.Fatalf("migrated isolation spec = %d, want legacy v1", run.IsolationSpecVersion)
 	}
 }
 
 func TestCT01SQLitePragmasSurviveConnectionReplacement(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, filepath.Join(t.TempDir(), "connection-churn.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer store.Close()
 	store.db.SetConnMaxLifetime(time.Nanosecond)
 
 	for range 3 {
 		time.Sleep(time.Millisecond)
 		info, err := store.SchemaInfo(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		if info.JournalMode != "wal" || !info.ForeignKeys || info.BusyTimeout != busyTimeoutMillis {
 			t.Fatalf("replacement connection SQLite pragmas = %#v", info)
 		}
@@ -127,15 +75,11 @@ func TestCT01LegacyDatabaseFailsClosedWithoutSchemaRewrite(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "legacy.db")
 	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if _, err := db.Exec(`CREATE TABLE work_contracts(id TEXT PRIMARY KEY, status TEXT); INSERT INTO work_contracts VALUES('old','active')`); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, db.Close())
 	opened, err := Open(ctx, path)
 	if opened != nil {
 		_ = opened.Close()
@@ -145,18 +89,14 @@ func TestCT01LegacyDatabaseFailsClosedWithoutSchemaRewrite(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 	db, err = sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer db.Close()
 	var status string
 	if err := db.QueryRow(`SELECT status FROM work_contracts WHERE id='old'`).Scan(&status); err != nil || status != "active" {
 		t.Fatalf("legacy row changed: status=%q err=%v", status, err)
 	}
 	var newTables int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='projects'`).Scan(&newTables); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='projects'`).Scan(&newTables))
 	if newTables != 0 {
 		t.Fatal("new schema was written beside legacy schema")
 	}
@@ -166,9 +106,7 @@ func TestCT01PartialOrCorruptDatabaseNeverBecomesReady(t *testing.T) {
 	t.Run("partial allowed table", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "partial.db")
 		db, err := sql.Open("sqlite", path)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		if _, err := db.Exec(`CREATE TABLE agents(id TEXT PRIMARY KEY)`); err != nil {
 			t.Fatal(err)
 		}
@@ -184,9 +122,7 @@ func TestCT01PartialOrCorruptDatabaseNeverBecomesReady(t *testing.T) {
 	})
 	t.Run("corrupt bytes", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "corrupt.db")
-		if err := os.WriteFile(path, []byte("not a sqlite database"), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, os.WriteFile(path, []byte("not a sqlite database"), 0o600))
 		store, err := Open(context.Background(), path)
 		if store != nil {
 			_ = store.Close()
@@ -245,21 +181,13 @@ func TestCT01ExistingSchemaDriftFailsClosed(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "drift.db")
 			opened, err := Open(context.Background(), path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := opened.Close(); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
+			requireNoError(t, opened.Close())
 
 			db, err := sql.Open("sqlite", path)
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			test.mutate(t, db)
-			if err := db.Close(); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, db.Close())
 
 			reopened, err := Open(context.Background(), path)
 			if reopened != nil {
@@ -276,9 +204,7 @@ func TestCT01ExistingSchemaDriftFailsClosed(t *testing.T) {
 func TestMutationAndEventRollbackTogether(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, filepath.Join(t.TempDir(), "atomic.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer store.Close()
 	agent := core.Agent{
 		ID: "agt_atomic", DisplayName: "Atomic", AdapterID: "one-shot", Image: "image",
@@ -299,16 +225,12 @@ func TestMutationAndEventRollbackTogether(t *testing.T) {
 		t.Fatal("invalid event unexpectedly committed")
 	}
 	snapshot, err := store.Snapshot(ctx, "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(snapshot.Agents) != 0 {
 		t.Fatalf("business row survived event failure: %#v", snapshot.Agents)
 	}
 	events, err := store.Events(ctx, core.EventFilter{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(events) != 0 {
 		t.Fatalf("events survived rollback: %#v", events)
 	}
@@ -317,9 +239,7 @@ func TestMutationAndEventRollbackTogether(t *testing.T) {
 func TestEventsLimitReturnsTheRecentTailInStableOrder(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, filepath.Join(t.TempDir(), "events.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer store.Close()
 	err = store.Transact(ctx, func(tx core.Transaction) error {
 		for _, kind := range []string{"first", "second", "third"} {
@@ -332,13 +252,9 @@ func TestEventsLimitReturnsTheRecentTailInStableOrder(t *testing.T) {
 		}
 		return nil
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	events, err := store.Events(ctx, core.EventFilter{Limit: 2})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(events) != 2 || events[0].Kind != "second" || events[1].Kind != "third" {
 		t.Fatalf("event tail = %#v", events)
 	}

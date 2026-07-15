@@ -96,31 +96,54 @@ func TestRuntimeWorkersWaitForExplicitShutdownAfterParentCancellation(t *testing
 	}
 }
 
+func TestRunLogRetentionTreatsPreLaunchEmptyPathAsAbsentAndLeavesGCReady(t *testing.T) {
+	ctx := context.Background()
+	service := newRuntimeTestService(t)
+	task := addRuntimeTestTask(t, service)
+	claim, ok, err := service.ClaimNext(ctx, "")
+	if err != nil || !ok || claim.Task.ID != task.ID {
+		t.Fatalf("claim pre-launch failure: claim=%#v ok=%t err=%v", claim, ok, err)
+	}
+	controller := &runtimeController{service: service, config: config.Config{Runtime: config.RuntimeConfig{LogRoot: filepath.Join(t.TempDir(), "logs")}}}
+	if err := controller.failUnpreparedRun(ctx, claim.Run, "INSTRUCTIONS_UNAVAILABLE", "missing instructions"); err == nil {
+		t.Fatal("pre-launch failure did not report its terminal error")
+	}
+	terminal, err := service.Run(ctx, claim.Run.ID)
+	if err != nil || !core.IsRunTerminal(terminal.State) || terminal.LogPath != "" {
+		t.Fatalf("pre-launch terminal Run = %#v err=%v", terminal, err)
+	}
+	if err := controller.cleanupRunLogs(ctx, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("retention=0 rejected absent Run log: %v", err)
+	}
+	if err := service.ReconcileWorkspaceGC(ctx, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("workspace GC after absent Run log: %v", err)
+	}
+	if err := service.ReconcileGitGC(ctx, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("Git GC after absent Run log: %v", err)
+	}
+	status, err := service.Status(ctx, "")
+	if err != nil || !status.DaemonReady {
+		t.Fatalf("readiness after retention/GC = %#v err=%v", status, err)
+	}
+}
+
 func TestReconcileSkipsRunOwnedBetweenClaimAndMonitorRegistration(t *testing.T) {
 	service := newRuntimeTestService(t)
 	root := t.TempDir()
 	instructions := filepath.Join(root, "instructions.md")
-	if err := os.WriteFile(instructions, []byte("Run only the assigned conversation."), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(instructions, []byte("Run only the assigned conversation."), 0o600))
 	coordlink := filepath.Join(root, "coordlink")
-	if err := os.WriteFile(coordlink, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(coordlink, []byte("#!/bin/sh\nexit 0\n"), 0o700))
 	agent, err := service.AddAgent(context.Background(), core.AddAgentInput{
 		DisplayName: "Launch Race Agent", AdapterID: "codex", Image: "agent:test",
 		InstructionsFile: instructions, RequestID: "add-launch-race-agent",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	project, err := service.AddProject(context.Background(), core.AddProjectInput{
 		Name: "Launch Race Project", Source: "/source", SourceRef: "refs/heads/main",
 		IntegrationAgentID: agent.ID, RequestID: "add-launch-race-project",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if _, err := service.Chat(context.Background(), core.ChatInput{
 		ProjectID: project.ID, AgentID: agent.ID, Body: "exercise launch ownership",
 		Wake: true, RequestID: "wake-launch-race",
@@ -147,25 +170,19 @@ func TestReconcileSkipsRunOwnedBetweenClaimAndMonitorRegistration(t *testing.T) 
 		t.Fatal("launch did not reach the blocked Create boundary")
 	}
 
-	if err := controller.Reconcile(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, controller.Reconcile(context.Background()))
 	if executor.inspectCalls.Load() != 0 {
 		t.Fatalf("reconcile inspected a Run owned by launch: calls=%d", executor.inspectCalls.Load())
 	}
 	persisted, err := service.Run(context.Background(), claim.Run.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if persisted.State != core.RunStarting || persisted.LaunchNonce == "" || persisted.ContainerID != "" {
 		t.Fatalf("reconcile mutated launch-owned Run: %#v", persisted)
 	}
 	close(executor.allowCreate)
 	select {
 	case err := <-launchDone:
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("launch did not finish after Create was released")
 	}
@@ -208,9 +225,7 @@ func TestReconcileRefreshesCanonicalRunAfterOwnershipHandoff(t *testing.T) {
 		RuntimeErrorCode: "LAUNCH_OWNER_FAILED", RequestID: "terminal-before-reconcile-owner",
 		OperationID: snapshot.Run.LaunchOperationID,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	executor := &runtimeTestExecutor{}
 	controller := &runtimeController{service: service, executor: executor}
 
@@ -221,9 +236,7 @@ func TestReconcileRefreshesCanonicalRunAfterOwnershipHandoff(t *testing.T) {
 		t.Fatalf("stale terminal Run reached Docker inspect: calls=%d", executor.inspectCalls.Load())
 	}
 	persisted, err := service.Run(context.Background(), snapshot.Run.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if persisted.State != terminal.Run.State || persisted.TerminalReason != terminal.Run.TerminalReason ||
 		persisted.RuntimeErrorCode != terminal.Run.RuntimeErrorCode {
 		t.Fatalf("stale reconciliation changed canonical terminal fact: %#v", persisted)
@@ -256,9 +269,7 @@ func TestShutdownPersistsIntentBeforeCancellingMonitorAndConverges(t *testing.T)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := controller.Shutdown(ctx); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, controller.Shutdown(ctx))
 	select {
 	case durable := <-intentBeforeCancel:
 		if !durable {
@@ -268,9 +279,7 @@ func TestShutdownPersistsIntentBeforeCancellingMonitorAndConverges(t *testing.T)
 		t.Fatal("shutdown did not cancel the registered monitor")
 	}
 	persisted, err := service.Run(context.Background(), active.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if persisted.State != core.RunInterrupted || persisted.StopReason != runtimeShutdownReason ||
 		persisted.CleanupState != core.CleanupRemoved {
 		t.Fatalf("shutdown Run did not converge: %#v", persisted)
@@ -296,13 +305,9 @@ func TestShutdownConvergesNonceLessRun(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := controller.Shutdown(ctx); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, controller.Shutdown(ctx))
 	persisted, err := service.Run(context.Background(), claim.Run.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if persisted.State != core.RunFailed || persisted.StopReason != runtimeShutdownReason ||
 		persisted.StopOperationID == "" || persisted.RuntimeErrorCode != "DAEMON_SHUTDOWN" {
 		t.Fatalf("nonce-less shutdown Run did not converge through fenced terminal state: %#v", persisted)
@@ -369,9 +374,7 @@ func TestFalseOutcomeSignalCannotStopHealthyRun(t *testing.T) {
 		t.Fatalf("false outcome signal stopped healthy container: calls=%d", executor.stopCalls.Load())
 	}
 	persisted, err := service.Run(context.Background(), active.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if persisted.RequestedOutcome != "" || persisted.StopRequestedAt != "" {
 		t.Fatalf("false outcome signal created durable stop intent: %#v", persisted)
 	}
@@ -435,9 +438,7 @@ func TestSupervisorStopsRunAfterSessionPersistenceFailure(t *testing.T) {
 
 	controller.supervise(monitor)
 	persisted, err := service.Run(context.Background(), active.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if persisted.StopRequestedAt == "" || persisted.StopReason != runtimeLogFailureReason ||
 		persisted.State != core.RunInterrupted || persisted.RuntimeErrorCode != runtimeSessionFailureCode ||
 		persisted.CleanupState != core.CleanupRemoved {
@@ -490,13 +491,9 @@ func TestShutdownReplaysTailLogsBeforeTerminalConvergence(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err := controller.Shutdown(ctx); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, controller.Shutdown(ctx))
 	persisted, err := service.Run(context.Background(), active.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if persisted.NativeSessionID != "shutdown-tail-session" || persisted.State != core.RunInterrupted ||
 		persisted.CleanupState != core.CleanupRemoved {
 		t.Fatalf("shutdown did not replay tail session before terminal convergence: %#v", persisted)
@@ -522,17 +519,13 @@ func TestDockerUnavailableDegradesWithoutRewritingLiveRun(t *testing.T) {
 		monitors: make(map[string]*runMonitor), controls: make(map[string]*runControl),
 		runOperations: make(map[string]*runOperation),
 	}
-	if err := controller.Reconcile(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, controller.Reconcile(context.Background()))
 	healthy, reason := controller.Healthy()
 	if healthy || reason == "" {
 		t.Fatalf("Docker outage did not degrade runtime: healthy=%t reason=%q", healthy, reason)
 	}
 	persisted, err := service.Run(context.Background(), active.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if persisted.State != active.State || persisted.ContainerID != active.ContainerID ||
 		persisted.LaunchPhase != active.LaunchPhase || persisted.CleanupState != active.CleanupState {
 		t.Fatalf("Docker outage rewrote live Run: before=%#v after=%#v", active, persisted)
@@ -559,17 +552,13 @@ func TestSuccessfulReconcileDoesNotClearSchedulerInvariantDegradedState(t *testi
 	}
 	controller.setSchedulerDegraded(`adapter "removed-adapter" is not registered`)
 
-	if err := controller.Reconcile(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, controller.Reconcile(context.Background()))
 	healthy, reason := controller.Healthy()
 	if healthy || !strings.Contains(reason, "removed-adapter") {
 		t.Fatalf("reconcile cleared scheduler invariant degradation: healthy=%t reason=%q", healthy, reason)
 	}
 	status, err := service.Status(context.Background(), "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if status.DaemonReady || !strings.Contains(status.Reason, "removed-adapter") {
 		t.Fatalf("status cleared scheduler invariant degradation: %#v", status)
 	}
@@ -588,18 +577,14 @@ func TestUnavailableContainerRemovalKeepsTerminalCleanupBlocked(t *testing.T) {
 		State: core.RunExited, ExitCode: &exitCode, TerminalReason: "provider exited",
 		RequestID: "terminal-before-cleanup-outage", OperationID: active.LaunchOperationID,
 	}))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	executor := &cleanupBlockingExecutor{}
 	controller := &runtimeController{service: service, executor: executor, controlRoot: t.TempDir()}
 	if err := controller.cleanupRun(context.Background(), terminal.Run, ref, nil, nil); !errors.Is(err, containerruntime.ErrUnavailable) {
 		t.Fatalf("cleanup outage error = %v", err)
 	}
 	persisted, err := service.Run(context.Background(), active.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if persisted.State != terminal.Run.State || persisted.CleanupState != core.CleanupBlocked ||
 		persisted.LastError == "" || executor.removeCalls.Load() != 1 {
 		t.Fatalf("cleanup outage guessed removal or changed terminal fact: %#v remove_calls=%d", persisted, executor.removeCalls.Load())
@@ -861,14 +846,10 @@ func (g *runtimeTestGit) Resolve(context.Context, string, string) (string, error
 func newRuntimeTestService(t *testing.T) *core.Service {
 	t.Helper()
 	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() { _ = database.Close() })
 	service, err := core.NewService(database, &runtimeTestGit{sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, core.ServiceOptions{MaxParallelRuns: 4, AdapterIDs: []string{"codex"}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	service.SetReady(true, "")
 	return service
 }
@@ -880,23 +861,17 @@ func addRuntimeTestTask(t *testing.T, service *core.Service) core.Task {
 		DisplayName: "Runtime Agent", AdapterID: "codex", Image: "agent:test",
 		InstructionsFile: "/instructions/runtime.md", RequestID: "add-runtime-agent",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	project, err := service.AddProject(ctx, core.AddProjectInput{
 		Name: "Runtime Project", Source: "/source", SourceRef: "refs/heads/main",
 		IntegrationAgentID: agent.ID, RequestID: "add-runtime-project",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	task, err := service.CreateTask(ctx, core.CreateTaskInput{
 		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
 		Title: "Runtime task", RequestID: "add-runtime-task",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	return task
 }
 
@@ -909,23 +884,15 @@ func activateRuntimeTestRun(t *testing.T, service *core.Service, claim core.Clai
 		LogPath: filepath.Join(root, "run.log"), InstructionsHash: "instructions-hash",
 		LaunchMode: "start", CleanupOperationID: "active-cleanup", RequestID: "prepare-active-run",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	ref := runtimeRef(prepared)
 	ref.ContainerID = "container-active"
 	created, err := service.RecordContainerCreated(context.Background(), runtimeFactInput(prepared, ref, "created-test"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	started, err := service.RecordRunStartIssued(context.Background(), runtimeFactInput(created, ref, "started-test"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	active, err := service.ObserveProcessAndActivateRun(context.Background(), runtimeFactInput(started, ref, "active-test"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	return active, ref
 }
 
@@ -934,9 +901,7 @@ func waitForRuntimeTestRun(t *testing.T, service *core.Service, runID string, re
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		run, err := service.Run(context.Background(), runID)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		if ready(run) {
 			return run
 		}

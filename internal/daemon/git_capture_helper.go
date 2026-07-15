@@ -18,6 +18,7 @@ import (
 	"coordplane/internal/config"
 	"coordplane/internal/gitcapture"
 	"coordplane/internal/gitrepo"
+	"coordplane/internal/perfobs"
 	containerruntime "coordplane/internal/runtime"
 )
 
@@ -268,7 +269,7 @@ func (h *dockerCaptureHelper) helperContainerSpec(
 		},
 		ReadOnlyRoot: true,
 		Limits: containerruntime.ResourceLimits{
-			PIDs: 64, MemoryBytes: 512 << 20, NanoCPUs: 1_000_000_000, TmpfsBytes: 128 << 20,
+			PIDs: 64, MemoryBytes: 128 << 20, NanoCPUs: 1_000_000_000, TmpfsBytes: 128 << 20,
 		},
 	}
 }
@@ -300,6 +301,18 @@ func (h *dockerCaptureHelper) runContainer(ctx context.Context, spec containerru
 			return fmt.Errorf("capture helper: start container: %w", err)
 		}
 	}
+	live, err := h.executor.Inspect(runCtx, ref)
+	if err != nil {
+		return fmt.Errorf("capture helper: inspect started container: %w", err)
+	}
+	if !live.Running {
+		return errors.New("capture helper: started container is not running")
+	}
+	role := "git_capture"
+	if strings.HasPrefix(ref.ContainerName, "coordplane-git-inspect-") {
+		role = "git_inspect"
+	}
+	perfobs.RuntimeLimit(perfobs.Fields{ProjectID: ref.ProjectID, TaskID: ref.TaskID, RunID: ref.RunID}, role, live.MemoryBytes, live.NanoCPUs, live.PIDsLimit)
 	exit, waitErr := h.executor.Wait(runCtx, ref)
 	logs := h.containerLogs(runCtx, ref)
 	removeErr := h.removeContainer(context.Background(), ref)

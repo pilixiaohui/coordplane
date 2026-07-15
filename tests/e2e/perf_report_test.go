@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"coordplane/internal/core"
 )
 
 type pfReferenceManifest struct {
@@ -38,6 +40,7 @@ type pfReferenceManifest struct {
 	CPUQuota               string `json:"cpu_quota"`
 	CPUSet                 string `json:"cpu_set"`
 	MountDevice            string `json:"mount_device"`
+	ImageDigest            string `json:"image_digest"`
 }
 
 type pfIdleSample struct {
@@ -94,8 +97,10 @@ func validatePFSamples(report *pfReport) (pfInventory, error) {
 		}
 		for _, fact := range sample.RunFacts {
 			key := fact.TaskID + "\x00" + fact.RunID
-			if wantFacts[key] == "" || wantFacts[key] != fact.Role || fact.TerminalState == "" || !fact.ContainerAbsent || !fact.ResourcesAbsent ||
-				fact.TerminalObservedUnixNS <= 0 || fact.ContainerAbsentNS <= 0 || fact.CleanupNS <= 0 || !result.allRuns[fact.RunID] {
+			if wantFacts[key] == "" || wantFacts[key] != fact.Role || !core.IsRunTerminal(core.RunState(fact.TerminalState)) ||
+				fact.ContainerID == "" || !fact.ContainerAbsent || !fact.ResourcesAbsent ||
+				fact.TerminalObservedUnixNS <= 0 || fact.ContainerAbsentNS <= 0 ||
+				fact.CleanupNS < fact.ContainerAbsentNS || !result.allRuns[fact.RunID] {
 				return result, fmt.Errorf("%s Run terminal/cleanup fact is missing, duplicate, or invalid", sample.ID)
 			}
 			delete(wantFacts, key)
@@ -125,6 +130,7 @@ func validatePFSamples(report *pfReport) (pfInventory, error) {
 		return result, fmt.Errorf("release scored wave exact set is not 20")
 	}
 	diskBySample := map[string]map[string]bool{}
+	diskCadence := map[string][]int64{}
 	for _, sample := range report.Disk {
 		if sample.SampleID == "" || sample.Boundary == "" || sample.ObservedUnixNS <= 0 || sample.Bytes < 0 || sample.Error != "" {
 			return result, fmt.Errorf("disk sample is incomplete")
@@ -134,6 +140,20 @@ func validatePFSamples(report *pfReport) (pfInventory, error) {
 		}
 		diskBySample[sample.SampleID][sample.Boundary] = true
 		report.RawMetrics["disk_bytes"] = append(report.RawMetrics["disk_bytes"], sample.Bytes)
+		if sample.Boundary == "daemon_ready" || sample.Boundary == "interval" || sample.Boundary == "gc_complete" {
+			diskCadence[sample.SampleID] = append(diskCadence[sample.SampleID], sample.ObservedUnixNS)
+		}
+	}
+	for sampleID, times := range diskCadence {
+		if len(times) < 2 {
+			return result, fmt.Errorf("disk cadence has fewer than two observations for %s", sampleID)
+		}
+		sort.Slice(times, func(left, right int) bool { return times[left] < times[right] })
+		for index := 1; index < len(times); index++ {
+			if times[index]-times[index-1] > int64(1200*time.Millisecond) {
+				return result, fmt.Errorf("disk cadence exceeded 1.2s for %s", sampleID)
+			}
+		}
 	}
 	for _, counts := range report.ObjectCounts {
 		if !diskBySample[counts.SampleID]["daemon_ready"] || !diskBySample[counts.SampleID]["gc_complete"] {
@@ -166,18 +186,12 @@ func measurePFIdle(t *testing.T, batch *pfBatch) pfIdleSample {
 func readPFProcess(t *testing.T, pid int) (int64, int64) {
 	t.Helper()
 	statm, err := os.ReadFile(fmt.Sprintf("/proc/%d/statm", pid))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	memory := strings.Fields(string(statm))
 	pages, err := strconv.ParseInt(memory[1], 10, 64)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	fields := strings.Fields(string(stat[strings.LastIndex(string(stat), ")")+1:]))
 	userTicks, userErr := strconv.ParseInt(fields[11], 10, 64)
 	systemTicks, systemErr := strconv.ParseInt(fields[12], 10, 64)
@@ -243,6 +257,7 @@ func validateReferenceEnvironment(ctx context.Context, root, image, revision str
 		"cpu_model": cpuModel, "kernel": environment["kernel"], "go_version": environment["go"],
 		"git_version": environment["git"], "docker_version": environment["docker"], "cpu_quota": cpuQuota,
 		"cpu_set": cpuSet, "mount_device": strconv.FormatUint(uint64(stat.Dev), 10),
+		"image_digest": environment["image_digest"],
 	}
 	fingerprint := fingerprintMap(facts)
 	environment["runner_id"] = runnerID
@@ -259,7 +274,8 @@ func validateReferenceEnvironment(ctx context.Context, root, image, revision str
 		manifest.DockerStorageDriver != driver || manifest.RunnerID != runnerID || manifest.EnvironmentFingerprint != fingerprint ||
 		manifest.StatisticsVersion != pfStatisticsVersion || manifest.CPUModel != cpuModel || manifest.Kernel != facts["kernel"] ||
 		manifest.GoVersion != facts["go_version"] || manifest.GitVersion != facts["git_version"] || manifest.DockerVersion != facts["docker_version"] ||
-		manifest.CPUQuota != cpuQuota || manifest.CPUSet != cpuSet || manifest.MountDevice != facts["mount_device"] {
+		manifest.CPUQuota != cpuQuota || manifest.CPUSet != cpuSet || manifest.MountDevice != facts["mount_device"] ||
+		manifest.ImageDigest != facts["image_digest"] {
 		return "actual cgroup/storage/image fingerprint does not match the approved 8 CPU / 16 GiB / 10 GiB reference manifest"
 	}
 	return ""
@@ -291,15 +307,20 @@ func validateObserver(report *pfReport) error {
 		report.RawMetrics["idle_rss_bytes"] = append(report.RawMetrics["idle_rss_bytes"], idle.RSSBytes...)
 		report.RawMetrics["idle_cpu_time"] = append(report.RawMetrics["idle_cpu_time"], idle.CPUNS)
 	}
-	type bounds struct{ start, end int64 }
+	type bounds struct {
+		start, end int64
+		origin     string
+	}
 	bursts := map[string]bounds{}
 	outcomes, submissions := map[string]map[string]any{}, map[string]map[string]any{}
 	createdMessages, acknowledgedMessages := map[string]map[string]any{}, map[string]map[string]any{}
 	cloneWork := map[string]int64{}
 	stageAttempts := map[string]map[int64]bool{}
-	stageStarts := map[string]bool{}
+	stageStarts := map[string]string{}
 	resourceOffsets := map[string][]int64{}
 	runtimeLimits := map[string]bool{}
+	helperLimits, processLimits := 0, 0
+	diskBoundaries := map[string]int{}
 	resourceCount := 0
 	for _, record := range report.Observer {
 		kind, origin := textField(record, "record_type"), textField(record, "daemon_origin_id")
@@ -342,6 +363,11 @@ func validateObserver(report *pfReport) error {
 			if normal && strings.HasPrefix(request, "p5-progress-") && scoredTasks[textField(record, "task_id")] {
 				wave := taskWave[textField(record, "task_id")]
 				boundary := bursts[wave]
+				if boundary.origin == "" {
+					boundary.origin = origin
+				} else if boundary.origin != origin {
+					return fmt.Errorf("progress burst crosses daemon origins for %s", wave)
+				}
 				if id == "api.progress.received" && textField(record, "result") != "error" && (boundary.start == 0 || intField(record, "mono_offset_ns") < boundary.start) {
 					boundary.start = intField(record, "mono_offset_ns")
 				}
@@ -370,7 +396,7 @@ func validateObserver(report *pfReport) error {
 					return fmt.Errorf("peer Message ack identity is missing or duplicate")
 				}
 			}
-		case "stage_start", "stage":
+		case "stage_start", "stage", "stage_interrupted":
 			id, key, duration := textField(record, "stage_id"), textField(record, "stage_key_sha256"), intField(record, "duration_ns")
 			attemptValue, attemptOK := record["attempt_index"].(float64)
 			attempt := int64(attemptValue)
@@ -379,16 +405,29 @@ func validateObserver(report *pfReport) error {
 				return fmt.Errorf("unknown stage or negative duration")
 			}
 			if kind == "stage_start" {
-				if stageStarts[identity] {
+				if stageStarts[identity] != "" {
 					return fmt.Errorf("duplicate stage start")
 				}
-				stageStarts[identity] = true
+				stageStarts[identity] = origin
 				continue
 			}
-			if !stageStarts[identity] || duration < 0 || textField(record, "result") == "" {
+			startedOrigin := stageStarts[identity]
+			if startedOrigin == "" || textField(record, "result") == "" {
 				return fmt.Errorf("stage completion has no start or a negative duration")
 			}
 			delete(stageStarts, identity)
+			if kind == "stage_interrupted" {
+				interruptedBy := textField(record, "interrupted_by_origin_id")
+				if origin != startedOrigin || interruptedBy == "" || interruptedBy == origin ||
+					textField(record, "result") != "interrupted" {
+					return fmt.Errorf("interrupted stage is not bound to its original daemon")
+				}
+				if _, exists := record["duration_ns"]; exists {
+					return fmt.Errorf("interrupted stage has a cross-origin duration")
+				}
+			} else if origin != startedOrigin || duration < 0 {
+				return fmt.Errorf("stage duration crosses daemon origins or is negative")
+			}
 			identity = id + "\x00" + key
 			if stageAttempts[identity] == nil {
 				stageAttempts[identity] = map[int64]bool{}
@@ -397,7 +436,7 @@ func validateObserver(report *pfReport) error {
 				return fmt.Errorf("duplicate stage attempt")
 			}
 			stageAttempts[identity][attempt] = true
-			if normalPFSample(textField(record, "sample_id")) && scoredTasks[textField(record, "task_id")] {
+			if kind == "stage" && normalPFSample(textField(record, "sample_id")) && scoredTasks[textField(record, "task_id")] {
 				stageSeen[id]++
 				report.RawMetrics["stage."+id] = append(report.RawMetrics["stage."+id], duration)
 				if id == "git.clone.prepare" && inventory.sourceTasks[textField(record, "task_id")] {
@@ -422,11 +461,34 @@ func validateObserver(report *pfReport) error {
 			}
 		case "runtime_limit":
 			runID := textField(record, "run_id")
-			if runID == "" || runtimeLimits[runID] || intField(record, "memory_bytes") != 512<<20 ||
-				intField(record, "nano_cpus") != 1_000_000_000 || intField(record, "pids_limit") != 256 {
+			role := textField(record, "runtime_role")
+			if role == "agent" && (runID == "" || runtimeLimits[runID] || intField(record, "memory_bytes") != 512<<20 ||
+				intField(record, "nano_cpus") != 1_000_000_000 || intField(record, "pids_limit") != 256) {
 				return fmt.Errorf("runtime cgroup fact is missing, duplicate, or incorrect")
 			}
-			runtimeLimits[runID] = true
+			if role == "agent" {
+				runtimeLimits[runID] = true
+			} else if (role != "git_capture" && role != "git_inspect") || intField(record, "memory_bytes") != 128<<20 ||
+				intField(record, "nano_cpus") != 1_000_000_000 || intField(record, "pids_limit") != 64 {
+				return fmt.Errorf("Git helper cgroup fact is missing or incorrect")
+			} else {
+				helperLimits++
+			}
+		case "process_limit":
+			if intField(record, "gomaxprocs") != 3 || intField(record, "memory_limit_bytes") != 384<<20 {
+				return fmt.Errorf("Daemon process resource limit is incorrect")
+			}
+			processLimits++
+		case "disk_boundary":
+			stageID, boundary := textField(record, "stage_id"), textField(record, "boundary")
+			if (stageID != "git.capture.freeze" && stageID != "git.capture.handoff" && stageID != "git.capture.import") ||
+				(boundary != "start" && boundary != "end") || intField(record, "observed_unix_ns") <= 0 || intField(record, "bytes") < 0 || textField(record, "error") != "" {
+				return fmt.Errorf("capture disk boundary fact is incomplete")
+			}
+			if normalPFSample(textField(record, "sample_id")) && scoredTasks[textField(record, "task_id")] {
+				diskBoundaries[stageID+"\x00"+boundary]++
+				report.RawMetrics["disk_bytes"] = append(report.RawMetrics["disk_bytes"], intField(record, "bytes"))
+			}
 		default:
 			return fmt.Errorf("unknown observer record type %s", kind)
 		}
@@ -436,7 +498,7 @@ func validateObserver(report *pfReport) error {
 	}
 	for request, client := range clients {
 		if api[request] == nil || committed[request] == nil || textField(api[request], "daemon_origin_id") != textField(committed[request], "daemon_origin_id") ||
-			textField(client, "run_id") != textField(committed[request], "run_id") {
+			textField(client, "daemon_origin_id") != textField(committed[request], "daemon_origin_id") || textField(client, "run_id") != textField(committed[request], "run_id") {
 			return fmt.Errorf("progress join failed for %s", request)
 		}
 	}
@@ -459,6 +521,16 @@ func validateObserver(report *pfReport) error {
 			return fmt.Errorf("capture duration is negative for %s", runID)
 		}
 		report.RawMetrics["T_capture"] = append(report.RawMetrics["T_capture"], duration)
+	}
+	if helperLimits == 0 || processLimits == 0 {
+		return fmt.Errorf("Daemon/Git helper resource facts are incomplete")
+	}
+	for _, stageID := range []string{"git.capture.freeze", "git.capture.handoff", "git.capture.import"} {
+		for _, boundary := range []string{"start", "end"} {
+			if count := diskBoundaries[stageID+"\x00"+boundary]; count != 7*len(scoredWaves) {
+				return fmt.Errorf("%s %s disk boundary count = %d", stageID, boundary, count)
+			}
+		}
 	}
 	for messageID, start := range createdMessages {
 		end := acknowledgedMessages[messageID]
@@ -558,7 +630,8 @@ func validatePFFaults(report *pfReport) error {
 			row.RecoveryNS <= 0 || row.RecoveryNS > int64(8*time.Second) || len(before) != wantRuns || strings.Join(before, "\x00") != strings.Join(after, "\x00") ||
 			row.PreRestart == "" || row.FinalSHA == "" || row.GitFSCK != "pass" || row.Cleanup != "absent" || row.Result != "PASS" ||
 			row.Counts.OpenRuns != 0 || row.Counts.OwnedResidue != 0 || row.Counts.PeerMessages != row.Counts.PeerAcknowledged || row.Counts.PeerMessages != row.Counts.PeerAckEvent ||
-			(row.Kind == "live" && (row.DurableUnacked != 4 || row.Counts.PeerMessages != 10)) || (row.Kind != "live" && row.DurableUnacked != 0) {
+			(row.Kind == "live" && (row.DurableUnacked != 4 || row.Counts.PeerMessages != 10)) ||
+			(row.Kind != "live" && (row.DurableUnacked != 0 || row.Counts.PeerMessages != 4)) {
 			return fmt.Errorf("fault row %s does not carry the complete durable signature", row.SampleID)
 		}
 		seen[row.Kind][row.Index], samples[row.SampleID], roots[row.FreshDataDirID] = true, true, true
@@ -642,6 +715,7 @@ func releasePFResult(report *pfReport) string {
 		baseline.Baseline["owner_approved"] != "true" ||
 		baseline.Environment["statistics_version"] != pfStatisticsVersion || report.Environment["statistics_version"] != pfStatisticsVersion ||
 		baseline.Environment["environment_fingerprint"] != report.Environment["environment_fingerprint"] ||
+		baseline.Environment["image_digest"] != report.Environment["image_digest"] ||
 		baseline.Fixture["generator_sha256"] != report.Fixture["generator_sha256"] || !sameMetricKeys(baseline.Statistics, report.Statistics) {
 		return "FAIL"
 	}
