@@ -1321,6 +1321,14 @@ func startDaemonBinaryWithEnv(t *testing.T, binary, configPath, socket string, e
 		lastProbeErr = client.JSON(probeContext, http.MethodGet, "/v1/status", nil, &lastStatus)
 		cancel()
 		if lastProbeErr == nil && lastStatus.DaemonReady {
+			info, statErr := os.Stat(socket)
+			if statErr != nil || info.Mode().Perm() != 0o600 {
+				t.Fatalf("operator socket mode: info=%v err=%v", info, statErr)
+			}
+			if lastStatus.Runtime == nil || lastStatus.Runtime.WorkspaceQuotaEnabled ||
+				!strings.Contains(lastStatus.Runtime.WorkspaceQuotaReason, "host bind mount") || lastStatus.Runtime.TmpfsLimitBytes != 64<<20 {
+				t.Fatalf("runtime quota status = %#v", lastStatus.Runtime)
+			}
 			t.Logf("daemon ready after %s (pid=%d)", time.Since(started).Round(time.Millisecond), command.Process.Pid)
 			return process
 		}

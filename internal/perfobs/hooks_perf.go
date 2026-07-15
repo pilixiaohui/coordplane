@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -26,8 +27,8 @@ const (
 )
 
 type stageStart struct {
-	offset, attempt int64
-	fields          Fields
+	offset, attempt, unixNS int64
+	fields                  Fields
 }
 
 type receivedPoint struct {
@@ -90,11 +91,16 @@ func Start(ctx context.Context) error {
 	sampleCtx, cancel := context.WithCancel(ctx)
 	observer.file, observer.start, observer.origin = file, time.Now(), origin
 	observer.sample, observer.cancel = strings.TrimSpace(os.Getenv(sampleEnvironment)), cancel
-	observer.stages, observer.attempts = map[string]stageStart{}, map[string]int64{}
-	observer.received, observer.clients = map[string]receivedPoint{}, loadClientSignatures(file)
+	observer.received = map[string]receivedPoint{}
+	observer.clients, observer.attempts, observer.stages = loadObserverState(file)
+	interrupted := observer.stages
+	observer.stages = map[string]stageStart{}
 	observer.samplerDone = make(chan struct{})
 	observer.Unlock()
 	emitResource()
+	for stageKey, started := range interrupted {
+		emitStage(stageKey, started, "interrupted")
+	}
 	go sampleResources(sampleCtx, observer.samplerDone)
 	return nil
 }
@@ -180,7 +186,7 @@ func StartStage(id, key string, fields Fields) {
 	if key == "" {
 		return
 	}
-	stageKey := id + "\x00" + key
+	stageKey := observedStageKey(id, key)
 	observer.Lock()
 	if observer.file == nil {
 		observer.Unlock()
@@ -189,28 +195,61 @@ func StartStage(id, key string, fields Fields) {
 	_, duplicate := observer.stages[stageKey]
 	attempt := observer.attempts[stageKey]
 	observer.attempts[stageKey]++
-	observer.stages[stageKey] = stageStart{time.Since(observer.start).Nanoseconds(), attempt, fields}
+	started := stageStart{time.Since(observer.start).Nanoseconds(), attempt, time.Now().UnixNano(), fields}
+	observer.stages[stageKey] = started
 	observer.Unlock()
 	if duplicate {
 		emitInvalid("overlapping stage attempt", stageKey)
 	}
+	record := baseRecord("stage_start", fields)
+	record["stage_id"], record["stage_key_sha256"], record["attempt_index"] = id, strings.Split(stageKey, "\x00")[1], attempt
+	record["start_offset_ns"], record["start_unix_ns"] = started.offset, started.unixNS
+	emit(record)
 	emitResource()
 }
 
 func EndStage(id, key, result string) {
-	stageKey := id + "\x00" + key
+	stageKey := observedStageKey(id, key)
 	observer.Lock()
 	started, ok := observer.stages[stageKey]
+	completed := observer.attempts[stageKey] > 0
 	delete(observer.stages, stageKey)
 	observer.Unlock()
 	if !ok {
+		if !completed {
+			emitInvalid("stage end without start", stageKey)
+		}
 		return
 	}
+	emitStage(stageKey, started, result)
+}
+
+func emitStage(stageKey string, started stageStart, result string) {
+	identity := strings.SplitN(stageKey, "\x00", 2)
 	record := baseRecord("stage", started.fields)
-	record["stage_id"], record["attempt_index"] = id, started.attempt
-	record["start_offset_ns"], record["duration_ns"], record["result"] = started.offset, offset()-started.offset, result
+	record["stage_id"], record["stage_key_sha256"], record["attempt_index"] = identity[0], identity[1], started.attempt
+	duration := time.Now().UnixNano() - started.unixNS
+	record["start_offset_ns"], record["start_unix_ns"], record["duration_ns"], record["result"] = started.offset, started.unixNS, duration, result
 	emit(record)
 	emitResource()
+}
+
+func EndOpenStages(key, result string, ids ...string) {
+	for _, id := range ids {
+		stageKey := observedStageKey(id, key)
+		observer.Lock()
+		_, open := observer.stages[stageKey]
+		observer.Unlock()
+		if open {
+			EndStage(id, key, result)
+		}
+	}
+}
+
+func RuntimeLimit(fields Fields, memoryBytes, nanoCPUs, pids int64) {
+	record := baseRecord("runtime_limit", fields)
+	record["memory_bytes"], record["nano_cpus"], record["pids_limit"] = memoryBytes, nanoCPUs, pids
+	emit(record)
 }
 
 func ClientLine(line []byte, fields Fields) {
@@ -318,18 +357,60 @@ func emitInvalid(reason, key string) {
 	emit(record)
 }
 
-func loadClientSignatures(file *os.File) map[string]string {
+func loadObserverState(file *os.File) (map[string]string, map[string]int64, map[string]stageStart) {
 	clients := map[string]string{}
+	attempts := map[string]int64{}
+	stages := map[string]stageStart{}
 	_, _ = file.Seek(0, 0)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		var client clientRecord
-		if json.Unmarshal(scanner.Bytes(), &client) == nil && client.RecordType == "client" && client.RequestID != nil && client.SampleID != nil {
-			clients[clientKey(*client.SampleID, *client.RequestID, client.Operation)] = fmt.Sprintf("%d\x00%s", client.DurationNS, client.Result)
+		var record map[string]any
+		if json.Unmarshal(scanner.Bytes(), &record) != nil {
+			continue
+		}
+		if record["record_type"] == "client" {
+			request, requestOK := record["request_id"].(string)
+			sample, sampleOK := record["sample_id"].(string)
+			operation, operationOK := record["operation"].(string)
+			duration, durationOK := record["duration_ns"].(float64)
+			result, resultOK := record["result"].(string)
+			if requestOK && sampleOK && operationOK && durationOK && resultOK {
+				clients[clientKey(sample, request, operation)] = fmt.Sprintf("%d\x00%s", int64(duration), result)
+			}
+		}
+		if record["record_type"] == "stage_start" || record["record_type"] == "stage" {
+			id, idOK := record["stage_id"].(string)
+			key, keyOK := record["stage_key_sha256"].(string)
+			attempt, attemptOK := record["attempt_index"].(float64)
+			stageKey := id + "\x00" + key
+			if idOK && keyOK && attemptOK {
+				attempts[stageKey] = max(attempts[stageKey], int64(attempt)+1)
+				if record["record_type"] == "stage" {
+					delete(stages, stageKey)
+				} else {
+					stages[stageKey] = stageStart{intRecord(record, "start_offset_ns"), int64(attempt), intRecord(record, "start_unix_ns"), fieldsRecord(record)}
+				}
+			}
 		}
 	}
 	_, _ = file.Seek(0, 2)
-	return clients
+	return clients, attempts, stages
+}
+
+func intRecord(record map[string]any, key string) int64 {
+	value, _ := record[key].(float64)
+	return int64(value)
+}
+
+func fieldsRecord(record map[string]any) Fields {
+	text := func(key string) string { value, _ := record[key].(string); return value }
+	return Fields{ProjectID: text("project_id"), TaskID: text("task_id"), RunID: text("run_id"),
+		MessageID: text("message_id"), OperationID: text("operation_id"), RequestID: text("request_id")}
+}
+
+func observedStageKey(id, key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return id + "\x00" + hex.EncodeToString(sum[:])
 }
 
 func residentBytes() int64 {

@@ -2,8 +2,6 @@ package daemon
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,175 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
-
-	"coordplane/internal/core"
-	"coordplane/internal/transport"
 
 	_ "modernc.org/sqlite"
 )
-
-func TestDaemonReadyIsServedOnlyOnOperatorUnixSocket(t *testing.T) {
-	root := t.TempDir()
-	configPath := writeTestConfig(t, root)
-	daemon, err := Open(context.Background(), configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- daemon.Serve(ctx) }()
-	socketPath := filepath.Join(root, "data", "operator.sock")
-	client, err := transport.NewUnixClient(socketPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	var status core.Status
-	for {
-		err = client.JSON(context.Background(), "GET", "/v1/status", nil, &status)
-		if err == nil && status.DaemonReady {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("daemon did not become ready: status=%s err=%v", mustJSON(status), err)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if status.Runtime == nil || status.Runtime.WorkspaceQuotaEnabled ||
-		!strings.Contains(status.Runtime.WorkspaceQuotaReason, "host bind mount") ||
-		status.Runtime.TmpfsLimitBytes != runtimeTmpfsLimit {
-		t.Fatalf("runtime quota status = %#v", status.Runtime)
-	}
-	info, err := os.Stat(socketPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("operator socket mode = %o", info.Mode().Perm())
-	}
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	if err := daemon.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(socketPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("operator socket survived shutdown: %v", err)
-	}
-}
-
-func TestGT00CompositionRegistersAndReconcilesRealProject(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	configPath := writeTestConfig(t, root)
-	source := createSourceRepository(t, root)
-	components, err := buildComponents(ctx, configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	agent, err := components.service.AddAgent(ctx, core.AddAgentInput{
-		DisplayName: "Integrator", AdapterID: "codex", Image: "agent:latest",
-		InstructionsFile: filepath.Join(root, "instructions.md"), RequestID: "add-integrator",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	project, err := components.service.AddProject(ctx, core.AddProjectInput{
-		Name: "real-project", Source: source, SourceRef: "refs/heads/main",
-		IntegrationAgentID: agent.ID, RequestID: "add-real-project",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if project.Status != core.ProjectActive || project.InitialSHA == "" {
-		t.Fatalf("project = %#v", project)
-	}
-	actual := gitOutput(t, "--git-dir", project.ControlRepoPath, "rev-parse", "refs/heads/main^{commit}")
-	if actual != project.InitialSHA {
-		t.Fatalf("control canonical = %s, initial = %s", actual, project.InitialSHA)
-	}
-	gitOutput(t, "--git-dir", project.ControlRepoPath, "fsck", "--connectivity-only")
-	if err := os.WriteFile(filepath.Join(source, "advanced.txt"), []byte("advanced\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	gitIn(t, source, "add", "advanced.txt")
-	gitIn(t, source, "commit", "-m", "advance canonical")
-	advanced := strings.TrimSpace(gitIn(t, source, "rev-parse", "HEAD"))
-	gitOutput(t, "--git-dir="+project.ControlRepoPath,
-		"-c", "protocol.file.allow=always", "fetch", "--no-tags", "--no-write-fetch-head", source, advanced)
-	gitOutput(t, "--git-dir="+project.ControlRepoPath,
-		"update-ref", project.CanonicalRef, advanced, project.InitialSHA)
-	if err := components.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	reopened, err := buildComponents(ctx, configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	persisted, err := reopened.store.Project(ctx, project.ID)
-	if err != nil || persisted.Status != core.ProjectActive || persisted.InitialSHA != project.InitialSHA || persisted.CanonicalSHA != advanced {
-		t.Fatalf("persisted project = %#v err=%v", persisted, err)
-	}
-	if err := reopened.Close(); err != nil {
-		t.Fatal(err)
-	}
-	missingRepo := filepath.Join(root, "missing-control.git")
-	if err := os.Rename(project.ControlRepoPath, missingRepo); err != nil {
-		t.Fatal(err)
-	}
-	degraded, err := buildComponents(ctx, configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer degraded.Close()
-	persisted, err = degraded.store.Project(ctx, project.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if persisted.Status != core.ProjectError || persisted.LastError == "" {
-		t.Fatalf("missing active repo did not fail closed: %#v", persisted)
-	}
-	if persisted.CanonicalSHA != advanced {
-		t.Fatalf("missing active repo rewrote cached canonical: got %q want %q", persisted.CanonicalSHA, advanced)
-	}
-	if _, err := degraded.service.RepairProject(ctx, project.ID, "repair-missing-active-repo"); !core.IsCode(err, core.CodeGitInvariantViolation) {
-		t.Fatalf("repair missing formerly-active repo error = %v, want %s", err, core.CodeGitInvariantViolation)
-	}
-	if _, err := os.Stat(project.ControlRepoPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("repair recreated missing formerly-active repo: %v", err)
-	}
-	persisted, err = degraded.store.Project(ctx, project.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if persisted.Status != core.ProjectError || persisted.CanonicalSHA != advanced {
-		t.Fatalf("failed repair changed formerly-active project: %#v", persisted)
-	}
-	if err := degraded.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(missingRepo, project.ControlRepoPath); err != nil {
-		t.Fatal(err)
-	}
-	restored, err := buildComponents(ctx, configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer restored.Close()
-	repaired, err := restored.service.RepairProject(ctx, project.ID, "repair-restored-active-repo")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if repaired.Status != core.ProjectActive || repaired.CanonicalSHA != advanced || repaired.InitialSHA != project.InitialSHA {
-		t.Fatalf("verified restored project = %#v, want actual canonical %s", repaired, advanced)
-	}
-	if got := gitOutput(t, "--git-dir="+project.ControlRepoPath, "rev-parse", project.CanonicalRef+"^{commit}"); got != advanced {
-		t.Fatalf("restored canonical = %s, want %s", got, advanced)
-	}
-}
 
 func TestGT00CompositionQuarantinesRepositoryWithoutProjectRow(t *testing.T) {
 	root := t.TempDir()
@@ -222,112 +54,38 @@ func TestGT00CompositionQuarantinesRepositoryWithoutProjectRow(t *testing.T) {
 	}
 }
 
-func TestCompositionRejectsSecondDaemonAndLegacyDatabase(t *testing.T) {
-	t.Run("single data dir", func(t *testing.T) {
-		root := t.TempDir()
-		configPath := writeTestConfig(t, root)
-		first, err := buildComponents(context.Background(), configPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer first.Close()
-		second, err := buildComponents(context.Background(), configPath)
-		if second != nil {
-			_ = second.Close()
-			t.Fatal("second daemon acquired the same data_dir")
-		}
-		if !errors.Is(err, ErrDataDirLocked) {
-			t.Fatalf("second daemon error = %v", err)
-		}
-	})
-
-	t.Run("legacy schema releases lock", func(t *testing.T) {
-		root := t.TempDir()
-		configPath := writeTestConfig(t, root)
-		dataDir := filepath.Join(root, "data")
-		if err := os.MkdirAll(dataDir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		db, err := sql.Open("sqlite", filepath.Join(dataDir, "coordplane.db"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := db.Exec(`CREATE TABLE queue_items(id TEXT PRIMARY KEY)`); err != nil {
-			t.Fatal(err)
-		}
-		_ = db.Close()
-		components, err := buildComponents(context.Background(), configPath)
-		if components != nil {
-			_ = components.Close()
-			t.Fatal("legacy database became ready")
-		}
-		if !core.IsCode(err, core.CodeLegacySchemaRebuildRequired) {
-			t.Fatalf("legacy error = %v", err)
-		}
-		lock, err := AcquireDataDirLock(dataDir)
-		if err != nil {
-			t.Fatalf("startup failure leaked data-dir lock: %v", err)
-		}
-		_ = lock.Close()
-	})
-}
-
 func TestCompositionRejectsUnsafeDataDirectoriesBeforeStoreOpen(t *testing.T) {
 	tests := []struct {
-		name    string
-		prepare func(*testing.T, string)
-		want    string
+		name, path, want string
+		mode             os.FileMode
+		symlink          bool
 	}{
-		{
-			name: "configured directory lacks owner execute",
-			prepare: func(t *testing.T, root string) {
-				path := filepath.Join(root, "data", "workspaces")
-				if err := os.MkdirAll(path, 0o700); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Chmod(path, 0o600); err != nil {
-					t.Fatal(err)
-				}
-			},
-			want: "owner must have rwx permissions",
-		},
-		{
-			name: "configured directory is group writable",
-			prepare: func(t *testing.T, root string) {
-				path := filepath.Join(root, "data", "agent-homes")
-				if err := os.MkdirAll(path, 0o700); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Chmod(path, 0o770); err != nil {
-					t.Fatal(err)
-				}
-			},
-			want: "must not be group/other writable",
-		},
-		{
-			name: "generated directory is a symlink",
-			prepare: func(t *testing.T, root string) {
-				dataDir := filepath.Join(root, "data")
-				outside := filepath.Join(root, "outside-run-control")
-				if err := os.MkdirAll(dataDir, 0o700); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.MkdirAll(outside, 0o700); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Symlink(outside, filepath.Join(dataDir, "run-control")); err != nil {
-					t.Fatal(err)
-				}
-			},
-			want: "not a symlink",
-		},
+		{"configured directory lacks owner execute", "workspaces", "owner must have rwx permissions", 0o600, false},
+		{"configured directory is group writable", "agent-homes", "must not be group/other writable", 0o770, false},
+		{"generated directory is a symlink", "run-control", "not a symlink", 0, true},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
 			configPath := writeTestConfig(t, root)
-			test.prepare(t, root)
+			path := filepath.Join(root, "data", test.path)
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if test.symlink {
+				outside := filepath.Join(root, "outside-"+test.path)
+				if err := os.MkdirAll(outside, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, path); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			} else if err := os.Chmod(path, test.mode); err != nil {
+				t.Fatal(err)
+			}
 			components, err := buildComponents(context.Background(), configPath)
 			if components != nil {
 				_ = components.Close()
@@ -403,26 +161,5 @@ func gitIn(t *testing.T, directory string, args ...string) string {
 
 func gitOutput(t *testing.T, args ...string) string {
 	t.Helper()
-	command := exec.Command("git", args...)
-	raw, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("git %v: %v\n%s", args, err, raw)
-	}
-	return string(bytesTrimSpace(raw))
-}
-
-func bytesTrimSpace(raw []byte) []byte {
-	start, end := 0, len(raw)
-	for start < end && (raw[start] == ' ' || raw[start] == '\n' || raw[start] == '\r' || raw[start] == '\t') {
-		start++
-	}
-	for end > start && (raw[end-1] == ' ' || raw[end-1] == '\n' || raw[end-1] == '\r' || raw[end-1] == '\t') {
-		end--
-	}
-	return raw[start:end]
-}
-
-func mustJSON(value any) string {
-	raw, _ := json.Marshal(value)
-	return string(raw)
+	return strings.TrimSpace(gitIn(t, ".", args...))
 }

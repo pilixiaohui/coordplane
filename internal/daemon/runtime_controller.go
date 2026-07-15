@@ -494,6 +494,7 @@ func verifyRuntimeLive(state *runtimePrepareState) error {
 		finish(<-monitor.wait)
 		return nil
 	}
+	perfobs.RuntimeLimit(perfobs.Fields{ProjectID: state.run.ProjectID, TaskID: state.run.TaskID, RunID: state.run.ID}, live.MemoryBytes, live.NanoCPUs, live.PIDsLimit)
 	perfobs.EndStage("runtime.container.create_start", state.run.ID, "success")
 	select {
 	case result := <-monitor.wait:

@@ -28,6 +28,7 @@ type pfFaultRow struct {
 	FinalSHA       string         `json:"final_sha"`
 	GitFSCK        string         `json:"git_fsck"`
 	Cleanup        string         `json:"cleanup"`
+	DurableUnacked int            `json:"durable_unacknowledged_messages"`
 	Counts         pfObjectCounts `json:"durable_counts"`
 	Result         string         `json:"result"`
 }
@@ -37,11 +38,12 @@ func runPFFaultTable(
 	ctx context.Context,
 	binary, image, source, initial, root string,
 	profile pfProfile,
-) ([]pfFaultRow, []map[string]any, []pfObjectCounts) {
+) ([]pfFaultRow, []map[string]any, []pfObjectCounts, []pfDiskSample) {
 	t.Helper()
 	var rows []pfFaultRow
 	var records []map[string]any
 	var counts []pfObjectCounts
+	var disks []pfDiskSample
 	for _, test := range []struct {
 		kind  string
 		count int
@@ -60,6 +62,7 @@ func runPFFaultTable(
 				row, batch = runPFPendingFault(t, ctx, binary, image, source, initial, faultRoot, id, "cas", index)
 			}
 			batch.close()
+			disks = append(disks, batch.diskFacts()...)
 			row.Counts = batch.objectCounts()
 			row.Cleanup = "absent"
 			row.Result = "PASS"
@@ -68,7 +71,7 @@ func runPFFaultTable(
 			records = append(records, readObserverRecords(t, batch.observer)...)
 		}
 	}
-	return rows, records, counts
+	return rows, records, counts, disks
 }
 
 func runPFLiveFault(
@@ -93,6 +96,17 @@ func runPFLiveFault(
 	for _, run := range runs {
 		row.RunIDsBefore = append(row.RunIDsBefore, run.ID)
 	}
+	database, err := sql.Open("sqlite", filepath.Join(batch.dataDir, "coordplane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRow(`SELECT count(*) FROM messages WHERE project_id=? AND body='PF01-HOLD' AND state<>'acknowledged'`, batch.project.ID).Scan(&row.DurableUnacked); err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil || row.DurableUnacked != 4 {
+		t.Fatalf("%s durable unacknowledged control Messages = %d, want 4: %v", id, row.DurableUnacked, err)
+	}
 	row.RecoveryNS = batch.restartAfterKill(time.Second, func() {
 		for _, run := range runs {
 			if !inspectContainer(t, ctx, run.ContainerID).State.Running {
@@ -113,7 +127,7 @@ func runPFLiveFault(
 	goBody := fmt.Sprintf("P5-GO wave=%s d_agent=%s d_task=%s", id, batch.agents[3].ID, tasks[3].ID)
 	batch.sendGO(tasks, goBody, id)
 	tasks = finishPFFaultTasks(t, batch, tasks, pfRoles[:])
-	row.PreRestart = "four live Runs and unacknowledged durable Messages"
+	row.PreRestart = "four live Runs and four unacknowledged durable Messages"
 	finishPFFaultBatch(t, batch, tasks, &row)
 	return row, batch
 }
@@ -214,8 +228,10 @@ func finishPFFaultBatch(t *testing.T, batch *pfBatch, tasks []core.Task, row *pf
 	row.GitFSCK = "pass"
 	waitForNoProjectContainers(t, batch.ctx, batch.project.ID)
 	runJSON[core.GCPreview](t, batch.ctx, batch.binary, "gc", "preview", "--socket", batch.socket, "--output", "json")
+	batch.recordDisk("gc_preview")
 	runJSON[core.GCRunResult](t, batch.ctx, batch.binary, "gc", "run", "--socket", batch.socket, "--confirm", "--request-id", batch.id+"-gc", "--output", "json")
 	waitForWorkspacesRemoved(t, batch.ctx, batch.dataDir, batch.project.ID, workspaceIDs...)
+	batch.recordDisk("gc_complete")
 }
 
 func (b *pfBatch) restartAfterKill(delay time.Duration, afterKill func()) int64 {

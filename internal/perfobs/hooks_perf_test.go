@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -35,10 +36,16 @@ func TestObserverCommitSchemaAndRestartContract(t *testing.T) {
 	for index := 0; index < 2; index++ {
 		startObserver(t)
 		ClientLine([]byte(validClient), fields)
+		StartStage("runtime.cleanup", fields.RunID, fields)
+		EndStage("runtime.cleanup", fields.RunID, "success")
 		stopObserver(t)
 	}
+	startObserver(t)
+	EndStage("runtime.cleanup", "missing", "success")
+	stopObserver(t)
 
 	counts, results := map[string]int{}, map[string]int{}
+	var attempts []int64
 	for _, record := range observerRecords(t, path) {
 		if record["schema_version"] != float64(1) {
 			t.Fatalf("invalid record schema: %#v", record)
@@ -49,14 +56,20 @@ func TestObserverCommitSchemaAndRestartContract(t *testing.T) {
 			result, _ := record["result"].(string)
 			results[result]++
 		}
+		if kind == "stage" && record["stage_id"] == "runtime.cleanup" {
+			attempts = append(attempts, int64(record["attempt_index"].(float64)))
+		}
 	}
 	for _, kind := range []string{"point", "stage", "resource", "client"} {
 		if counts[kind] == 0 {
 			t.Fatalf("missing %s record: %v", kind, counts)
 		}
 	}
-	if counts["client"] != 1 || counts["invalid"] != 2 || results["error"] != 1 || results["received"] != 1 {
+	if counts["client"] != 1 || counts["invalid"] != 3 || results["error"] != 1 || results["received"] != 1 {
 		t.Fatalf("observer terminal counts=%v results=%v", counts, results)
+	}
+	if fmt.Sprint(attempts) != "[0 1 2]" {
+		t.Fatalf("stage attempts across restart = %v, want [0 1 2]", attempts)
 	}
 }
 

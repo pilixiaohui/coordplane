@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,34 +26,47 @@ import (
 )
 
 type pfSample struct {
-	ID                 string   `json:"sample_id"`
-	BatchID            string   `json:"batch_id"`
-	Parallelism        int      `json:"parallelism"`
-	Warmup             bool     `json:"warmup"`
-	Soak               bool     `json:"soak"`
-	WaveNS             int64    `json:"t_wave_ns"`
-	WorkNS             int64    `json:"t_work_ns"`
-	CleanupNS          int64    `json:"t_cleanup_ns"`
-	ContainerAbsentNS  int64    `json:"t_container_absent_ns"`
-	ProgressOperations int      `json:"progress_operations"`
-	PeerMessages       int      `json:"peer_messages"`
-	IntegrationTasks   int      `json:"integration_tasks"`
-	FinalSHA           string   `json:"final_sha"`
-	TaskHeads          []string `json:"task_heads"`
-	TaskIDs            []string `json:"task_ids"`
-	RunIDs             []string `json:"run_ids"`
-	IntegrationTaskIDs []string `json:"integration_task_ids,omitempty"`
-	IntegrationRunIDs  []string `json:"integration_run_ids,omitempty"`
-	QueueNS            []int64  `json:"t_queue_ns"`
-	FanoutNS           int64    `json:"t_fanout4_ns"`
-	DirectCASNS        int64    `json:"t_cas_ns"`
-	IntegrationNS      []int64  `json:"t_integration_ns"`
-	Integrations3NS    int64    `json:"t_integrations3_ns"`
-	StatusNS           []int64  `json:"status_ns,omitempty"`
-	DiskBytes          int64    `json:"data_dir_bytes"`
-	StableRSSBytes     int64    `json:"stable_rss_bytes,omitempty"`
-	StableGoroutines   int64    `json:"stable_goroutines,omitempty"`
-	StableFDs          int64    `json:"stable_open_fds,omitempty"`
+	ID                 string      `json:"sample_id"`
+	BatchID            string      `json:"batch_id"`
+	Parallelism        int         `json:"parallelism"`
+	Warmup             bool        `json:"warmup"`
+	Soak               bool        `json:"soak"`
+	WaveNS             int64       `json:"t_wave_ns"`
+	WorkNS             int64       `json:"t_work_ns"`
+	ProgressOperations int         `json:"progress_operations"`
+	PeerMessages       int         `json:"peer_messages"`
+	IntegrationTasks   int         `json:"integration_tasks"`
+	FinalSHA           string      `json:"final_sha"`
+	TaskHeads          []string    `json:"task_heads"`
+	TaskIDs            []string    `json:"task_ids"`
+	RunIDs             []string    `json:"run_ids"`
+	IntegrationTaskIDs []string    `json:"integration_task_ids,omitempty"`
+	IntegrationRunIDs  []string    `json:"integration_run_ids,omitempty"`
+	QueueNS            []int64     `json:"t_queue_ns"`
+	FanoutNS           int64       `json:"t_fanout4_ns"`
+	DirectCASNS        int64       `json:"t_cas_ns"`
+	IntegrationNS      []int64     `json:"t_integration_ns"`
+	Integrations3NS    int64       `json:"t_integrations3_ns"`
+	StatusNS           []int64     `json:"status_ns,omitempty"`
+	DiskBytes          int64       `json:"data_dir_bytes"`
+	StableRSSBytes     int64       `json:"stable_rss_bytes,omitempty"`
+	StableGoroutines   int64       `json:"stable_goroutines,omitempty"`
+	StableFDs          int64       `json:"stable_open_fds,omitempty"`
+	ExternalRSSBytes   int64       `json:"external_rss_bytes,omitempty"`
+	ExternalFDs        int64       `json:"external_open_fds,omitempty"`
+	RunFacts           []pfRunFact `json:"run_cleanup_facts"`
+}
+
+type pfRunFact struct {
+	TaskID                 string `json:"task_id"`
+	RunID                  string `json:"run_id"`
+	Role                   string `json:"role"`
+	TerminalState          string `json:"terminal_state"`
+	TerminalObservedUnixNS int64  `json:"terminal_observed_unix_ns"`
+	ContainerAbsentNS      int64  `json:"t_container_absent_ns"`
+	CleanupNS              int64  `json:"t_cleanup_ns"`
+	ContainerAbsent        bool   `json:"container_absent"`
+	ResourcesAbsent        bool   `json:"resources_absent"`
 }
 
 type pfObjectCounts struct {
@@ -89,7 +103,10 @@ type pfReport struct {
 	Resources     map[string]int64   `json:"resource_facts"`
 	Baseline      map[string]string  `json:"baseline"`
 	Idle          []pfIdleSample     `json:"idle_resource_samples"`
+	Disk          []pfDiskSample     `json:"disk_samples"`
 }
+
+const pfStatisticsVersion = "pf01-nearest-rank-v2"
 
 type pfProfile struct {
 	concurrentBatches, concurrentWaves, soakWaves int
@@ -109,6 +126,17 @@ type pfBatch struct {
 	initialSHA, observer  string
 	parallel              int
 	trackSoak             bool
+	diskMu                sync.Mutex
+	diskStop, diskDone    chan struct{}
+	disk                  []pfDiskSample
+}
+
+type pfDiskSample struct {
+	SampleID       string `json:"sample_id"`
+	Boundary       string `json:"boundary"`
+	ObservedUnixNS int64  `json:"observed_unix_ns"`
+	Bytes          int64  `json:"bytes"`
+	Error          string `json:"error,omitempty"`
 }
 
 var pfRoles = [...]string{"A", "B", "C", "D"}
@@ -150,7 +178,7 @@ func TestPF01FourAgentPerformance(t *testing.T) {
 	defer cancel()
 	root := t.TempDir()
 	report := pfReport{
-		SchemaVersion: 1, Scenario: "PF-01", Profile: profile, Revision: commandText(ctx, "git", "rev-parse", "HEAD"),
+		SchemaVersion: 2, Scenario: "PF-01", Profile: profile, Revision: commandText(ctx, "git", "rev-parse", "HEAD"),
 		Environment: perfEnvironment(ctx, image),
 		Thresholds:  map[string]int64{"t_wave_p50": int64(60 * time.Second), "t_wave_p90": int64(90 * time.Second), "t_wave_max": int64(180 * time.Second)},
 	}
@@ -185,13 +213,15 @@ func TestPF01FourAgentPerformance(t *testing.T) {
 			}
 		}
 		batch.close()
+		report.Disk = append(report.Disk, batch.diskFacts()...)
 		report.Observer = append(report.Observer, readObserverRecords(t, batch.observer)...)
 		report.ObjectCounts = append(report.ObjectCounts, batch.objectCounts())
 	}
-	faults, records, counts := runPFFaultTable(t, ctx, coordplane, image, source, initial, root, settings)
+	faults, records, counts, disks := runPFFaultTable(t, ctx, coordplane, image, source, initial, root, settings)
 	report.Faults = faults
 	report.Observer = append(report.Observer, records...)
 	report.ObjectCounts = append(report.ObjectCounts, counts...)
+	report.Disk = append(report.Disk, disks...)
 	for batchIndex := 0; batchIndex < settings.serialBatches; batchIndex++ {
 		batchID := fmt.Sprintf("serial-%02d", batchIndex+1)
 		batch := newPFBatch(t, ctx, coordplane, image, source, initial, filepath.Join(root, batchID), batchID, 1)
@@ -202,6 +232,7 @@ func TestPF01FourAgentPerformance(t *testing.T) {
 			report.Samples = append(report.Samples, batch.runWave(fmt.Sprintf("wave-%02d", wave+1), false, false))
 		}
 		batch.close()
+		report.Disk = append(report.Disk, batch.diskFacts()...)
 		report.Observer = append(report.Observer, readObserverRecords(t, batch.observer)...)
 		report.ObjectCounts = append(report.ObjectCounts, batch.objectCounts())
 	}
@@ -276,7 +307,9 @@ func newPFBatchWithEnv(
 		t: t, ctx: ctx, binary: binary, image: image, id: id,
 		root: root, dataDir: dataDir, socket: socket, daemon: daemon,
 		initialSHA: initial, parallel: parallel, observer: observer,
+		diskStop: make(chan struct{}), diskDone: make(chan struct{}),
 	}
+	go batch.sampleDisk()
 	batch.agents = make([]core.Agent, len(pfRoles))
 	for index, role := range pfRoles {
 		batch.agents[index] = pfJSON[core.Agent](batch, "agent", "add", "--socket", socket, "--display-name", "PF01 "+role, "--adapter", "codex", "--image", image, "--instructions-file", instructions, "--request-id", id+"-agent-"+role, "--output", "json")
@@ -290,6 +323,8 @@ func newPFBatchWithEnv(
 
 func (b *pfBatch) close() {
 	b.t.Helper()
+	close(b.diskStop)
+	<-b.diskDone
 	if err := b.daemon.Stop(); err != nil {
 		b.t.Fatalf("stop PF-01 batch %s: %v\n%s", b.id, err, readLog(b.daemon.logPath))
 	}
@@ -299,6 +334,7 @@ func (b *pfBatch) runWave(name string, warmup, soak bool) pfSample {
 	b.t.Helper()
 	waveID := b.id + "-" + name
 	waveStart := time.Now()
+	b.recordDisk("wave_start")
 	base := projectDetail(b.t, b.ctx, b.binary, b.socket, b.project.ID).ActualCanonicalSHA
 	tasks := make([]core.Task, len(pfRoles))
 	createStarted := make([]time.Time, len(pfRoles))
@@ -344,6 +380,7 @@ func (b *pfBatch) runWave(name string, warmup, soak bool) pfSample {
 	for index := range tasks {
 		tasks[index] = b.waitTask(tasks[index].ID, pfRoles[index]+" submitted", capturedTask)
 	}
+	b.recordDisk("capture_submitted")
 	workDuration := time.Since(workStart)
 	var directCASNS, integrations3NS int64
 	var integrationNS []int64
@@ -364,6 +401,7 @@ func (b *pfBatch) runWave(name string, warmup, soak bool) pfSample {
 			}
 		}
 		integrations3NS = time.Since(integrationsStarted).Nanoseconds()
+		b.recordDisk("integration_completed")
 	} else {
 		for index := range tasks {
 			tasks[index] = pfJSON[core.Task](b, "task", "cancel", tasks[index].ID, "--socket", b.socket, "--reason", "PF-01 serial comparison complete", "--request-id", waveID+"-cancel-"+pfRoles[index], "--output", "json")
@@ -381,18 +419,6 @@ func (b *pfBatch) runWave(name string, warmup, soak bool) pfSample {
 	gitDirSucceeds(b.t, b.ctx, control, "fsck", "--full", "--strict")
 	diskBytes := directoryBytesExcept(b.t, b.dataDir, "")
 	waveDuration := time.Since(waveStart)
-	cleanupStart := time.Now()
-	waitForNoProjectContainers(b.t, b.ctx, b.project.ID)
-	containerAbsentNS := time.Since(cleanupStart).Nanoseconds()
-	pfJSON[core.GCPreview](b, "gc", "preview", "--socket", b.socket, "--output", "json")
-	pfJSON[core.GCRunResult](b, "gc", "run", "--socket", b.socket, "--confirm", "--request-id", waveID+"-gc", "--output", "json")
-	waitForWorkspacesRemoved(b.t, b.ctx, b.dataDir, b.project.ID, tasks[0].ID, tasks[1].ID, tasks[2].ID, tasks[3].ID)
-	cleanupDuration := time.Since(cleanupStart)
-	var stableRSS, stableGoroutines, stableFDs int64
-	if b.trackSoak && !warmup {
-		time.Sleep(5 * time.Second)
-		stableRSS, stableGoroutines, stableFDs = latestPFResource(b.t, b.observer)
-	}
 	heads := make([]string, 4)
 	taskIDs := make([]string, 4)
 	runIDs := make([]string, 4)
@@ -407,14 +433,32 @@ func (b *pfBatch) runWave(name string, warmup, soak bool) pfSample {
 			integrationRunIDs = append(integrationRunIDs, integration.HeadRunID)
 		}
 	}
+	runFacts := b.terminalRunFacts(taskIDs, runIDs, integrationTaskIDs, integrationRunIDs)
+	waitForNoProjectContainers(b.t, b.ctx, b.project.ID)
+	for index := range runFacts {
+		runFacts[index].ContainerAbsent = true
+		runFacts[index].ContainerAbsentNS = time.Now().UnixNano() - runFacts[index].TerminalObservedUnixNS
+	}
+	pfJSON[core.GCPreview](b, "gc", "preview", "--socket", b.socket, "--output", "json")
+	b.recordDisk("gc_preview")
+	pfJSON[core.GCRunResult](b, "gc", "run", "--socket", b.socket, "--confirm", "--request-id", waveID+"-gc", "--output", "json")
+	waitForWorkspacesRemoved(b.t, b.ctx, b.dataDir, b.project.ID, append(taskIDs, integrationTaskIDs...)...)
+	b.recordDisk("gc_complete")
+	b.finishRunFacts(runFacts)
+	var stableRSS, stableGoroutines, stableFDs, externalRSS, externalFDs int64
+	if b.trackSoak && !warmup {
+		time.Sleep(5 * time.Second)
+		stableRSS, stableGoroutines, stableFDs = medianPFResource(b.t, b.observer)
+		externalRSS, _ = readPFProcess(b.t, b.daemon.command.Process.Pid)
+		externalFDs = pfProcessFDs(b.t, b.daemon.command.Process.Pid)
+	}
 	integrationTasks := 0
 	if b.parallel == 4 {
 		integrationTasks = 3
 	}
 	return pfSample{
 		ID: waveID, BatchID: b.id, Parallelism: b.parallel, Warmup: warmup, Soak: soak,
-		WaveNS: waveDuration.Nanoseconds(), WorkNS: workDuration.Nanoseconds(), CleanupNS: cleanupDuration.Nanoseconds(),
-		ContainerAbsentNS:  containerAbsentNS,
+		WaveNS: waveDuration.Nanoseconds(), WorkNS: workDuration.Nanoseconds(),
 		ProgressOperations: 200, PeerMessages: 10, IntegrationTasks: integrationTasks,
 		FinalSHA: final, TaskHeads: heads, TaskIDs: taskIDs, RunIDs: runIDs,
 		IntegrationTaskIDs: integrationTaskIDs, IntegrationRunIDs: integrationRunIDs,
@@ -422,6 +466,7 @@ func (b *pfBatch) runWave(name string, warmup, soak bool) pfSample {
 		IntegrationNS: integrationNS, Integrations3NS: integrations3NS, StatusNS: statusNS,
 		DiskBytes:      diskBytes,
 		StableRSSBytes: stableRSS, StableGoroutines: stableGoroutines, StableFDs: stableFDs,
+		ExternalRSSBytes: externalRSS, ExternalFDs: externalFDs, RunFacts: runFacts,
 	}
 }
 
@@ -459,20 +504,81 @@ func samplePFStatus(t *testing.T, ctx context.Context, binary, socket string) []
 	return values
 }
 
-func latestPFResource(t *testing.T, path string) (int64, int64, int64) {
+func medianPFResource(t *testing.T, path string) (int64, int64, int64) {
 	t.Helper()
-	var rss, goroutines, fds int64
-	for _, record := range readObserverRecords(t, path) {
-		if record["record_type"] == "resource" {
-			rss = int64(record["rss_bytes"].(float64))
-			goroutines = int64(record["goroutines"].(float64))
-			fds = int64(record["open_fds"].(float64))
+	var rss, goroutines, fds []int64
+	var latest int64
+	records := readObserverRecords(t, path)
+	for _, record := range records {
+		if record["record_type"] == "resource" && int64(record["mono_offset_ns"].(float64)) > latest {
+			latest = int64(record["mono_offset_ns"].(float64))
 		}
 	}
-	if rss == 0 {
+	for _, record := range records {
+		if record["record_type"] == "resource" && int64(record["mono_offset_ns"].(float64)) >= latest-int64(5*time.Second) {
+			rss = append(rss, int64(record["rss_bytes"].(float64)))
+			goroutines = append(goroutines, int64(record["goroutines"].(float64)))
+			fds = append(fds, int64(record["open_fds"].(float64)))
+		}
+	}
+	if len(rss) == 0 {
 		t.Fatal("observer has no resource record")
 	}
-	return rss, goroutines, fds
+	return nearestRank(rss, 50), nearestRank(goroutines, 50), nearestRank(fds, 50)
+}
+
+func pfProcessFDs(t *testing.T, pid int) int64 {
+	t.Helper()
+	entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return int64(len(entries))
+}
+
+func (b *pfBatch) terminalRunFacts(sourceTasks, sourceRuns, integrationTasks, integrationRuns []string) []pfRunFact {
+	b.t.Helper()
+	facts := make([]pfRunFact, 0, len(sourceRuns)+len(integrationRuns))
+	add := func(role string, tasks, runs []string) {
+		if len(tasks) != len(runs) {
+			b.t.Fatalf("%s Task/Run identity count differs: %d/%d", role, len(tasks), len(runs))
+		}
+		for index, runID := range runs {
+			run := pfJSON[core.Run](b, "run", "show", runID, "--socket", b.socket, "--output", "json")
+			if run.TaskID != tasks[index] || !core.IsRunTerminal(run.State) || run.EndedAt == "" {
+				b.t.Fatalf("%s terminal Run fact is incomplete: %#v", role, run)
+			}
+			facts = append(facts, pfRunFact{TaskID: tasks[index], RunID: runID, Role: role,
+				TerminalState: string(run.State), TerminalObservedUnixNS: time.Now().UnixNano()})
+		}
+	}
+	add("source", sourceTasks, sourceRuns)
+	add("integration", integrationTasks, integrationRuns)
+	return facts
+}
+
+func (b *pfBatch) finishRunFacts(facts []pfRunFact) {
+	b.t.Helper()
+	for index := range facts {
+		fact := &facts[index]
+		paths := []string{
+			filepath.Join(b.dataDir, "workspaces", b.project.ID, fact.TaskID),
+			filepath.Join(b.dataDir, "handoff", b.project.ID, fact.TaskID, fact.RunID),
+			filepath.Join(b.dataDir, "run-control", fact.RunID), filepath.Join(b.dataDir, "logs", fact.RunID),
+		}
+		eventually(b.t, b.ctx, 20*time.Second, "all Run-owned resources absent", func() (bool, bool, string) {
+			for _, path := range paths {
+				if _, err := os.Lstat(path); err == nil {
+					return false, false, path
+				} else if !errors.Is(err, os.ErrNotExist) {
+					return false, false, err.Error()
+				}
+			}
+			return true, true, ""
+		})
+		fact.ResourcesAbsent = true
+		fact.CleanupNS = time.Now().UnixNano() - fact.TerminalObservedUnixNS
+	}
 }
 
 func (b *pfBatch) objectCounts() pfObjectCounts {
@@ -498,9 +604,10 @@ func (b *pfBatch) objectCounts() pfObjectCounts {
 	); err != nil {
 		b.t.Fatal(err)
 	}
-	counts.OwnedResidue = ownedResidue(b.t, b.dataDir)
+	residue := ownedResidue(b.t, b.dataDir)
+	counts.OwnedResidue = len(residue)
 	if counts.OpenRuns != 0 || counts.OwnedResidue != 0 || counts.PeerMessages != counts.PeerAcknowledged || counts.PeerMessages != counts.PeerAckEvent {
-		b.t.Fatalf("%s durable counts or cleanup differ: %#v", b.id, counts)
+		b.t.Fatalf("%s durable counts or cleanup differ: %#v residue=%v", b.id, counts, residue)
 	}
 	return counts
 }
@@ -527,18 +634,24 @@ func readObserverRecords(t *testing.T, path string) []map[string]any {
 	return records
 }
 
-func ownedResidue(t *testing.T, dataDir string) int {
+func ownedResidue(t *testing.T, dataDir string) []string {
 	t.Helper()
-	count := 0
-	for _, root := range []string{"workspaces", "handoff", "run-control"} {
-		_ = filepath.Walk(filepath.Join(dataDir, root), func(path string, info os.FileInfo, err error) error {
-			if err == nil && info.Mode().IsRegular() {
-				count++
+	var residue []string
+	for root, minimumDepth := range map[string]int{"workspaces": 2, "handoff": 3, "run-control": 1, "logs": 1} {
+		base := filepath.Join(dataDir, root)
+		_ = filepath.Walk(base, func(path string, _ os.FileInfo, err error) error {
+			relative := filepath.ToSlash(strings.TrimPrefix(path, base+string(filepath.Separator)))
+			depth := len(strings.Split(relative, "/"))
+			if root == "workspaces" && strings.HasPrefix(relative, ".partial/") {
+				depth--
+			}
+			if err == nil && path != base && depth >= minimumDepth {
+				residue = append(residue, filepath.ToSlash(strings.TrimPrefix(path, dataDir+string(filepath.Separator))))
 			}
 			return nil
 		})
 	}
-	return count
+	return residue
 }
 
 func capturedTask(task core.Task) bool {
@@ -709,6 +822,55 @@ func directoryBytesExcept(t *testing.T, root, excluded string) int64 {
 	return total
 }
 
+func (b *pfBatch) sampleDisk() {
+	defer close(b.diskDone)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	b.recordDisk("daemon_ready")
+	for {
+		select {
+		case <-ticker.C:
+			b.recordDisk("interval")
+		case <-b.diskStop:
+			return
+		}
+	}
+}
+
+func (b *pfBatch) recordDisk(boundary string) {
+	sample := pfDiskSample{SampleID: b.id, Boundary: boundary, ObservedUnixNS: time.Now().UnixNano()}
+	sample.Bytes, sample.Error = directoryBytes(b.dataDir)
+	b.diskMu.Lock()
+	b.disk = append(b.disk, sample)
+	b.diskMu.Unlock()
+}
+
+func directoryBytes(root string) (int64, string) {
+	var total int64
+	err := filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() {
+			total += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err.Error()
+	}
+	return total, ""
+}
+
+func (b *pfBatch) diskFacts() []pfDiskSample {
+	b.diskMu.Lock()
+	defer b.diskMu.Unlock()
+	return append([]pfDiskSample(nil), b.disk...)
+}
+
 func matchingFileBytes(t *testing.T, root, suffix string) int64 {
 	t.Helper()
 	entries, err := os.ReadDir(root)
@@ -773,6 +935,7 @@ func perfEnvironment(ctx context.Context, image string) map[string]string {
 		"image_digest":          commandText(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", image),
 		"git":                   commandText(ctx, "git", "--version"),
 		"runner_id":             strings.TrimSpace(os.Getenv("PF01_RUNNER_ID")),
+		"statistics_version":    pfStatisticsVersion,
 	}
 }
 func writePerfReport(t *testing.T, path string, report *pfReport) {

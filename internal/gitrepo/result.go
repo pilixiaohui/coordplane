@@ -213,9 +213,7 @@ func (m *WorkspaceManager) Capture(ctx context.Context, spec CaptureSpec) (fact 
 		if resultErr == nil {
 			return
 		}
-		for _, stage := range []string{"git.capture.handoff", "git.capture.lock_wait", "git.capture.import", "git.capture.fsck", "git.capture.ref"} {
-			perfobs.EndStage(stage, spec.RunID, "error")
-		}
+		perfobs.EndOpenStages(spec.RunID, "error", "git.capture.handoff", "git.capture.lock_wait", "git.capture.import", "git.capture.fsck", "git.capture.ref")
 	}()
 	perfobs.EndStage("git.capture.freeze", spec.RunID, "success")
 	if err := runCapturePhaseHook(ctx, capturePhaseIntentChecked, spec); err != nil {
