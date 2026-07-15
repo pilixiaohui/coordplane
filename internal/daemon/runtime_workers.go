@@ -25,7 +25,6 @@ type runtimeWorker struct {
 
 var runtimeWorkers = []runtimeWorker{
 	{name: "scheduler", run: runScheduler},
-	{name: "notifier", run: runNotifier},
 	{name: "supervisor", run: runSupervisor},
 	{name: "reconciler", run: runReconciler},
 	{name: "gc", run: runRuntimeGC},
@@ -54,13 +53,6 @@ func runScheduler(ctx context.Context, controller *runtimeController) {
 			_ = controller.launchOwned(ctx, claim, operation)
 		}
 	}
-}
-
-func runNotifier(ctx context.Context, controller *runtimeController) {
-	// The production one-shot adapter has no Inject path. Durable Message wake
-	// state is consumed by scheduler input; this worker remains the static owner
-	// of any future live-adapter notification optimization.
-	<-ctx.Done()
 }
 
 func runSupervisor(ctx context.Context, controller *runtimeController) {

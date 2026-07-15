@@ -137,16 +137,11 @@ type RemoveResult struct {
 	AlreadyAbsent bool
 }
 
-type InjectResult struct {
-	Accepted bool
-}
-
 type Executor interface {
 	Ping(context.Context) error
 	Create(context.Context, ContainerSpec) (RuntimeRef, error)
 	Attach(context.Context, RuntimeRef) (RuntimeRef, error)
 	Start(context.Context, RuntimeRef) (RuntimeRef, error)
-	Inject(context.Context, RuntimeRef, []byte) (InjectResult, error)
 	Inspect(context.Context, RuntimeRef) (LiveState, error)
 	Wait(context.Context, RuntimeRef) (ExitFact, error)
 	Logs(context.Context, RuntimeRef, bool) (io.ReadCloser, error)

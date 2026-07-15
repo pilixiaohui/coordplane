@@ -165,10 +165,6 @@ func (e *DockerExecutor) Start(ctx context.Context, ref RuntimeRef) (RuntimeRef,
 	return started.Ref, nil
 }
 
-func (e *DockerExecutor) Inject(context.Context, RuntimeRef, []byte) (InjectResult, error) {
-	return InjectResult{}, ErrUnsupported
-}
-
 func (e *DockerExecutor) Inspect(ctx context.Context, ref RuntimeRef) (LiveState, error) {
 	lookup := strings.TrimSpace(ref.ContainerID)
 	if lookup == "" {

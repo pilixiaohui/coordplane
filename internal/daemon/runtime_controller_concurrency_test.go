@@ -764,10 +764,6 @@ func (e *blockingLaunchExecutor) Start(context.Context, containerruntime.Runtime
 	return e.ref, nil
 }
 
-func (*blockingLaunchExecutor) Inject(context.Context, containerruntime.RuntimeRef, []byte) (containerruntime.InjectResult, error) {
-	return containerruntime.InjectResult{}, containerruntime.ErrUnsupported
-}
-
 func (e *blockingLaunchExecutor) Inspect(context.Context, containerruntime.RuntimeRef) (containerruntime.LiveState, error) {
 	e.inspectCalls.Add(1)
 	select {
