@@ -1,11 +1,9 @@
 package gitrepo
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 )
@@ -77,25 +75,9 @@ func ensureWorkspaceMarker(path string, want workspaceMarker) (bool, error) {
 }
 
 func readWorkspaceMarker(path string) (workspaceMarker, error) {
-	info, err := os.Lstat(path)
+	marker, err := readStrictMarker[workspaceMarker](path, "workspace ownership marker")
 	if err != nil {
-		return workspaceMarker{}, fmt.Errorf("stat workspace ownership marker: %w", err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return workspaceMarker{}, errors.New("workspace ownership marker must be a direct regular file")
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return workspaceMarker{}, fmt.Errorf("read workspace ownership marker: %w", err)
-	}
-	var marker workspaceMarker
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&marker); err != nil {
-		return workspaceMarker{}, fmt.Errorf("decode workspace ownership marker: %w", err)
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return workspaceMarker{}, errors.New("workspace ownership marker contains trailing content")
+		return workspaceMarker{}, err
 	}
 	if marker.Version != workspaceMarkerVersion {
 		return workspaceMarker{}, errors.New("unsupported workspace ownership marker version")

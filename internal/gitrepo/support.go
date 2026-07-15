@@ -112,30 +112,38 @@ func writeMarker(path string, marker repositoryMarker) error {
 }
 
 func readMarker(path string) (repositoryMarker, error) {
-	info, err := os.Lstat(path)
+	marker, err := readStrictMarker[repositoryMarker](path, "ownership marker")
 	if err != nil {
-		return repositoryMarker{}, fmt.Errorf("gitrepo: stat ownership marker: %w", err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return repositoryMarker{}, errors.New("gitrepo: ownership marker must be a direct regular file")
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return repositoryMarker{}, fmt.Errorf("gitrepo: read ownership marker: %w", err)
-	}
-	var marker repositoryMarker
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&marker); err != nil {
-		return repositoryMarker{}, fmt.Errorf("gitrepo: decode ownership marker: %w", err)
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return repositoryMarker{}, errors.New("gitrepo: ownership marker contains trailing content")
+		return repositoryMarker{}, err
 	}
 	if marker.Version != 1 {
 		return repositoryMarker{}, errors.New("gitrepo: unsupported ownership marker version")
 	}
 	return marker, nil
+}
+
+func readStrictMarker[T any](path, kind string) (T, error) {
+	var value T
+	info, err := os.Lstat(path)
+	if err != nil {
+		return value, fmt.Errorf("gitrepo: stat %s: %w", kind, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return value, fmt.Errorf("gitrepo: %s must be a direct regular file", kind)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return value, fmt.Errorf("gitrepo: read %s: %w", kind, err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&value); err != nil {
+		return value, fmt.Errorf("gitrepo: decode %s: %w", kind, err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return value, fmt.Errorf("gitrepo: %s contains trailing content", kind)
+	}
+	return value, nil
 }
 
 func canonicalExistingDirectory(path string) (string, error) {
@@ -198,28 +206,32 @@ func (i *Initializer) ensureDirectSubdirectories(target string) error {
 	if err := i.validateRoot(); err != nil {
 		return err
 	}
-	relative, err := filepath.Rel(i.root, target)
+	return ensureDirectSubdirectories(i.root, target, "repository")
+}
+
+func ensureDirectSubdirectories(root, target, kind string) error {
+	relative, err := filepath.Rel(root, target)
 	if err != nil || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return errors.New("gitrepo: repository path escapes the repository root")
+		return fmt.Errorf("gitrepo: %s path escapes its root", kind)
 	}
-	current := i.root
+	current := root
 	if relative == "." {
 		return nil
 	}
 	for _, element := range strings.Split(relative, string(filepath.Separator)) {
 		if element == "" || element == "." || element == ".." {
-			return errors.New("gitrepo: repository path contains an invalid component")
+			return fmt.Errorf("gitrepo: %s path contains an invalid component", kind)
 		}
 		parent := current
 		current = filepath.Join(current, element)
 		if err := os.Mkdir(current, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("gitrepo: create repository directory: %w", err)
+			return fmt.Errorf("gitrepo: create %s directory: %w", kind, err)
 		}
-		if err := validateDirectDirectory(current, "repository directory"); err != nil {
+		if err := validateDirectDirectory(current, kind+" directory"); err != nil {
 			return err
 		}
 		if err := syncDirectory(parent); err != nil {
-			return fmt.Errorf("gitrepo: sync repository directory parent: %w", err)
+			return fmt.Errorf("gitrepo: sync %s directory parent: %w", kind, err)
 		}
 	}
 	return nil

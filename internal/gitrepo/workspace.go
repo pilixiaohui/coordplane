@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -939,31 +938,7 @@ func (m *WorkspaceManager) ensureSubdirectories(target string) error {
 	if err := m.validateRoot(); err != nil {
 		return err
 	}
-	relative, err := filepath.Rel(m.root, target)
-	if err != nil || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
-		return errors.New("workspace path escapes workspace root")
-	}
-	current := m.root
-	if relative == "." {
-		return nil
-	}
-	for _, element := range strings.Split(relative, string(os.PathSeparator)) {
-		if element == "" || element == "." || element == ".." {
-			return errors.New("workspace path contains invalid component")
-		}
-		parent := current
-		current = filepath.Join(current, element)
-		if err := os.Mkdir(current, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("create workspace directory: %w", err)
-		}
-		if err := validateDirectDirectory(current, "workspace directory"); err != nil {
-			return err
-		}
-		if err := syncDirectory(parent); err != nil {
-			return fmt.Errorf("sync workspace directory parent: %w", err)
-		}
-	}
-	return nil
+	return ensureDirectSubdirectories(m.root, target, "workspace")
 }
 
 func (m *WorkspaceManager) validateFinalWorkspacePath(path string, spec WorkspaceSpec) error {
@@ -1003,23 +978,14 @@ func (m *WorkspaceManager) markerPath(projectID, taskID string) (string, error) 
 }
 
 func (m *WorkspaceManager) git(ctx context.Context, operation string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, m.initializer.gitPath, args...)
-	cmd.Env = gitEnvironment()
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	output, err := m.initializer.git(ctx, args...)
+	if err != nil {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
-		detail := boundedText(stderr.String())
-		if detail == "" {
-			return "", fmt.Errorf("%s failed: %w", operation, err)
-		}
-		return "", fmt.Errorf("%s failed: %w: %s", operation, err, detail)
+		return "", fmt.Errorf("%s failed: %w", operation, err)
 	}
-	return stdout.String(), nil
+	return output, nil
 }
 
 type workspacePublicError struct {

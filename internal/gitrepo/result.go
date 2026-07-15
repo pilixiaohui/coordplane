@@ -159,66 +159,71 @@ func TaskRef(taskID, runID string) (string, error) {
 
 // Capture freezes an actual private-workspace commit behind an immutable
 // controller ref. The caller must first establish that the Run is terminal.
-func (m *WorkspaceManager) Capture(ctx context.Context, spec CaptureSpec) (CaptureFact, error) {
+func (m *WorkspaceManager) Capture(ctx context.Context, spec CaptureSpec) (fact CaptureFact, resultErr error) {
 	if m == nil || m.initializer == nil {
 		return CaptureFact{}, errors.New("gitrepo: nil workspace manager")
 	}
+	defer func() {
+		if resultErr != nil {
+			resultErr = m.publicError("capture", resultErr)
+		}
+	}()
 	if err := m.validateSpec(ctx, spec.Workspace); err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
+		return CaptureFact{}, err
 	}
 	if err := validateID("run", spec.RunID); err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
+		return CaptureFact{}, err
 	}
 	if err := validateObjectID(spec.ExpectedHead); err != nil {
-		return CaptureFact{}, m.publicError("capture", fmt.Errorf("invalid expected head: %w", err))
+		return CaptureFact{}, fmt.Errorf("invalid expected head: %w", err)
 	}
 	if err := m.initializer.validateFinalPath(spec.ControlRepoPath); err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
+		return CaptureFact{}, err
 	}
 	wantControl := filepath.Join(m.initializer.root, spec.Workspace.ProjectID+".git")
 	if spec.ControlRepoPath != wantControl {
-		return CaptureFact{}, m.publicError("capture", errors.New("control repository does not match workspace project"))
+		return CaptureFact{}, errors.New("control repository does not match workspace project")
 	}
 	taskRef, err := TaskRef(spec.Workspace.TaskID, spec.RunID)
 	if err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
+		return CaptureFact{}, err
 	}
 
 	path, err := m.Path(spec.Workspace.ProjectID, spec.Workspace.TaskID)
 	if err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
+		return CaptureFact{}, err
 	}
 	if err := m.validateFinalWorkspacePath(path, spec.Workspace); err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
+		return CaptureFact{}, err
 	}
 	if m.capture == nil {
-		return CaptureFact{}, m.publicError("capture", errors.New("trusted capture helper is not configured"))
+		return CaptureFact{}, errors.New("trusted capture helper is not configured")
 	}
 	if err := runCapturePhaseHook(ctx, capturePhaseIntentChecked, spec); err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
+		return CaptureFact{}, err
 	}
 
 	unlock, err := m.initializer.maintenance.lock(ctx, spec.Workspace.ProjectID)
 	if err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
+		return CaptureFact{}, err
 	}
 	actualRef, exists, err := m.initializer.resolveRef(ctx, spec.ControlRepoPath, taskRef)
 	if err != nil {
 		unlock()
-		return CaptureFact{}, m.publicError("capture", err)
+		return CaptureFact{}, err
 	}
 	if exists {
 		if actualRef != spec.ExpectedHead {
 			unlock()
-			return CaptureFact{}, m.publicError("capture", &InvariantError{message: "task ref does not match expected head"})
+			return CaptureFact{}, &InvariantError{message: "task ref does not match expected head"}
 		}
 		if err := m.validateExistingCapture(ctx, spec, actualRef); err != nil {
 			unlock()
-			return CaptureFact{}, m.publicError("capture", err)
+			return CaptureFact{}, err
 		}
 		if err := m.cleanupCaptureImportRef(ctx, spec); err != nil {
 			unlock()
-			return CaptureFact{}, m.publicError("capture", err)
+			return CaptureFact{}, err
 		}
 		unlock()
 		return CaptureFact{HeadSHA: actualRef, TaskRef: taskRef}, nil
@@ -234,48 +239,48 @@ func (m *WorkspaceManager) Capture(ctx context.Context, spec CaptureSpec) (Captu
 	}
 	handoff, err := m.capture.Capture(ctx, helperRequest)
 	if err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
+		return CaptureFact{}, err
 	}
 	if handoff.HeadSHA != spec.ExpectedHead || handoff.ObjectCount <= 0 || handoff.BundleBytes <= 0 {
-		return CaptureFact{}, m.publicError("capture", &InvariantError{message: "capture helper facts do not match durable intent"})
+		return CaptureFact{}, &InvariantError{message: "capture helper facts do not match durable intent"}
 	}
 	if err := runCapturePhaseHook(ctx, capturePhaseHandoffReady, spec); err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
+		return CaptureFact{}, err
 	}
 	info, err := os.Lstat(handoff.ReadyBundle)
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return CaptureFact{}, m.publicError("capture", errors.New("capture handoff is not a direct regular file"))
+		return CaptureFact{}, errors.New("capture handoff is not a direct regular file")
 	}
 	if info.Size() != handoff.BundleBytes {
-		return CaptureFact{}, m.publicError("capture", &InvariantError{message: "capture bundle size does not match helper fact"})
+		return CaptureFact{}, &InvariantError{message: "capture bundle size does not match helper fact"}
 	}
 
 	unlock, err = m.initializer.maintenance.lock(ctx, spec.Workspace.ProjectID)
 	if err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
+		return CaptureFact{}, err
 	}
 	defer unlock()
 	actualRef, exists, err = m.initializer.resolveRef(ctx, spec.ControlRepoPath, taskRef)
 	if err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
+		return CaptureFact{}, err
 	}
 	if exists {
 		if actualRef != spec.ExpectedHead {
-			return CaptureFact{}, m.publicError("capture", &InvariantError{message: "task ref does not match expected head"})
+			return CaptureFact{}, &InvariantError{message: "task ref does not match expected head"}
 		}
 		if err := m.validateExistingCapture(ctx, spec, actualRef); err != nil {
-			return CaptureFact{}, m.publicError("capture", err)
+			return CaptureFact{}, err
 		}
 		if err := m.cleanupCaptureImportRef(ctx, spec); err != nil {
-			return CaptureFact{}, m.publicError("capture", err)
+			return CaptureFact{}, err
 		}
 		return CaptureFact{HeadSHA: actualRef, TaskRef: taskRef}, nil
 	}
 	if _, err := m.git(ctx, "verify capture bundle", "--git-dir="+spec.ControlRepoPath, "bundle", "verify", handoff.ReadyBundle); err != nil {
-		return CaptureFact{}, m.publicError("capture", &InvariantError{message: "capture bundle verification failed", cause: err})
+		return CaptureFact{}, &InvariantError{message: "capture bundle verification failed", cause: err}
 	}
 	if err := runCapturePhaseHook(ctx, capturePhaseBundleVerified, spec); err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
+		return CaptureFact{}, err
 	}
 
 	importRef := "refs/coordplane/imports/" + spec.Workspace.TaskID + "/" + spec.RunID
@@ -283,43 +288,43 @@ func (m *WorkspaceManager) Capture(ctx context.Context, spec CaptureSpec) (Captu
 		"-c", "protocol.file.allow=always", "--git-dir="+spec.ControlRepoPath,
 		"fetch", "--force", "--no-tags", "--no-write-fetch-head", handoff.ReadyBundle, "HEAD:"+importRef,
 	); err != nil {
-		return CaptureFact{}, m.publicError("capture", &InvariantError{message: "import capture handoff", cause: err})
+		return CaptureFact{}, &InvariantError{message: "import capture handoff", cause: err}
 	}
 	defer func() {
 		_, _ = m.initializer.git(context.Background(), "--git-dir="+spec.ControlRepoPath, "update-ref", "-d", importRef, spec.ExpectedHead)
 	}()
 	imported, exists, err := m.initializer.resolveRef(ctx, spec.ControlRepoPath, importRef)
 	if err != nil || !exists || imported != spec.ExpectedHead {
-		return CaptureFact{}, m.publicError("capture", &InvariantError{message: "imported capture does not match actual head", cause: err})
+		return CaptureFact{}, &InvariantError{message: "imported capture does not match actual head", cause: err}
 	}
 	typeName, err := m.initializer.git(ctx, "--git-dir="+spec.ControlRepoPath, "cat-file", "-t", imported)
 	if err != nil || strings.TrimSpace(typeName) != "commit" {
-		return CaptureFact{}, m.publicError("capture", &InvariantError{message: "imported capture is not a commit", cause: err})
+		return CaptureFact{}, &InvariantError{message: "imported capture is not a commit", cause: err}
 	}
 	if err := runCapturePhaseHook(ctx, capturePhaseObjectsImported, spec); err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
+		return CaptureFact{}, err
 	}
 	if err := m.validateCapturedAncestry(ctx, spec.ControlRepoPath, spec.Workspace, imported); err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
+		return CaptureFact{}, err
 	}
 	if _, err := m.initializer.git(ctx, "--git-dir="+spec.ControlRepoPath, "update-ref", taskRef, imported, zeroObjectID(imported)); err != nil {
 		current, exists, resolveErr := m.initializer.resolveRef(ctx, spec.ControlRepoPath, taskRef)
 		if resolveErr != nil || !exists || current != imported {
-			return CaptureFact{}, m.publicError("capture", &InvariantError{message: "create immutable task ref", cause: err})
+			return CaptureFact{}, &InvariantError{message: "create immutable task ref", cause: err}
 		}
 	}
 	if err := runCapturePhaseHook(ctx, capturePhaseTaskRefWritten, spec); err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
+		return CaptureFact{}, err
 	}
 	current, exists, err := m.initializer.resolveRef(ctx, spec.ControlRepoPath, taskRef)
 	if err != nil || !exists || current != imported {
-		return CaptureFact{}, m.publicError("capture", &InvariantError{message: "task ref read-back mismatch", cause: err})
+		return CaptureFact{}, &InvariantError{message: "task ref read-back mismatch", cause: err}
 	}
 	if _, err := m.initializer.git(ctx, "--git-dir="+spec.ControlRepoPath, "fsck", "--connectivity-only", "--strict"); err != nil {
-		return CaptureFact{}, m.publicError("capture", &InvariantError{message: "control repository fsck failed", cause: err})
+		return CaptureFact{}, &InvariantError{message: "control repository fsck failed", cause: err}
 	}
 	if err := runCapturePhaseHook(ctx, capturePhaseIntegrityChecked, spec); err != nil {
-		return CaptureFact{}, m.publicError("capture", err)
+		return CaptureFact{}, err
 	}
 	return CaptureFact{HeadSHA: current, TaskRef: taskRef}, nil
 }

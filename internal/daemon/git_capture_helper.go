@@ -72,40 +72,9 @@ func (h *dockerCaptureHelper) Capture(ctx context.Context, request gitrepo.Captu
 	if err != nil {
 		return gitrepo.CaptureHelperFact{}, err
 	}
-	runCtx, cancel := context.WithTimeout(ctx, h.config.CaptureTimeout)
-	defer cancel()
 	ref := captureRuntimeRef(request)
-	state, inspectErr := h.executor.Inspect(runCtx, ref)
-	switch {
-	case inspectErr == nil && state.Running:
-		ref = state.Ref
-	case inspectErr == nil:
-		_ = h.removeContainer(runCtx, state.Ref)
-	case !errors.Is(inspectErr, containerruntime.ErrNotFound):
-		return gitrepo.CaptureHelperFact{}, fmt.Errorf("capture helper: inspect container: %w", inspectErr)
-	}
-	if state.Ref.ContainerID == "" || !state.Running {
-		created, err := h.executor.Create(runCtx, h.containerSpec(request, handoff, executable, ref))
-		if err != nil {
-			return gitrepo.CaptureHelperFact{}, fmt.Errorf("capture helper: create container: %w", err)
-		}
-		ref, err = h.executor.Start(runCtx, created)
-		if err != nil {
-			_ = h.removeContainer(context.Background(), created)
-			return gitrepo.CaptureHelperFact{}, fmt.Errorf("capture helper: start container: %w", err)
-		}
-	}
-	exit, waitErr := h.executor.Wait(runCtx, ref)
-	logs := h.containerLogs(runCtx, ref)
-	removeErr := h.removeContainer(context.Background(), ref)
-	if waitErr != nil {
-		return gitrepo.CaptureHelperFact{}, fmt.Errorf("capture helper: wait for container: %w", waitErr)
-	}
-	if exit.ExitCode != 0 {
-		return gitrepo.CaptureHelperFact{}, fmt.Errorf("capture helper: container exited %d: %s", exit.ExitCode, logs)
-	}
-	if removeErr != nil {
-		return gitrepo.CaptureHelperFact{}, removeErr
+	if err := h.runContainer(ctx, h.containerSpec(request, handoff, executable, ref), true); err != nil {
+		return gitrepo.CaptureHelperFact{}, err
 	}
 	fact, ok, err := h.readyFact(handoff, request)
 	if err != nil {
@@ -135,29 +104,9 @@ func (h *dockerCaptureHelper) Inspect(ctx context.Context, request gitrepo.Works
 	if err != nil {
 		return gitrepo.WorkspaceInspectFact{}, err
 	}
-	runCtx, cancel := context.WithTimeout(ctx, h.config.CaptureTimeout)
-	defer cancel()
 	ref := inspectRuntimeRef(request, operationID)
-	created, err := h.executor.Create(runCtx, h.inspectContainerSpec(request, handoff, executable, ref))
-	if err != nil {
-		return gitrepo.WorkspaceInspectFact{}, fmt.Errorf("capture helper: create inspect container: %w", err)
-	}
-	ref, err = h.executor.Start(runCtx, created)
-	if err != nil {
-		_ = h.removeContainer(context.Background(), created)
-		return gitrepo.WorkspaceInspectFact{}, fmt.Errorf("capture helper: start inspect container: %w", err)
-	}
-	exit, waitErr := h.executor.Wait(runCtx, ref)
-	logs := h.containerLogs(runCtx, ref)
-	removeErr := h.removeContainer(context.Background(), ref)
-	if waitErr != nil {
-		return gitrepo.WorkspaceInspectFact{}, fmt.Errorf("capture helper: wait for inspect container: %w", waitErr)
-	}
-	if exit.ExitCode != 0 {
-		return gitrepo.WorkspaceInspectFact{}, fmt.Errorf("capture helper: inspect container exited %d: %s", exit.ExitCode, logs)
-	}
-	if removeErr != nil {
-		return gitrepo.WorkspaceInspectFact{}, removeErr
+	if err := h.runContainer(ctx, h.inspectContainerSpec(request, handoff, executable, ref), false); err != nil {
+		return gitrepo.WorkspaceInspectFact{}, err
 	}
 	fact, err := h.readyInspectFact(handoff)
 	if err != nil {
@@ -287,13 +236,33 @@ func (h *dockerCaptureHelper) containerSpec(
 	if request.SourceSHA != "" {
 		args = append(args, "--source", request.SourceSHA)
 	}
+	return h.helperContainerSpec(request.Workspace, handoff, executable, ref, args)
+}
+
+func (h *dockerCaptureHelper) inspectContainerSpec(
+	request gitrepo.WorkspaceInspectRequest,
+	handoff, executable string,
+	ref containerruntime.RuntimeRef,
+) containerruntime.ContainerSpec {
+	return h.helperContainerSpec(request.Workspace, handoff, executable, ref, []string{
+		"inspect", "--workspace", "/workspace", "--handoff", "/handoff",
+		"--max-objects", strconv.Itoa(h.config.MaximumObjects),
+	})
+}
+
+func (h *dockerCaptureHelper) helperContainerSpec(
+	workspace, handoff, executable string,
+	ref containerruntime.RuntimeRef,
+	args []string,
+) containerruntime.ContainerSpec {
+	gid := strconv.Itoa(os.Getgid())
 	return containerruntime.ContainerSpec{
 		Ref: ref, Image: h.config.CaptureHelperImage,
 		Command:    containerruntime.CommandSpec{Executable: "/usr/local/bin/coordplane-git-helper", Args: args},
-		WorkingDir: "/workspace", User: strconv.Itoa(captureHelperContainerUID) + ":" + strconv.Itoa(os.Getgid()),
-		GroupAdd: []string{strconv.Itoa(os.Getgid())}, Network: "none",
+		WorkingDir: "/workspace", User: strconv.Itoa(captureHelperContainerUID) + ":" + gid,
+		GroupAdd: []string{gid}, Network: "none",
 		Mounts: []containerruntime.Mount{
-			{Source: request.Workspace, Target: "/workspace", ReadOnly: true},
+			{Source: workspace, Target: "/workspace", ReadOnly: true},
 			{Source: handoff, Target: "/handoff"},
 			{Source: executable, Target: "/usr/local/bin/coordplane-git-helper", ReadOnly: true},
 		},
@@ -304,32 +273,43 @@ func (h *dockerCaptureHelper) containerSpec(
 	}
 }
 
-func (h *dockerCaptureHelper) inspectContainerSpec(
-	request gitrepo.WorkspaceInspectRequest,
-	handoff, executable string,
-	ref containerruntime.RuntimeRef,
-) containerruntime.ContainerSpec {
-	return containerruntime.ContainerSpec{
-		Ref: ref, Image: h.config.CaptureHelperImage,
-		Command: containerruntime.CommandSpec{
-			Executable: "/usr/local/bin/coordplane-git-helper",
-			Args: []string{
-				"inspect", "--workspace", "/workspace", "--handoff", "/handoff",
-				"--max-objects", strconv.Itoa(h.config.MaximumObjects),
-			},
-		},
-		WorkingDir: "/workspace", User: strconv.Itoa(captureHelperContainerUID) + ":" + strconv.Itoa(os.Getgid()),
-		GroupAdd: []string{strconv.Itoa(os.Getgid())}, Network: "none",
-		Mounts: []containerruntime.Mount{
-			{Source: request.Workspace, Target: "/workspace", ReadOnly: true},
-			{Source: handoff, Target: "/handoff"},
-			{Source: executable, Target: "/usr/local/bin/coordplane-git-helper", ReadOnly: true},
-		},
-		ReadOnlyRoot: true,
-		Limits: containerruntime.ResourceLimits{
-			PIDs: 64, MemoryBytes: 512 << 20, NanoCPUs: 1_000_000_000, TmpfsBytes: 128 << 20,
-		},
+func (h *dockerCaptureHelper) runContainer(ctx context.Context, spec containerruntime.ContainerSpec, adopt bool) error {
+	runCtx, cancel := context.WithTimeout(ctx, h.config.CaptureTimeout)
+	defer cancel()
+	ref := spec.Ref
+	running := false
+	if adopt {
+		state, err := h.executor.Inspect(runCtx, ref)
+		switch {
+		case err == nil && state.Running:
+			ref, running = state.Ref, true
+		case err == nil:
+			_ = h.removeContainer(runCtx, state.Ref)
+		case !errors.Is(err, containerruntime.ErrNotFound):
+			return fmt.Errorf("capture helper: inspect container: %w", err)
+		}
 	}
+	if !running {
+		created, err := h.executor.Create(runCtx, spec)
+		if err != nil {
+			return fmt.Errorf("capture helper: create container: %w", err)
+		}
+		ref, err = h.executor.Start(runCtx, created)
+		if err != nil {
+			_ = h.removeContainer(context.Background(), created)
+			return fmt.Errorf("capture helper: start container: %w", err)
+		}
+	}
+	exit, waitErr := h.executor.Wait(runCtx, ref)
+	logs := h.containerLogs(runCtx, ref)
+	removeErr := h.removeContainer(context.Background(), ref)
+	if waitErr != nil {
+		return fmt.Errorf("capture helper: wait for container: %w", waitErr)
+	}
+	if exit.ExitCode != 0 {
+		return fmt.Errorf("capture helper: container exited %d: %s", exit.ExitCode, logs)
+	}
+	return removeErr
 }
 
 func captureRuntimeRef(request gitrepo.CaptureHelperRequest) containerruntime.RuntimeRef {
