@@ -2,8 +2,11 @@
 set -eu
 
 echo '{"type":"thread.started","thread_id":"scripted-session-p3"}'
-/usr/local/bin/coordlink progress --summary "provider process is live" --request-id scripted-progress --output json >/dev/null
 bootstrap=/run/coordplane/bootstrap
+if grep -q "crash matrix" "$bootstrap"; then
+    sleep 0.3
+fi
+/usr/local/bin/coordlink progress --summary "provider process is live" --request-id scripted-progress --output json >/dev/null
 
 if grep -q "resume fallback" "$bootstrap"; then
     if [ "${2:-}" = "resume" ]; then

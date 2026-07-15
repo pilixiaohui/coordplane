@@ -134,7 +134,7 @@ func runRT05ProcessCase(
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(root)
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	configPath := writeTestConfig(t, root)
 	rawConfig, err := os.ReadFile(configPath)
 	if err != nil {
@@ -207,6 +207,10 @@ func runRT05ProcessCase(
 		crashRun = waitForOperatorRun(t, client, task.ID, func(run core.Run) bool {
 			return run.State == core.RunActive
 		})
+		registerRT05ImmutableCleanup(t, executor, crashRun)
+		if intent == "outcome" {
+			waitForRT05DurableProgress(t, ctx, root, crashRun)
+		}
 		intentDurable = applyRT05Intent(t, ctx, client, root, task, crashRun, intent, true)
 		waitForRT05Phase(t, first, readyPath, phase)
 		crashRun = waitForOperatorRun(t, client, task.ID, func(run core.Run) bool {
@@ -226,7 +230,11 @@ func runRT05ProcessCase(
 				return false
 			}
 		})
+		registerRT05ImmutableCleanup(t, executor, crashRun)
 		outcomeAllowed := phase == runtimePhaseProcessObserved || phase == runtimePhaseProcessExited
+		if intent == "outcome" && outcomeAllowed {
+			waitForRT05DurableProgress(t, ctx, root, crashRun)
+		}
 		intentDurable = applyRT05Intent(t, ctx, client, root, task, crashRun, intent, outcomeAllowed)
 	}
 	killP3DaemonProcess(t, first)
@@ -260,6 +268,56 @@ func runRT05ProcessCase(
 	})
 	stopP3DaemonProcess(t, second)
 	assertRT05Converged(t, ctx, executor, root, project.ID, task.ID, final.ID, intent, 1)
+}
+
+func registerRT05ImmutableCleanup(t *testing.T, executor *containerruntime.DockerExecutor, run core.Run) {
+	t.Helper()
+	if run.ContainerID == "" {
+		return
+	}
+	ref := runtimeRef(run)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := executor.Stop(ctx, ref, 0); err != nil {
+			t.Errorf("RT-05 cleanup immutable Run %s stop: %v", ref.RunID, err)
+			return
+		}
+		if _, err := executor.Remove(ctx, ref); err != nil {
+			t.Errorf("RT-05 cleanup immutable Run %s remove: %v", ref.RunID, err)
+		}
+	})
+}
+
+func waitForRT05DurableProgress(t *testing.T, ctx context.Context, root string, run core.Run) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		database, err := store.Open(ctx, filepath.Join(root, "data", "coordplane.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		events, readErr := database.Events(ctx, core.EventFilter{
+			ProjectID: run.ProjectID, RunID: run.ID, EntityType: "task", EntityID: run.TaskID,
+		})
+		closeErr := database.Close()
+		if readErr != nil || closeErr != nil {
+			t.Fatalf("read RT-05 progress barrier: events=%v close=%v", readErr, closeErr)
+		}
+		count := countDaemonEvent(events, "task.progress")
+		if count == 1 {
+			return
+		}
+		if count > 1 {
+			t.Fatalf("RT-05 Run %s progress barrier count = %d", run.ID, count)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	t.Fatalf("RT-05 Run %s did not durably record progress before outcome injection", run.ID)
 }
 
 func applyRT05Intent(
