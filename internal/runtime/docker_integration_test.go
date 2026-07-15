@@ -20,9 +20,7 @@ import (
 
 func TestDockerExecutorRealLifecycleAndOwnershipFence(t *testing.T) {
 	executor, err := NewDockerExecutorFromEnvironment()
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	if err := executor.Ping(ctx); err != nil {
@@ -48,9 +46,7 @@ func TestDockerExecutorRealLifecycleAndOwnershipFence(t *testing.T) {
 		Limits: ResourceLimits{PIDs: 32, MemoryBytes: 128 << 20, NanoCPUs: 500_000_000, TmpfsBytes: 8 << 20},
 	}
 	created, err := executor.Create(ctx, spec)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() {
 		cleanup, stop := context.WithTimeout(context.Background(), 15*time.Second)
 		defer stop()
@@ -66,13 +62,9 @@ func TestDockerExecutorRealLifecycleAndOwnershipFence(t *testing.T) {
 		t.Fatalf("attach = %#v err=%v", attached, err)
 	}
 	started, err := executor.Start(ctx, created)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	state, err := executor.Inspect(ctx, started)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if !state.Running || state.Status != StatusRunning || state.PID <= 0 || state.AutoRemove ||
 		state.RestartPolicy != "no" || state.Privileged || !state.ReadonlyRootfs || state.PublishedPorts != 0 ||
 		!contains(state.CapDrop, "ALL") || !contains(state.SecurityOpt, "no-new-privileges") || !state.Init {
@@ -82,9 +74,7 @@ func TestDockerExecutorRealLifecycleAndOwnershipFence(t *testing.T) {
 		t.Fatalf("live container does not match its creation contract: %v", err)
 	}
 	logs, err := executor.Logs(ctx, started, true)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	line, readErr := bufio.NewReader(logs).ReadString('\n')
 	closeErr := logs.Close()
 	if readErr != nil || closeErr != nil || !strings.Contains(line, "runtime-ready") {
@@ -128,9 +118,7 @@ func TestDockerExecutorRealLifecycleAndOwnershipFence(t *testing.T) {
 
 func TestDockerExecutorRejectsMaliciousSameLabelContainer(t *testing.T) {
 	executor, err := NewDockerExecutorFromEnvironment()
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	if err := executor.Ping(ctx); err != nil {
@@ -144,9 +132,7 @@ func TestDockerExecutorRejectsMaliciousSameLabelContainer(t *testing.T) {
 		ProjectID:     "project-drift", TaskID: "task-drift", AgentID: "agent-drift",
 		RunID: "run-drift", Generation: 11, LaunchNonce: "nonce-drift",
 	}
-	if err := validateContainerSpec(&spec); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, validateContainerSpec(&spec))
 	payload := dockerCreateRequest(spec)
 	payload.User = "0:0"
 	payload.HostConfig.Privileged = true
@@ -156,9 +142,7 @@ func TestDockerExecutorRejectsMaliciousSameLabelContainer(t *testing.T) {
 	payload.HostConfig.Mounts = append(payload.HostConfig.Mounts, extra)
 	query := url.Values{"name": []string{spec.Ref.ContainerName}}
 	response, err := executor.call(ctx, http.MethodPost, "/"+dockerAPIVersion+"/containers/create?"+query.Encode(), payload, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusCreated {
 		t.Fatal(dockerResponseError(response, "create malicious fixture"))
@@ -166,9 +150,7 @@ func TestDockerExecutorRejectsMaliciousSameLabelContainer(t *testing.T) {
 	var created struct {
 		ID string `json:"Id"`
 	}
-	if err := decodeResponse(response.Body, &created); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, decodeResponse(response.Body, &created))
 	ref := spec.Ref
 	ref.ContainerID = created.ID
 	t.Cleanup(func() {
@@ -214,9 +196,7 @@ func buildDockerFixtureImage(t *testing.T, ctx context.Context) string {
 	}
 	image := "coordplane-runtime-test:" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	dockerConfig := filepath.Join(contextRoot, "docker-config")
-	if err := os.Mkdir(dockerConfig, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Mkdir(dockerConfig, 0o700))
 	dockerfile := filepath.Join(packageRoot, "testdata", "docker-fixture", "Dockerfile")
 	buildImage := exec.CommandContext(
 		ctx, "docker", "build", "--network=none", "--pull=false", "-q",

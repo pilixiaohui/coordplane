@@ -22,9 +22,7 @@ func TestGT02DirtyOrMismatchedWorkspaceCreatesNoControlRef(t *testing.T) {
 		{
 			name: "dirty untracked file",
 			mutate: func(t *testing.T, path string) string {
-				if err := os.WriteFile(filepath.Join(path, "untracked.txt"), []byte("dirty\n"), 0o644); err != nil {
-					t.Fatal(err)
-				}
+				requireNoError(t, os.WriteFile(filepath.Join(path, "untracked.txt"), []byte("dirty\n"), 0o644))
 				return initial
 			},
 			want: "clean",
@@ -47,9 +45,7 @@ func TestGT02DirtyOrMismatchedWorkspaceCreatesNoControlRef(t *testing.T) {
 			runID := "run-reject-" + string(rune('a'+index))
 			spec := WorkspaceSpec{ProjectID: project.ID, TaskID: taskID, BaseSHA: initial}
 			workspace, err := manager.Materialize(ctx, spec)
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			expected := test.mutate(t, workspace.Path)
 			_, err = manager.Capture(ctx, CaptureSpec{
 				Workspace: spec, RunID: runID, ExpectedHead: expected,
@@ -72,9 +68,7 @@ func TestGT03CorruptReadyBundleFailsLoudAndLeavesControllerFSCKClean(t *testing.
 	manager.capture = corruptCaptureHelper{next: manager.capture}
 	spec := WorkspaceSpec{ProjectID: project.ID, TaskID: "task-corrupt", BaseSHA: initial}
 	workspace, err := manager.Materialize(ctx, spec)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	gitOutput(t, workspace.Path, "config", "user.name", "Corrupt Capture")
 	gitOutput(t, workspace.Path, "config", "user.email", "corrupt@example.invalid")
 	head := commitFile(t, workspace.Path, "corrupt.txt", "corrupt me\n", "corrupt capture")
@@ -93,13 +87,9 @@ func TestGT03CorruptReadyBundleFailsLoudAndLeavesControllerFSCKClean(t *testing.
 
 func TestGT03PublicCaptureErrorsRedactDistinctHandoffRootAndRawGitArgs(t *testing.T) {
 	realGit, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	realGit, err = filepath.Abs(realGit)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	for _, mode := range []string{"verify", "fetch"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
@@ -108,9 +98,7 @@ func TestGT03PublicCaptureErrorsRedactDistinctHandoffRootAndRawGitArgs(t *testin
 			manager.capture = testCaptureHelper{root: handoffRoot}
 			spec := WorkspaceSpec{ProjectID: project.ID, TaskID: "task-redact-" + mode, BaseSHA: initial}
 			workspace, err := manager.Materialize(ctx, spec)
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			gitOutput(t, workspace.Path, "config", "user.name", "Redaction Test")
 			gitOutput(t, workspace.Path, "config", "user.email", "redaction@example.invalid")
 			head := commitFile(t, workspace.Path, "redact.txt", mode+"\n", "redaction "+mode)
@@ -122,9 +110,7 @@ case " $* " in
 esac
 exec %q "$@"
 `, map[string]string{"verify": "bundle verify", "fetch": "fetch"}[mode], realGit)
-			if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, os.WriteFile(wrapper, []byte(script), 0o700))
 			initializer.gitPath = wrapper
 			_, err = manager.Capture(ctx, CaptureSpec{
 				Workspace: spec, RunID: runID, ExpectedHead: head, ControlRepoPath: project.ControlRepoPath,
@@ -149,9 +135,7 @@ exec %q "$@"
 				}
 			}
 			taskRef, err := TaskRef(spec.TaskID, runID)
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			initializer.gitPath = realGit
 			if _, exists, err := initializer.resolveRef(ctx, project.ControlRepoPath, taskRef); err != nil || exists {
 				t.Fatalf("rejected capture task ref exists=%t err=%v", exists, err)
@@ -194,18 +178,14 @@ func TestGT04ConcurrentExpectedOldCASBarrierUpdatesCanonicalExactlyOnce(t *testi
 		t.Helper()
 		spec := WorkspaceSpec{ProjectID: project.ID, TaskID: taskID, BaseSHA: initial}
 		workspace, err := manager.Materialize(ctx, spec)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		gitOutput(t, workspace.Path, "config", "user.name", taskID)
 		gitOutput(t, workspace.Path, "config", "user.email", taskID+"@example.invalid")
 		head := commitFile(t, workspace.Path, filename, taskID+"\n", taskID)
 		fact, err := manager.Capture(ctx, CaptureSpec{
 			Workspace: spec, RunID: runID, ExpectedHead: head, ControlRepoPath: project.ControlRepoPath,
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		return fact
 	}
 	left := capture("task-cas-left", "run-cas-left", "left.txt")
@@ -265,9 +245,7 @@ func TestGT04ConcurrentExpectedOldCASBarrierUpdatesCanonicalExactlyOnce(t *testi
 
 	descendantSpec := WorkspaceSpec{ProjectID: project.ID, TaskID: "task-cas-descendant", BaseSHA: winner.HeadSHA}
 	descendantWorkspace, err := manager.Materialize(ctx, descendantSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	gitOutput(t, descendantWorkspace.Path, "config", "user.name", "CAS Descendant")
 	gitOutput(t, descendantWorkspace.Path, "config", "user.email", "cas-descendant@example.invalid")
 	descendantHead := commitFile(t, descendantWorkspace.Path, "descendant.txt", "descendant\n", "canonical descendant")
@@ -275,9 +253,7 @@ func TestGT04ConcurrentExpectedOldCASBarrierUpdatesCanonicalExactlyOnce(t *testi
 		Workspace: descendantSpec, RunID: "run-cas-descendant", ExpectedHead: descendantHead,
 		ControlRepoPath: project.ControlRepoPath,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if advanced, err := initializer.Advance(ctx, AdvanceSpec{
 		ProjectID: project.ID, ControlRepoPath: project.ControlRepoPath, CanonicalRef: project.CanonicalRef,
 		TaskRef: descendant.TaskRef, ExpectedOldSHA: winner.HeadSHA, TargetSHA: descendant.HeadSHA,
@@ -304,9 +280,7 @@ func TestGT05IntegrationCaptureRequiresRealCanonicalAndSourceLineage(t *testing.
 
 	sourceSpec := WorkspaceSpec{ProjectID: project.ID, TaskID: "source-lineage", BaseSHA: initial}
 	sourceWorkspace, err := manager.Materialize(ctx, sourceSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	gitOutput(t, sourceWorkspace.Path, "config", "user.name", "Source")
 	gitOutput(t, sourceWorkspace.Path, "config", "user.email", "source@example.invalid")
 	sourceHead := commitFile(t, sourceWorkspace.Path, "source.txt", "source\n", "source")
@@ -314,9 +288,7 @@ func TestGT05IntegrationCaptureRequiresRealCanonicalAndSourceLineage(t *testing.
 		Workspace: sourceSpec, RunID: "source-run", ExpectedHead: sourceHead,
 		ControlRepoPath: project.ControlRepoPath,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	source := WorkspaceSource{
 		TaskID: sourceSpec.TaskID, RunID: "source-run",
 		TaskRef: sourceCapture.TaskRef, HeadSHA: sourceHead,
@@ -324,9 +296,7 @@ func TestGT05IntegrationCaptureRequiresRealCanonicalAndSourceLineage(t *testing.
 
 	canonicalSpec := WorkspaceSpec{ProjectID: project.ID, TaskID: "canonical-lineage", BaseSHA: initial}
 	canonicalWorkspace, err := manager.Materialize(ctx, canonicalSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	gitOutput(t, canonicalWorkspace.Path, "config", "user.name", "Canonical")
 	gitOutput(t, canonicalWorkspace.Path, "config", "user.email", "canonical@example.invalid")
 	canonicalHead := commitFile(t, canonicalWorkspace.Path, "canonical.txt", "canonical\n", "canonical")
@@ -334,9 +304,7 @@ func TestGT05IntegrationCaptureRequiresRealCanonicalAndSourceLineage(t *testing.
 		Workspace: canonicalSpec, RunID: "canonical-run", ExpectedHead: canonicalHead,
 		ControlRepoPath: project.ControlRepoPath,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if _, err := initializer.Advance(ctx, AdvanceSpec{
 		ProjectID: project.ID, ControlRepoPath: project.ControlRepoPath,
 		CanonicalRef: project.CanonicalRef, TaskRef: canonicalCapture.TaskRef,
@@ -349,9 +317,7 @@ func TestGT05IntegrationCaptureRequiresRealCanonicalAndSourceLineage(t *testing.
 		ProjectID: project.ID, TaskID: "integration-invalid", BaseSHA: canonicalHead, Source: &source,
 	}
 	invalidWorkspace, err := manager.Materialize(ctx, invalidSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	gitOutput(t, invalidWorkspace.Path, "config", "user.name", "Invalid Integration")
 	gitOutput(t, invalidWorkspace.Path, "config", "user.email", "invalid@example.invalid")
 	invalidHead := commitFile(t, invalidWorkspace.Path, "invalid.txt", "no source\n", "invalid integration")
@@ -370,9 +336,7 @@ func TestGT05IntegrationCaptureRequiresRealCanonicalAndSourceLineage(t *testing.
 		ProjectID: project.ID, TaskID: "integration-valid", BaseSHA: canonicalHead, Source: &source,
 	}
 	validWorkspace, err := manager.Materialize(ctx, validSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	gitOutput(t, validWorkspace.Path, "config", "user.name", "Valid Integration")
 	gitOutput(t, validWorkspace.Path, "config", "user.email", "valid@example.invalid")
 	gitOutput(t, validWorkspace.Path, "merge", "--no-ff", source.ConvenienceRef(), "-m", "integrate source")
@@ -381,9 +345,7 @@ func TestGT05IntegrationCaptureRequiresRealCanonicalAndSourceLineage(t *testing.
 		Workspace: validSpec, RunID: "integration-run", ExpectedHead: integrationHead,
 		ControlRepoPath: project.ControlRepoPath,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	advanced, err := initializer.Advance(ctx, AdvanceSpec{
 		ProjectID: project.ID, ControlRepoPath: project.ControlRepoPath,
 		CanonicalRef: project.CanonicalRef, TaskRef: integrationCapture.TaskRef,

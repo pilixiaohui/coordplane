@@ -99,9 +99,7 @@ func TestGT00DaemonBinaryRecoversEveryInitializationPhase(t *testing.T) {
 	for _, phase := range phases {
 		t.Run(phase, func(t *testing.T) {
 			root, err := os.MkdirTemp("/tmp", "cp-gt00-")
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			t.Cleanup(func() { _ = os.RemoveAll(root) })
 			dataDir := filepath.Join(root, "data")
 			socket := filepath.Join(dataDir, "operator.sock")
@@ -121,18 +119,14 @@ func TestGT00DaemonBinaryRecoversEveryInitializationPhase(t *testing.T) {
 				"--request-id", "phase-"+phase, "--output", "json")
 			add.Stdout = &addOutput
 			add.Stderr = &addOutput
-			if err := add.Start(); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, add.Start())
 			waitForFile(t, readyPath)
 			killDaemon(t, daemon)
 			if err := add.Wait(); err == nil {
 				t.Fatalf("project add survived daemon kill: %s", addOutput.String())
 			}
 
-			if err := os.WriteFile(filepath.Join(source, "advanced.txt"), []byte(phase+"\n"), 0o600); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, os.WriteFile(filepath.Join(source, "advanced.txt"), []byte(phase+"\n"), 0o600))
 			git(t, source, "add", "advanced.txt")
 			git(t, source, "commit", "-m", "advance source after "+phase)
 			advanced := strings.TrimSpace(git(t, source, "rev-parse", "refs/heads/main"))
@@ -141,9 +135,7 @@ func TestGT00DaemonBinaryRecoversEveryInitializationPhase(t *testing.T) {
 			}
 			sourceStatus := git(t, source, "status", "--porcelain=v1", "--untracked-files=all")
 			sourceConfig, err := os.ReadFile(filepath.Join(source, ".git", "config"))
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 
 			daemon = startDaemon(t, configPath, socket)
 			t.Cleanup(func() { stopDaemon(t, daemon, socket) })
@@ -175,9 +167,7 @@ func TestGT00DaemonBinaryRecoversEveryInitializationPhase(t *testing.T) {
 				t.Fatalf("recovery changed source worktree: before=%q after=%q", sourceStatus, got)
 			}
 			afterConfig, err := os.ReadFile(filepath.Join(source, ".git", "config"))
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			if !bytes.Equal(afterConfig, sourceConfig) {
 				t.Fatal("recovery changed source Git config")
 			}
@@ -248,18 +238,12 @@ func TestP3ProductionBinaryRejectsUnknownAdapterWithoutDurableWrites(t *testing.
 	stopDaemon(t, daemon, socket)
 
 	database, err := store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer database.Close()
 	snapshot, err := database.Snapshot(context.Background(), "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	events, err := database.Events(context.Background(), core.EventFilter{EntityType: "agent"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(snapshot.Agents) != 0 || len(events) != 0 {
 		t.Fatalf("unknown adapter wrote durable state: agents=%#v events=%#v", snapshot.Agents, events)
 	}
@@ -274,9 +258,7 @@ func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 	sourceRefBefore := git(t, source, "rev-parse", "refs/heads/main")
 	sourceStatusBefore := git(t, source, "status", "--porcelain=v1", "--untracked-files=all")
 	sourceConfigBefore, err := os.ReadFile(filepath.Join(source, ".git", "config"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	daemon := startDaemon(t, configPath, socket)
 
 	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
@@ -344,9 +326,7 @@ func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 		Messages core.MessagePage `json:"messages"`
 		Events   core.EventPage   `json:"events"`
 	}{status, taskDetail, messagesBefore, eventsBefore})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 
 	secondDaemon := exec.Command(testBinaries.coordplane, "serve", "--config", configPath)
 	secondOutput, err := secondDaemon.CombinedOutput()
@@ -384,9 +364,7 @@ func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 		Messages core.MessagePage `json:"messages"`
 		Events   core.EventPage   `json:"events"`
 	}{statusAfter, taskAfter, messages, eventsAfter})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if !bytes.Equal(afterRestart, beforeRestart) {
 		t.Fatalf("restart changed row versions or Event IDs/order\nbefore=%s\nafter=%s", beforeRestart, afterRestart)
 	}
@@ -397,27 +375,21 @@ func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 		t.Fatalf("source status changed: before=%q after=%q", sourceStatusBefore, got)
 	}
 	sourceConfigAfter, err := os.ReadFile(filepath.Join(source, ".git", "config"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if !bytes.Equal(sourceConfigBefore, sourceConfigAfter) {
 		t.Fatal("project registration modified source Git config")
 	}
 
 	stopDaemon(t, daemon, socket)
 	controlRepo := filepath.Join(dataDir, "repos", project.ID+".git")
-	if err := os.WriteFile(filepath.Join(source, "canonical-advanced.txt"), []byte("advanced\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(filepath.Join(source, "canonical-advanced.txt"), []byte("advanced\n"), 0o600))
 	git(t, source, "add", "canonical-advanced.txt")
 	git(t, source, "commit", "-m", "advance canonical before loss")
 	advancedSHA := strings.TrimSpace(git(t, source, "rev-parse", "refs/heads/main"))
 	git(t, controlRepo, "fetch", "--no-tags", source, advancedSHA)
 	git(t, controlRepo, "update-ref", "refs/heads/main", advancedSHA, strings.TrimSpace(sourceRefBefore))
 	missingRepo := filepath.Join(root, "missing-control.git")
-	if err := os.Rename(controlRepo, missingRepo); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Rename(controlRepo, missingRepo))
 	daemon = startDaemon(t, configPath, socket)
 	failedRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"project", "show", project.ID, "--socket", socket, "--output", "json")
@@ -446,9 +418,7 @@ func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 		t.Fatalf("failed repair changed project truth: %#v", failedView)
 	}
 
-	if err := os.Rename(missingRepo, controlRepo); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Rename(missingRepo, controlRepo))
 	repairedRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"project", "repair", project.ID, "--socket", socket,
 		"--request-id", "binary-project-repair-restored", "--output", "json")
@@ -468,14 +438,10 @@ func TestGT07FormalOperatorBinaryChecksOutExactControllerTaskRef(t *testing.T) {
 	socket := filepath.Join(dataDir, "operator.sock")
 	configPath := writeConfig(t, root, dataDir, socket, "")
 	configRaw, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	configRaw = bytes.ReplaceAll(configRaw, []byte("completed_workspace: 24h"), []byte("completed_workspace: 0"))
 	configRaw = bytes.ReplaceAll(configRaw, []byte("terminal_task_ref: 168h"), []byte("terminal_task_ref: 0"))
-	if err := os.WriteFile(configPath, configRaw, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(configPath, configRaw, 0o600))
 	source := createRepository(t, root)
 	daemon := startDaemon(t, configPath, socket)
 	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
@@ -500,9 +466,7 @@ func TestGT07FormalOperatorBinaryChecksOutExactControllerTaskRef(t *testing.T) {
 	stopDaemon(t, daemon, socket)
 
 	database, err := store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	project, err = database.Project(context.Background(), project.ID)
 	if err != nil {
 		_ = database.Close()
@@ -539,9 +503,7 @@ func TestGT07FormalOperatorBinaryChecksOutExactControllerTaskRef(t *testing.T) {
 		_ = database.Close()
 		t.Fatal(err)
 	}
-	if err := database.Close(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, database.Close())
 	gitDir(t, project.ControlRepoPath, "update-ref", taskRef, head)
 
 	daemon = startDaemon(t, configPath, socket)
@@ -562,9 +524,7 @@ func TestGT07FormalOperatorBinaryChecksOutExactControllerTaskRef(t *testing.T) {
 	}
 	stopDaemon(t, daemon, socket)
 	database, err = store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	err = database.Transact(context.Background(), func(tx core.Transaction) error {
 		persisted, err := tx.Task(task.ID)
 		if err != nil {
@@ -609,9 +569,7 @@ func TestGT07FormalOperatorBinaryChecksOutExactControllerTaskRef(t *testing.T) {
 		t.Fatalf("formal gc preview omitted workspace identity: %#v", preview)
 	}
 	auditStore, err := store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() { _ = auditStore.Close() })
 	workspaceArgs := []string{
 		"gc", "discard-workspace", "--socket", socket, "--task", consumer.ID,
@@ -731,9 +689,7 @@ func TestGT07FormalOperatorBinaryCreatesRetryLineageFromClosedSameProjectTask(t 
 	decodeJSON(t, crossRaw, &cross)
 
 	stopDaemon(t, daemon, socket)
-	if err := os.WriteFile(filepath.Join(source, "retry-canonical.txt"), []byte("advanced\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(filepath.Join(source, "retry-canonical.txt"), []byte("advanced\n"), 0o600))
 	git(t, source, "add", "retry-canonical.txt")
 	git(t, source, "commit", "-m", "advance canonical for retry")
 	advanced := strings.TrimSpace(git(t, source, "rev-parse", "refs/heads/main^{commit}"))
@@ -762,9 +718,7 @@ func TestGT07FormalOperatorBinaryCreatesRetryLineageFromClosedSameProjectTask(t 
 		t.Fatalf("formal retry replay = %s, want %s", replay.ID, retry.ID)
 	}
 	auditStore, err := store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() { _ = auditStore.Close() })
 	for _, invalid := range []struct {
 		name, target, requestID string
@@ -819,9 +773,7 @@ func TestP1ServeRejectsUnknownConfigBeforeCreatingDatabase(t *testing.T) {
 
 func TestP1BinaryReadSurfacesStayBoundedPastTwoMiBLedger(t *testing.T) {
 	root, err := os.MkdirTemp("/tmp", "cp-bounded-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	dataDir := filepath.Join(root, "data")
 	socket := filepath.Join(dataDir, "operator.sock")
@@ -873,9 +825,7 @@ func TestP1BinaryReadSurfacesStayBoundedPastTwoMiBLedger(t *testing.T) {
 
 	stopDaemon(t, daemon, socket)
 	database, err := store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	service, err := core.NewService(database, &contractGit{sha: project.InitialSHA, root: filepath.Join(dataDir, "repos")}, core.ServiceOptions{MaxParallelRuns: 1, AdapterIDs: []string{"codex"}})
 	if err != nil {
 		_ = database.Close()
@@ -892,9 +842,7 @@ func TestP1BinaryReadSurfacesStayBoundedPastTwoMiBLedger(t *testing.T) {
 	}
 	activateContractRuntimeRun(t, context.Background(), service, claim, "bounded-run")
 	operatorServer, err := transport.NewUnixServer(dataDir, socket, transport.NewOperatorHandler(service))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- operatorServer.Serve() }()
 	defer func() {
@@ -1039,9 +987,7 @@ func TestP1BinaryReadSurfacesStayBoundedPastTwoMiBLedger(t *testing.T) {
 	}
 
 	durableEvents, err := database.Events(context.Background(), core.EventFilter{ProjectID: project.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(seenEventIDs) != len(durableEvents) {
 		t.Fatalf("binary event traversal returned %d of %d durable events", len(seenEventIDs), len(durableEvents))
 	}
@@ -1056,9 +1002,7 @@ func TestCT03CoordlinkBinaryRejectsStaleRunWithoutSideEffects(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	database, err := store.Open(ctx, filepath.Join(root, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer database.Close()
 	gitFacts := &contractGit{sha: strings.Repeat("a", 40), root: filepath.Join(root, "repos")}
 	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
@@ -1066,21 +1010,13 @@ func TestCT03CoordlinkBinaryRejectsStaleRunWithoutSideEffects(t *testing.T) {
 		MaxParallelRuns: 2, AdapterIDs: []string{"one-shot"},
 		Now: func() time.Time { return now },
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	agent, err := service.AddAgent(ctx, core.AddAgentInput{DisplayName: "Agent", AdapterID: "one-shot", Image: "agent:latest", InstructionsFile: "/instructions", RequestID: "agent"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	project, err := service.AddProject(ctx, core.AddProjectInput{Name: "Project", Source: "/source", SourceRef: "refs/heads/main", RequestID: "project"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	chat, err := service.Chat(ctx, core.ChatInput{ProjectID: project.ID, AgentID: agent.ID, Body: "work", Wake: true, RequestID: "chat"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	run1, ok, err := service.ClaimNext(ctx, project.ID)
 	if err != nil || !ok {
 		t.Fatalf("run1 claim ok=%v err=%v", ok, err)
@@ -1094,15 +1030,11 @@ func TestCT03CoordlinkBinaryRejectsStaleRunWithoutSideEffects(t *testing.T) {
 	}
 	activateContractRuntimeRun(t, ctx, service, run2, "stale-run-2")
 	controlRoot, err := os.MkdirTemp("/tmp", "coordplane-run-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(controlRoot) })
 	socket := filepath.Join(controlRoot, "api.sock")
 	server, err := transport.NewUnixServer(controlRoot, socket, transport.NewRunHandler(service))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve() }()
 	defer func() {
@@ -1175,36 +1107,26 @@ func TestP2CoordlinkBinaryPersistsOutcomeIntentBeforeTerminalFact(t *testing.T) 
 			ctx := context.Background()
 			root := t.TempDir()
 			database, err := store.Open(ctx, filepath.Join(root, "coordplane.db"))
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			defer database.Close()
 			gitFacts := &contractGit{sha: strings.Repeat("a", 40), root: filepath.Join(root, "repos")}
 			service, err := core.NewService(database, gitFacts, core.ServiceOptions{MaxParallelRuns: 1, AdapterIDs: []string{"one-shot"}})
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			agent, err := service.AddAgent(ctx, core.AddAgentInput{
 				DisplayName: "Agent", AdapterID: "one-shot", Image: "agent:latest",
 				InstructionsFile: "/instructions", RequestID: "agent-" + test.name,
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			project, err := service.AddProject(ctx, core.AddProjectInput{
 				Name: "Project " + test.name, Source: "/source", SourceRef: "refs/heads/main",
 				RequestID: "project-" + test.name,
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			task, err := service.CreateTask(ctx, core.CreateTaskInput{
 				ProjectID: project.ID, Kind: core.TaskWork, AssigneeAgentID: agent.ID,
 				Title: "work " + test.name, RequestID: "task-" + test.name,
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			claim, ok, err := service.ClaimNext(ctx, project.ID)
 			if err != nil || !ok || claim.Task.ID != task.ID {
 				t.Fatalf("claim=%#v ok=%v err=%v", claim, ok, err)
@@ -1212,15 +1134,11 @@ func TestP2CoordlinkBinaryPersistsOutcomeIntentBeforeTerminalFact(t *testing.T) 
 			activateContractRuntimeRun(t, ctx, service, claim, "outcome-"+test.name)
 
 			controlRoot, err := os.MkdirTemp("/tmp", "coordplane-run-")
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			t.Cleanup(func() { _ = os.RemoveAll(controlRoot) })
 			socket := filepath.Join(controlRoot, "api.sock")
 			server, err := transport.NewUnixServer(controlRoot, socket, transport.NewRunHandler(service))
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			serveDone := make(chan error, 1)
 			go func() { serveDone <- server.Serve() }()
 			defer func() {
@@ -1234,9 +1152,7 @@ func TestP2CoordlinkBinaryPersistsOutcomeIntentBeforeTerminalFact(t *testing.T) 
 				t.Fatalf("coordlink %v err=%v output=%s", args, err, raw)
 			}
 			snapshot, err := database.Snapshot(ctx, project.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			gotTask := contractTaskWithID(t, snapshot, task.ID)
 			gotRun := contractRunWithID(t, snapshot, claim.Run.ID)
 			if gotTask.Status != core.TaskFinishing || gotTask.CurrentRunID != gotRun.ID ||
@@ -1302,9 +1218,7 @@ func startDaemonBinaryWithEnv(t *testing.T, binary, configPath, socket string, e
 	command.Env = append(os.Environ(), extraEnv...)
 	command.Stdout = output
 	command.Stderr = output
-	if err := command.Start(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, command.Start())
 	process := &daemonProcess{command: command, output: output}
 	client, err := transport.NewUnixClient(socket)
 	if err != nil {
@@ -1414,9 +1328,7 @@ func runBinaryJSON(t *testing.T, binary string, args ...string) []byte {
 func runCoordlink(t *testing.T, socket, token string, args ...string) ([]byte, error) {
 	t.Helper()
 	tokenFile := filepath.Join(t.TempDir(), "run-token")
-	if err := os.WriteFile(tokenFile, []byte(token+"\n"), 0o440); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(tokenFile, []byte(token+"\n"), 0o440))
 	command := exec.Command(testBinaries.coordlink, args...)
 	command.Env = append(os.Environ(), "COORDPLANE_RUN_SOCKET="+socket, "COORDPLANE_RUN_TOKEN_FILE="+tokenFile)
 	return command.CombinedOutput()
@@ -1425,20 +1337,14 @@ func runCoordlink(t *testing.T, socket, token string, args ...string) ([]byte, e
 func durableSignature(t *testing.T, database *store.Store, projectID string) string {
 	t.Helper()
 	snapshot, err := database.Snapshot(context.Background(), projectID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	events, err := database.Events(context.Background(), core.EventFilter{ProjectID: projectID})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	raw, err := json.Marshal(struct {
 		Snapshot core.Snapshot `json:"snapshot"`
 		Events   []core.Event  `json:"events"`
 	}{snapshot, events})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	return string(raw)
 }
 
@@ -1460,24 +1366,18 @@ runtime:
   default_image: agent:latest
   provider_env_allowlist: []
 %s`, dataDir, socket, filepath.Join(dataDir, "workspaces"), filepath.Join(dataDir, "agent-homes"), filepath.Join(dataDir, "logs"), suffix)
-	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(path, []byte(raw), 0o600))
 	return path
 }
 
 func createRepository(t *testing.T, root string) string {
 	t.Helper()
 	path := filepath.Join(root, "source")
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.MkdirAll(path, 0o700))
 	git(t, path, "init", "-b", "main")
 	git(t, path, "config", "user.email", "contract@coordplane.local")
 	git(t, path, "config", "user.name", "CoordPlane Contract")
-	if err := os.WriteFile(filepath.Join(path, "README.md"), []byte("initial\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(filepath.Join(path, "README.md"), []byte("initial\n"), 0o600))
 	git(t, path, "add", "README.md")
 	git(t, path, "commit", "-m", "initial")
 	return path

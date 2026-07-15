@@ -27,12 +27,8 @@ func TestGT07FormalOperatorGCDeletesOnlyArchivedAgentHome(t *testing.T) {
 	var agent core.Agent
 	decodeJSON(t, raw, &agent)
 	home := filepath.Join(dataDir, "agent-homes", agent.ID)
-	if err := os.MkdirAll(home, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(home, "session"), []byte("recoverable\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.MkdirAll(home, 0o700))
+	requireNoError(t, os.WriteFile(filepath.Join(home, "session"), []byte("recoverable\n"), 0o600))
 
 	active := formalAgentHomeTarget(t, socket, agent.ID)
 	if !active.Exists || active.Eligible || !hasGCReason(active.Reasons, "agent_not_archived") {
@@ -55,9 +51,7 @@ func TestGT07FormalOperatorGCDeletesOnlyArchivedAgentHome(t *testing.T) {
 	}
 
 	database, err := store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() { _ = database.Close() })
 	args := []string{"gc", "run", "--socket", socket, "--confirm", "--request-id", "archived-home-gc", "--output", "json"}
 	first := runBinaryJSON(t, testBinaries.coordplane, args...)

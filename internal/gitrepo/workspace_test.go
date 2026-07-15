@@ -14,19 +14,22 @@ import (
 	"coordplane/internal/gitcapture"
 )
 
+func requireNoError(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestGT01MaterializeCreatesExactPrivateClone(t *testing.T) {
 	ctx := context.Background()
 	initializer, manager, project, _, initial := newWorkspaceFixture(t)
 	spec := WorkspaceSpec{ProjectID: project.ID, TaskID: "task-a", BaseSHA: initial}
 	hookRoot := t.TempDir()
 	sentinel := filepath.Join(hookRoot, "host-hook-ran")
-	if err := os.WriteFile(filepath.Join(hookRoot, "post-checkout"), []byte("#!/bin/sh\n: > "+sentinel+"\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(filepath.Join(hookRoot, "post-checkout"), []byte("#!/bin/sh\n: > "+sentinel+"\n"), 0o700))
 	home := t.TempDir()
-	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[core]\n\thooksPath = "+hookRoot+"\n[credential]\n\thelper = host-only\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[core]\n\thooksPath = "+hookRoot+"\n[credential]\n\thelper = host-only\n"), 0o600))
 	t.Setenv("HOME", home)
 	t.Setenv("GIT_CONFIG_COUNT", "1")
 	t.Setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
@@ -55,9 +58,7 @@ func TestGT01MaterializeCreatesExactPrivateClone(t *testing.T) {
 	}
 
 	markerPath, err := manager.markerPath(spec.ProjectID, spec.TaskID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if strings.HasPrefix(markerPath, fact.Path+string(os.PathSeparator)) {
 		t.Fatalf("ownership marker %s is inside mounted workspace %s", markerPath, fact.Path)
 	}
@@ -83,13 +84,9 @@ func TestGT01TaskWorkspacesAreIndependentAndVerifyDoesNotReset(t *testing.T) {
 	specA := WorkspaceSpec{ProjectID: project.ID, TaskID: "task-a", BaseSHA: initial}
 	specB := WorkspaceSpec{ProjectID: project.ID, TaskID: "task-b", BaseSHA: initial}
 	factA, err := manager.Materialize(ctx, specA)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	factB, err := manager.Materialize(ctx, specB)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if factA.Path == factB.Path || factA.TaskBranch == factB.TaskBranch {
 		t.Fatalf("task workspaces are not distinct: A=%+v B=%+v", factA, factB)
 	}
@@ -109,9 +106,7 @@ func TestGT01TaskWorkspacesAreIndependentAndVerifyDoesNotReset(t *testing.T) {
 	}
 
 	dirtyPath := filepath.Join(factA.Path, "untracked.txt")
-	if err := os.WriteFile(dirtyPath, []byte("preserve me\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(dirtyPath, []byte("preserve me\n"), 0o600))
 	before := workspaceSnapshot(t, factA.Path)
 	verified, err := manager.Verify(ctx, specA)
 	if err != nil {
@@ -137,9 +132,7 @@ func TestGT01VerifyRejectsIsolationTamperingWithoutRepairOrPathLeak(t *testing.T
 	initializer, manager, project, _, initial := newWorkspaceFixture(t)
 	spec := WorkspaceSpec{ProjectID: project.ID, TaskID: "task-tamper", BaseSHA: initial}
 	fact, err := manager.Materialize(ctx, spec)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 
 	t.Run("control origin", func(t *testing.T) {
 		gitOutput(t, fact.Path, "remote", "add", "origin", project.ControlRepoPath)
@@ -154,20 +147,14 @@ func TestGT01VerifyRejectsIsolationTamperingWithoutRepairOrPathLeak(t *testing.T
 
 	t.Run("alternates", func(t *testing.T) {
 		alternates := filepath.Join(fact.Path, ".git", "objects", "info", "alternates")
-		if err := os.WriteFile(alternates, []byte(filepath.Join(project.ControlRepoPath, "objects")+"\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, os.WriteFile(alternates, []byte(filepath.Join(project.ControlRepoPath, "objects")+"\n"), 0o600))
 		_, err := manager.Verify(ctx, spec)
 		assertWorkspaceRejection(t, err, "alternates", initializer.root, manager.root, project.ControlRepoPath)
-		if err := os.Remove(alternates); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, os.Remove(alternates))
 	})
 
 	t.Run("workspace access", func(t *testing.T) {
-		if err := os.Chmod(fact.Path, 0o700); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, os.Chmod(fact.Path, 0o700))
 		_, err := manager.Verify(ctx, spec)
 		assertWorkspaceRejection(t, err, "group-rw", initializer.root, manager.root, project.ControlRepoPath)
 		info, statErr := os.Stat(fact.Path)
@@ -177,24 +164,16 @@ func TestGT01VerifyRejectsIsolationTamperingWithoutRepairOrPathLeak(t *testing.T
 		if info.Mode().Perm() != 0o700 {
 			t.Fatalf("Verify rewrote workspace mode to %v", info.Mode())
 		}
-		if err := os.Chmod(fact.Path, 0o770|os.ModeSetgid); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, os.Chmod(fact.Path, 0o770|os.ModeSetgid))
 	})
 
 	t.Run("ownership marker", func(t *testing.T) {
 		markerPath, err := manager.markerPath(spec.ProjectID, spec.TaskID)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		raw, err := os.ReadFile(markerPath)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		tampered := strings.Replace(string(raw), spec.TaskID, "other-task", 1)
-		if err := os.WriteFile(markerPath, []byte(tampered), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, os.WriteFile(markerPath, []byte(tampered), 0o600))
 		_, err = manager.Verify(ctx, spec)
 		assertWorkspaceRejection(t, err, "marker", initializer.root, manager.root, project.ControlRepoPath)
 	})
@@ -225,9 +204,7 @@ func TestGT01MaterializeImportsExactSourceThroughMovableConvenienceRef(t *testin
 		t.Fatalf("Materialize mismatched source error = %v", err)
 	}
 	wrongPath, err := manager.Path(wrongSpec.ProjectID, wrongSpec.TaskID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if _, err := os.Lstat(wrongPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("mismatched source published a workspace: %v", err)
 	}
@@ -254,9 +231,7 @@ func TestGT01MaterializeImportsExactSourceThroughMovableConvenienceRef(t *testin
 	assertPrivateWorkspace(t, initializer, manager, spec, fact.Path)
 	gitDirOutput(t, project.ControlRepoPath, "update-ref", project.CanonicalRef, sourceHead, initial)
 	canonicalRef, err := manager.RefreshCanonical(ctx, spec, project.ControlRepoPath, project.CanonicalRef, sourceHead)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if got := gitOutput(t, fact.Path, "rev-parse", canonicalRef+"^{commit}"); got != sourceHead {
 		t.Fatalf("canonical convenience ref = %s, want %s", got, sourceHead)
 	}
@@ -278,9 +253,7 @@ func TestGT01VerifyNeverCreatesMissingWorkspace(t *testing.T) {
 	_, manager, project, _, initial := newWorkspaceFixture(t)
 	spec := WorkspaceSpec{ProjectID: project.ID, TaskID: "missing-task", BaseSHA: initial}
 	want, err := manager.Path(spec.ProjectID, spec.TaskID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if _, err := manager.Verify(ctx, spec); err == nil || !strings.Contains(err.Error(), "does not exist") {
 		t.Fatalf("Verify missing workspace error = %v", err)
 	}
@@ -292,9 +265,7 @@ func TestGT01VerifyNeverCreatesMissingWorkspace(t *testing.T) {
 func TestProjectMaintenanceLockIsPerProjectAndHonorsCancellation(t *testing.T) {
 	var locks projectLocks
 	unlock, err := locks.lock(context.Background(), "project-a")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer unlock()
 
 	unlockOther, err := locks.lock(context.Background(), "project-b")
@@ -316,17 +287,13 @@ func newWorkspaceFixture(t *testing.T) (*Initializer, *WorkspaceManager, Project
 	sourceRepo, initial := newSourceRepository(t)
 	initializer := newTestInitializer(t)
 	preflight, err := initializer.Preflight(ctx, sourceRepo, "refs/heads/main")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	project := testProject(t, initializer, preflight, "project-workspace", "operation-workspace")
 	if _, err := initializer.Initialize(ctx, project); err != nil {
 		t.Fatal(err)
 	}
 	manager, err := NewWorkspaceManager(initializer, filepath.Join(t.TempDir(), "workspaces"), testCaptureHelper{root: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	return initializer, manager, project, sourceRepo, initial
 }
 
@@ -378,17 +345,13 @@ func inspectWithGitCapture(ctx context.Context, root string, request WorkspaceIn
 func assertPrivateWorkspace(t *testing.T, initializer *Initializer, manager *WorkspaceManager, spec WorkspaceSpec, path string) {
 	t.Helper()
 	gitDir := filepath.Join(path, ".git")
-	if err := validateDirectDirectory(gitDir, "workspace Git directory"); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, validateDirectDirectory(gitDir, "workspace Git directory"))
 	common := gitOutput(t, path, "rev-parse", "--git-common-dir")
 	if !filepath.IsAbs(common) {
 		common = filepath.Join(path, common)
 	}
 	resolvedCommon, err := filepath.EvalSymlinks(common)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if resolvedCommon != gitDir {
 		t.Fatalf("common Git directory = %s, want private %s", resolvedCommon, gitDir)
 	}
@@ -404,9 +367,7 @@ func assertPrivateWorkspace(t *testing.T, initializer *Initializer, manager *Wor
 		t.Fatalf("workspace remotes = %q, want none", got)
 	}
 	config, err := os.ReadFile(filepath.Join(gitDir, "config"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if bytes.Contains(config, []byte("credential")) || bytes.Contains(config, []byte("hooksPath")) {
 		t.Fatalf("workspace config inherited host Git behavior: %s", config)
 	}
@@ -439,9 +400,7 @@ func assertPrivateWorkspace(t *testing.T, initializer *Initializer, manager *Wor
 		t.Fatalf("published workspace access: %v", err)
 	}
 	rootInfo, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if rootInfo.Mode().Perm() != 0o770 || rootInfo.Mode()&os.ModeSetgid == 0 {
 		t.Fatalf("workspace root mode = %v, want group-rw setgid without world access", rootInfo.Mode())
 	}
@@ -449,9 +408,7 @@ func assertPrivateWorkspace(t *testing.T, initializer *Initializer, manager *Wor
 		t.Fatalf("new workspace is dirty: %q", got)
 	}
 	markerPath, err := manager.markerPath(spec.ProjectID, spec.TaskID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if _, err := os.Stat(markerPath); err != nil {
 		t.Fatalf("workspace ownership marker: %v", err)
 	}
@@ -479,9 +436,7 @@ type workspaceState struct {
 func workspaceSnapshot(t *testing.T, path string) workspaceState {
 	t.Helper()
 	config, err := os.ReadFile(filepath.Join(path, ".git", "config"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	return workspaceState{
 		Head:   gitOutput(t, path, "rev-parse", "HEAD^{commit}"),
 		Branch: gitOutput(t, path, "symbolic-ref", "HEAD"),

@@ -26,21 +26,13 @@ func TestReconcileRefusesToStartInsecureSameLabelContainer(t *testing.T) {
 		t.Fatalf("claim = %#v ok=%t err=%v", claim, ok, err)
 	}
 	workspacePath, err := fixture.components.runtime.workspaces.Path(project.ID, task.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	launch, err := fixture.components.service.RuntimeLaunchContext(fixture.ctx, claim.Run.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	instructions, instructionsHash, err := readInstructions(launch.Agent.InstructionsFile)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	workspaceSpec, err := gitWorkspaceSpec(task)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	prepared, err := fixture.components.service.BeginRunLaunch(fixture.ctx, core.RunLaunchInput{
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: "nonce-insecure-adoption",
 		WorkspacePath: workspacePath, HomePath: filepath.Join(fixture.components.config.Runtime.AgentHomeRoot, agent.ID),
@@ -48,12 +40,8 @@ func TestReconcileRefusesToStartInsecureSameLabelContainer(t *testing.T) {
 		InstructionsHash: instructionsHash, LaunchMode: "start",
 		CleanupOperationID: "cleanup-insecure-adoption", RequestID: runtimeRequest(claim.Run, "prepare"),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := fixture.components.runtime.prepareWorkspace(fixture.ctx, prepared, workspaceSpec); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
+	requireNoError(t, fixture.components.runtime.prepareWorkspace(fixture.ctx, prepared, workspaceSpec))
 	controlPath := filepath.Join(fixture.components.runtime.controlRoot, prepared.ID)
 	for _, directory := range []struct {
 		path string
@@ -63,20 +51,12 @@ func TestReconcileRefusesToStartInsecureSameLabelContainer(t *testing.T) {
 		{filepath.Dir(prepared.LogPath), 0o700},
 		{controlPath, runControlDirectoryMode},
 	} {
-		if err := ensureRuntimeDirectory(directory.path, directory.mode); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, ensureRuntimeDirectory(directory.path, directory.mode))
 	}
 	bootstrap := buildBootstrap(launch, prepared, instructions, workspacePath, workspaceSpec)
-	if err := writeRunControlMarker(controlPath, prepared); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeRuntimeFile(filepath.Join(controlPath, "token"), []byte(claim.Token+"\n"), runControlFileMode); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeRuntimeFile(filepath.Join(controlPath, "bootstrap"), []byte(bootstrap), runControlFileMode); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, writeRunControlMarker(controlPath, prepared))
+	requireNoError(t, writeRuntimeFile(filepath.Join(controlPath, "token"), []byte(claim.Token+"\n"), runControlFileMode))
+	requireNoError(t, writeRuntimeFile(filepath.Join(controlPath, "bootstrap"), []byte(bootstrap), runControlFileMode))
 	labels := map[string]string{
 		containerruntime.LabelManaged:     "true",
 		containerruntime.LabelContract:    "v1",
@@ -114,9 +94,7 @@ func TestReconcileRefusesToStartInsecureSameLabelContainer(t *testing.T) {
 	if err != nil || before.Status != containerruntime.StatusCreated || before.Running {
 		t.Fatalf("malicious fixture before reconcile = %#v err=%v", before, err)
 	}
-	if err := fixture.components.runtime.Reconcile(fixture.ctx); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, fixture.components.runtime.Reconcile(fixture.ctx))
 	healthy, reason := fixture.components.runtime.Healthy()
 	if healthy || reason == "" {
 		t.Fatalf("insecure adoption did not degrade runtime: healthy=%t reason=%q", healthy, reason)
@@ -126,9 +104,7 @@ func TestReconcileRefusesToStartInsecureSameLabelContainer(t *testing.T) {
 		t.Fatalf("insecure container was started: %#v err=%v", after, err)
 	}
 	persisted, err := fixture.components.service.Run(fixture.ctx, prepared.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if persisted.ContainerID == "" || persisted.LaunchPhase != core.LaunchCreated || persisted.State != core.RunStarting {
 		t.Fatalf("durable Run did not stop at the rejected adoption boundary: %#v", persisted)
 	}

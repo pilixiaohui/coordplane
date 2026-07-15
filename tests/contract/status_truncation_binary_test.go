@@ -75,9 +75,7 @@ func TestStatusHumanBinaryReportsTruncatedTasksAndAgents(t *testing.T) {
 
 func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t *testing.T) {
 	root, err := os.MkdirTemp("/tmp", "cp-field-trunc-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	dataDir := filepath.Join(root, "data")
 	socket := filepath.Join(dataDir, "operator.sock")
@@ -125,9 +123,7 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 
 	stopDaemon(t, daemon, socket)
 	database, err := store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	service, err := core.NewService(database, &contractGit{sha: project.InitialSHA, root: filepath.Join(dataDir, "repos")}, core.ServiceOptions{MaxParallelRuns: 1, AdapterIDs: []string{"codex"}})
 	if err != nil {
 		_ = database.Close()
@@ -148,9 +144,7 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 		_ = database.Close()
 		t.Fatalf("P1 interrupt changed legal terminal reason: got %d bytes, want %d", len(interrupted.TerminalReason), len(longReason))
 	}
-	if err := database.Close(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, database.Close())
 	daemon = startDaemon(t, configPath, socket)
 
 	statusRaw := runBinaryJSON(t, testBinaries.coordplane,

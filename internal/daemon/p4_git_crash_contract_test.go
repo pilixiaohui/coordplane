@@ -39,16 +39,12 @@ func TestGT03SQLiteTaskRunAndRealGitCaptureRecoverAcrossProcessSIGKILL(t *testin
 		t.Run(test.name, func(t *testing.T) {
 			h := newRealP4Harness(t)
 			task, claim, head := prepareGT03Capture(t, h, test.name, test.terminal)
-			if err := h.database.Close(); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, h.database.Close())
 			killGT03CoreGitWorker(t, h.root, task.ID, test.phase, filepath.Join(h.root, "gt03-worker-ready"))
 
 			postKill, closePostKill := openGT03Store(t, h.root)
 			persisted, err := postKill.Task(context.Background(), task.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			if test.phase == "submitted_before_cleanup" {
 				if persisted.Status != core.TaskSubmitted || persisted.PendingAction != "" || persisted.HeadSHA != head {
 					t.Fatalf("post-kill submitted task = %#v", persisted)
@@ -64,31 +60,23 @@ func TestGT03SQLiteTaskRunAndRealGitCaptureRecoverAcrossProcessSIGKILL(t *testin
 				closePostKill()
 				configPath := writeP4ComponentsConfig(t, h.root)
 				first, err := buildComponents(context.Background(), configPath)
-				if err != nil {
-					t.Fatal(err)
-				}
+				requireNoError(t, err)
 				h.database = first.store
 				assertGT03RecoveredCapture(t, h, task, claim, head)
 				assertP4QuarantineEmpty(t, h.root)
 				if after := p4StoreDurableSignature(t, first.store, h.project.ID); after != beforeRestart {
 					t.Fatal("first production restart changed finalized capture state")
 				}
-				if err := first.Close(); err != nil {
-					t.Fatal(err)
-				}
+				requireNoError(t, first.Close())
 				second, err := buildComponents(context.Background(), configPath)
-				if err != nil {
-					t.Fatal(err)
-				}
+				requireNoError(t, err)
 				if after := p4StoreDurableSignature(t, second.store, h.project.ID); after != beforeRestart {
 					t.Fatal("second production restart changed finalized capture state")
 				}
 				h.database = second.store
 				assertGT03RecoveredCapture(t, h, task, claim, head)
 				assertP4QuarantineEmpty(t, h.root)
-				if err := second.Close(); err != nil {
-					t.Fatal(err)
-				}
+				requireNoError(t, second.Close())
 				return
 			} else if persisted.Status != core.TaskFinishing || persisted.PendingAction != "capture" || persisted.HeadSHA != "" {
 				t.Fatalf("post-kill pending task = %#v", persisted)
@@ -97,9 +85,7 @@ func TestGT03SQLiteTaskRunAndRealGitCaptureRecoverAcrossProcessSIGKILL(t *testin
 
 			request := captureHelperRequest(task, claim)
 			valid := []gitrepo.CaptureHelperRequest{request}
-			if err := (&dockerCaptureHelper{root: filepath.Join(h.root, "handoff")}).Recover(valid); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, (&dockerCaptureHelper{root: filepath.Join(h.root, "handoff")}).Recover(valid))
 			h.database, h.service = reopenRealP4Service(t, h)
 			if !test.terminal {
 				h.stopRun(t, claim, test.name)
@@ -112,9 +98,7 @@ func TestGT03SQLiteTaskRunAndRealGitCaptureRecoverAcrossProcessSIGKILL(t *testin
 	t.Run("task_ref_is_diagnostic_after_capture_fence_changes", func(t *testing.T) {
 		h := newRealP4Harness(t)
 		task, claim, head := prepareGT03Capture(t, h, "stale-fence", true)
-		if err := h.database.Close(); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, h.database.Close())
 		killGT03CoreGitWorker(t, h.root, task.ID, "task_ref_written", filepath.Join(h.root, "gt03-fence-ready"))
 		h.database, h.service = reopenRealP4Service(t, h)
 		if err := h.database.Transact(context.Background(), func(tx core.Transaction) error {
@@ -142,19 +126,11 @@ func TestGT03SQLiteTaskRunAndRealGitCaptureRecoverAcrossProcessSIGKILL(t *testin
 			t.Fatalf("diagnostic task ref = %s, want %s", actual, head)
 		}
 		legacyQuarantine := filepath.Join(h.root, "handoff", "quarantine", "legacy")
-		if err := os.MkdirAll(legacyQuarantine, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(legacyQuarantine, "bundle"), []byte("obsolete\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, os.MkdirAll(legacyQuarantine, 0o700))
+		requireNoError(t, os.WriteFile(filepath.Join(legacyQuarantine, "bundle"), []byte("obsolete\n"), 0o600))
 		recovery := &dockerCaptureHelper{root: filepath.Join(h.root, "handoff")}
-		if err := recovery.Recover(nil); err != nil {
-			t.Fatal(err)
-		}
-		if err := recovery.Recover(nil); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, recovery.Recover(nil))
+		requireNoError(t, recovery.Recover(nil))
 		if _, err := os.Stat(filepath.Join(h.root, "handoff", task.ProjectID, task.ID, claim.Run.ID)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("stale capture handoff survived production recovery: %v", err)
 		}
@@ -198,9 +174,7 @@ func assertP4QuarantineEmpty(t *testing.T, root string) {
 
 func writeP4ComponentsConfig(t *testing.T, root string) string {
 	t.Helper()
-	if err := os.Chmod(root, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Chmod(root, 0o700))
 	path := filepath.Join(root, "coordplane.yaml")
 	raw := fmt.Sprintf(`data_dir: %s
 operator_socket: %s
@@ -217,9 +191,7 @@ runtime:
   default_image: agent:test
   provider_env_allowlist: []
 `, root, filepath.Join(root, "operator.sock"), filepath.Join(root, "workspaces"), filepath.Join(root, "homes"), filepath.Join(root, "logs"))
-	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(path, []byte(raw), 0o600))
 	return path
 }
 
@@ -229,13 +201,9 @@ func TestGT03ExistingTaskRefReplayIsIdempotentAndRejectsDifferentHead(t *testing
 	h.reconcileGit(t)
 	var err error
 	task, err = h.database.Task(context.Background(), task.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	workspacePath, err := h.workspaces.Path(task.ProjectID, task.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	intent := core.GitCaptureIntent{
 		ProjectID: task.ProjectID, TaskID: task.ID, RunID: claim.Run.ID,
 		WorkspacePath: workspacePath, ControlRepo: h.project.ControlRepoPath,
@@ -277,9 +245,7 @@ func TestGT04RealCASProcessKillThenDescendantReplayCompletesSQLite(t *testing.T)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.database.Close(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, h.database.Close())
 	ready := filepath.Join(h.root, "gt04-cas-ready")
 	killGT03CoreGitWorker(t, h.root, task.ID, "after_cas", ready)
 	if actual := strings.TrimSpace(gitOutput(t, "--git-dir="+h.project.ControlRepoPath, "rev-parse", h.project.CanonicalRef+"^{commit}")); actual != head {
@@ -297,9 +263,7 @@ func TestGT04RealCASProcessKillThenDescendantReplayCompletesSQLite(t *testing.T)
 		t.Fatalf("included CAS recovery = %#v err=%v", completed, err)
 	}
 	snapshot, err := h.database.Snapshot(context.Background(), h.project.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	for _, candidate := range snapshot.Tasks {
 		if candidate.Kind == core.TaskIntegration {
 			t.Fatalf("included CAS recovery created integration task: %#v", candidate)
@@ -328,13 +292,9 @@ func killGT03CoreGitWorker(t *testing.T, root, taskID, mode, ready string) {
 		environment = append(environment, "COORDPLANE_CONTRACT_CAPTURE_FINALIZED_READY="+ready)
 	}
 	worker.Env = environment
-	if err := worker.Start(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, worker.Start())
 	waitP4File(t, ready)
-	if err := worker.Process.Kill(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, worker.Process.Kill())
 	if err := worker.Wait(); err == nil {
 		t.Fatal("GT03 worker exited successfully before SIGKILL")
 	}
@@ -343,19 +303,13 @@ func killGT03CoreGitWorker(t *testing.T, root, taskID, mode, ready string) {
 func runGT03CoreGitWorker(t *testing.T) {
 	root := os.Getenv("COORDPLANE_GT03_ROOT")
 	database, err := store.Open(context.Background(), filepath.Join(root, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer database.Close()
 	initializer, err := gitrepo.New(filepath.Join(root, "repos"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	helper := localCaptureHelper{root: filepath.Join(root, "handoff")}
 	workspaces, err := gitrepo.NewWorkspaceManager(initializer, filepath.Join(root, "workspaces"), helper)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	adapter := projectGitAdapter{initializer: initializer, workspaces: workspaces}
 	var controller core.ProjectGit = adapter
 	if os.Getenv("COORDPLANE_GT03_MODE") == "after_cas" {
@@ -364,31 +318,21 @@ func runGT03CoreGitWorker(t *testing.T) {
 	service, err := core.NewService(database, controller, core.ServiceOptions{
 		Now: time.Now, NewID: (&realP4IDs{}).New, MaxParallelRuns: 4, AdapterIDs: []string{"codex"},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	switch os.Getenv("COORDPLANE_GT03_MODE") {
 	case "after_cas":
-		if err := service.ReconcileGit(context.Background()); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, service.ReconcileGit(context.Background()))
 	case "nonterminal":
-		if err := service.ReconcileGit(context.Background()); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, service.ReconcileGit(context.Background()))
 		publishGT03Ready(t)
 	default:
-		if err := service.ReconcileGit(context.Background()); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, service.ReconcileGit(context.Background()))
 	}
 }
 
 func publishGT03Ready(t *testing.T) {
 	t.Helper()
-	if err := os.WriteFile(os.Getenv("COORDPLANE_GT03_READY"), []byte("ready"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(os.Getenv("COORDPLANE_GT03_READY"), []byte("ready"), 0o600))
 	select {}
 }
 
@@ -418,25 +362,19 @@ func captureHelperRequest(task core.Task, claim core.Claim) gitrepo.CaptureHelpe
 func openGT03Store(t *testing.T, root string) (*store.Store, func()) {
 	t.Helper()
 	database, err := store.Open(context.Background(), filepath.Join(root, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	return database, func() { _ = database.Close() }
 }
 
 func reopenRealP4Service(t *testing.T, h *realP4Harness) (*store.Store, *core.Service) {
 	t.Helper()
 	database, err := store.Open(context.Background(), filepath.Join(h.root, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() { _ = database.Close() })
 	service, err := core.NewService(database, projectGitAdapter{initializer: h.initializer, workspaces: h.workspaces}, core.ServiceOptions{
 		Now: time.Now, NewID: (&realP4IDs{}).New, MaxParallelRuns: 4, AdapterIDs: []string{"codex"},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	service.SetReady(true, "")
 	return database, service
 }

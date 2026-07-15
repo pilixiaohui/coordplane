@@ -54,16 +54,12 @@ func TestStartingOutcomeDoesNotConsumeRequestIDBeforeActiveRetry(t *testing.T) {
 		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
 		Title: "retry outcome after active", RequestID: "starting-outcome-task",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	message, err := h.service.SendBossMessage(context.Background(), core.BossMessageInput{
 		ProjectID: project.ID, AgentID: agent.ID, TaskID: task.ID,
 		Body: "ack only after outcome admission", Wake: true, RequestID: "starting-outcome-message",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 	if err != nil || !ok {
 		t.Fatalf("claim starting outcome Run: ok=%t err=%v", ok, err)
@@ -83,9 +79,7 @@ func TestStartingOutcomeDoesNotConsumeRequestIDBeforeActiveRetry(t *testing.T) {
 	}
 
 	active, err := activateRun(t, h, context.Background(), claim.Run.ID, "starting-outcome-active")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	result, err := h.service.RequestOutcome(context.Background(), input)
 	if err != nil {
 		t.Fatalf("retry same outcome request after active: %v", err)

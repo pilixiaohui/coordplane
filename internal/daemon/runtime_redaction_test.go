@@ -75,15 +75,9 @@ func TestRuntimeLogBoundaryRedactsBoundsAndReplaysFromZero(t *testing.T) {
 	}
 	controlRoot := filepath.Join(root, "run-control")
 	controlPath := filepath.Join(controlRoot, run.ID)
-	if err := os.MkdirAll(controlPath, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(controlPath, "token"), []byte(runToken+"\n"), 0o400); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Dir(run.LogPath), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.MkdirAll(controlPath, 0o700))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, "token"), []byte(runToken+"\n"), 0o400))
+	requireNoError(t, os.MkdirAll(filepath.Dir(run.LogPath), 0o700))
 	firstLine := "canary " + secretLineA + " " + secretLineB + " " + runToken + " " + root + "\n"
 	filler := strings.Repeat("log-data-", 128) + "\n"
 	var payload strings.Builder
@@ -105,14 +99,10 @@ func TestRuntimeLogBoundaryRedactsBoundsAndReplaysFromZero(t *testing.T) {
 		t.Fatal("codex adapter is not registered")
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		if err := controller.streamLogs(context.Background(), run, containerruntime.RuntimeRef{}, entry, monitor); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, controller.streamLogs(context.Background(), run, containerruntime.RuntimeRef{}, entry, monitor))
 	}
 	raw, err := os.ReadFile(run.LogPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	text := string(raw)
 	if len(raw) > runtimeLogLimit {
 		t.Fatalf("runtime log bytes = %d, limit = %d", len(raw), runtimeLogLimit)

@@ -17,9 +17,7 @@ func TestP3LaunchContextIncludesEveryEligibleMessage(t *testing.T) {
 		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
 		Title: "launch with all messages", RequestID: "launch-message-task",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	want := make(map[string]struct{}, core.MessagePageLimit+5)
 	for index := 0; index < core.MessagePageLimit+5; index++ {
 		message, err := h.service.SendBossMessage(context.Background(), core.BossMessageInput{
@@ -27,9 +25,7 @@ func TestP3LaunchContextIncludesEveryEligibleMessage(t *testing.T) {
 			Body: fmt.Sprintf("launch message %02d", index), Wake: false,
 			RequestID: fmt.Sprintf("launch-message-%02d", index),
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		want[message.ID] = struct{}{}
 	}
 	claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
@@ -37,9 +33,7 @@ func TestP3LaunchContextIncludesEveryEligibleMessage(t *testing.T) {
 		t.Fatalf("claim = %#v ok=%t err=%v", claim, ok, err)
 	}
 	launch, err := h.service.RuntimeLaunchContext(context.Background(), claim.Run.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(launch.Messages) != len(want) {
 		t.Fatalf("launch messages = %d, want every %d eligible ID", len(launch.Messages), len(want))
 	}
@@ -65,9 +59,7 @@ func TestP3RuntimeFactsAdvanceMonotonicallyAndFenceEveryExternalFact(t *testing.
 		LaunchMode: "start", CleanupOperationID: "cleanup-runtime-facts",
 		RequestID: "prepare-runtime-facts",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if prepared.LaunchPhase != core.LaunchIntent || prepared.LaunchNonce == "" ||
 		prepared.CleanupState != core.CleanupPending || prepared.WorkspacePath == "" ||
 		prepared.HomePath == "" || prepared.LogPath == "" {
@@ -75,9 +67,7 @@ func TestP3RuntimeFactsAdvanceMonotonicallyAndFenceEveryExternalFact(t *testing.
 	}
 	fact := runtimeFact(prepared, "container-runtime-facts")
 	created, err := h.service.RecordContainerCreated(context.Background(), fact)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if created.LaunchPhase != core.LaunchCreated || created.ContainerID != fact.ContainerID {
 		t.Fatalf("created Run = %#v", created)
 	}
@@ -110,17 +100,13 @@ func TestP3RuntimeFactsAdvanceMonotonicallyAndFenceEveryExternalFact(t *testing.
 
 	fact.RequestID = "start-runtime-facts"
 	started, err := h.service.RecordRunStartIssued(context.Background(), fact)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if started.LaunchPhase != core.LaunchStartIssued || started.State != core.RunStarting {
 		t.Fatalf("start-issued Run = %#v", started)
 	}
 	fact.RequestID = "observe-runtime-facts"
 	active, err := h.service.ObserveProcessAndActivateRun(context.Background(), fact)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if active.State != core.RunActive || active.LaunchPhase != core.LaunchProcessObserved ||
 		active.StartedAt == "" || active.HeartbeatAt == "" {
 		t.Fatalf("active Run = %#v", active)
@@ -140,9 +126,7 @@ func TestP3SessionFactIsImmediateImmutableAndReplaySafe(t *testing.T) {
 	session, err := h.service.RecordRunSession(context.Background(), core.RunSessionInput{
 		RunRuntimeFactInput: fact, NativeSessionID: "session-native-1",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if session.NativeSessionID != "session-native-1" {
 		t.Fatalf("session Run = %#v", session)
 	}
@@ -161,9 +145,7 @@ func TestP3SessionFactIsImmediateImmutableAndReplaySafe(t *testing.T) {
 		t.Fatalf("changed session error = %v, want %s", err, core.CodeInvalidState)
 	}
 	events, err := h.database.Events(context.Background(), core.EventFilter{ProjectID: project.ID, RunID: active.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if countEvent(events, "run.session_recorded") != 1 {
 		t.Fatalf("session Events = %#v", events)
 	}
@@ -186,9 +168,7 @@ func TestP3CleanupRequiresTerminalAndStableOperationFence(t *testing.T) {
 	terminalInput.TerminalReason = "CLI exited without a Task outcome"
 	terminalInput.OperationID = active.LaunchOperationID
 	terminal, err := h.service.RecordRuntimeRunTerminal(context.Background(), terminalInput)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if terminal.Task.Status == core.TaskCompleted || terminal.Task.Status == core.TaskSubmitted {
 		t.Fatalf("exit 0 completed Task: %#v", terminal.Task)
 	}
@@ -198,25 +178,19 @@ func TestP3CleanupRequiresTerminalAndStableOperationFence(t *testing.T) {
 		RunRuntimeFactInput: terminalFact, CleanupOperationID: terminal.Run.CleanupOperationID,
 		State: core.CleanupBlocked, LastError: "Docker temporarily unavailable",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	terminalFact.RequestID = "cleanup-retry"
 	pending, err := h.service.RecordRunCleanup(context.Background(), core.RunCleanupInput{
 		RunRuntimeFactInput: terminalFact, CleanupOperationID: blocked.CleanupOperationID,
 		State: core.CleanupPending,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	terminalFact.RequestID = "cleanup-removed"
 	removed, err := h.service.RecordRunCleanup(context.Background(), core.RunCleanupInput{
 		RunRuntimeFactInput: terminalFact, CleanupOperationID: pending.CleanupOperationID,
 		State: core.CleanupRemoved,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if removed.CleanupState != core.CleanupRemoved || removed.LastError != "Docker temporarily unavailable" {
 		t.Fatalf("removed cleanup = %#v", removed)
 	}
@@ -240,18 +214,14 @@ func TestP3CleanupOwnershipBlocksNextAgentRunUntilEveryRuntimeResourceIsRemoved(
 		ProjectID: project.ID, AssigneeAgentID: claim.Run.AgentID, Kind: core.TaskWork,
 		Title: "must wait for prior Run cleanup", Priority: 100, RequestID: "cleanup-admission-next-task",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	active := prepareAndActivateRuntimeRun(t, h, claim, t.TempDir(), "p3-cleanup-admission")
 	terminalInput := runtimeTerminalInput(active, core.RunExited, "cleanup-admission-terminal")
 	exitCode := 1
 	terminalInput.ExitCode = &exitCode
 	terminalInput.TerminalReason = "provider exited"
 	terminal, err := h.service.RecordRuntimeRunTerminal(context.Background(), terminalInput)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if terminal.Run.CleanupState != core.CleanupPending || terminal.Task.Status != core.TaskFailed {
 		t.Fatalf("terminal cleanup fixture = %#v", terminal)
 	}
@@ -263,18 +233,14 @@ func TestP3CleanupOwnershipBlocksNextAgentRunUntilEveryRuntimeResourceIsRemoved(
 		RunRuntimeFactInput: fact, CleanupOperationID: terminal.Run.CleanupOperationID,
 		State: core.CleanupBlocked, LastError: "container removal is uncertain",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	assertAgentCannotClaimUntilCleanupRemoved(t, h, project.ID)
 
 	fact.RequestID = "cleanup-admission-retry"
 	pending, err := h.service.RecordRunCleanup(context.Background(), core.RunCleanupInput{
 		RunRuntimeFactInput: fact, CleanupOperationID: blocked.CleanupOperationID, State: core.CleanupPending,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	fact.RequestID = "cleanup-admission-removed"
 	if _, err := h.service.RecordRunCleanup(context.Background(), core.RunCleanupInput{
 		RunRuntimeFactInput: fact, CleanupOperationID: pending.CleanupOperationID, State: core.CleanupRemoved,
@@ -310,9 +276,7 @@ func TestP3TerminalCleanupDoesNotConsumeAnotherAgentsGlobalRunSlot(t *testing.T)
 	terminalInput.ExitCode = &exitCode
 	terminalInput.TerminalReason = "provider exited"
 	terminal, err := h.service.RecordRuntimeRunTerminal(context.Background(), terminalInput)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if terminal.Run.CleanupState != core.CleanupPending {
 		t.Fatalf("terminal cleanup state = %q, want %q", terminal.Run.CleanupState, core.CleanupPending)
 	}
@@ -323,15 +287,11 @@ func TestP3TerminalCleanupDoesNotConsumeAnotherAgentsGlobalRunSlot(t *testing.T)
 		Title: "other Agent still has global capacity", Priority: 100,
 		RequestID: "cleanup-global-slot-other-task",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	h.service, err = core.NewService(h.database, h.git, core.ServiceOptions{
 		Now: h.clock.Now, NewID: h.ids.New, MaxParallelRuns: 1, AdapterIDs: []string{"one-shot"},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	h.service.SetReady(true, "")
 
 	next, ok, err := h.service.ClaimNext(context.Background(), project.ID)
@@ -373,9 +333,7 @@ func TestP3RuntimeTerminalIngressRejectsEveryStaleOwnershipFact(t *testing.T) {
 	}
 
 	terminal, err := h.service.RecordRuntimeRunTerminal(context.Background(), base)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if terminal.Run.State != core.RunExited || terminal.Task.Status != core.TaskFailed {
 		t.Fatalf("fenced terminal result = %#v", terminal)
 	}
@@ -398,9 +356,7 @@ func TestP3RuntimeTerminalIngressAllowsOnlyNarrowPreLaunchFailure(t *testing.T) 
 	input.State = core.RunFailed
 	input.RequestID = "prelaunch-failed"
 	terminal, err := h.service.RecordRuntimeRunTerminal(context.Background(), input)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if terminal.Run.State != core.RunFailed || terminal.Run.LaunchNonce != "" || terminal.Run.ContainerID != "" ||
 		terminal.Task.Status != core.TaskFailed {
 		t.Fatalf("pre-launch failure result = %#v", terminal)
@@ -421,21 +377,15 @@ func prepareAndActivateRuntimeRun(t *testing.T, h *harness, claim core.Claim, ro
 	fact := runtimeFact(prepared, prefix+"-container")
 	fact.RequestID = prefix + "-created"
 	created, err := h.service.RecordContainerCreated(context.Background(), fact)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	fact = runtimeFact(created, created.ContainerID)
 	fact.RequestID = prefix + "-start"
 	started, err := h.service.RecordRunStartIssued(context.Background(), fact)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	fact = runtimeFact(started, started.ContainerID)
 	fact.RequestID = prefix + "-active"
 	active, err := h.service.ObserveProcessAndActivateRun(context.Background(), fact)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	return active
 }
 
@@ -447,9 +397,7 @@ func prepareRuntimeRun(t *testing.T, h *harness, claim core.Claim, root, prefix 
 		LogPath: filepath.Join(root, "run.log"), InstructionsHash: prefix + "-instructions",
 		LaunchMode: "start", CleanupOperationID: prefix + "-cleanup", RequestID: prefix + "-prepare",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	return prepared
 }
 

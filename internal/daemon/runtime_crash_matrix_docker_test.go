@@ -25,9 +25,7 @@ func TestRT05DaemonSIGKILLCrashPointIntentMatrix(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
 	defer cancel()
 	executor, err := containerruntime.NewDockerExecutorFromEnvironment()
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if err := executor.Ping(ctx); err != nil {
 		t.Fatalf("real Docker is required for RT-05: %v", err)
 	}
@@ -63,17 +61,13 @@ func TestRT05EarlyOwnerFallbackIsSoleContainerCleanup(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	executor, err := containerruntime.NewDockerExecutorFromEnvironment()
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if err := executor.Ping(ctx); err != nil {
 		t.Fatalf("real Docker is required for RT-05: %v", err)
 	}
 	artifacts := buildRT05ProcessArtifacts(t, ctx)
 	root, err := os.MkdirTemp("/tmp", "cp-rt05-owner-fallback-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	databasePath := filepath.Join(root, "data", "coordplane.db")
 	disableFallback := os.Getenv("COORDPLANE_CONTRACT_DISABLE_RT05_OWNER_FALLBACK") == "1"
@@ -82,21 +76,13 @@ func TestRT05EarlyOwnerFallbackIsSoleContainerCleanup(t *testing.T) {
 	t.Run("container_created_sigkill", func(t *testing.T) {
 		configPath := writeTestConfig(t, root)
 		rawConfig, err := os.ReadFile(configPath)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		rawConfig = []byte(strings.ReplaceAll(string(rawConfig), "  docker_network: coordplane\n", "  docker_network: none\n"))
-		if err := os.WriteFile(configPath, rawConfig, 0o600); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, os.WriteFile(configPath, rawConfig, 0o600))
 		instructions := filepath.Join(root, "instructions.md")
-		if err := os.WriteFile(instructions, []byte("Execute only the owner-fallback crash task."), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, os.WriteFile(instructions, []byte("Execute only the owner-fallback crash task."), 0o600))
 		seed, err := buildComponents(ctx, configPath)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		agent, err := seed.service.AddAgent(ctx, core.AddAgentInput{
 			DisplayName: "RT-05 owner fallback", AdapterID: "codex", Image: artifacts.image,
 			InstructionsFile: instructions, RequestID: "rt05-owner-fallback-agent",
@@ -124,9 +110,7 @@ func TestRT05EarlyOwnerFallbackIsSoleContainerCleanup(t *testing.T) {
 			t.Fatal(err)
 		}
 		taskID = task.ID
-		if err := seed.Close(); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, seed.Close())
 		if !disableFallback {
 			registerRT05OwnerFallback(t, executor, databasePath, task.ID)
 		}
@@ -139,18 +123,14 @@ func TestRT05EarlyOwnerFallbackIsSoleContainerCleanup(t *testing.T) {
 		})
 		t.Cleanup(func() { killP3DaemonProcess(t, first) })
 		client, err := transport.NewUnixClient(socket)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		waitForRT05Phase(t, first, readyPath, runtimePhaseContainerCreated)
 		created := waitForOperatorRun(t, client, task.ID, func(run core.Run) bool {
 			return run.State == core.RunStarting && run.ContainerID != ""
 		})
 		killP3DaemonProcess(t, first)
 		database, err := store.Open(ctx, databasePath)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		persisted, readErr := database.Run(ctx, created.ID)
 		closeErr := database.Close()
 		if readErr != nil || closeErr != nil {
@@ -178,9 +158,7 @@ type rt05ProcessArtifacts struct {
 func buildRT05ProcessArtifacts(t *testing.T, ctx context.Context) rt05ProcessArtifacts {
 	t.Helper()
 	root, err := os.MkdirTemp("/tmp", "cp-rt05-matrix-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	repositoryRoot := daemonRepositoryRoot(t)
 	artifacts := rt05ProcessArtifacts{
 		root: root, daemon: filepath.Join(root, "coordplane-contract"),
@@ -188,9 +166,7 @@ func buildRT05ProcessArtifacts(t *testing.T, ctx context.Context) rt05ProcessArt
 		image:      "coordplane-rt05-matrix:" + fmt.Sprintf("%x", time.Now().UnixNano()),
 		dockerConf: filepath.Join(root, "docker-config"),
 	}
-	if err := os.MkdirAll(artifacts.dockerConf, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.MkdirAll(artifacts.dockerConf, 0o700))
 	for _, target := range []struct {
 		output string
 		path   string
@@ -239,30 +215,20 @@ func runRT05ProcessCase(
 ) {
 	t.Helper()
 	root, err := os.MkdirTemp("/tmp", "cp-rt05-case-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	configPath := writeTestConfig(t, root)
 	rawConfig, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	rawConfig = []byte(strings.ReplaceAll(string(rawConfig), "  docker_network: coordplane\n", "  docker_network: none\n"))
 	if intent == "timeout" {
 		rawConfig = []byte(strings.Replace(string(rawConfig), "  default_image:", "  run_timeout: 2s\n  default_image:", 1))
 	}
-	if err := os.WriteFile(configPath, rawConfig, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(configPath, rawConfig, 0o600))
 	instructions := filepath.Join(root, "instructions.md")
-	if err := os.WriteFile(instructions, []byte("Execute only the assigned crash-matrix task."), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(instructions, []byte("Execute only the assigned crash-matrix task."), 0o600))
 	seed, err := buildComponents(ctx, configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	agent, err := seed.service.AddAgent(ctx, core.AddAgentInput{
 		DisplayName: "RT-05 " + string(phase) + " " + intent,
 		AdapterID:   "codex", Image: artifacts.image, InstructionsFile: instructions,
@@ -293,9 +259,7 @@ func runRT05ProcessCase(
 		_ = seed.Close()
 		t.Fatal(err)
 	}
-	if err := seed.Close(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, seed.Close())
 	registerRT05OwnerFallback(t, executor, filepath.Join(root, "data", "coordplane.db"), task.ID)
 
 	socket := filepath.Join(root, "data", "operator.sock")
@@ -306,9 +270,7 @@ func runRT05ProcessCase(
 	})
 	t.Cleanup(func() { killP3DaemonProcess(t, first) })
 	client, err := transport.NewUnixClient(socket)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 
 	var crashRun core.Run
 	intentDurable := false
@@ -352,9 +314,7 @@ func runRT05ProcessCase(
 	second := startP3DaemonProcess(t, artifacts.daemon, configPath, socket, filepath.Join(root, "daemon-second.log"))
 	t.Cleanup(func() { stopP3DaemonProcess(t, second) })
 	client, err = transport.NewUnixClient(socket)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if intent == "outcome" && !intentDurable {
 		if phase == runtimePhaseContainerCreated {
 			active := waitForOperatorRun(t, client, task.ID, func(run core.Run) bool { return run.State == core.RunActive })
@@ -468,9 +428,7 @@ func waitForRT05DurableProgress(t *testing.T, ctx context.Context, root string, 
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		database, err := store.Open(ctx, filepath.Join(root, "data", "coordplane.db"))
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		events, readErr := database.Events(ctx, core.EventFilter{
 			ProjectID: run.ProjectID, RunID: run.ID, EntityType: "task", EntityID: run.TaskID,
 		})
@@ -513,16 +471,12 @@ func applyRT05Intent(
 			before = rt05DurableSignature(t, ctx, root, task.ProjectID, run.ID, requestID)
 		}
 		token, err := os.ReadFile(filepath.Join(root, "data", "run-control", run.ID, "token"))
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		runClient, err := transport.NewUnixClient(
 			filepath.Join(root, "data", "run-control", run.ID, "api.sock"),
 			transport.WithBearerToken(strings.TrimSpace(string(token))),
 		)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		var result core.OutcomeResult
 		err = runClient.JSON(ctx, http.MethodPost, "/v1/task/outcome", core.OutcomeInput{
 			Outcome: core.OutcomeWait, Reason: "RT-05 durable outcome", RequestID: requestID,
@@ -612,9 +566,7 @@ func assertRT05CrashFact(
 ) {
 	t.Helper()
 	database, err := store.Open(ctx, filepath.Join(root, "data", "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	persisted, err := database.Run(ctx, run.ID)
 	if closeErr := database.Close(); err != nil || closeErr != nil {
 		t.Fatalf("read crash Run: err=%v close=%v", err, closeErr)
@@ -649,37 +601,25 @@ func assertRT05Converged(
 ) {
 	t.Helper()
 	database, err := store.Open(ctx, filepath.Join(root, "data", "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer database.Close()
 	run, err := database.Run(ctx, runID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	task, err := database.Task(ctx, taskID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	runs, err := database.Runs(ctx, core.RunFilter{TaskID: taskID, Limit: 10})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(runs.Items) != wantRuns || run.CleanupState != core.CleanupRemoved {
 		t.Fatalf("RT-05 duplicated Run or missed cleanup: Runs=%#v Run=%#v", runs.Items, run)
 	}
 	for _, summary := range runs.Items {
 		candidate, err := database.Run(ctx, summary.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		if candidate.CleanupState != core.CleanupRemoved {
 			t.Fatalf("RT-05 Run %s cleanup = %s", candidate.ID, candidate.CleanupState)
 		}
 		events, err := database.Events(ctx, core.EventFilter{ProjectID: projectID, RunID: candidate.ID})
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		for _, kind := range []string{"run.created", "run.container_created", "run.start_issued", "run.active", "run.terminal"} {
 			if count := countDaemonEvent(events, kind); count > 1 || (kind == "run.created" && count != 1) {
 				t.Fatalf("RT-05 Run %s Event %s count = %d: %#v", candidate.ID, kind, count, events)
@@ -723,14 +663,10 @@ func rt05DurableSignature(
 ) string {
 	t.Helper()
 	database, err := store.Open(ctx, filepath.Join(root, "data", "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer database.Close()
 	snapshot, err := database.Snapshot(ctx, projectID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	dedupeExists := false
 	if err := database.Transact(ctx, func(tx core.Transaction) error {
 		_, dedupeExists, err = tx.Dedupe("run:"+runID, "task.outcome", requestID)
@@ -742,27 +678,19 @@ func rt05DurableSignature(
 		Snapshot     core.Snapshot `json:"snapshot"`
 		DedupeExists bool          `json:"dedupe_exists"`
 	}{Snapshot: snapshot, DedupeExists: dedupeExists})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	return string(raw)
 }
 
 func assertRT05OutcomeDurable(t *testing.T, ctx context.Context, root, taskID, runID, requestID string) {
 	t.Helper()
 	database, err := store.Open(ctx, filepath.Join(root, "data", "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer database.Close()
 	run, err := database.Run(ctx, runID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	task, err := database.Task(ctx, taskID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	dedupeExists := false
 	if err := database.Transact(ctx, func(tx core.Transaction) error {
 		_, dedupeExists, err = tx.Dedupe("run:"+runID, "task.outcome", requestID)
@@ -771,9 +699,7 @@ func assertRT05OutcomeDurable(t *testing.T, ctx context.Context, root, taskID, r
 		t.Fatal(err)
 	}
 	events, err := database.Events(ctx, core.EventFilter{ProjectID: run.ProjectID, RunID: run.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if run.RequestedOutcome != string(core.OutcomeWait) || run.RequestedAt == "" || run.TokenRevokedAt == "" ||
 		task.Status != core.TaskFinishing || !dedupeExists || countDaemonEvent(events, "run.outcome_requested") != 1 {
 		t.Fatalf("outcome was not durable before SIGKILL: Run=%#v Task=%#v dedupe=%t Events=%#v", run, task, dedupeExists, events)

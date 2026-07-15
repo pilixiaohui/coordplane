@@ -92,15 +92,11 @@ func TestCT02EntityCASRejectsStaleVersionAndStateWithoutSideEffects(t *testing.T
 			t.Run(test.name+"/stale_"+stale.name, func(t *testing.T) {
 				ctx := context.Background()
 				database, err := Open(ctx, filepath.Join(t.TempDir(), "cas.db"))
-				if err != nil {
-					t.Fatal(err)
-				}
+				requireNoError(t, err)
 				defer database.Close()
 				fixture := insertCASFixture(t, database)
 				before, err := database.Snapshot(ctx, fixture.project.ID)
-				if err != nil {
-					t.Fatal(err)
-				}
+				requireNoError(t, err)
 
 				err = database.Transact(ctx, func(tx core.Transaction) error {
 					return stale.apply(tx, fixture)
@@ -113,16 +109,12 @@ func TestCT02EntityCASRejectsStaleVersionAndStateWithoutSideEffects(t *testing.T
 					t.Fatalf("stale CAS current fact = state %q version %d, want %q/1", conflict.State, conflict.Version, test.state)
 				}
 				after, err := database.Snapshot(ctx, fixture.project.ID)
-				if err != nil {
-					t.Fatal(err)
-				}
+				requireNoError(t, err)
 				if !reflect.DeepEqual(after, before) {
 					t.Fatalf("stale CAS changed durable rows\nbefore=%#v\nafter=%#v", before, after)
 				}
 				events, err := database.Events(ctx, core.EventFilter{ProjectID: fixture.project.ID})
-				if err != nil {
-					t.Fatal(err)
-				}
+				requireNoError(t, err)
 				if len(events) != 0 {
 					t.Fatalf("stale CAS wrote events: %#v", events)
 				}

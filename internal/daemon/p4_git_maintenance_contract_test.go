@@ -54,16 +54,12 @@ func TestGT07PublicSourceCreateAndCheckoutSerializeWithRealTaskRefGC(t *testing.
 			case <-time.After(75 * time.Millisecond):
 			}
 			assertP4TaskRef(t, h, source.TaskRef, source.HeadSHA)
-			if err := os.WriteFile(release, []byte("release\n"), 0o600); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, os.WriteFile(release, []byte("release\n"), 0o600))
 			result := <-operationDone
 			if result.err != nil {
 				t.Fatal(result.err)
 			}
-			if err := <-gcDone; err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, <-gcDone)
 			if operation == "task_create_source" {
 				if result.task.SourceTaskRef != source.TaskRef || result.task.SourceHeadSHA != source.HeadSHA {
 					t.Fatalf("source-backed task = %#v", result.task)

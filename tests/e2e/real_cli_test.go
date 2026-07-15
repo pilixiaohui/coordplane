@@ -243,9 +243,7 @@ func requireRealCLI(t *testing.T) {
 func releaseLiveDocker(t *testing.T) {
 	t.Helper()
 	release, err := testsupport.AcquireSerialResource(testsupport.DockerResource, "tests/e2e-real", liveE2ETimeout)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() {
 		if err := release(); err != nil {
 			t.Errorf("release Docker test resource: %v", err)
@@ -322,19 +320,11 @@ func seedCodexAuth(t *testing.T, dataDir string, agentIDs ...string) {
 	}
 	for _, agentID := range agentIDs {
 		home := filepath.Join(dataDir, "agent-homes", agentID)
-		if err := os.MkdirAll(home, 0o770); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chmod(home, 0o770); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, os.MkdirAll(home, 0o770))
+		requireNoError(t, os.Chmod(home, 0o770))
 		auth := filepath.Join(home, "auth.json")
-		if err := os.WriteFile(auth, raw, 0o640); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chmod(auth, 0o640); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, os.WriteFile(auth, raw, 0o640))
+		requireNoError(t, os.Chmod(auth, 0o640))
 	}
 }
 

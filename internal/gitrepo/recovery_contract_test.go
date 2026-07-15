@@ -30,9 +30,7 @@ func TestGT00ProjectIntentAndRealGitPhasesReconcileAfterRestart(t *testing.T) {
 			source, initial := newSourceRepository(t)
 			root := t.TempDir()
 			initializer, err := New(filepath.Join(root, "repos"))
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			adapter := &recoveryProjectGit{initializer: initializer, interruptBeforeGit: test.beforeGit}
 			if !test.beforeGit {
 				fired := false
@@ -46,13 +44,9 @@ func TestGT00ProjectIntentAndRealGitPhasesReconcileAfterRestart(t *testing.T) {
 			}
 			databasePath := filepath.Join(root, "coordplane.db")
 			database, err := store.Open(ctx, databasePath)
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			service, err := core.NewService(database, adapter, core.ServiceOptions{AdapterIDs: []string{"one-shot"}})
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			project, err := service.AddProject(ctx, core.AddProjectInput{
 				Name: "recovery-" + test.name, Source: source, SourceRef: "refs/heads/main",
 				RequestID: "request-" + test.name,
@@ -61,9 +55,7 @@ func TestGT00ProjectIntentAndRealGitPhasesReconcileAfterRestart(t *testing.T) {
 				t.Fatalf("interrupted project add error = %v, want context cancellation", err)
 			}
 			persisted, err := database.Project(ctx, project.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			if persisted.Status != core.ProjectCreating || persisted.PendingAction != "initialize" || persisted.InitialSHA != initial {
 				t.Fatalf("pending project = %#v", persisted)
 			}
@@ -74,28 +66,18 @@ func TestGT00ProjectIntentAndRealGitPhasesReconcileAfterRestart(t *testing.T) {
 			if advanced == initial {
 				t.Fatal("source branch did not advance")
 			}
-			if err := database.Close(); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, database.Close())
 
 			initializer.phaseHook = nil
 			adapter.interruptBeforeGit = false
 			reopened, err := store.Open(ctx, databasePath)
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			defer reopened.Close()
 			restarted, err := core.NewService(reopened, adapter, core.ServiceOptions{AdapterIDs: []string{"one-shot"}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := restarted.ReconcileProjects(ctx); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
+			requireNoError(t, restarted.ReconcileProjects(ctx))
 			persisted, err = reopened.Project(ctx, project.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			if persisted.Status != core.ProjectActive || persisted.InitialSHA != initial || persisted.CanonicalSHA != initial || persisted.PendingAction != "" {
 				t.Fatalf("reconciled project = %#v, want original initial SHA %s", persisted, initial)
 			}
@@ -104,9 +86,7 @@ func TestGT00ProjectIntentAndRealGitPhasesReconcileAfterRestart(t *testing.T) {
 				t.Fatalf("actual canonical = %s err=%v, want %s", actual, err, initial)
 			}
 			events, err := reopened.Events(ctx, core.EventFilter{ProjectID: project.ID})
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			var creatingOperation, activeOperation string
 			for _, event := range events {
 				switch event.Kind {
@@ -128,9 +108,7 @@ func TestGT00RepairRetriesOnlyNeverActiveInitializationAtSavedSHA(t *testing.T) 
 	source, initial := newSourceRepository(t)
 	root := t.TempDir()
 	initializer, err := New(filepath.Join(root, "repos"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	injected := errors.New("injected initialization failure")
 	fired := false
 	initializer.phaseHook = func(_ context.Context, phase Phase, _ phaseFact) error {
@@ -142,14 +120,10 @@ func TestGT00RepairRetriesOnlyNeverActiveInitializationAtSavedSHA(t *testing.T) 
 	}
 	adapter := &recoveryProjectGit{initializer: initializer}
 	database, err := store.Open(ctx, filepath.Join(root, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer database.Close()
 	service, err := core.NewService(database, adapter, core.ServiceOptions{AdapterIDs: []string{"one-shot"}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	project, err := service.AddProject(ctx, core.AddProjectInput{
 		Name: "repair-never-active", Source: source, SourceRef: "refs/heads/main", RequestID: "add-never-active",
 	})
@@ -157,9 +131,7 @@ func TestGT00RepairRetriesOnlyNeverActiveInitializationAtSavedSHA(t *testing.T) 
 		t.Fatalf("project add error = %v, want %s", err, core.CodeGitInvariantViolation)
 	}
 	persisted, err := database.Project(ctx, project.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if persisted.Status != core.ProjectError || persisted.CanonicalSHA != "" || persisted.InitialSHA != initial {
 		t.Fatalf("failed never-active project = %#v", persisted)
 	}
@@ -170,9 +142,7 @@ func TestGT00RepairRetriesOnlyNeverActiveInitializationAtSavedSHA(t *testing.T) 
 
 	initializer.phaseHook = nil
 	repaired, err := service.RepairProject(ctx, project.ID, "repair-never-active")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if repaired.Status != core.ProjectActive || repaired.InitialSHA != initial || repaired.CanonicalSHA != initial {
 		t.Fatalf("repaired project = %#v, want saved initial SHA %s", repaired, initial)
 	}

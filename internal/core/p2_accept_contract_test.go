@@ -16,18 +16,14 @@ func TestCT08AcceptIntentFreezesDecisionWithoutAdvancingGit(t *testing.T) {
 		ProjectID: project.ID, AssigneeAgentID: worker.ID, Kind: core.TaskWork,
 		Title: "submitted result", RequestID: "accept-task",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	task = makeSubmittedTask(t, h, task, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 	gitCalls := h.git.initializeCallCount()
 
 	accepted, err := h.service.RequestAccept(context.Background(), core.AcceptInput{
 		TaskID: task.ID, RequestID: "accept-intent",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if accepted.Status != core.TaskSubmitted || accepted.AcceptedByKind != "boss" ||
 		accepted.AcceptedIntegrationAgentID != integrator.ID || accepted.PendingAction != "advance" ||
 		accepted.PendingActionID == "" || accepted.PendingActionVersion != accepted.Version ||
@@ -62,16 +58,12 @@ func TestCT08ReadableAssignmentDoesNotAuthorizeAgentAcceptOrRework(t *testing.T)
 		ProjectID: project.ID, AssigneeAgentID: worker.ID, Kind: core.TaskWork,
 		Title: "controller", Priority: 100, RequestID: "scope-controller",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	target, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
 		ProjectID: project.ID, AssigneeAgentID: worker.ID, Kind: core.TaskWork,
 		Title: "readable assignment", Priority: 10, RequestID: "scope-target",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 	if err != nil || !ok || claim.Task.ID != controller.ID {
 		t.Fatalf("controller claim = %#v ok=%t err=%v", claim, ok, err)
@@ -117,8 +109,6 @@ func makeSubmittedTask(t *testing.T, h *harness, task core.Task, head string) co
 		task = persisted
 		return nil
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	return task
 }

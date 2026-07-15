@@ -45,9 +45,7 @@ func TestRuntimeTerminalUsesRetryBudgetAndBackoffExactlyOnce(t *testing.T) {
 	project, first := createClaimedWorkRun(t, h, "one-retry", 1)
 	first.Run = prepareRuntimeRun(t, h, first, t.TempDir(), "first")
 	firstTerminal, err := recordInterruptedRun(h, first.Run, "start lost", "first-interrupt")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	assertRetryProjection(t, h, project.ID, first.Task.ID, first.Run.ID, core.TaskQueued, 1)
 	assertInterruptEvents(t, h, project.ID, "first-interrupt", "task.requeued")
 	recordCleanupRemoved(t, h, firstTerminal.Run, "first-cleanup")
@@ -65,9 +63,7 @@ func TestRuntimeTerminalUsesRetryBudgetAndBackoffExactlyOnce(t *testing.T) {
 	assertInterruptEvents(t, h, project.ID, "second-interrupt", "task.failed")
 
 	events, err := h.database.Events(context.Background(), core.EventFilter{ProjectID: project.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if countEvent(events, "task.requeued") != 1 || countEvent(events, "task.failed") != 1 ||
 		countEvent(events, "run.interrupted") != 2 {
 		t.Fatalf("retry terminal events = %#v", events)
@@ -83,9 +79,7 @@ func TestRuntimeTerminalBoundsReasonAndReplaysWithoutDurableSideEffects(t *testi
 	}
 
 	snapshot, err := h.database.Snapshot(context.Background(), project.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	run := runWithID(t, snapshot, claim.Run.ID)
 	if run.State != core.RunInterrupted || len(run.TerminalReason) > core.MaximumTerminalTextBytes ||
 		!strings.HasSuffix(run.TerminalReason, "...[truncated]") || run.LastError != "" || run.ExitCode != nil {
@@ -114,9 +108,7 @@ func createClaimedWorkRun(t *testing.T, h *harness, name string, maxRetries int)
 		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
 		Title: name, MaxRetries: maxRetries, RequestID: name + "-task",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 	if err != nil || !ok {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
@@ -154,9 +146,7 @@ func recordCleanupRemoved(t *testing.T, h *harness, run core.Run, requestID stri
 func assertRetryProjection(t *testing.T, h *harness, projectID, taskID, runID string, status core.TaskStatus, retryCount int) {
 	t.Helper()
 	snapshot, err := h.database.Snapshot(context.Background(), projectID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	task := taskWithID(t, snapshot, taskID)
 	run := runWithID(t, snapshot, runID)
 	if task.Status != status || task.RetryCount != retryCount || task.CurrentRunID != "" {
@@ -173,9 +163,7 @@ func assertRetryProjection(t *testing.T, h *harness, projectID, taskID, runID st
 func assertInterruptEvents(t *testing.T, h *harness, projectID, requestID, taskKind string) {
 	t.Helper()
 	events, err := h.database.Events(context.Background(), core.EventFilter{ProjectID: projectID})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	kinds := map[string]int{}
 	for _, event := range events {
 		if event.RequestID == requestID {

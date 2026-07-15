@@ -22,9 +22,7 @@ func TestGT03DockerCaptureHelperIsolatesConfigAndPublishesBoundedReadyHandoff(t 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	executor, err := containerruntime.NewDockerExecutorFromEnvironment()
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if err := executor.Ping(ctx); err != nil {
 		t.Fatalf("real Docker is required for GT-03: %v", err)
 	}
@@ -43,17 +41,13 @@ func TestGT03DockerCaptureHelperIsolatesConfigAndPublishesBoundedReadyHandoff(t 
 		CaptureHelperImage: image, CaptureTimeout: time.Minute,
 		MaximumBundleBytes: 8 << 20, MaximumObjects: 100, MaximumHandoffBytes: 16 << 20,
 	}, handoffRoot, helperBinary)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	request := gitrepo.CaptureHelperRequest{
 		ProjectID: "project-docker-capture", TaskID: "task-docker-capture", RunID: "run-docker-capture",
 		Workspace: workspace, ExpectedHead: head, BaseSHA: head,
 	}
 	fact, err := helper.Capture(ctx, request)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if fact.HeadSHA != head || fact.BundleBytes <= 0 || fact.ObjectCount <= 0 || !strings.HasSuffix(fact.ReadyBundle, "capture.ready/result.bundle") {
 		t.Fatalf("Docker capture fact = %#v", fact)
 	}
@@ -63,9 +57,7 @@ func TestGT03DockerCaptureHelperIsolatesConfigAndPublishesBoundedReadyHandoff(t 
 	if _, err := executor.Inspect(ctx, captureRuntimeRef(request)); !errors.Is(err, containerruntime.ErrNotFound) {
 		t.Fatalf("capture helper container survived completion: %v", err)
 	}
-	if err := helper.Cleanup(ctx, request); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, helper.Cleanup(ctx, request))
 
 	limitedRequest := request
 	limitedRequest.RunID = "run-object-limit"
@@ -79,9 +71,7 @@ func TestGT03DockerCaptureHelperIsolatesConfigAndPublishesBoundedReadyHandoff(t 
 	}
 	helper.config.MaximumObjects = 100
 	helper.config.MaximumHandoffBytes = helper.config.MaximumBundleBytes
-	if err := os.WriteFile(filepath.Join(handoffRoot, "quota-reservation"), []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(filepath.Join(handoffRoot, "quota-reservation"), []byte("x"), 0o600))
 	totalRequest := request
 	totalRequest.RunID = "run-total-quota"
 	if _, err := helper.Capture(ctx, totalRequest); err == nil || !strings.Contains(err.Error(), "total handoff quota") {
@@ -93,9 +83,7 @@ func TestGT07DockerGCPreviewAndDiscardNeverExecuteWorkspaceGitConfigOnHost(t *te
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	executor, err := containerruntime.NewDockerExecutorFromEnvironment()
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if err := executor.Ping(ctx); err != nil {
 		t.Fatalf("real Docker is required for GT-07: %v", err)
 	}
@@ -112,24 +100,16 @@ func TestGT07DockerGCPreviewAndDiscardNeverExecuteWorkspaceGitConfigOnHost(t *te
 		CaptureHelperImage: image, CaptureTimeout: time.Minute,
 		MaximumBundleBytes: 8 << 20, MaximumObjects: 100, MaximumHandoffBytes: 16 << 20,
 	}, filepath.Join(root, "handoff"), helperBinary)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 
 	source, _ := dockerCaptureRepository(t, root)
 	sourceRef := dockerGit(t, source, "symbolic-ref", "HEAD")
 	initializer, err := gitrepo.New(filepath.Join(root, "repos"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	preflight, err := initializer.Preflight(ctx, source, sourceRef)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	paths, err := initializer.Paths("project-docker-gc", "initialize-docker-gc")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	project := gitrepo.Project{
 		ID: "project-docker-gc", OperationID: "initialize-docker-gc",
 		SourcePath: preflight.SourcePath, SourceRef: preflight.SourceRef, InitialSHA: preflight.InitialSHA,
@@ -139,32 +119,22 @@ func TestGT07DockerGCPreviewAndDiscardNeverExecuteWorkspaceGitConfigOnHost(t *te
 		t.Fatal(err)
 	}
 	manager, err := gitrepo.NewWorkspaceManager(initializer, filepath.Join(root, "workspaces"), helper)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	spec := gitrepo.WorkspaceSpec{ProjectID: project.ID, TaskID: "task-docker-gc", BaseSHA: preflight.InitialSHA}
 	workspace, err := manager.Materialize(ctx, spec)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	marker := filepath.Join(root, "host-fsmonitor-ran")
 	command := filepath.Join(workspace.Path, ".git", "host-fsmonitor")
-	if err := os.WriteFile(command, []byte(fmt.Sprintf("#!/bin/sh\n: > %q\n", marker)), 0o770); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(command, []byte(fmt.Sprintf("#!/bin/sh\n: > %q\n", marker)), 0o770))
 	dockerGit(t, workspace.Path, "config", "core.fsmonitor", command)
 
 	preview, err := manager.State(ctx, spec, workspace.HeadSHA, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if !preview.Exists || !preview.Clean || preview.HeadSHA != workspace.HeadSHA || preview.Fingerprint == "" {
 		t.Fatalf("GC preview workspace fact = %#v", preview)
 	}
 	assertHostFSMonitorDidNotRun(t, marker)
-	if err := os.WriteFile(filepath.Join(workspace.Path, "dirty.txt"), []byte("dirty\n"), 0o660); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(filepath.Join(workspace.Path, "dirty.txt"), []byte("dirty\n"), 0o660))
 	if discarded, err := manager.Discard(ctx, spec, workspace.HeadSHA, 1, preview.Fingerprint, func() (bool, error) {
 		return true, nil
 	}); err == nil || discarded || !strings.Contains(err.Error(), "fingerprint changed") {
@@ -172,9 +142,7 @@ func TestGT07DockerGCPreviewAndDiscardNeverExecuteWorkspaceGitConfigOnHost(t *te
 	}
 	assertHostFSMonitorDidNotRun(t, marker)
 	dirty, err := manager.State(ctx, spec, workspace.HeadSHA, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if dirty.Clean || dirty.Fingerprint == preview.Fingerprint {
 		t.Fatalf("dirty GC preview fact = %#v, clean = %#v", dirty, preview)
 	}
@@ -216,9 +184,7 @@ func dockerGitHelperImage(t *testing.T, ctx context.Context, root string) string
 	}
 	image := "coordplane-git-helper-test:" + fmt.Sprintf("%x", time.Now().UnixNano())
 	dockerConfig := filepath.Join(root, "docker-config")
-	if err := os.Mkdir(dockerConfig, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Mkdir(dockerConfig, 0o700))
 	dockerBuild := exec.CommandContext(ctx, "docker", "build", "-q", "-t", image,
 		filepath.Join(daemonRepositoryRoot(t), "internal", "daemon", "testdata", "git-capture-helper"))
 	dockerBuild.Env = append(os.Environ(), "DOCKER_CONFIG="+dockerConfig)
@@ -238,21 +204,15 @@ func dockerGitHelperImage(t *testing.T, ctx context.Context, root string) string
 func dockerCaptureRepository(t *testing.T, root string) (string, string) {
 	t.Helper()
 	workspace := filepath.Join(root, "workspace")
-	if err := os.Mkdir(workspace, 0o770); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Mkdir(workspace, 0o770))
 	dockerGit(t, workspace, "init", "-q")
 	dockerGit(t, workspace, "config", "user.name", "Docker Capture")
 	dockerGit(t, workspace, "config", "user.email", "capture@example.invalid")
-	if err := os.WriteFile(filepath.Join(workspace, "result.txt"), []byte("captured\n"), 0o660); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(filepath.Join(workspace, "result.txt"), []byte("captured\n"), 0o660))
 	dockerGit(t, workspace, "add", "result.txt")
 	dockerGit(t, workspace, "commit", "-q", "-m", "capture")
 	command := filepath.Join(workspace, ".git", "malicious-fsmonitor")
-	if err := os.WriteFile(command, []byte("#!/bin/sh\n: > /handoff/host-command-ran\n"), 0o770); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(command, []byte("#!/bin/sh\n: > /handoff/host-command-ran\n"), 0o770))
 	dockerGit(t, workspace, "config", "core.fsmonitor", "/workspace/.git/malicious-fsmonitor")
 	if err := filepath.WalkDir(workspace, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {

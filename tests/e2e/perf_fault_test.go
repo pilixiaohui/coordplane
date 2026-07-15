@@ -97,9 +97,7 @@ func runPFLiveFault(
 		row.RunIDsBefore = append(row.RunIDsBefore, run.ID)
 	}
 	database, err := sql.Open("sqlite", filepath.Join(batch.dataDir, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if err := database.QueryRow(`SELECT count(*) FROM messages WHERE project_id=? AND body='PF01-HOLD' AND state<>'acknowledged'`, batch.project.ID).Scan(&row.DurableUnacked); err != nil {
 		_ = database.Close()
 		t.Fatal(err)
@@ -258,14 +256,10 @@ func (b *pfBatch) restartAfterKill(delay time.Duration, afterKill func()) int64 
 func assertPFFaultBoundary(t *testing.T, batch *pfBatch, task core.Task, runID, status, pending string) string {
 	t.Helper()
 	database, err := sql.Open("sqlite", filepath.Join(batch.dataDir, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer database.Close()
 	var actualStatus, actualPending, head string
-	if err := database.QueryRow("SELECT status,pending_action,head_sha FROM tasks WHERE id=?", task.ID).Scan(&actualStatus, &actualPending, &head); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, database.QueryRow("SELECT status,pending_action,head_sha FROM tasks WHERE id=?", task.ID).Scan(&actualStatus, &actualPending, &head))
 	if actualStatus != status || actualPending != pending {
 		t.Fatalf("fault boundary Task = %s/%s, want %s/%s", actualStatus, actualPending, status, pending)
 	}

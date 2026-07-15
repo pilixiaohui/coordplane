@@ -18,21 +18,15 @@ func TestCT02ConcurrentClaimAcrossSQLiteConnectionsCreatesOneRun(t *testing.T) {
 		ProjectID: project.ID, Kind: core.TaskWork, AssigneeAgentID: agent.ID,
 		Title: "claim once", RequestID: "cross-connection-task",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 
 	secondStore, err := store.Open(context.Background(), h.path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer secondStore.Close()
 	secondService, err := core.NewService(secondStore, h.git, core.ServiceOptions{
 		Now: h.clock.Now, NewID: h.ids.New, MaxParallelRuns: 4, AdapterIDs: []string{"one-shot"},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 
 	type claimResult struct {
 		claim core.Claim
@@ -72,17 +66,13 @@ func TestCT02ConcurrentClaimAcrossSQLiteConnectionsCreatesOneRun(t *testing.T) {
 	}
 
 	snapshot, err := h.database.Snapshot(context.Background(), project.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	claimedTask := taskWithID(t, snapshot, task.ID)
 	if len(snapshot.Runs) != 1 || claimedTask.Generation != 1 || claimedTask.CurrentRunID != snapshot.Runs[0].ID {
 		t.Fatalf("durable claim did not converge: Task=%#v Runs=%#v", claimedTask, snapshot.Runs)
 	}
 	events, err := h.database.Events(context.Background(), core.EventFilter{ProjectID: project.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if countEvent(events, "task.claimed") != 1 || countEvent(events, "run.created") != 1 {
 		t.Fatalf("claim Events were duplicated: %#v", events)
 	}

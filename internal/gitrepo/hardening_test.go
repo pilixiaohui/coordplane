@@ -22,13 +22,9 @@ func TestGitCommandsIgnoreAmbientRepositoryObjectAndConfigOverrides(t *testing.T
 	hookRoot := t.TempDir()
 	sentinel := filepath.Join(hookRoot, "hook-ran")
 	hook := filepath.Join(hookRoot, "reference-transaction")
-	if err := os.WriteFile(hook, []byte(fmt.Sprintf("#!/bin/sh\n: > %q\n", sentinel)), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(hook, []byte(fmt.Sprintf("#!/bin/sh\n: > %q\n", sentinel)), 0o700))
 	home := t.TempDir()
-	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte(fmt.Sprintf("[core]\n\thooksPath = %s\n", hookRoot)), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(filepath.Join(home, ".gitconfig"), []byte(fmt.Sprintf("[core]\n\thooksPath = %s\n", hookRoot)), 0o600))
 
 	poisonGitDir := filepath.Join(poison, ".git")
 	poisonVariables := map[string]string{
@@ -85,19 +81,13 @@ func TestInitializeRejectsNonEmptyGitTemplateBeforeHooksCanRun(t *testing.T) {
 	source, _ := newSourceRepository(t)
 	initializer := newTestInitializer(t)
 	preflight, err := initializer.Preflight(ctx, source, "refs/heads/main")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	project := testProject(t, initializer, preflight, "project-template", "operation-template")
 	templateHooks := filepath.Join(initializer.root, ".empty-git-template", "hooks")
-	if err := os.MkdirAll(templateHooks, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.MkdirAll(templateHooks, 0o700))
 	sentinel := filepath.Join(t.TempDir(), "hook-ran")
 	hook := filepath.Join(templateHooks, "reference-transaction")
-	if err := os.WriteFile(hook, []byte(fmt.Sprintf("#!/bin/sh\n: > %q\n", sentinel)), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(hook, []byte(fmt.Sprintf("#!/bin/sh\n: > %q\n", sentinel)), 0o700))
 
 	if _, err := initializer.Initialize(ctx, project); err == nil || !strings.Contains(err.Error(), "must be empty") {
 		t.Fatalf("Initialize error = %v, want non-empty template rejection", err)
@@ -126,20 +116,14 @@ func TestInitializeAndVerifyRejectValidRepositoryReachedThroughFinalSymlink(t *t
 	source, initial := newSourceRepository(t)
 	initializer := newTestInitializer(t)
 	preflight, err := initializer.Preflight(ctx, source, "refs/heads/main")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	project := testProject(t, initializer, preflight, "project-final-link", "operation-final-link")
 	if _, err := initializer.Initialize(ctx, project); err != nil {
 		t.Fatal(err)
 	}
 	outdir := filepath.Join(t.TempDir(), "owned.git")
-	if err := os.Rename(project.ControlRepoPath, outdir); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(outdir, project.ControlRepoPath); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Rename(project.ControlRepoPath, outdir))
+	requireNoError(t, os.Symlink(outdir, project.ControlRepoPath))
 
 	for name, call := range map[string]func() error{
 		"initialize": func() error {
@@ -178,13 +162,9 @@ func TestInitializeRejectsSymlinkedPartialRepositoryAndParent(t *testing.T) {
 			name: "repository",
 			setup: func(t *testing.T, initializer *Initializer, paths Paths) string {
 				t.Helper()
-				if err := initializer.ensureDirectSubdirectories(filepath.Dir(paths.Partial)); err != nil {
-					t.Fatal(err)
-				}
+				requireNoError(t, initializer.ensureDirectSubdirectories(filepath.Dir(paths.Partial)))
 				outside := t.TempDir()
-				if err := os.Symlink(outside, paths.Partial); err != nil {
-					t.Fatal(err)
-				}
+				requireNoError(t, os.Symlink(outside, paths.Partial))
 				return outside
 			},
 		},
@@ -193,13 +173,9 @@ func TestInitializeRejectsSymlinkedPartialRepositoryAndParent(t *testing.T) {
 			setup: func(t *testing.T, initializer *Initializer, paths Paths) string {
 				t.Helper()
 				partialRoot := filepath.Join(initializer.root, ".partial")
-				if err := initializer.ensureDirectSubdirectories(partialRoot); err != nil {
-					t.Fatal(err)
-				}
+				requireNoError(t, initializer.ensureDirectSubdirectories(partialRoot))
 				outside := t.TempDir()
-				if err := os.Symlink(outside, filepath.Dir(paths.Partial)); err != nil {
-					t.Fatal(err)
-				}
+				requireNoError(t, os.Symlink(outside, filepath.Dir(paths.Partial)))
 				return outside
 			},
 		},
@@ -209,22 +185,16 @@ func TestInitializeRejectsSymlinkedPartialRepositoryAndParent(t *testing.T) {
 			source, _ := newSourceRepository(t)
 			initializer := newTestInitializer(t)
 			preflight, err := initializer.Preflight(ctx, source, "refs/heads/main")
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			project := testProject(t, initializer, preflight, "project-partial-link", "operation-partial-link")
 			paths, err := initializer.Paths(project.ID, project.OperationID)
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			outside := test.setup(t, initializer, paths)
 			if _, err := initializer.Initialize(ctx, project); err == nil || !strings.Contains(err.Error(), "symlink") {
 				t.Fatalf("Initialize error = %v, want symlink rejection", err)
 			}
 			entries, err := os.ReadDir(outside)
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			if len(entries) != 0 {
 				t.Fatalf("symlink target was mutated: %v", entries)
 			}
@@ -240,25 +210,17 @@ func TestInitializeRejectsRepositoryRootReplacedBySymlink(t *testing.T) {
 	source, _ := newSourceRepository(t)
 	initializer := newTestInitializer(t)
 	preflight, err := initializer.Preflight(ctx, source, "refs/heads/main")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	project := testProject(t, initializer, preflight, "project-root-link", "operation-root-link")
 	originalRoot := initializer.root + ".moved"
-	if err := os.Rename(initializer.root, originalRoot); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Rename(initializer.root, originalRoot))
 	outside := t.TempDir()
-	if err := os.Symlink(outside, initializer.root); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Symlink(outside, initializer.root))
 	if _, err := initializer.Initialize(ctx, project); err == nil || !strings.Contains(err.Error(), "symlink") {
 		t.Fatalf("Initialize error = %v, want replaced root rejection", err)
 	}
 	entries, err := os.ReadDir(outside)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(entries) != 0 {
 		t.Fatalf("replacement root was mutated: %v", entries)
 	}

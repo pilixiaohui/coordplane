@@ -35,9 +35,7 @@ func TestRunControlValidationRequiresOwnedIdentityAndTokenHash(t *testing.T) {
 func TestCloseControlIsIdempotentAcrossConcurrentConvergence(t *testing.T) {
 	root := t.TempDir()
 	server, err := transport.NewUnixServer(root, filepath.Join(root, "api.sock"), http.NotFoundHandler())
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	control := &runControl{
 		server: server, done: make(chan error, 1), outcome: make(chan struct{}, 1),
 		closed: make(chan struct{}),
@@ -68,63 +66,37 @@ func TestCloseControlIsIdempotentAcrossConcurrentConvergence(t *testing.T) {
 func TestRunControlValidationRejectsFilesystemAndScopeDrift(t *testing.T) {
 	tests := map[string]func(*testing.T, string, string, core.Run){
 		"directory mode": func(t *testing.T, _, path string, _ core.Run) {
-			if err := os.Chmod(path, 0o770); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, os.Chmod(path, 0o770))
 		},
 		"directory symlink": func(t *testing.T, root, path string, _ core.Run) {
-			if err := os.RemoveAll(path); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, os.RemoveAll(path))
 			target := filepath.Join(root, "other-control")
-			if err := os.Mkdir(target, runControlDirectoryMode); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Symlink(target, path); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, os.Mkdir(target, runControlDirectoryMode))
+			requireNoError(t, os.Symlink(target, path))
 		},
 		"token mode": func(t *testing.T, _, path string, _ core.Run) {
-			if err := os.Chmod(filepath.Join(path, "token"), 0o640); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, os.Chmod(filepath.Join(path, "token"), 0o640))
 		},
 		"token symlink": func(t *testing.T, _, path string, _ core.Run) {
-			if err := os.Remove(filepath.Join(path, "token")); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Symlink(runControlMarkerName, filepath.Join(path, "token")); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, os.Remove(filepath.Join(path, "token")))
+			requireNoError(t, os.Symlink(runControlMarkerName, filepath.Join(path, "token")))
 		},
 		"token hardlink": func(t *testing.T, _, path string, _ core.Run) {
-			if err := os.Link(filepath.Join(path, "token"), filepath.Join(path, "token-copy")); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, os.Link(filepath.Join(path, "token"), filepath.Join(path, "token-copy")))
 		},
 		"token framing": func(t *testing.T, _, path string, _ core.Run) {
-			if err := writeRuntimeFile(filepath.Join(path, "token"), []byte("token-control\nsecond\n"), runControlFileMode); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, writeRuntimeFile(filepath.Join(path, "token"), []byte("token-control\nsecond\n"), runControlFileMode))
 		},
 		"marker mismatch": func(t *testing.T, _, path string, run core.Run) {
 			run.Generation++
-			if err := writeRunControlMarker(path, run); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, writeRunControlMarker(path, run))
 		},
 		"marker trailing content": func(t *testing.T, _, path string, run core.Run) {
-			if err := writeRunControlMarker(path, run); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, writeRunControlMarker(path, run))
 			markerPath := filepath.Join(path, runControlMarkerName)
 			raw, err := os.ReadFile(markerPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := writeRuntimeFile(markerPath, append(raw, []byte("{}")...), runControlFileMode); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
+			requireNoError(t, writeRuntimeFile(markerPath, append(raw, []byte("{}")...), runControlFileMode))
 		},
 	}
 	for name, mutate := range tests {
@@ -161,9 +133,7 @@ func TestRunControlRemovalRevalidatesDurableIdentity(t *testing.T) {
 	root, path, run := newRunControlFixture(t)
 	other := run
 	other.Generation++
-	if err := writeRunControlMarker(path, other); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, writeRunControlMarker(path, other))
 	if err := removeRunControl(root, run); !errors.Is(err, containerruntime.ErrOwnership) {
 		t.Fatalf("remove drifted control error = %v, want ownership failure", err)
 	}
@@ -180,14 +150,8 @@ func newRunControlFixture(t *testing.T) (string, string, core.Run) {
 		Generation: 3, LaunchNonce: "nonce-control",
 	}
 	path := filepath.Join(root, run.ID)
-	if err := os.Mkdir(path, runControlDirectoryMode); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeRunControlMarker(path, run); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeRuntimeFile(filepath.Join(path, "token"), []byte("token-control\n"), runControlFileMode); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Mkdir(path, runControlDirectoryMode))
+	requireNoError(t, writeRunControlMarker(path, run))
+	requireNoError(t, writeRuntimeFile(filepath.Join(path, "token"), []byte("token-control\n"), runControlFileMode))
 	return root, path, run
 }

@@ -78,9 +78,7 @@ func TestGT04CT08FormalCommandsDeterministicallyFenceAcceptAndRevocation(t *test
 				}
 				assertP4Refs(t, h, h.project.InitialSHA, task.ID, head)
 				close(gate.advanceRelease)
-				if err := <-reconcile; err != nil {
-					t.Fatal(err)
-				}
+				requireNoError(t, <-reconcile)
 				completed, err := h.database.Task(context.Background(), task.ID)
 				if err != nil || completed.Status != core.TaskCompleted || completed.FinalCanonicalSHA != head {
 					t.Fatalf("completed accepted task = %#v err=%v", completed, err)
@@ -99,15 +97,11 @@ func TestGT06RealConflictSecondStaleRequeuesSameIntegrationTaskAndCompletes(t *t
 		ProjectID: h.project.ID, AssigneeAgentID: h.worker.ID, Kind: core.TaskWork,
 		Title: "source with same-line change", MaxRetries: 2, RequestID: "gt06-source-create",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	sourceClaim := h.claim(t, sourceTask.ID)
 	sourceSpec := taskWorkspaceSpec(sourceClaim.Task)
 	sourceWorkspace, err := h.workspaces.Materialize(ctx, sourceSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	h.activate(t, sourceClaim, sourceWorkspace.Path, "gt06-source")
 	configureRealGitWorkspace(t, sourceWorkspace.Path, "Source Worker")
 	writeRealGitFile(t, sourceWorkspace.Path, "README.md", "source line\n")
@@ -127,9 +121,7 @@ func TestGT06RealConflictSecondStaleRequeuesSameIntegrationTaskAndCompletes(t *t
 	firstCanonical := h.captureAndAdvanceDirect(t, "canonical-first", h.project.InitialSHA, "README.md", "canonical line\n")
 	h.reconcileGit(t)
 	snapshot, err := h.database.Snapshot(ctx, h.project.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	integration := onlyIntegrationTask(t, snapshot.Tasks)
 	source, err := h.database.Task(ctx, sourceTask.ID)
 	if err != nil || source.IntegrationTaskID != integration.ID || source.Status != core.TaskSubmitted {
@@ -144,9 +136,7 @@ func TestGT06RealConflictSecondStaleRequeuesSameIntegrationTaskAndCompletes(t *t
 	firstRun.close(t)
 	h.stopRun(t, firstClaim, "gt06-integration-first")
 	progress, err := h.database.Events(ctx, core.EventFilter{ProjectID: h.project.ID, EntityType: "task", EntityID: integration.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	foundConflict := false
 	for _, event := range progress {
 		foundConflict = foundConflict || event.Kind == "task.progress" && strings.Contains(event.PayloadJSON, "same-line conflict")
@@ -168,9 +158,7 @@ func TestGT06RealConflictSecondStaleRequeuesSameIntegrationTaskAndCompletes(t *t
 		t.Fatalf("source after second stale = %#v err=%v", sourceAfterStale, err)
 	}
 	messages, err := h.database.Messages(ctx, core.MessageFilter{TaskID: integration.ID, Limit: 20})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	foundSecondStale := false
 	for _, message := range messages.Items {
 		if strings.Contains(message.Body, secondCanonical) {
@@ -196,13 +184,9 @@ func TestGT06RealConflictSecondStaleRequeuesSameIntegrationTaskAndCompletes(t *t
 	h.reconcileGit(t)
 	h.reconcileGit(t)
 	finalSource, err := h.database.Task(ctx, sourceTask.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	finalIntegration, err := h.database.Task(ctx, integration.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if finalSource.Status != core.TaskCompleted || finalIntegration.Status != core.TaskCompleted ||
 		finalSource.FinalCanonicalSHA != finalHead || finalIntegration.FinalCanonicalSHA != finalHead {
 		t.Fatalf("final source=%#v integration=%#v", finalSource, finalIntegration)
@@ -211,9 +195,7 @@ func TestGT06RealConflictSecondStaleRequeuesSameIntegrationTaskAndCompletes(t *t
 		t.Fatalf("final canonical = %s, want %s", actual, finalHead)
 	}
 	finalSnapshot, err := h.database.Snapshot(ctx, h.project.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if got := onlyIntegrationTask(t, finalSnapshot.Tasks).ID; got != integration.ID {
 		t.Fatalf("nested integration task created: got %s want %s", got, integration.ID)
 	}
@@ -228,33 +210,21 @@ func TestGT07WorkspaceDeleteCrashReopenReleasesDurableSourceOnce(t *testing.T) {
 		ProjectID: h.project.ID, AssigneeAgentID: h.integrator.ID,
 		Title: "replay source consumer", SourceTaskID: source.ID, RequestID: "gt07-replay-create",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	spec := taskWorkspaceSpec(consumer)
 	workspace, err := h.workspaces.Materialize(ctx, spec)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	consumer, err = h.service.CancelTask(ctx, core.TaskActionInput{
 		TaskID: consumer.ID, Reason: "finished", RequestID: "gt07-replay-cancel",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	dirty := filepath.Join(workspace.Path, "dirty.txt")
-	if err := os.WriteFile(dirty, []byte("preserve\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.service.ReconcileWorkspaceGC(ctx, consumer.ClosedAt); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(dirty, []byte("preserve\n"), 0o600))
+	requireNoError(t, h.service.ReconcileWorkspaceGC(ctx, consumer.ClosedAt))
 	if _, err := os.Stat(workspace.Path); err != nil {
 		t.Fatalf("dirty workspace was deleted: %v", err)
 	}
-	if err := os.Remove(dirty); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Remove(dirty))
 	deleted, err := h.workspaces.Delete(ctx, spec, consumer.BaseSHA, func() (bool, error) { return true, nil })
 	if err != nil || !deleted {
 		t.Fatalf("pre-crash workspace delete = %t err=%v", deleted, err)
@@ -265,26 +235,18 @@ func TestGT07WorkspaceDeleteCrashReopenReleasesDurableSourceOnce(t *testing.T) {
 	if persisted, err := h.database.Task(ctx, consumer.ID); err != nil || persisted.SourceRefReleasedAt != "" {
 		t.Fatalf("source ref released before restart = %#v err=%v", persisted, err)
 	}
-	if err := h.database.Close(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, h.database.Close())
 	h.database, err = store.Open(ctx, filepath.Join(h.root, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() { _ = h.database.Close() })
 	h.service = newRealP4Service(t, h.database, projectGitAdapter{initializer: h.initializer, workspaces: h.workspaces})
-	if err := h.service.ReconcileWorkspaceGC(ctx, consumer.ClosedAt); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, h.service.ReconcileWorkspaceGC(ctx, consumer.ClosedAt))
 	released, err := h.database.Task(ctx, consumer.ID)
 	if err != nil || released.SourceRefReleasedAt == "" {
 		t.Fatalf("reopened source release = %#v err=%v", released, err)
 	}
 	stable := p4DurableSignature(t, h)
-	if err := h.service.ReconcileWorkspaceGC(ctx, consumer.ClosedAt); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, h.service.ReconcileWorkspaceGC(ctx, consumer.ClosedAt))
 	if replay := p4DurableSignature(t, h); replay != stable {
 		t.Fatal("absent workspace replay changed durable state")
 	}
@@ -307,9 +269,7 @@ func TestGT07SourceRefRetentionUsesLaterIntegrationAndSourceClosedAt(t *testing.
 	source, _, _ := prepareGT03Capture(t, h, "gt07-later-close-source", true)
 	h.reconcileGit(t)
 	source, err := h.database.Task(ctx, source.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if _, err := h.service.RequestAccept(ctx, core.AcceptInput{
 		TaskID: source.ID, IntegrationAgentID: h.integrator.ID, RequestID: "gt07-later-close-accept",
 	}); err != nil {
@@ -318,9 +278,7 @@ func TestGT07SourceRefRetentionUsesLaterIntegrationAndSourceClosedAt(t *testing.
 	h.captureAndAdvanceDirect(t, "gt07-later-close-winner", h.project.InitialSHA, "winner.txt", "winner\n")
 	h.reconcileGit(t)
 	snapshot, err := h.database.Snapshot(ctx, h.project.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	integration := onlyIntegrationTask(t, snapshot.Tasks)
 	if _, err := h.workspaces.Materialize(ctx, taskWorkspaceSpec(integration)); err != nil {
 		t.Fatal(err)
@@ -328,12 +286,8 @@ func TestGT07SourceRefRetentionUsesLaterIntegrationAndSourceClosedAt(t *testing.
 	integration, err = h.service.CancelTask(ctx, core.TaskActionInput{
 		TaskID: integration.ID, Reason: "cancel integration", RequestID: "gt07-later-close-integration",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.service.ReconcileWorkspaceGC(ctx, integration.ClosedAt); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
+	requireNoError(t, h.service.ReconcileWorkspaceGC(ctx, integration.ClosedAt))
 	released, err := h.database.Task(ctx, integration.ID)
 	if err != nil || released.SourceRefReleasedAt == "" {
 		t.Fatalf("integration source release = %#v err=%v", released, err)
@@ -372,17 +326,11 @@ func newRealP4Harness(t *testing.T) *realP4Harness {
 	gitIn(t, source, "add", "README.md")
 	gitIn(t, source, "commit", "-m", "same-line base")
 	initializer, err := gitrepo.New(filepath.Join(root, "repos"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	preflight, err := initializer.Preflight(context.Background(), source, "refs/heads/main")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	paths, err := initializer.Paths("project-real-p4", "initialize-real-p4")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	gitProject := gitrepo.Project{
 		ID: "project-real-p4", OperationID: "initialize-real-p4",
 		SourcePath: preflight.SourcePath, SourceRef: preflight.SourceRef, InitialSHA: preflight.InitialSHA,
@@ -392,17 +340,11 @@ func newRealP4Harness(t *testing.T) *realP4Harness {
 		t.Fatal(err)
 	}
 	helper := localCaptureHelper{root: filepath.Join(root, "handoff")}
-	if err := os.MkdirAll(helper.root, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.MkdirAll(helper.root, 0o700))
 	workspaces, err := gitrepo.NewWorkspaceManager(initializer, filepath.Join(root, "workspaces"), helper)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	database, err := store.Open(context.Background(), filepath.Join(root, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() { _ = database.Close() })
 	clock := &realP4Clock{value: time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)}
 	project := core.Project{
@@ -432,9 +374,7 @@ func newRealP4Harness(t *testing.T) *realP4Harness {
 	service, err := core.NewService(database, projectGitAdapter{initializer: initializer, workspaces: workspaces}, core.ServiceOptions{
 		Now: clock.Now, NewID: ids.New, MaxParallelRuns: 4, AdapterIDs: []string{"codex"},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	service.SetReady(true, "")
 	return &realP4Harness{
 		root: root, database: database, service: service, initializer: initializer, workspaces: workspaces,
@@ -453,9 +393,7 @@ func (h *realP4Harness) claim(t *testing.T, taskID string) core.Claim {
 
 func (h *realP4Harness) reconcileGit(t *testing.T) {
 	t.Helper()
-	if err := h.service.ReconcileGit(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, h.service.ReconcileGit(context.Background()))
 }
 
 func (h *realP4Harness) activate(t *testing.T, claim core.Claim, workspace, prefix string) core.Run {
@@ -466,27 +404,19 @@ func (h *realP4Harness) activate(t *testing.T, claim core.Claim, workspace, pref
 		LogPath: filepath.Join(h.root, "logs", claim.Run.ID+".log"), InstructionsHash: prefix + "-instructions",
 		LaunchMode: "start", CleanupOperationID: prefix + "-cleanup", RequestID: prefix + "-prepare",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	fact := core.RunRuntimeFactInput{
 		RunID: run.ID, Generation: run.Generation, LaunchNonce: run.LaunchNonce,
 		LaunchOperationID: run.LaunchOperationID, ContainerID: prefix + "-container", RequestID: prefix + "-created",
 	}
 	run, err = h.service.RecordContainerCreated(context.Background(), fact)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	fact.ContainerID, fact.RequestID = run.ContainerID, prefix+"-started"
 	run, err = h.service.RecordRunStartIssued(context.Background(), fact)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	fact.ContainerID, fact.RequestID = run.ContainerID, prefix+"-active"
 	run, err = h.service.ObserveProcessAndActivateRun(context.Background(), fact)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	return run
 }
 
@@ -503,18 +433,14 @@ func (h *realP4Harness) submitAndStop(t *testing.T, claim core.Claim, head, pref
 func (h *realP4Harness) stopRun(t *testing.T, claim core.Claim, prefix string) {
 	t.Helper()
 	run, err := h.database.Run(context.Background(), claim.Run.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	exitCode := 0
 	terminal, err := h.service.RecordRuntimeRunTerminal(context.Background(), core.RunTerminalInput{
 		RunID: run.ID, Generation: run.Generation, LaunchNonce: run.LaunchNonce,
 		LaunchOperationID: run.LaunchOperationID, ContainerID: run.ContainerID,
 		State: core.RunExited, ExitCode: &exitCode, TerminalReason: "process_exited", RequestID: prefix + "-terminal",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if _, err := h.service.RecordRunCleanup(context.Background(), core.RunCleanupInput{
 		RunRuntimeFactInput: core.RunRuntimeFactInput{
 			RunID: terminal.Run.ID, Generation: terminal.Run.Generation, LaunchNonce: terminal.Run.LaunchNonce,
@@ -533,18 +459,14 @@ func (h *realP4Harness) captureAndAdvanceDirect(t *testing.T, suffix, baseSHA, f
 	taskID, runID := "direct-"+suffix, "run-"+suffix
 	spec := gitrepo.WorkspaceSpec{ProjectID: h.project.ID, TaskID: taskID, BaseSHA: baseSHA}
 	workspace, err := h.workspaces.Materialize(ctx, spec)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	configureRealGitWorkspace(t, workspace.Path, suffix)
 	writeRealGitFile(t, workspace.Path, filename, content)
 	head := commitRealGitWorkspace(t, workspace.Path, suffix)
 	captured, err := h.workspaces.Capture(ctx, gitrepo.CaptureSpec{
 		Workspace: spec, RunID: runID, ExpectedHead: head, ControlRepoPath: h.project.ControlRepoPath,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	advanced, err := h.initializer.Advance(ctx, gitrepo.AdvanceSpec{
 		ProjectID: h.project.ID, ControlRepoPath: h.project.ControlRepoPath,
 		CanonicalRef: h.project.CanonicalRef, TaskRef: captured.TaskRef,
@@ -593,9 +515,7 @@ func configureRealGitWorkspace(t *testing.T, workspace, name string) {
 
 func writeRealGitFile(t *testing.T, workspace, name, content string) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(workspace, name), []byte(content), 0o660); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(filepath.Join(workspace, name), []byte(content), 0o660))
 }
 
 func commitRealGitWorkspace(t *testing.T, workspace, message string) string {
@@ -676,9 +596,7 @@ func runP4OperatorCLI(binary string, args ...string) p4CLIResult {
 func buildP4Binary(t *testing.T, name string) string {
 	t.Helper()
 	working, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	binary := filepath.Join(t.TempDir(), name)
 	command := exec.Command("go", "build", "-buildvcs=false", "-o", binary, "./cmd/"+name)
 	command.Dir = filepath.Clean(filepath.Join(working, "..", ".."))
@@ -701,61 +619,39 @@ func prepareP4ScriptedRun(t *testing.T, h *realP4Harness, claim core.Claim, pref
 	t.Helper()
 	ctx := context.Background()
 	launch, err := h.service.RuntimeLaunchContext(ctx, claim.Run.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	spec, err := gitWorkspaceSpec(launch.Task)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	workspace, err := h.workspaces.Path(launch.Project.ID, launch.Task.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	run, err := h.service.BeginRunLaunch(ctx, core.RunLaunchInput{
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: prefix + "-nonce",
 		WorkspacePath: workspace, HomePath: filepath.Join(h.root, "homes", claim.Run.ID),
 		LogPath: filepath.Join(h.root, "logs", claim.Run.ID+".log"), InstructionsHash: prefix,
 		LaunchMode: "start", CleanupOperationID: prefix + "-cleanup", RequestID: prefix + "-prepare",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	controller := &runtimeController{service: h.service, workspaces: h.workspaces, controls: make(map[string]*runControl)}
 	state := &runtimePrepareState{controller: controller, ctx: ctx, launch: launch, workspaceSpec: spec, run: run}
-	if err := prepareRuntimeWorkspace(state); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, prepareRuntimeWorkspace(state))
 	fact := core.RunRuntimeFactInput{
 		RunID: run.ID, Generation: run.Generation, LaunchNonce: run.LaunchNonce,
 		LaunchOperationID: run.LaunchOperationID, ContainerID: prefix + "-container", RequestID: prefix + "-created",
 	}
 	run, err = h.service.RecordContainerCreated(ctx, fact)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	fact.ContainerID, fact.RequestID = run.ContainerID, prefix+"-started"
 	run, err = h.service.RecordRunStartIssued(ctx, fact)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	fact.RequestID = prefix + "-active"
 	run, err = h.service.ObserveProcessAndActivateRun(ctx, fact)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	controlPath := filepath.Join(h.root, "run-control", run.ID)
-	if err := os.MkdirAll(controlPath, runControlDirectoryMode); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.MkdirAll(controlPath, runControlDirectoryMode))
 	tokenFile := filepath.Join(controlPath, "token")
-	if err := os.WriteFile(tokenFile, []byte(claim.Token+"\n"), runControlFileMode); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(tokenFile, []byte(claim.Token+"\n"), runControlFileMode))
 	control, err := controller.openRunControl(run, controlPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	controller.controls[run.ID] = control
 	return p4ScriptedRun{
 		controller: controller, run: run, workspace: workspace,
@@ -765,9 +661,7 @@ func prepareP4ScriptedRun(t *testing.T, h *realP4Harness, claim core.Claim, pref
 
 func (r p4ScriptedRun) close(t *testing.T) {
 	t.Helper()
-	if err := r.controller.closeControl(r.run.ID, r.control); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, r.controller.closeControl(r.run.ID, r.control))
 }
 
 func runP4IntegrationCLI(t *testing.T, coordlink string, run p4ScriptedRun, mergeRef string, conflict bool) {
@@ -810,9 +704,7 @@ func startP4OperatorServer(t *testing.T, root string, service *core.Service) (st
 	t.Helper()
 	socket := filepath.Join(root, "operator.sock")
 	server, err := transport.NewUnixServer(root, socket, transport.NewOperatorHandler(service))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	done := make(chan error, 1)
 	go func() { done <- server.Serve() }()
 	var once sync.Once
@@ -852,9 +744,7 @@ func newRealP4Service(t *testing.T, database *store.Store, controller core.Proje
 	service, err := core.NewService(database, controller, core.ServiceOptions{
 		Now: time.Now, NewID: (&realP4IDs{}).New, MaxParallelRuns: 4, AdapterIDs: []string{"codex"},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	service.SetReady(true, "")
 	return service
 }
@@ -866,20 +756,14 @@ func p4DurableSignature(t *testing.T, h *realP4Harness) string {
 func p4StoreDurableSignature(t *testing.T, database *store.Store, projectID string) string {
 	t.Helper()
 	snapshot, err := database.Snapshot(context.Background(), projectID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	events, err := database.Events(context.Background(), core.EventFilter{ProjectID: projectID})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	raw, err := json.Marshal(struct {
 		Snapshot core.Snapshot
 		Events   []core.Event
 	}{snapshot, events})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	return string(raw)
 }
 
@@ -924,14 +808,10 @@ func prepareGT03Capture(t *testing.T, h *realP4Harness, suffix string, terminal 
 		ProjectID: h.project.ID, AssigneeAgentID: h.worker.ID, Kind: core.TaskWork,
 		Title: "GT03 " + suffix, MaxRetries: 1, RequestID: "gt03-create-" + suffix,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	claim := h.claim(t, task.ID)
 	workspace, err := h.workspaces.Materialize(context.Background(), taskWorkspaceSpec(claim.Task))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	h.activate(t, claim, workspace.Path, "gt03-"+suffix)
 	configureRealGitWorkspace(t, workspace.Path, "GT03 "+suffix)
 	writeRealGitFile(t, workspace.Path, "gt03-"+suffix+".txt", suffix+"\n")

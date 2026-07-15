@@ -18,9 +18,7 @@ func TestP2BossMessageSendTargetsWorkAndReroutesClosedTask(t *testing.T) {
 		ProjectID: project.ID, AgentID: agent.ID, TaskID: claim.Task.ID,
 		Body: "wake this work", Wake: true, RequestID: "boss-send-direct",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if direct.TaskID != claim.Task.ID || direct.RelatedTaskID != "" || direct.RecipientID != agent.ID {
 		t.Fatalf("direct Boss message = %#v", direct)
 	}
@@ -38,9 +36,7 @@ func TestP2BossMessageSendTargetsWorkAndReroutesClosedTask(t *testing.T) {
 		ProjectID: project.ID, AgentID: agent.ID, TaskID: claim.Task.ID,
 		Body: "discuss closed work", Wake: false, RequestID: "boss-send-reroute",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if rerouted.TaskID == claim.Task.ID || rerouted.RelatedTaskID != claim.Task.ID || rerouted.RecipientID != agent.ID {
 		t.Fatalf("rerouted Boss message = %#v", rerouted)
 	}
@@ -59,13 +55,9 @@ func TestP2BossReadMarksDeliveredWithoutPretendingAcknowledgement(t *testing.T) 
 		Token: claim.Token, RecipientKind: "boss", Body: "read me",
 		RequestID: "boss-read-message",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	delivered, err := h.service.ReadBossMessage(context.Background(), message.ID, "boss-read")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if delivered.State != core.MessageDelivered || delivered.DeliveredRunID != "" ||
 		delivered.DeliveredAt == "" || delivered.DeliveryCount != 0 || delivered.AcknowledgedAt != "" {
 		t.Fatalf("Boss read projection = %#v", delivered)
@@ -88,9 +80,7 @@ func TestP2AgentInboxReadUsesCurrentRunScope(t *testing.T) {
 		ProjectID: project.ID, AgentID: agent.ID, Body: "scoped inbox",
 		Wake: true, RequestID: "inbox-read-chat",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 	if err != nil || !ok || claim.Task.ID != chat.Task.ID {
 		t.Fatalf("inbox claim = %#v ok=%t err=%v", claim, ok, err)
@@ -110,9 +100,7 @@ func TestP2AgentInboxReadUsesCurrentRunScope(t *testing.T) {
 		ProjectID: project.ID, AssigneeAgentID: other.ID, Kind: core.TaskWork,
 		Title: "other", Priority: 100, RequestID: "inbox-read-other-task",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	otherClaim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 	if err != nil || !ok || otherClaim.Task.ID != otherTask.ID {
 		t.Fatalf("other claim = %#v ok=%t err=%v", otherClaim, ok, err)

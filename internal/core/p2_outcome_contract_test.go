@@ -16,23 +16,17 @@ func TestP2OutcomeAckBundleRollsBackAsAUnit(t *testing.T) {
 		ProjectID: project.ID, AgentID: agent.ID, Body: "valid ack",
 		Wake: false, RequestID: "rollback-valid",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	foreign, err := h.service.Chat(context.Background(), core.ChatInput{
 		ProjectID: project.ID, AgentID: foreignAgent.ID, Body: "foreign ack",
 		Wake: false, RequestID: "rollback-foreign",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
 		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
 		Title: "atomic outcome", Priority: 100, RequestID: "rollback-task",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 	if err != nil || !ok || claim.Task.ID != task.ID {
 		t.Fatalf("claim = %#v ok=%t err=%v", claim, ok, err)
@@ -74,9 +68,7 @@ func TestP2FailAndSubmitRemainTwoPhaseAtRunTerminal(t *testing.T) {
 			Token: claim.Token, Outcome: core.OutcomeFail,
 			Reason: "cannot complete", RequestID: "terminal-fail-outcome",
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		if requested.Task.Status != core.TaskFinishing || requested.Run.State != core.RunActive {
 			t.Fatalf("premature fail projection = %#v", requested)
 		}
@@ -84,9 +76,7 @@ func TestP2FailAndSubmitRemainTwoPhaseAtRunTerminal(t *testing.T) {
 			RunID: claim.Run.ID, State: core.RunExited,
 			ExitCode: intPointer(1), RequestID: "terminal-fail-fact",
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		if terminal.Task.Status != core.TaskFailed || terminal.Task.CurrentRunID != "" ||
 			terminal.Task.FailureReason != "cannot complete" {
 			t.Fatalf("terminal fail projection = %#v", terminal.Task)
@@ -102,9 +92,7 @@ func TestP2FailAndSubmitRemainTwoPhaseAtRunTerminal(t *testing.T) {
 			Token: claim.Token, Outcome: core.OutcomeSubmit, Summary: "ready for capture",
 			ExpectedHead: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", RequestID: "terminal-submit-outcome",
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		if requested.Task.Status != core.TaskFinishing || requested.Task.PendingAction != "capture" ||
 			requested.Task.PendingActionRunID != claim.Run.ID || requested.Task.PendingActionVersion != requested.Task.Version {
 			t.Fatalf("submit intent = %#v", requested.Task)
@@ -113,9 +101,7 @@ func TestP2FailAndSubmitRemainTwoPhaseAtRunTerminal(t *testing.T) {
 			RunID: claim.Run.ID, State: core.RunExited,
 			ExitCode: intPointer(0), RequestID: "terminal-submit-fact",
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		if terminal.Task.Status != core.TaskFinishing || terminal.Task.PendingAction != "capture" ||
 			terminal.Task.CurrentRunID != claim.Run.ID || terminal.Task.Status == core.TaskSubmitted {
 			t.Fatalf("submit terminal pretended capture succeeded: %#v", terminal.Task)
@@ -141,16 +127,12 @@ func TestP2FinishingWindowQueuesExactlyOnceOnlyForWakeMessage(t *testing.T) {
 				ProjectID: project.ID, AssigneeAgentID: targetAgent.ID, Kind: core.TaskWork,
 				Title: "target", Priority: 100, RequestID: "finishing-target-" + test.name,
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			sender, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
 				ProjectID: project.ID, AssigneeAgentID: senderAgent.ID, Kind: core.TaskWork,
 				Title: "sender", Priority: 90, RequestID: "finishing-sender-" + test.name,
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			targetClaim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 			if err != nil || !ok || targetClaim.Task.ID != target.ID {
 				t.Fatalf("target claim = %#v ok=%t err=%v", targetClaim, ok, err)
@@ -185,17 +167,13 @@ func TestP2FinishingWindowQueuesExactlyOnceOnlyForWakeMessage(t *testing.T) {
 				RunID: targetClaim.Run.ID, State: core.RunExited,
 				ExitCode: intPointer(0), RequestID: "finishing-terminal-" + test.name,
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			if terminal.Task.Status != test.wantStatus || terminal.Task.CurrentRunID != "" {
 				t.Fatalf("finishing terminal projection = %#v", terminal.Task)
 			}
 			recordCleanupRemoved(t, h, terminal.Run, "finishing-cleanup-"+test.name)
 			claim, claimed, err := h.service.ClaimNext(context.Background(), project.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			if test.wake && (!claimed || claim.Task.ID != target.ID) {
 				t.Fatalf("wake message did not produce one new claim: %#v claimed=%t", claim, claimed)
 			}
@@ -212,9 +190,7 @@ func createActiveWorkClaim(t *testing.T, h *harness, project core.Project, agent
 		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
 		Title: requestPrefix, RequestID: requestPrefix + "-task",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 	if err != nil || !ok || claim.Task.ID != task.ID {
 		t.Fatalf("claim = %#v ok=%t err=%v", claim, ok, err)

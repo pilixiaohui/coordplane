@@ -12,15 +12,9 @@ func TestQuarantineUnknownPreservesOnlyRegisteredRepositoryPaths(t *testing.T) {
 	initializer := newTestInitializer(t)
 	registered := RegisteredPath{ProjectID: "project-known", PendingOperationID: "operation-known"}
 	paths, err := initializer.Paths(registered.ProjectID, registered.PendingOperationID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(paths.Final, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(paths.Partial, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
+	requireNoError(t, os.MkdirAll(paths.Final, 0o700))
+	requireNoError(t, os.MkdirAll(paths.Partial, 0o700))
 	unknown := []string{
 		filepath.Join(initializer.root, "orphan.git"),
 		filepath.Join(initializer.root, "orphan.file"),
@@ -28,23 +22,15 @@ func TestQuarantineUnknownPreservesOnlyRegisteredRepositoryPaths(t *testing.T) {
 		filepath.Join(initializer.root, ".partial", registered.ProjectID, "operation-old.git"),
 	}
 	for _, path := range unknown {
-		if err := os.MkdirAll(path, 0o700); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, os.MkdirAll(path, 0o700))
 	}
 	outside := filepath.Join(t.TempDir(), "outside")
-	if err := os.WriteFile(outside, []byte("unchanged\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(outside, []byte("unchanged\n"), 0o600))
 	unknownLink := filepath.Join(initializer.root, "orphan-link.git")
-	if err := os.Symlink(outside, unknownLink); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Symlink(outside, unknownLink))
 
 	got, err := initializer.QuarantineUnknown([]RegisteredPath{registered})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	want := []string{
 		".partial/project-known/operation-old.git",
 		".partial/project-orphan",

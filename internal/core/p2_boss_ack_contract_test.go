@@ -16,16 +16,12 @@ func TestP2BossTaskCreateAndChatReplyBundleMessageAcknowledgement(t *testing.T) 
 		Token: claim.Token, RecipientKind: "boss", Body: "please create follow-up",
 		RequestID: "boss-ack-first-message",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	created, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
 		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
 		Title: "follow-up", AckMessageIDs: []string{first.ID}, RequestID: "boss-ack-create",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if created.ID == "" {
 		t.Fatal("Boss task create returned no Task")
 	}
@@ -35,16 +31,12 @@ func TestP2BossTaskCreateAndChatReplyBundleMessageAcknowledgement(t *testing.T) 
 		Token: claim.Token, RecipientKind: "boss", Body: "please reply",
 		RequestID: "boss-ack-second-message",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	reply, err := h.service.Chat(context.Background(), core.ChatInput{
 		ProjectID: project.ID, AgentID: agent.ID, Body: "replying now", ReplyTo: second.ID,
 		Wake: false, AckMessageIDs: []string{second.ID}, RequestID: "boss-ack-reply",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if reply.Message.ReplyToMessageID != second.ID || reply.Message.State != core.MessagePending {
 		t.Fatalf("Boss reply = %#v", reply)
 	}
@@ -59,9 +51,7 @@ func TestP2BossChatFailureRollsBackBundledAcknowledgement(t *testing.T) {
 		ProjectID: project.ID, AgentID: agent.ID, Body: "start conversation",
 		Wake: true, RequestID: "boss-ack-rollback-start",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 	if err != nil || !ok || claim.Task.ID != chat.Task.ID {
 		t.Fatalf("conversation claim = %#v ok=%t err=%v", claim, ok, err)
@@ -73,9 +63,7 @@ func TestP2BossChatFailureRollsBackBundledAcknowledgement(t *testing.T) {
 		Token: claim.Token, RecipientKind: "boss", Body: "cannot continue",
 		RequestID: "boss-ack-rollback-message",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if _, err := h.service.RequestOutcome(context.Background(), core.OutcomeInput{
 		Token: claim.Token, Outcome: core.OutcomeFail,
 		Reason: "conversation failed", RequestID: "boss-ack-rollback-fail",
@@ -104,9 +92,7 @@ func TestP2BossChatFailureRollsBackBundledAcknowledgement(t *testing.T) {
 func assertMessageState(t *testing.T, h *harness, messageID string, want core.MessageState) {
 	t.Helper()
 	messages, err := h.database.Messages(context.Background(), core.MessageFilter{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	for _, message := range messages.Items {
 		if message.ID == messageID {
 			if message.State != want {

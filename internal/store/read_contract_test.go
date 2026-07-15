@@ -18,14 +18,10 @@ func TestSnapshotUsesOneFileBackedSQLiteReadTransaction(t *testing.T) {
 	defer cancel()
 	path := filepath.Join(t.TempDir(), "snapshot.db")
 	reader, err := Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer reader.Close()
 	writer, err := Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer writer.Close()
 
 	reachedBarrier := make(chan struct{})
@@ -67,9 +63,7 @@ func TestSnapshotUsesOneFileBackedSQLiteReadTransaction(t *testing.T) {
 		t.Fatalf("snapshot mixed a post-barrier commit into the old view: %v", got)
 	}
 	after, err := reader.Snapshot(ctx, "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if got := snapshotFamilySizes(after); got != [6]int{1, 1, 1, 1, 1, 2} {
 		t.Fatalf("next snapshot did not see the complete committed view: %v", got)
 	}
@@ -78,43 +72,27 @@ func TestSnapshotUsesOneFileBackedSQLiteReadTransaction(t *testing.T) {
 func TestTaskRunAndMessageHistoryUseStableOpaqueCursorPages(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, filepath.Join(t.TempDir(), "pages.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer database.Close()
 	for _, suffix := range []string{"c", "a", "b"} {
-		if err := insertReadFixture(ctx, database, suffix, core.TaskCompleted, core.RunExited, core.MessageAcknowledged, false); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, insertReadFixture(ctx, database, suffix, core.TaskCompleted, core.RunExited, core.MessageAcknowledged, false))
 	}
 	projects1, err := database.Projects(ctx, core.ProjectFilter{Limit: 2})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	projects2, err := database.Projects(ctx, core.ProjectFilter{Limit: 2, Cursor: projects1.NextCursor})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	assertIDs(t, projectIDs(append(projects1.Items, projects2.Items...)), []string{"prj_a", "prj_b", "prj_c"})
 
 	agents1, err := database.Agents(ctx, core.AgentFilter{Limit: 2})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	agents2, err := database.Agents(ctx, core.AgentFilter{Limit: 2, Cursor: agents1.NextCursor})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	assertIDs(t, agentIDs(append(agents1.Items, agents2.Items...)), []string{"agt_a", "agt_b", "agt_c"})
 
 	tasks1, err := database.Tasks(ctx, core.TaskFilter{Limit: 2})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	tasks2, err := database.Tasks(ctx, core.TaskFilter{Limit: 2, Cursor: tasks1.NextCursor})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	assertIDs(t, taskIDs(tasks1.Items), []string{"tsk_a", "tsk_b"})
 	assertIDs(t, taskIDs(tasks2.Items), []string{"tsk_c"})
 	if tasks1.NextCursor == "" || strings.Contains(tasks1.NextCursor, "2026-") || tasks2.NextCursor != "" {
@@ -122,23 +100,15 @@ func TestTaskRunAndMessageHistoryUseStableOpaqueCursorPages(t *testing.T) {
 	}
 
 	runs1, err := database.Runs(ctx, core.RunFilter{Limit: 2})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	runs2, err := database.Runs(ctx, core.RunFilter{Limit: 2, Cursor: runs1.NextCursor})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	assertIDs(t, runIDs(append(runs1.Items, runs2.Items...)), []string{"run_a", "run_b", "run_c"})
 
 	messages1, err := database.Messages(ctx, core.MessageFilter{Limit: 2})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	messages2, err := database.Messages(ctx, core.MessageFilter{Limit: 2, Cursor: messages1.NextCursor})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	assertIDs(t, messageIDs(append(messages1.Items, messages2.Items...)), []string{"msg_a", "msg_b", "msg_c"})
 
 	if _, err := database.Tasks(ctx, core.TaskFilter{Cursor: "created-at-and-id-are-not-public"}); !core.IsCode(err, core.CodeInvalidArgument) {
@@ -152,9 +122,7 @@ func TestTaskRunAndMessageHistoryUseStableOpaqueCursorPages(t *testing.T) {
 func TestTaskHasStartedRunSearchesBeyondTheFirstHundredHistoryRows(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, filepath.Join(t.TempDir(), "run-history.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer database.Close()
 
 	const (
@@ -215,9 +183,7 @@ func TestTaskHasStartedRunSearchesBeyondTheFirstHundredHistoryRows(t *testing.T)
 	}
 
 	firstPage, err := database.Runs(ctx, core.RunFilter{TaskID: taskID, Limit: core.MaximumCompactPageLimit})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(firstPage.Items) != core.MaximumCompactPageLimit || firstPage.NextCursor == "" {
 		t.Fatalf("first Run page = %d rows, next=%q", len(firstPage.Items), firstPage.NextCursor)
 	}
@@ -239,14 +205,10 @@ func TestTaskHasStartedRunSearchesBeyondTheFirstHundredHistoryRows(t *testing.T)
 func TestEventHistoryUsesOpaqueIDCursorWithoutGapsOrDuplicates(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, filepath.Join(t.TempDir(), "event-pages.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer database.Close()
 	payload, err := json.Marshal(map[string]string{"text": strings.Repeat("\x01", 4000)})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	const eventCount = 47
 	if err := database.Transact(ctx, func(tx core.Transaction) error {
 		for index := 1; index <= eventCount; index++ {
@@ -270,16 +232,12 @@ func TestEventHistoryUsesOpaqueIDCursorWithoutGapsOrDuplicates(t *testing.T) {
 		page, err := database.EventsPage(ctx, core.EventFilter{
 			ProjectID: "prj_events", Cursor: cursor, Limit: core.MaximumEventPageLimit,
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		if len(page.Items) == 0 {
 			t.Fatalf("event page %d made no cursor progress", pageNumber)
 		}
 		raw, err := json.Marshal(page)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		if len(raw) >= pageDataJSONBudget {
 			t.Fatalf("event page %d exceeded JSON budget: %d", pageNumber, len(raw))
 		}
@@ -326,13 +284,9 @@ func TestEventHistoryUsesOpaqueIDCursorWithoutGapsOrDuplicates(t *testing.T) {
 func TestStatusProjectionIsBoundedAndOmitsHistoricalPayloads(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, filepath.Join(t.TempDir(), "status.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer database.Close()
-	if err := insertReadFixture(ctx, database, "zzzz", core.TaskQueued, core.RunStarting, core.MessagePending, true); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, insertReadFixture(ctx, database, "zzzz", core.TaskQueued, core.RunStarting, core.MessagePending, true))
 	if _, err := database.db.ExecContext(ctx, `UPDATE tasks SET title=? WHERE id='tsk_zzzz'`, strings.Repeat("x", 300)); err != nil {
 		t.Fatal(err)
 	}
@@ -349,14 +303,10 @@ func TestStatusProjectionIsBoundedAndOmitsHistoricalPayloads(t *testing.T) {
 		}
 		return nil
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 
 	projection, err := database.StatusProjection(ctx, "prj_zzzz")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(projection.Tasks) != core.StatusSnapshotLimit {
 		t.Fatalf("status task count = %d, want hard limit %d", len(projection.Tasks), core.StatusSnapshotLimit)
 	}
@@ -384,13 +334,9 @@ func TestStatusProjectionIsBoundedAndOmitsHistoricalPayloads(t *testing.T) {
 func TestTaskAndRunSummariesUseConsistentUTF8ByteBudgets(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, filepath.Join(t.TempDir(), "utf8-summaries.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer database.Close()
-	if err := insertReadFixture(ctx, database, "utf8", core.TaskRunning, core.RunActive, core.MessagePending, false); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, insertReadFixture(ctx, database, "utf8", core.TaskRunning, core.RunActive, core.MessagePending, false))
 
 	title := strings.Repeat("题", 100)
 	waitReason := strings.Repeat("等", 200)
@@ -407,20 +353,14 @@ func TestTaskAndRunSummariesUseConsistentUTF8ByteBudgets(t *testing.T) {
 	}
 
 	status, err := database.StatusProjection(ctx, "prj_utf8")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if status.Truncated || len(status.Tasks) != 1 || status.Tasks[0].CurrentRun == nil {
 		t.Fatalf("status object bound/current run = truncated:%t tasks:%d view:%#v", status.Truncated, len(status.Tasks), status.Tasks)
 	}
 	tasks, err := database.Tasks(ctx, core.TaskFilter{ProjectID: "prj_utf8"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	runs, err := database.Runs(ctx, core.RunFilter{ProjectID: "prj_utf8"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(tasks.Items) != 1 || len(runs.Items) != 1 {
 		t.Fatalf("list object counts = tasks:%d runs:%d", len(tasks.Items), len(runs.Items))
 	}
@@ -444,13 +384,9 @@ func TestTaskAndRunSummariesUseConsistentUTF8ByteBudgets(t *testing.T) {
 		t.Fatalf("truncation flags = title:%t task_text:%t run_text:%t", listTask.TitleTruncated, listTask.TextTruncated, listRun.TextTruncated)
 	}
 	fullTask, err := database.Task(ctx, "tsk_utf8")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	fullRun, err := database.Run(ctx, "run_utf8")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if fullTask.Title != title || fullTask.WaitReason != waitReason || fullTask.ResultSummary != resultSummary || fullTask.FailureReason != failure {
 		t.Fatalf("full task read did not preserve UTF-8 text: %#v", fullTask)
 	}
@@ -469,13 +405,9 @@ func assertUTF8Budget(t *testing.T, field, value string, limit, wantBytes int) {
 func TestStatusProjectionMarksAgentsOmittedAfterRequiredSlotsFillTheBound(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, filepath.Join(t.TempDir(), "status-agents.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer database.Close()
-	if err := insertReadFixture(ctx, database, "agent_bound", core.TaskCompleted, core.RunExited, core.MessageAcknowledged, false); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, insertReadFixture(ctx, database, "agent_bound", core.TaskCompleted, core.RunExited, core.MessageAcknowledged, false))
 	err = database.Transact(ctx, func(tx core.Transaction) error {
 		for index := 0; index < core.StatusSnapshotLimit; index++ {
 			id := fmt.Sprintf("agt_required_%02d", index)
@@ -501,14 +433,10 @@ func TestStatusProjectionMarksAgentsOmittedAfterRequiredSlotsFillTheBound(t *tes
 			Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime,
 		})
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 
 	projection, err := database.StatusProjection(ctx, "prj_agent_bound")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(projection.Tasks) != core.StatusSnapshotLimit || len(projection.Snapshot.Agents) != core.StatusSnapshotLimit {
 		t.Fatalf("status bounds = tasks:%d agents:%d", len(projection.Tasks), len(projection.Snapshot.Agents))
 	}

@@ -15,25 +15,19 @@ func TestP2CoordlinkBinaryFixedSurfacePersistsSuccessfulCoordination(t *testing.
 	ctx := context.Background()
 	root := t.TempDir()
 	database, err := store.Open(ctx, filepath.Join(root, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer database.Close()
 
 	gitFacts := &contractGit{sha: strings.Repeat("a", 40), root: filepath.Join(root, "repos")}
 	service, err := core.NewService(database, gitFacts, core.ServiceOptions{MaxParallelRuns: 4, AdapterIDs: []string{"one-shot"}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	addAgent := func(name string) core.Agent {
 		t.Helper()
 		agent, err := service.AddAgent(ctx, core.AddAgentInput{
 			DisplayName: name, AdapterID: "one-shot", Image: "agent:latest",
 			InstructionsFile: "/instructions", RequestID: "p2-surface-agent-" + name,
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		return agent
 	}
 	parentAgent := addAgent("parent")
@@ -43,23 +37,17 @@ func TestP2CoordlinkBinaryFixedSurfacePersistsSuccessfulCoordination(t *testing.
 		Name: "P2 surface", Source: "/source", SourceRef: "refs/heads/main",
 		IntegrationAgentID: integrationAgent.ID, RequestID: "p2-surface-project",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	parent, err := service.CreateTask(ctx, core.CreateTaskInput{
 		ProjectID: project.ID, Kind: core.TaskWork, AssigneeAgentID: parentAgent.ID,
 		Title: "coordinate children", Priority: 100, RequestID: "p2-surface-parent",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	incoming, err := service.SendBossMessage(ctx, core.BossMessageInput{
 		ProjectID: project.ID, AgentID: parentAgent.ID, TaskID: parent.ID,
 		Body: "review these requirements", RequestID: "p2-surface-incoming",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	claim, ok, err := service.ClaimNext(ctx, project.ID)
 	if err != nil || !ok || claim.Task.ID != parent.ID {
 		t.Fatalf("parent claim = %#v ok=%t err=%v", claim, ok, err)
@@ -68,9 +56,7 @@ func TestP2CoordlinkBinaryFixedSurfacePersistsSuccessfulCoordination(t *testing.
 
 	socket := filepath.Join(root, "run.sock")
 	server, err := transport.NewUnixServer(root, socket, transport.NewRunHandler(service))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve() }()
 	defer func() {
@@ -173,9 +159,7 @@ func TestP2CoordlinkBinaryFixedSurfacePersistsSuccessfulCoordination(t *testing.
 	}
 
 	snapshot, err := database.Snapshot(ctx, project.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(snapshot.Tasks) != 3 || len(snapshot.Runs) != 1 || len(snapshot.Messages) != 2 {
 		t.Fatalf("durable P2 snapshot = %#v", snapshot)
 	}
@@ -220,9 +204,7 @@ func seedP2SurfaceSubmittedTask(t *testing.T, database *store.Store, task core.T
 		persisted.Version++
 		return tx.UpdateTask(persisted, expectedVersion, expectedStatus)
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 }
 
 func p2SurfaceMessageWithID(t *testing.T, snapshot core.Snapshot, id string) core.Message {

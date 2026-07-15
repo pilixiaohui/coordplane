@@ -16,9 +16,7 @@ func TestP2RuntimeRetryExhaustionDisposesMessagesAndNotifiesParent(t *testing.T)
 		ProjectID: project.ID, AssigneeAgentID: parentAgent.ID, Kind: core.TaskWork,
 		Title: "parent", Priority: 20, RequestID: "runtime-parent-task",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	parentClaim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 	if err != nil || !ok || parentClaim.Task.ID != parent.ID {
 		t.Fatalf("parent claim = %#v ok=%t err=%v", parentClaim, ok, err)
@@ -30,16 +28,12 @@ func TestP2RuntimeRetryExhaustionDisposesMessagesAndNotifiesParent(t *testing.T)
 		Token: parentClaim.Token, AssigneeAgentID: childAgent.ID, Title: "child",
 		Priority: 10, MaxRetries: 0, RequestID: "runtime-child-task",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	unresolved, err := h.service.SendAgentMessage(context.Background(), core.SendMessageInput{
 		Token: parentClaim.Token, RecipientKind: "agent", RecipientID: childAgent.ID,
 		TaskID: child.ID, Body: "pending child input", Wake: true, RequestID: "runtime-child-message",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	waitAndTerminate(t, h, parentClaim, "runtime-parent-wait")
 
 	childClaim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
@@ -53,16 +47,12 @@ func TestP2RuntimeRetryExhaustionDisposesMessagesAndNotifiesParent(t *testing.T)
 		RunID: childClaim.Run.ID, State: core.RunInterrupted,
 		TerminalReason: "runtime lost", RequestID: "runtime-child-terminal",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if terminal.Task.Status != core.TaskFailed || terminal.Task.CurrentRunID != "" {
 		t.Fatalf("exhausted child projection = %#v", terminal.Task)
 	}
 	message, err := h.database.Messages(context.Background(), core.MessageFilter{TaskID: child.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(message.Items) != 1 || message.Items[0].ID != unresolved.ID || message.Items[0].State != core.MessageCancelled {
 		t.Fatalf("unresolved child message disposition = %#v", message.Items)
 	}
@@ -71,9 +61,7 @@ func TestP2RuntimeRetryExhaustionDisposesMessagesAndNotifiesParent(t *testing.T)
 		t.Fatalf("parent wake projection = %#v err=%v", parentAfter, err)
 	}
 	parentMessages, err := h.database.Messages(context.Background(), core.MessageFilter{TaskID: parent.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if !hasChildResult(parentMessages.Items, child.ID, "agent", parentAgent.ID) {
 		t.Fatalf("parent notification missing: %#v", parentMessages.Items)
 	}
@@ -88,9 +76,7 @@ func TestP2ClosedParentChildResultFallsBackToBoss(t *testing.T) {
 		ProjectID: project.ID, AssigneeAgentID: parentAgent.ID, Kind: core.TaskWork,
 		Title: "parent", Priority: 20, RequestID: "fallback-parent-task",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	parentClaim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 	if err != nil || !ok || parentClaim.Task.ID != parent.ID {
 		t.Fatalf("parent claim = %#v ok=%t err=%v", parentClaim, ok, err)
@@ -102,9 +88,7 @@ func TestP2ClosedParentChildResultFallsBackToBoss(t *testing.T) {
 		Token: parentClaim.Token, AssigneeAgentID: childAgent.ID, Title: "child",
 		Priority: 10, RequestID: "fallback-child-task",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	waitAndTerminate(t, h, parentClaim, "fallback-parent-wait")
 	if _, err := h.service.CancelTask(context.Background(), core.TaskActionInput{
 		TaskID: parent.ID, Reason: "parent closed", RequestID: "fallback-parent-cancel",
@@ -132,9 +116,7 @@ func TestP2ClosedParentChildResultFallsBackToBoss(t *testing.T) {
 		t.Fatal(err)
 	}
 	messages, err := h.database.Messages(context.Background(), core.MessageFilter{TaskID: parent.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if !hasChildResult(messages.Items, child.ID, "boss", "") {
 		t.Fatalf("Boss fallback missing parent/child association: %#v", messages.Items)
 	}
@@ -149,26 +131,20 @@ func TestP2CancelPreservesExistingRunStopOperation(t *testing.T) {
 		RunID: claim.Run.ID, Reason: "operator stop", OperationID: "op-existing-stop",
 		RequestID: "stop-before-cancel",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if _, err := h.service.CancelTask(context.Background(), core.TaskActionInput{
 		TaskID: claim.Task.ID, Reason: "cancel responsibility", RequestID: "cancel-after-stop",
 	}); err != nil {
 		t.Fatal(err)
 	}
 	cancelled, err := h.database.Task(context.Background(), claim.Task.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if cancelled.Status != core.TaskCancelled || cancelled.CurrentRunID != claim.Run.ID ||
 		cancelled.Generation != claim.Run.Generation+1 {
 		t.Fatalf("cancelled task lost live Run ownership: %#v", cancelled)
 	}
 	persisted, err := h.database.Run(context.Background(), claim.Run.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if persisted.StopOperationID != stopped.StopOperationID || persisted.StopRequestedAt != stopped.StopRequestedAt ||
 		persisted.StopReason != stopped.StopReason {
 		t.Fatalf("cancel replaced existing stop identity: before=%#v after=%#v", stopped, persisted)
@@ -180,9 +156,7 @@ func TestP2CancelPreservesExistingRunStopOperation(t *testing.T) {
 		RunID: claim.Run.ID, State: core.RunCancelled,
 		TerminalReason: "cancelled by operator", RequestID: "cancel-terminal",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if terminal.Task.Status != core.TaskCancelled || terminal.Task.CurrentRunID != "" {
 		t.Fatalf("terminal cancellation projection = %#v", terminal.Task)
 	}

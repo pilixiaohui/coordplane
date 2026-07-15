@@ -15,32 +15,22 @@ func TestGT07DiscardRespectsRetentionBeforeAndAtBoundary(t *testing.T) {
 	integrator := h.addAgent(t, "retention-integrator")
 	project := h.addProject(t, "retention-project", integrator.ID)
 	task := createAndSubmitCodeTask(t, h, project, worker, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "retention")
-	if err := h.service.ReconcileGit(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, h.service.ReconcileGit(context.Background()))
 	if _, err := h.service.RequestAccept(context.Background(), core.AcceptInput{
 		TaskID: task.ID, IntegrationAgentID: integrator.ID, RequestID: "retention-accept",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.service.ReconcileGit(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, h.service.ReconcileGit(context.Background()))
 	task, err := h.database.Task(context.Background(), task.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	closedAt, err := time.Parse(time.RFC3339Nano, task.ClosedAt)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	service, err := core.NewService(h.database, h.git, core.ServiceOptions{
 		Now: h.clock.Now, NewID: h.ids.New, MaxParallelRuns: 4, AdapterIDs: []string{"one-shot"},
 		CompletedWorkspaceRetention: retention, TerminalTaskRefRetention: retention,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	setNextClock := func(next time.Time) {
 		h.clock.mu.Lock()
 		h.clock.value = next.Add(-time.Microsecond)
@@ -49,9 +39,7 @@ func TestGT07DiscardRespectsRetentionBeforeAndAtBoundary(t *testing.T) {
 
 	setNextClock(closedAt.Add(retention).Add(-time.Microsecond))
 	preview, err := service.GCPreview(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	var workspaceTarget core.GCWorkspaceTarget
 	for _, candidate := range preview.Workspaces {
 		if candidate.TaskID == task.ID {
@@ -86,9 +74,7 @@ func TestGT07DiscardRespectsRetentionBeforeAndAtBoundary(t *testing.T) {
 
 	setNextClock(closedAt.Add(retention).Add(-3 * time.Microsecond))
 	preview, err = service.GCPreview(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	var refTarget core.GCTaskRefTarget
 	for _, candidate := range preview.TaskRefs {
 		if candidate.TaskID == task.ID {
@@ -125,9 +111,7 @@ func TestGT07ConcurrentGCRequestIDConflictHasOneDestructiveSuccess(t *testing.T)
 		ProjectID: project.ID, AssigneeAgentID: worker.ID, Kind: core.TaskWork,
 		Title: "cancelled discard target", RequestID: "gc-request-task",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if _, err := h.service.CancelTask(context.Background(), core.TaskActionInput{
 		TaskID: task.ID, Reason: "discard", RequestID: "gc-request-cancel",
 	}); err != nil {
@@ -177,9 +161,7 @@ func createAndSubmitCodeTask(t *testing.T, h *harness, project core.Project, wor
 		ProjectID: project.ID, AssigneeAgentID: worker.ID, Kind: core.TaskWork,
 		Title: "code " + suffix, MaxRetries: 1, RequestID: "create-" + suffix,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 	if err != nil || !ok || claim.Task.ID != task.ID {
 		t.Fatalf("claim = %#v ok=%t err=%v", claim, ok, err)
@@ -200,9 +182,7 @@ func createAndSubmitCodeTask(t *testing.T, h *harness, project core.Project, wor
 func terminalActiveRun(t *testing.T, h *harness, runID, requestID string) {
 	t.Helper()
 	run, err := h.database.Run(context.Background(), runID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	zero := 0
 	if _, err := h.service.RecordRuntimeRunTerminal(context.Background(), core.RunTerminalInput{
 		RunID: run.ID, Generation: run.Generation, LaunchNonce: run.LaunchNonce,

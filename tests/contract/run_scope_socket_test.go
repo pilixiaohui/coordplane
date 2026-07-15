@@ -17,36 +17,26 @@ func TestRT01PerRunSocketsRequireMatchingTokenScope(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	database, err := store.Open(ctx, filepath.Join(root, "coordplane.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	t.Cleanup(func() { _ = database.Close() })
 	service, err := core.NewService(database, &contractGit{
 		sha: strings.Repeat("a", 40), root: filepath.Join(root, "repos"),
 	}, core.ServiceOptions{MaxParallelRuns: 2, AdapterIDs: []string{"one-shot"}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	agentA, err := service.AddAgent(ctx, core.AddAgentInput{
 		DisplayName: "Socket A", AdapterID: "one-shot", Image: "agent:latest",
 		InstructionsFile: "/instructions/a", RequestID: "socket-agent-a",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	agentB, err := service.AddAgent(ctx, core.AddAgentInput{
 		DisplayName: "Socket B", AdapterID: "one-shot", Image: "agent:latest",
 		InstructionsFile: "/instructions/b", RequestID: "socket-agent-b",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	project, err := service.AddProject(ctx, core.AddProjectInput{
 		Name: "Socket Project", Source: "/source", SourceRef: "refs/heads/main", RequestID: "socket-project",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	for _, input := range []core.CreateTaskInput{
 		{ProjectID: project.ID, AssigneeAgentID: agentA.ID, Kind: core.TaskWork, Title: "socket A", Priority: 20, RequestID: "socket-task-a"},
 		{ProjectID: project.ID, AssigneeAgentID: agentB.ID, Kind: core.TaskWork, Title: "socket B", Priority: 10, RequestID: "socket-task-b"},
@@ -68,23 +58,17 @@ func TestRT01PerRunSocketsRequireMatchingTokenScope(t *testing.T) {
 	socketB := startScopedRunSocket(t, root, "b", service, scopeForRun(claimB.Run))
 	for _, socket := range []string{socketA, socketB} {
 		info, err := os.Stat(socket)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 		if info.Mode().Perm() != 0o660 {
 			t.Fatalf("Run socket %s mode = %o, want 660", socket, info.Mode().Perm())
 		}
 	}
 
 	clientA, err := transport.NewUnixClient(socketA, transport.WithBearerToken(claimA.Token))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer clientA.CloseIdleConnections()
 	crossClient, err := transport.NewUnixClient(socketB, transport.WithBearerToken(claimA.Token))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer crossClient.CloseIdleConnections()
 
 	before := durableSignature(t, database, project.ID)
@@ -104,16 +88,12 @@ func TestRT01PerRunSocketsRequireMatchingTokenScope(t *testing.T) {
 func startScopedRunSocket(t *testing.T, root, name string, service *core.Service, scope core.RunScope) string {
 	t.Helper()
 	controlDir := filepath.Join(root, "run-control", name)
-	if err := os.MkdirAll(controlDir, 0o750); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.MkdirAll(controlDir, 0o750))
 	socket := filepath.Join(controlDir, "api.sock")
 	server, err := transport.NewUnixServerWithMode(
 		root, socket, 0o660, transport.NewScopedRunHandler(service, scope),
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	done := make(chan error, 1)
 	go func() { done <- server.Serve() }()
 	t.Cleanup(func() {
