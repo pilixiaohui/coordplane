@@ -162,7 +162,10 @@ func TestPFOwnedResidueRejectsUnknownDirectChildren(t *testing.T) {
 	for _, path := range []string{
 		filepath.Join(dataDir, "workspaces", projectID),
 		filepath.Join(dataDir, "workspaces", ".partial"),
+		filepath.Join(dataDir, "workspaces", ".partial", projectID),
+		filepath.Join(dataDir, "workspaces", ".empty-git-template"),
 		filepath.Join(dataDir, "handoff", projectID),
+		filepath.Join(dataDir, "handoff", projectID, "empty-task"),
 		filepath.Join(dataDir, "handoff", "quarantine"),
 	} {
 		requireNoError(t, os.MkdirAll(path, 0o700))
@@ -698,15 +701,17 @@ func ownedResidue(t *testing.T, dataDir, projectID string) []string {
 	t.Helper()
 	var residue []string
 	allowedDirect := map[string]map[string]bool{
-		"workspaces": {projectID: true, ".partial": true},
+		"workspaces": {projectID: true, ".partial": true, ".empty-git-template": true},
 		"handoff":    {projectID: true, "quarantine": true},
 	}
 	for _, root := range []string{"workspaces", "handoff", "run-control", "logs"} {
 		base := filepath.Join(dataDir, root)
 		_ = filepath.Walk(base, func(path string, _ os.FileInfo, err error) error {
 			relative := filepath.ToSlash(strings.TrimPrefix(path, base+string(filepath.Separator)))
-			depth := len(strings.Split(relative, "/"))
-			structural := depth == 1 && allowedDirect[root][relative]
+			parts := strings.Split(relative, "/")
+			structural := len(parts) == 1 && allowedDirect[root][relative]
+			structural = structural || root == "workspaces" && len(parts) == 2 && parts[0] == ".partial" && parts[1] == projectID
+			structural = structural || root == "handoff" && len(parts) == 2 && parts[0] == projectID
 			if err == nil && path != base && !structural {
 				residue = append(residue, filepath.ToSlash(strings.TrimPrefix(path, dataDir+string(filepath.Separator))))
 			}
