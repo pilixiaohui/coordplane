@@ -188,6 +188,7 @@ func runRT05ProcessCase(
 	if err := seed.Close(); err != nil {
 		t.Fatal(err)
 	}
+	registerRT05OwnerFallback(t, executor, filepath.Join(root, "data", "coordplane.db"), task.ID)
 
 	socket := filepath.Join(root, "data", "operator.sock")
 	readyPath := filepath.Join(root, "runtime-phase-ready")
@@ -268,6 +269,60 @@ func runRT05ProcessCase(
 	})
 	stopP3DaemonProcess(t, second)
 	assertRT05Converged(t, ctx, executor, root, project.ID, task.ID, final.ID, intent, 1)
+}
+
+func registerRT05OwnerFallback(t *testing.T, executor *containerruntime.DockerExecutor, databasePath, taskID string) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		database, err := store.Open(ctx, databasePath)
+		if err != nil {
+			t.Errorf("RT-05 owner fallback open database: %v", err)
+			return
+		}
+		defer database.Close()
+		cursor := ""
+		for {
+			page, err := database.Runs(ctx, core.RunFilter{TaskID: taskID, Cursor: cursor, Limit: core.MaximumCompactPageLimit})
+			if err != nil {
+				t.Errorf("RT-05 owner fallback list Runs: %v", err)
+				return
+			}
+			for _, summary := range page.Items {
+				run, err := database.Run(ctx, summary.ID)
+				if err != nil {
+					t.Errorf("RT-05 owner fallback load Run %s: %v", summary.ID, err)
+					continue
+				}
+				if run.ContainerID == "" {
+					continue
+				}
+				ref := runtimeRef(run)
+				if _, err := executor.Stop(ctx, ref, 0); err != nil {
+					t.Errorf("RT-05 owner fallback stop Run %s: %v", run.ID, err)
+					continue
+				}
+				if _, err := executor.Remove(ctx, ref); err != nil {
+					t.Errorf("RT-05 owner fallback remove Run %s: %v", run.ID, err)
+				}
+			}
+			if page.NextCursor == "" {
+				break
+			}
+			cursor = page.NextCursor
+		}
+		managed, err := executor.Managed(ctx)
+		if err != nil {
+			t.Errorf("RT-05 owner fallback list managed containers: %v", err)
+			return
+		}
+		for _, state := range managed {
+			if state.Ref.TaskID == taskID {
+				t.Errorf("RT-05 owned container residue after cleanup: task=%s run=%s container=%s", taskID, state.Ref.RunID, state.Ref.ContainerID)
+			}
+		}
+	})
 }
 
 func registerRT05ImmutableCleanup(t *testing.T, executor *containerruntime.DockerExecutor, run core.Run) {

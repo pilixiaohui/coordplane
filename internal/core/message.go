@@ -50,11 +50,7 @@ func (s *Service) bossAgentMessage(
 }
 
 func (s *Service) sendBossAgentMessage(ctx context.Context, input bossAgentMessage) (Task, Message, error) {
-	inputHash, err := inputFingerprint(struct {
-		ProjectID, AgentID, TaskID, RelatedTaskID, Body, ReplyTo, AckIDs string
-		Wake                                                             bool
-	}{input.projectID, input.agentID, input.taskID, input.relatedTaskID, input.body,
-		input.replyTo, strings.Join(input.ackIDs, "\x00"), input.wake})
+	inputHash, err := bossMessageFingerprint(input)
 	if err != nil {
 		return Task{}, Message{}, err
 	}
@@ -65,10 +61,7 @@ func (s *Service) sendBossAgentMessage(ctx context.Context, input bossAgentMessa
 		if replay, ok, err := dedupe.replay(tx); err != nil {
 			return err
 		} else if ok {
-			message, err = tx.Message(replay.ID)
-			if err == nil {
-				task, err = tx.Task(message.TaskID)
-			}
+			task, message, err = replayBossAgentMessage(tx, input.operation, replay)
 			return err
 		}
 		project, err := tx.Project(input.projectID)
@@ -107,9 +100,66 @@ func (s *Service) sendBossAgentMessage(ctx context.Context, input bossAgentMessa
 		if err != nil {
 			return err
 		}
-		return dedupe.record(tx, message.ID, task.ID, now)
+		return recordBossAgentMessage(dedupe, tx, input.operation, task, message, now)
 	})
 	return task, message, err
+}
+
+func bossMessageFingerprint(input bossAgentMessage) (string, error) {
+	ackIDs := strings.Join(input.ackIDs, "\x00")
+	switch input.operation {
+	case "chat.send":
+		return inputFingerprint(struct {
+			ProjectID, AgentID, Body, RelatedTaskID, ReplyToID, AckIDs string
+			Wake                                                       bool
+		}{input.projectID, input.agentID, input.body, input.relatedTaskID, input.replyTo, ackIDs, input.wake})
+	case "message.send":
+		return inputFingerprint(struct {
+			ProjectID, AgentID, TaskID, RelatedTaskID, Body, ReplyToID, AckIDs string
+			Wake                                                               bool
+		}{input.projectID, input.agentID, input.taskID, input.relatedTaskID, input.body, input.replyTo, ackIDs, input.wake})
+	default:
+		return "", NewError(CodeInternal, "unsupported boss message operation", false)
+	}
+}
+
+func replayBossAgentMessage(tx Transaction, operation string, replay dedupeResult) (Task, Message, error) {
+	var task Task
+	var message Message
+	var err error
+	switch operation {
+	case "chat.send":
+		task, err = tx.Task(replay.ID)
+		if err == nil {
+			message, err = tx.Message(replay.RelatedID)
+		}
+	case "message.send":
+		message, err = tx.Message(replay.ID)
+		if err == nil {
+			task, err = tx.Task(message.TaskID)
+		}
+	default:
+		err = NewError(CodeInternal, "unsupported boss message operation", false)
+	}
+	return task, message, err
+}
+
+func recordBossAgentMessage(
+	dedupe requestDedupe,
+	tx Transaction,
+	operation string,
+	task Task,
+	message Message,
+	now string,
+) error {
+	switch operation {
+	case "chat.send":
+		return dedupe.record(tx, task.ID, message.ID, now)
+	case "message.send":
+		return dedupe.record(tx, message.ID, "", now)
+	default:
+		return NewError(CodeInternal, "unsupported boss message operation", false)
+	}
 }
 
 func bossMessageScope(tx Transaction, projectID, relatedTaskID, replyTo string) error {

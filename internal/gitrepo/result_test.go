@@ -2,7 +2,9 @@ package gitrepo
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -87,6 +89,76 @@ func TestGT03CorruptReadyBundleFailsLoudAndLeavesControllerFSCKClean(t *testing.
 		t.Fatalf("corrupt capture task ref exists=%t err=%v", exists, resolveErr)
 	}
 	gitDirOutput(t, project.ControlRepoPath, "fsck", "--full", "--strict")
+}
+
+func TestGT03PublicCaptureErrorsRedactDistinctHandoffRootAndRawGitArgs(t *testing.T) {
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realGit, err = filepath.Abs(realGit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"verify", "fetch"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			initializer, manager, project, _, initial := newWorkspaceFixture(t)
+			handoffRoot := t.TempDir()
+			manager.capture = testCaptureHelper{root: handoffRoot}
+			spec := WorkspaceSpec{ProjectID: project.ID, TaskID: "task-redact-" + mode, BaseSHA: initial}
+			workspace, err := manager.Materialize(ctx, spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gitOutput(t, workspace.Path, "config", "user.name", "Redaction Test")
+			gitOutput(t, workspace.Path, "config", "user.email", "redaction@example.invalid")
+			head := commitFile(t, workspace.Path, "redact.txt", mode+"\n", "redaction "+mode)
+			runID := "run-redact-" + mode
+			wrapper := filepath.Join(t.TempDir(), "git")
+			script := fmt.Sprintf(`#!/bin/sh
+case " $* " in
+  *" %s "*) echo "$*" >&2; exit 23 ;;
+esac
+exec %q "$@"
+`, map[string]string{"verify": "bundle verify", "fetch": "fetch"}[mode], realGit)
+			if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			initializer.gitPath = wrapper
+			_, err = manager.Capture(ctx, CaptureSpec{
+				Workspace: spec, RunID: runID, ExpectedHead: head, ControlRepoPath: project.ControlRepoPath,
+			})
+			if err == nil {
+				t.Fatal("Capture() succeeded through failing Git wrapper")
+			}
+			want := map[string]string{
+				"verify": "capture bundle verification failed",
+				"fetch":  "import capture handoff",
+			}[mode]
+			if !strings.Contains(strings.ToLower(err.Error()), want) {
+				t.Fatalf("public error = %v, want safe context %q", err, want)
+			}
+			readyBundle := filepath.Join(handoffRoot, project.ID, spec.TaskID, runID, "capture.ready", "result.bundle")
+			for _, forbidden := range []string{
+				handoffRoot, manager.root, initializer.root, project.ControlRepoPath, readyBundle,
+				"--git-dir", "bundle verify", "--no-write-fetch-head", "HEAD:refs/coordplane/imports",
+			} {
+				if forbidden != "" && strings.Contains(err.Error(), forbidden) {
+					t.Fatalf("public error leaked %q: %v", forbidden, err)
+				}
+			}
+			taskRef, err := TaskRef(spec.TaskID, runID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			initializer.gitPath = realGit
+			if _, exists, err := initializer.resolveRef(ctx, project.ControlRepoPath, taskRef); err != nil || exists {
+				t.Fatalf("rejected capture task ref exists=%t err=%v", exists, err)
+			}
+			gitDirOutput(t, project.ControlRepoPath, "fsck", "--full", "--strict")
+		})
+	}
 }
 
 type corruptCaptureHelper struct{ next CaptureHelper }

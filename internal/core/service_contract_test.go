@@ -2,6 +2,8 @@ package core_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -376,6 +378,142 @@ func TestCT07ConversationIsDurableReusedAndKindSafe(t *testing.T) {
 	if len(messages.Items) != 2 || messages.Items[0].Body != "first" || messages.Items[1].Body != "second" {
 		t.Fatalf("messages after restart = %#v", messages)
 	}
+}
+
+func TestCT07LegacyBossMessageDedupesSurviveSQLiteReopen(t *testing.T) {
+	tests := []struct {
+		name      string
+		operation string
+		setup     func(*testing.T, *harness, core.Project, core.Agent) (core.Task, core.Message)
+		inputHash func(core.Project, core.Agent, core.Task, core.Message) string
+		replay    func(context.Context, *core.Service, core.Project, core.Agent, core.Task, string, string) (core.Task, core.Message, error)
+	}{
+		{
+			name: "chat", operation: "chat.send",
+			setup: func(t *testing.T, h *harness, project core.Project, agent core.Agent) (core.Task, core.Message) {
+				result, err := h.service.Chat(context.Background(), core.ChatInput{
+					ProjectID: project.ID, AgentID: agent.ID, Body: "legacy chat", Wake: true,
+					RequestID: "legacy-chat-setup",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return result.Task, result.Message
+			},
+			inputHash: func(project core.Project, agent core.Agent, _ core.Task, _ core.Message) string {
+				return legacyFingerprint(t, struct {
+					ProjectID, AgentID, Body, RelatedTaskID, ReplyToID, AckIDs string
+					Wake                                                       bool
+				}{project.ID, agent.ID, "legacy chat", "", "", "", true})
+			},
+			replay: func(ctx context.Context, service *core.Service, project core.Project, agent core.Agent, _ core.Task, requestID, body string) (core.Task, core.Message, error) {
+				result, err := service.Chat(ctx, core.ChatInput{
+					ProjectID: project.ID, AgentID: agent.ID, Body: body, Wake: true, RequestID: requestID,
+				})
+				return result.Task, result.Message, err
+			},
+		},
+		{
+			name: "message", operation: "message.send",
+			setup: func(t *testing.T, h *harness, project core.Project, agent core.Agent) (core.Task, core.Message) {
+				task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+					ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
+					Title: "legacy message task", RequestID: "legacy-message-task",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				message, err := h.service.SendBossMessage(context.Background(), core.BossMessageInput{
+					ProjectID: project.ID, AgentID: agent.ID, TaskID: task.ID, Body: "legacy message",
+					Wake: true, RequestID: "legacy-message-setup",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return task, message
+			},
+			inputHash: func(project core.Project, agent core.Agent, task core.Task, _ core.Message) string {
+				return legacyFingerprint(t, struct {
+					ProjectID, AgentID, TaskID, RelatedTaskID, Body, ReplyToID, AckIDs string
+					Wake                                                               bool
+				}{project.ID, agent.ID, task.ID, "", "legacy message", "", "", true})
+			},
+			replay: func(ctx context.Context, service *core.Service, project core.Project, agent core.Agent, task core.Task, requestID, body string) (core.Task, core.Message, error) {
+				message, err := service.SendBossMessage(ctx, core.BossMessageInput{
+					ProjectID: project.ID, AgentID: agent.ID, TaskID: task.ID, Body: body,
+					Wake: true, RequestID: requestID,
+				})
+				return task, message, err
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := newHarness(t)
+			agent := h.addAgent(t, "legacy-"+test.name+"-agent")
+			project := h.addProject(t, "legacy-"+test.name+"-project", "")
+			task, message := test.setup(t, h, project, agent)
+			requestID := "legacy-" + test.name + "-replay"
+			resultID, relatedID := message.ID, ""
+			if test.operation == "chat.send" {
+				resultID, relatedID = task.ID, message.ID
+			}
+			raw, err := json.Marshal(struct {
+				ID        string `json:"id"`
+				RelatedID string `json:"related_id,omitempty"`
+				InputHash string `json:"input_hash"`
+			}{resultID, relatedID, test.inputHash(project, agent, task, message)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.database.Transact(context.Background(), func(tx core.Transaction) error {
+				return tx.PutDedupe("boss", test.operation, requestID, raw, h.clock.Now().Format(time.RFC3339Nano))
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.database.Close(); err != nil {
+				t.Fatal(err)
+			}
+			h.database, err = store.Open(context.Background(), h.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.service, err = core.NewService(h.database, h.git, core.ServiceOptions{
+				Now: h.clock.Now, NewID: h.ids.New, MaxParallelRuns: 4, AdapterIDs: []string{"one-shot"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := h.durableSignature(t, project.ID)
+			replayedTask, replayedMessage, err := test.replay(context.Background(), h.service, project, agent, task, requestID, message.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if replayedTask.ID != task.ID || replayedMessage.ID != message.ID {
+				t.Fatalf("legacy replay = task %s message %s, want %s/%s", replayedTask.ID, replayedMessage.ID, task.ID, message.ID)
+			}
+			if after := h.durableSignature(t, project.ID); after != before {
+				t.Fatal("same-input legacy replay changed durable state")
+			}
+			if _, _, err := test.replay(context.Background(), h.service, project, agent, task, requestID, message.Body+" changed"); !core.IsCode(err, core.CodeVersionConflict) {
+				t.Fatalf("different-input legacy replay error = %v, want VERSION_CONFLICT", err)
+			}
+			if after := h.durableSignature(t, project.ID); after != before {
+				t.Fatal("different-input legacy replay changed durable state")
+			}
+		})
+	}
+}
+
+func legacyFingerprint(t *testing.T, value any) string {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }
 
 func TestCT07KindErrorsRemainStableWhileTaskIsFinishing(t *testing.T) {

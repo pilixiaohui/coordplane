@@ -284,7 +284,7 @@ func (m *WorkspaceManager) Capture(ctx context.Context, spec CaptureSpec) (fact 
 	}
 
 	importRef := "refs/coordplane/imports/" + spec.Workspace.TaskID + "/" + spec.RunID
-	if _, err := m.initializer.git(ctx,
+	if _, err := m.git(ctx, "import capture handoff",
 		"-c", "protocol.file.allow=always", "--git-dir="+spec.ControlRepoPath,
 		"fetch", "--force", "--no-tags", "--no-write-fetch-head", handoff.ReadyBundle, "HEAD:"+importRef,
 	); err != nil {

@@ -983,7 +983,7 @@ func (m *WorkspaceManager) git(ctx context.Context, operation string, args ...st
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
-		return "", fmt.Errorf("%s failed: %w", operation, err)
+		return "", errors.New(operation + " failed")
 	}
 	return output, nil
 }
@@ -1005,6 +1005,14 @@ func (m *WorkspaceManager) publicError(operation string, cause error) error {
 		return nil
 	}
 	message := cause.Error()
+	var invariantError *InvariantError
+	var commandError *gitCommandError
+	switch {
+	case errors.As(cause, &invariantError):
+		message = "gitrepo: " + invariantError.message
+	case errors.As(cause, &commandError):
+		message = "git operation failed"
+	}
 	var replacements []struct{ old, new string }
 	if m != nil {
 		replacements = append(replacements, struct{ old, new string }{m.root, "<workspace-root>"})
