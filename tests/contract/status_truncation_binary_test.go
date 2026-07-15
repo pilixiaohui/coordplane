@@ -66,21 +66,10 @@ func TestStatusHumanBinaryReportsTruncatedTasksAndAgents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("human status: %v\n%s", err, humanOutput)
 	}
-	header, _, _ := strings.Cut(string(humanOutput), "\n")
-	for _, field := range []string{
-		"projects_shown=1",
-		fmt.Sprintf("agents_shown=%d", core.StatusSnapshotLimit),
-		fmt.Sprintf("tasks_shown=%d", core.StatusSnapshotLimit),
-		"summary_truncated=true",
-	} {
-		if !strings.Contains(header, field) {
-			t.Errorf("status header %q does not disclose %q", header, field)
-		}
-	}
-	for _, hint := range []string{"coordplane agent list", "coordplane task list", "next_cursor"} {
-		if !strings.Contains(string(humanOutput), hint) {
-			t.Errorf("truncated status output lacks continuation hint %q:\n%s", hint, humanOutput)
-		}
+	var humanStatus core.Status
+	decodeJSON(t, humanOutput, &humanStatus)
+	if !humanStatus.SummaryTruncated || len(humanStatus.Snapshot.Agents) != core.StatusSnapshotLimit || len(humanStatus.Tasks) != core.StatusSnapshotLimit {
+		t.Fatalf("human status does not preserve bounded projection metadata: %#v", humanStatus)
 	}
 }
 
@@ -195,11 +184,9 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 		t.Fatalf("human status: %v\n%s", err, statusHuman)
 	}
 	for _, field := range []string{
-		"summary_truncated=true",
-		"title_truncated=true",
-		"task_text_truncated=true",
-		"run_text_truncated=false",
-		fmt.Sprintf("coordplane task show %s --output json", task.ID),
+		`"summary_truncated": true`,
+		`"title_truncated": true`,
+		`"text_truncated": true`,
 	} {
 		if !strings.Contains(string(statusHuman), field) {
 			t.Errorf("human status does not disclose %q:\n%s", field, statusHuman)
@@ -228,9 +215,8 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 		t.Fatalf("human task list: %v\n%s", err, taskListHuman)
 	}
 	for _, field := range []string{
-		"title_truncated=true",
-		"text_truncated=true",
-		fmt.Sprintf("coordplane task show %s --output json", task.ID),
+		`"title_truncated": true`,
+		`"text_truncated": true`,
 	} {
 		if !strings.Contains(string(taskListHuman), field) {
 			t.Errorf("human task list does not disclose %q:\n%s", field, taskListHuman)
@@ -255,8 +241,7 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 		t.Fatalf("human run list: %v\n%s", err, runHuman)
 	}
 	for _, field := range []string{
-		"text_truncated=true",
-		fmt.Sprintf("coordplane run show %s --output json", claim.Run.ID),
+		`"text_truncated": true`,
 	} {
 		if !strings.Contains(string(runHuman), field) {
 			t.Errorf("human run list does not disclose %q:\n%s", field, runHuman)

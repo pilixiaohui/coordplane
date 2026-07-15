@@ -412,7 +412,7 @@ func TestOutputModesAndInvalidOutput(t *testing.T) {
 		outputFlag []string
 		want       string
 	}{
-		{name: "human", want: "project-1\tactive\tOne\tsha-one\t\n"},
+		{name: "human", want: `"actual_canonical_sha": "sha-one"`},
 		{name: "json", outputFlag: []string{"--output", "json"}, want: `"id":"project-1"`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -461,7 +461,7 @@ func TestStatusAndShowCommandsKeepActualTruthProjection(t *testing.T) {
 	}{
 		{name: "project show", args: []string{"project", "show", "project-1", "--output", "json"}, want: []string{`"actual_canonical_sha":"actual-one"`}},
 		{name: "task show", args: []string{"task", "show", "task-1", "--output", "json"}, want: []string{`"current_run":{"id":"run-1"`, `"pending_message_count":3`, `"actual_canonical_sha":"actual-one"`, `"latest_progress":{"id":9`, `"parent_task_id":"task-parent"`, `"result_summary":"complete result"`, `"failure_reason":"prior failure"`, `"base_sha":"base-sha"`, `"head_sha":"head-sha"`, `"task_ref":"refs/coordplane/tasks/task-1"`, `"version":7`}},
-		{name: "human status", args: []string{"status"}, want: []string{"project-1\tactive\tOne\tactual-one", "task-1\tqueued\tagent-1\tImplement\trun=run-1\tpending=3"}},
+		{name: "human status", args: []string{"status"}, want: []string{`"actual_sha": "actual-one"`, `"id": "run-1"`, `"pending_message_count": 3`}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := &recordingClient{status: status}

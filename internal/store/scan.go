@@ -162,127 +162,50 @@ func scanAgentSummary(row scanner) (core.AgentSummary, error) {
 }
 
 func collectProjects(rows *sql.Rows) ([]core.Project, error) {
-	defer rows.Close()
-	var projects []core.Project
-	for rows.Next() {
-		project, err := scanProject(rows)
-		if err != nil {
-			return nil, err
-		}
-		projects = append(projects, project)
-	}
-	return projects, rows.Err()
+	return collectRows(rows, scanProject)
 }
 
 func collectAgents(rows *sql.Rows) ([]core.Agent, error) {
-	defer rows.Close()
-	var agents []core.Agent
-	for rows.Next() {
-		agent, err := scanAgent(rows)
-		if err != nil {
-			return nil, err
-		}
-		agents = append(agents, agent)
-	}
-	return agents, rows.Err()
+	return collectRows(rows, scanAgent)
 }
 
 func collectTasks(rows *sql.Rows) ([]core.Task, error) {
-	defer rows.Close()
-	var tasks []core.Task
-	for rows.Next() {
-		task, err := scanTask(rows)
-		if err != nil {
-			return nil, err
-		}
-		tasks = append(tasks, task)
-	}
-	return tasks, rows.Err()
+	return collectRows(rows, scanTask)
 }
 
 func collectRuns(rows *sql.Rows) ([]core.Run, error) {
-	defer rows.Close()
-	var runs []core.Run
-	for rows.Next() {
-		run, err := scanRun(rows)
-		if err != nil {
-			return nil, err
-		}
-		runs = append(runs, run)
-	}
-	return runs, rows.Err()
+	return collectRows(rows, scanRun)
 }
 
 func collectMessages(rows *sql.Rows) ([]core.Message, error) {
-	defer rows.Close()
-	var messages []core.Message
-	for rows.Next() {
-		message, err := scanMessage(rows)
-		if err != nil {
-			return nil, err
-		}
-		messages = append(messages, message)
-	}
-	return messages, rows.Err()
+	return collectRows(rows, scanMessage)
 }
 
 func collectEvents(rows *sql.Rows) ([]core.Event, error) {
-	defer rows.Close()
-	var events []core.Event
-	for rows.Next() {
-		event, err := scanEvent(rows)
-		if err != nil {
-			return nil, err
-		}
-		events = append(events, event)
-	}
-	return events, rows.Err()
+	return collectRows(rows, scanEvent)
 }
 
 func collectTaskSummaries(rows *sql.Rows) ([]core.TaskSummary, error) {
-	defer rows.Close()
-	var items []core.TaskSummary
-	for rows.Next() {
-		item, err := scanTaskSummary(rows)
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, item)
-	}
-	return items, rows.Err()
+	return collectRows(rows, scanTaskSummary)
 }
 
 func collectRunSummaries(rows *sql.Rows) ([]core.RunSummary, error) {
-	defer rows.Close()
-	var items []core.RunSummary
-	for rows.Next() {
-		item, err := scanRunSummary(rows)
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, item)
-	}
-	return items, rows.Err()
+	return collectRows(rows, scanRunSummary)
 }
 
 func collectProjectSummaries(rows *sql.Rows) ([]core.ProjectSummary, error) {
-	defer rows.Close()
-	var items []core.ProjectSummary
-	for rows.Next() {
-		item, err := scanProjectSummary(rows)
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, item)
-	}
-	return items, rows.Err()
+	return collectRows(rows, scanProjectSummary)
 }
 
 func collectAgentSummaries(rows *sql.Rows) ([]core.AgentSummary, error) {
+	return collectRows(rows, scanAgentSummary)
+}
+
+func collectRows[T any](rows *sql.Rows, scan func(scanner) (T, error)) ([]T, error) {
 	defer rows.Close()
-	var items []core.AgentSummary
+	var items []T
 	for rows.Next() {
-		item, err := scanAgentSummary(rows)
+		item, err := scan(rows)
 		if err != nil {
 			return nil, err
 		}
