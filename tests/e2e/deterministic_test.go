@@ -296,8 +296,18 @@ func waitForReady(t *testing.T, ctx context.Context, binary, socket, reason stri
 
 func waitForConcurrentRuns(t *testing.T, ctx context.Context, binary, socket, taskA, taskB string) (core.Run, core.Run) {
 	t.Helper()
+	return waitForConcurrentRunsWithProgress(t, ctx, binary, socket, taskA, taskB, "P5-READY", 45*time.Second)
+}
+
+func waitForConcurrentRunsWithProgress(
+	t *testing.T,
+	ctx context.Context,
+	binary, socket, taskA, taskB, progress string,
+	timeout time.Duration,
+) (core.Run, core.Run) {
+	t.Helper()
 	type pair struct{ A, B core.Run }
-	result := eventually(t, ctx, 45*time.Second, "two active Docker Runs with P5-READY", func() (pair, bool, string) {
+	result := eventually(t, ctx, timeout, "two active Docker Runs with "+progress, func() (pair, bool, string) {
 		a, err := commandJSON[core.TaskDetail](ctx, binary, "task", "show", taskA, "--socket", socket, "--output", "json")
 		if err != nil {
 			return pair{}, false, err.Error()
@@ -309,7 +319,7 @@ func waitForConcurrentRuns(t *testing.T, ctx context.Context, binary, socket, ta
 		ready := func(detail core.TaskDetail) bool {
 			return detail.Task.Status == core.TaskRunning && detail.CurrentRun != nil &&
 				detail.CurrentRun.State == core.RunActive && detail.CurrentRun.ContainerID != "" &&
-				detail.LatestProgress != nil && strings.Contains(detail.LatestProgress.PayloadJSON, "P5-READY")
+				detail.LatestProgress != nil && strings.Contains(detail.LatestProgress.PayloadJSON, progress)
 		}
 		if !ready(a) || !ready(b) {
 			return pair{}, false, fmt.Sprintf("A=%s/%v B=%s/%v", a.Task.Status, a.CurrentRun != nil, b.Task.Status, b.CurrentRun != nil)
@@ -464,7 +474,7 @@ func inspectContainer(t *testing.T, ctx context.Context, id string) dockerInspec
 	raw := runOutput(t, ctx, "", "docker", "inspect", id)
 	var values []dockerInspection
 	if err := json.Unmarshal(raw, &values); err != nil || len(values) != 1 {
-		t.Fatalf("decode docker inspect for %s: %v\n%s", id, err, raw)
+		t.Fatalf("decode docker inspect for %s: %v (documents=%d)", id, err, len(values))
 	}
 	return values[0]
 }
