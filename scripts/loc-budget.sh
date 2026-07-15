@@ -22,7 +22,8 @@ case "$output" in
   *) output=$PWD/$output ;;
 esac
 
-root=$(git rev-parse --show-toplevel)
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+git -C "$root" rev-parse --is-inside-work-tree >/dev/null
 cd "$root"
 manifest=scripts/loc-manifest.tsv
 generated_manifest=scripts/generated-manifest.json
