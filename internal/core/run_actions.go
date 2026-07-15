@@ -28,17 +28,13 @@ func (s *Service) requestRunStop(ctx context.Context, input RunStopInput, actor 
 	if err != nil {
 		return Run{}, err
 	}
+	dedupe := requestDedupe{actor, "run.stop", requestID, inputHash}
 	var run Run
 	err = s.repository.Transact(ctx, func(tx Transaction) error {
-		actorScope := actor
-		if raw, ok, err := tx.Dedupe(actorScope, "run.stop", requestID); err != nil {
+		if replay, ok, err := dedupe.replay(tx); err != nil {
 			return err
 		} else if ok {
-			result, err := decodeDedupe(raw, inputHash)
-			if err != nil {
-				return err
-			}
-			run, err = tx.Run(result.ID)
+			run, err = tx.Run(replay.ID)
 			return err
 		}
 		run, err = tx.Run(runID)
@@ -74,11 +70,7 @@ func (s *Service) requestRunStop(ctx context.Context, input RunStopInput, actor 
 		} else if run.StopReason != reason || (requestedOperationID != "" && run.StopOperationID != requestedOperationID) {
 			return Conflict(CodeActionInProgress, "a different run stop is already requested", string(run.State), run.Version)
 		}
-		raw, err := encodeDedupe(run.ID, "", inputHash)
-		if err != nil {
-			return err
-		}
-		return tx.PutDedupe(actorScope, "run.stop", requestID, raw, now)
+		return dedupe.record(tx, run.ID, "", now)
 	})
 	return run, err
 }

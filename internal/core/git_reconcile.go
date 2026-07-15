@@ -558,22 +558,14 @@ func integrationSourceFence(source, integration Task) error {
 }
 
 func (s *Service) insertGitTaskMessage(tx Transaction, task Task, code, body, now string) error {
-	messageID, err := s.requiredID("msg")
-	if err != nil {
-		return err
-	}
-	message := Message{
-		ID: messageID, ProjectID: task.ProjectID, TaskID: task.ID,
-		SenderKind: "system", RecipientKind: "agent", RecipientID: task.AssigneeAgentID,
-		SystemCode: code, Body: boundedDurableText(body, MaximumMessageBodyBytes), Wake: true,
-		State: MessagePending, MaxDeliveries: 3, NextDeliveryAt: now,
-		IdempotencyKey: code + ":" + task.ID + ":" + fmt.Sprint(task.Version),
-		Version:        1, CreatedAt: now,
-	}
-	if err := tx.InsertMessage(message); err != nil {
-		return err
-	}
-	_, err = tx.AppendEvent(event(task.ProjectID, "message", message.ID, "message.created", "system", "", "", "", "", eventPayload(map[string]any{"task_id": task.ID, "system_code": code}), now))
+	_, err := s.insertMessage(tx, messageInsert{
+		projectID: task.ProjectID, taskID: task.ID, senderKind: "system",
+		recipientKind: "agent", recipientID: task.AssigneeAgentID,
+		systemCode: code, body: boundedDurableText(body, MaximumMessageBodyBytes), wake: true,
+		maxDeliveries: 3, idempotencyKey: code + ":" + task.ID + ":" + fmt.Sprint(task.Version),
+		actor: taskMutationActor{kind: "system"}, now: now,
+		payload: eventPayload(map[string]any{"task_id": task.ID, "system_code": code}),
+	})
 	return err
 }
 

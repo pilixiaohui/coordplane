@@ -29,6 +29,7 @@ func (s *Service) AddProject(ctx context.Context, input AddProjectInput) (Projec
 	if err != nil {
 		return Project{}, err
 	}
+	dedupe := requestDedupe{"boss", "project.add", requestID, inputHash}
 	if existing, ok, err := s.dedupedProject(ctx, "project.add", requestID, inputHash); err != nil || ok {
 		if err == nil && existing.Status == ProjectError {
 			err = replayProjectGitFailure(existing.LastError)
@@ -59,14 +60,10 @@ func (s *Service) AddProject(ctx context.Context, input AddProjectInput) (Projec
 	}
 	created := false
 	err = s.repository.Transact(ctx, func(tx Transaction) error {
-		if raw, ok, err := tx.Dedupe("boss", "project.add", requestID); err != nil {
+		if replay, ok, err := dedupe.replay(tx); err != nil {
 			return err
 		} else if ok {
-			result, err := decodeDedupe(raw, inputHash)
-			if err != nil {
-				return err
-			}
-			project, err = tx.Project(result.ID)
+			project, err = tx.Project(replay.ID)
 			return err
 		}
 		if _, err := tx.ProjectByName(name); err == nil {
@@ -89,11 +86,7 @@ func (s *Service) AddProject(ctx context.Context, input AddProjectInput) (Projec
 		if _, err := tx.AppendEvent(event(project.ID, "project", project.ID, "project.creating", "boss", "", "", requestID, operationID, eventPayload(map[string]any{"initial_sha": project.InitialSHA}), now)); err != nil {
 			return err
 		}
-		raw, err := encodeDedupe(project.ID, "", inputHash)
-		if err != nil {
-			return err
-		}
-		if err := tx.PutDedupe("boss", "project.add", requestID, raw, now); err != nil {
+		if err := dedupe.record(tx, project.ID, "", now); err != nil {
 			return err
 		}
 		created = true
@@ -120,6 +113,7 @@ func (s *Service) RepairProject(ctx context.Context, projectID, requestID string
 	if err != nil {
 		return Project{}, err
 	}
+	dedupe := requestDedupe{"boss", "project.repair", requestID, inputHash}
 	if existing, ok, err := s.dedupedProject(ctx, "project.repair", requestID, inputHash); err != nil || ok {
 		if err == nil && existing.Status == ProjectError {
 			err = replayProjectGitFailure(existing.LastError)
@@ -159,11 +153,7 @@ func (s *Service) RepairProject(ctx context.Context, projectID, requestID string
 		if _, err := tx.AppendEvent(event(project.ID, "project", project.ID, "project.creating", "boss", "", "", requestID, operationID, eventPayload(map[string]any{"action": action}), now)); err != nil {
 			return err
 		}
-		raw, err := encodeDedupe(project.ID, "", inputHash)
-		if err != nil {
-			return err
-		}
-		return tx.PutDedupe("boss", "project.repair", requestID, raw, now)
+		return dedupe.record(tx, project.ID, "", now)
 	})
 	if err != nil {
 		return Project{}, err

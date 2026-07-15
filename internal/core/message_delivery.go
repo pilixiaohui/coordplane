@@ -28,6 +28,7 @@ func (s *Service) RecordMessagesDelivered(ctx context.Context, input MessageDeli
 	if err != nil {
 		return nil, err
 	}
+	dedupe := requestDedupe{"daemon:run:" + runID, "message.deliver", requestID, inputHash}
 
 	var delivered []Message
 	err = s.repository.Transact(ctx, func(tx Transaction) error {
@@ -35,13 +36,9 @@ func (s *Service) RecordMessagesDelivered(ctx context.Context, input MessageDeli
 		if err != nil {
 			return err
 		}
-		actorScope := "daemon:run:" + run.ID
-		if raw, ok, err := tx.Dedupe(actorScope, "message.deliver", requestID); err != nil {
+		if _, ok, err := dedupe.replay(tx); err != nil {
 			return err
 		} else if ok {
-			if _, err := decodeDedupe(raw, inputHash); err != nil {
-				return err
-			}
 			delivered, err = loadMessages(tx, messageIDs)
 			return err
 		}
@@ -101,11 +98,7 @@ func (s *Service) RecordMessagesDelivered(ctx context.Context, input MessageDeli
 			}
 			delivered = append(delivered, message)
 		}
-		raw, err := encodeDedupe(run.ID, "", inputHash)
-		if err != nil {
-			return err
-		}
-		return tx.PutDedupe(actorScope, "message.deliver", requestID, raw, now)
+		return dedupe.record(tx, run.ID, "", now)
 	})
 	return delivered, err
 }

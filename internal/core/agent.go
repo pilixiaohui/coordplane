@@ -39,16 +39,13 @@ func (s *Service) AddAgent(ctx context.Context, input AddAgentInput) (Agent, err
 	if err != nil {
 		return Agent{}, err
 	}
+	dedupe := requestDedupe{"boss", "agent.add", requestID, inputHash}
 	var agent Agent
 	err = s.repository.Transact(ctx, func(tx Transaction) error {
-		if raw, ok, err := tx.Dedupe("boss", "agent.add", requestID); err != nil {
+		if replay, ok, err := dedupe.replay(tx); err != nil {
 			return err
 		} else if ok {
-			result, err := decodeDedupe(raw, inputHash)
-			if err != nil {
-				return err
-			}
-			agent, err = tx.Agent(result.ID)
+			agent, err = tx.Agent(replay.ID)
 			return err
 		}
 		agentID := requestedID
@@ -76,11 +73,7 @@ func (s *Service) AddAgent(ctx context.Context, input AddAgentInput) (Agent, err
 		if _, err := tx.AppendEvent(event("", "agent", agent.ID, "agent.created", "boss", "", "", requestID, "", "{}", now)); err != nil {
 			return err
 		}
-		raw, err := encodeDedupe(agent.ID, "", inputHash)
-		if err != nil {
-			return err
-		}
-		return tx.PutDedupe("boss", "agent.add", requestID, raw, now)
+		return dedupe.record(tx, agent.ID, "", now)
 	})
 	return agent, err
 }

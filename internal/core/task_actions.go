@@ -255,20 +255,18 @@ func (s *Service) applyTaskMutation(ctx context.Context, input TaskActionInput, 
 	if err != nil {
 		return Task{}, err
 	}
+	dedupe := requestDedupe{"", operation, requestID, inputHash}
 	var task Task
 	err = s.repository.Transact(ctx, func(tx Transaction) error {
 		actor, err := s.taskActorForDedupe(tx, input.Token)
 		if err != nil {
 			return err
 		}
-		if raw, ok, err := tx.Dedupe(actor.dedupeScope, operation, requestID); err != nil {
+		dedupe.scope = actor.dedupeScope
+		if replay, ok, err := dedupe.replay(tx); err != nil {
 			return err
 		} else if ok {
-			result, err := decodeDedupe(raw, inputHash)
-			if err != nil {
-				return err
-			}
-			task, err = tx.Task(result.ID)
+			task, err = tx.Task(replay.ID)
 			return err
 		}
 		task, err = tx.Task(taskID)
@@ -286,11 +284,7 @@ func (s *Service) applyTaskMutation(ctx context.Context, input TaskActionInput, 
 		if err := mutate(tx, &task, actor, requestID, now); err != nil {
 			return err
 		}
-		raw, err := encodeDedupe(task.ID, "", inputHash)
-		if err != nil {
-			return err
-		}
-		return tx.PutDedupe(actor.dedupeScope, operation, requestID, raw, now)
+		return dedupe.record(tx, task.ID, "", now)
 	})
 	return task, err
 }

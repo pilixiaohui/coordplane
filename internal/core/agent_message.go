@@ -39,6 +39,7 @@ func (s *Service) SendAgentMessage(ctx context.Context, input SendMessageInput) 
 	if err != nil {
 		return Message{}, err
 	}
+	dedupe := requestDedupe{"", "message.send", requestID, inputHash}
 
 	var message Message
 	err = s.repository.Transact(ctx, func(tx Transaction) error {
@@ -47,14 +48,11 @@ func (s *Service) SendAgentMessage(ctx context.Context, input SendMessageInput) 
 			return err
 		}
 		actorScope := "run:" + scope.ID
-		if raw, ok, err := tx.Dedupe(actorScope, "message.send", requestID); err != nil {
+		dedupe.scope = actorScope
+		if replay, ok, err := dedupe.replay(tx); err != nil {
 			return err
 		} else if ok {
-			result, err := decodeDedupe(raw, inputHash)
-			if err != nil {
-				return err
-			}
-			message, err = tx.Message(result.ID)
+			message, err = tx.Message(replay.ID)
 			return err
 		}
 		run, current, err := s.authenticateRun(tx, input.Token)
@@ -129,32 +127,21 @@ func (s *Service) SendAgentMessage(ctx context.Context, input SendMessageInput) 
 			}
 		}
 
-		messageID, err := s.requiredID("msg")
-		if err != nil {
-			return err
-		}
 		maxDeliveries := 1
 		if recipientKind == "agent" {
 			maxDeliveries = 3
 		}
-		message = Message{
-			ID: messageID, ProjectID: current.ProjectID, TaskID: deliveryTask.ID,
-			RelatedTaskID: relatedTaskID, SenderKind: "agent", SenderID: run.AgentID,
-			RecipientKind: recipientKind, RecipientID: recipientID, ReplyToMessageID: replyToID,
-			Body: body, Wake: input.Wake, State: MessagePending, MaxDeliveries: maxDeliveries,
-			NextDeliveryAt: now, IdempotencyKey: requestID, Version: 1, CreatedAt: now,
-		}
-		if err := tx.InsertMessage(message); err != nil {
-			return err
-		}
-		if _, err := tx.AppendEvent(event(current.ProjectID, "message", message.ID, "message.created", "agent", run.AgentID, run.ID, requestID, "", "{}", now)); err != nil {
-			return err
-		}
-		raw, err := encodeDedupe(message.ID, "", inputHash)
+		message, err = s.insertMessage(tx, messageInsert{
+			projectID: current.ProjectID, taskID: deliveryTask.ID, relatedTaskID: relatedTaskID,
+			senderKind: "agent", senderID: run.AgentID, recipientKind: recipientKind, recipientID: recipientID,
+			replyTo: replyToID, body: body, wake: input.Wake, maxDeliveries: maxDeliveries,
+			idempotencyKey: requestID, actor: taskMutationActor{kind: "agent", id: run.AgentID, runID: run.ID},
+			requestID: requestID, now: now,
+		})
 		if err != nil {
 			return err
 		}
-		return tx.PutDedupe(actorScope, "message.send", requestID, raw, now)
+		return dedupe.record(tx, message.ID, "", now)
 	})
 	return message, err
 }

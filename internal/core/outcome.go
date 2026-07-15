@@ -51,6 +51,7 @@ func (s *Service) RequestOutcome(ctx context.Context, input OutcomeInput) (Outco
 	if err != nil {
 		return OutcomeResult{}, err
 	}
+	dedupe := requestDedupe{"", "task.outcome", requestID, inputHash}
 
 	var result OutcomeResult
 	err = s.repository.Transact(ctx, func(tx Transaction) error {
@@ -59,19 +60,15 @@ func (s *Service) RequestOutcome(ctx context.Context, input OutcomeInput) (Outco
 			return err
 		}
 		actorScope := "run:" + scope.ID
-		operation := "task.outcome"
-		if raw, ok, err := tx.Dedupe(actorScope, operation, requestID); err != nil {
+		dedupe.scope = actorScope
+		if replay, ok, err := dedupe.replay(tx); err != nil {
 			return err
 		} else if ok {
-			dedupe, err := decodeDedupe(raw, inputHash)
+			result.Run, err = tx.Run(replay.ID)
 			if err != nil {
 				return err
 			}
-			result.Run, err = tx.Run(dedupe.ID)
-			if err != nil {
-				return err
-			}
-			result.Task, err = tx.Task(dedupe.RelatedID)
+			result.Task, err = tx.Task(replay.RelatedID)
 			if err != nil {
 				return err
 			}
@@ -143,11 +140,7 @@ func (s *Service) RequestOutcome(ctx context.Context, input OutcomeInput) (Outco
 				return err
 			}
 		}
-		raw, err := encodeDedupe(run.ID, task.ID, inputHash)
-		if err != nil {
-			return err
-		}
-		if err := tx.PutDedupe(actorScope, operation, requestID, raw, now); err != nil {
+		if err := dedupe.record(tx, run.ID, task.ID, now); err != nil {
 			return err
 		}
 		result = OutcomeResult{Task: task, Run: run, Acknowledged: acknowledged}

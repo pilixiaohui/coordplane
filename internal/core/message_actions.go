@@ -17,16 +17,13 @@ func (s *Service) RetryMessage(ctx context.Context, messageID, requestID string)
 	if err != nil {
 		return Message{}, err
 	}
+	dedupe := requestDedupe{"boss", "message.retry", requestID, inputHash}
 	var message Message
 	err = s.repository.Transact(ctx, func(tx Transaction) error {
-		if raw, ok, err := tx.Dedupe("boss", "message.retry", requestID); err != nil {
+		if replay, ok, err := dedupe.replay(tx); err != nil {
 			return err
 		} else if ok {
-			result, err := decodeDedupe(raw, inputHash)
-			if err != nil {
-				return err
-			}
-			message, err = tx.Message(result.ID)
+			message, err = tx.Message(replay.ID)
 			return err
 		}
 		message, err = tx.Message(messageID)
@@ -71,11 +68,7 @@ func (s *Service) RetryMessage(ctx context.Context, messageID, requestID string)
 		if _, err := tx.AppendEvent(event(message.ProjectID, "message", message.ID, "message.retry_enabled", "boss", "", "", requestID, "", "{}", now)); err != nil {
 			return err
 		}
-		raw, err := encodeDedupe(message.ID, "", inputHash)
-		if err != nil {
-			return err
-		}
-		return tx.PutDedupe("boss", "message.retry", requestID, raw, now)
+		return dedupe.record(tx, message.ID, "", now)
 	})
 	return message, err
 }

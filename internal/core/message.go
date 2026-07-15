@@ -5,157 +5,133 @@ import (
 	"strings"
 )
 
+type bossAgentMessage struct {
+	projectID, agentID, taskID, relatedTaskID string
+	body, replyTo                             string
+	wake                                      bool
+	ackIDs                                    []string
+	requestID, operation                      string
+}
+
 func (s *Service) Chat(ctx context.Context, input ChatInput) (ChatResult, error) {
-	projectID, err := requireText("project_id", input.ProjectID)
+	request, err := s.bossAgentMessage(input.ProjectID, input.AgentID, "", input.RelatedTask,
+		input.Body, input.ReplyTo, input.Wake, input.AckMessageIDs, input.RequestID, "chat.send")
 	if err != nil {
 		return ChatResult{}, err
 	}
-	agentID, err := requireText("agent_id", input.AgentID)
-	if err != nil {
-		return ChatResult{}, err
+	task, message, err := s.sendBossAgentMessage(ctx, request)
+	return ChatResult{Task: task, Message: message}, err
+}
+
+func (s *Service) bossAgentMessage(
+	projectID, agentID, taskID, relatedTaskID, body, replyTo string,
+	wake bool, ackIDs []string, requestID, operation string,
+) (bossAgentMessage, error) {
+	var result bossAgentMessage
+	var err error
+	if result.projectID, err = requireText("project_id", projectID); err != nil {
+		return result, err
 	}
-	body, err := requireText("body", input.Body)
-	if err != nil {
-		return ChatResult{}, err
+	if result.agentID, err = requireText("agent_id", agentID); err != nil {
+		return result, err
 	}
-	ackIDs, err := canonicalMessageIDs(input.AckMessageIDs)
-	if err != nil {
-		return ChatResult{}, err
+	if result.body, err = requireText("body", body); err != nil {
+		return result, err
 	}
-	requestID, err := s.requestID(input.RequestID)
-	if err != nil {
-		return ChatResult{}, err
+	if result.ackIDs, err = canonicalMessageIDs(ackIDs); err != nil {
+		return result, err
 	}
-	relatedTaskID := strings.TrimSpace(input.RelatedTask)
-	replyToID := strings.TrimSpace(input.ReplyTo)
+	if result.requestID, err = s.requestID(requestID); err != nil {
+		return result, err
+	}
+	result.taskID, result.relatedTaskID = strings.TrimSpace(taskID), strings.TrimSpace(relatedTaskID)
+	result.replyTo, result.wake, result.operation = strings.TrimSpace(replyTo), wake, operation
+	return result, nil
+}
+
+func (s *Service) sendBossAgentMessage(ctx context.Context, input bossAgentMessage) (Task, Message, error) {
 	inputHash, err := inputFingerprint(struct {
-		ProjectID, AgentID, Body, RelatedTaskID, ReplyToID, AckIDs string
-		Wake                                                       bool
-	}{projectID, agentID, body, relatedTaskID, replyToID, strings.Join(ackIDs, "\x00"), input.Wake})
+		ProjectID, AgentID, TaskID, RelatedTaskID, Body, ReplyTo, AckIDs string
+		Wake                                                             bool
+	}{input.projectID, input.agentID, input.taskID, input.relatedTaskID, input.body,
+		input.replyTo, strings.Join(input.ackIDs, "\x00"), input.wake})
 	if err != nil {
-		return ChatResult{}, err
+		return Task{}, Message{}, err
 	}
-	var result ChatResult
+	dedupe := requestDedupe{"boss", input.operation, input.requestID, inputHash}
+	var task Task
+	var message Message
 	err = s.repository.Transact(ctx, func(tx Transaction) error {
-		if raw, ok, err := tx.Dedupe("boss", "chat.send", requestID); err != nil {
+		if replay, ok, err := dedupe.replay(tx); err != nil {
 			return err
 		} else if ok {
-			dedupe, err := decodeDedupe(raw, inputHash)
-			if err != nil {
-				return err
+			message, err = tx.Message(replay.ID)
+			if err == nil {
+				task, err = tx.Task(message.TaskID)
 			}
-			result.Task, err = tx.Task(dedupe.ID)
-			if err != nil {
-				return err
-			}
-			result.Message, err = tx.Message(dedupe.RelatedID)
 			return err
 		}
-		project, err := tx.Project(projectID)
+		project, err := tx.Project(input.projectID)
 		if err != nil {
 			return err
 		}
 		if project.Status != ProjectActive {
 			return Conflict(CodeInvalidState, "project is not active", string(project.Status), project.Version)
 		}
-		agent, err := tx.Agent(agentID)
+		agent, err := tx.Agent(input.agentID)
 		if err != nil {
 			return err
 		}
 		if agent.Status == AgentArchived {
 			return Conflict(CodeInvalidState, "archived agent cannot receive messages", string(agent.Status), agent.Version)
 		}
-		if relatedTaskID != "" {
-			related, err := tx.Task(relatedTaskID)
-			if err != nil {
-				return err
-			}
-			if related.ProjectID != projectID {
-				return NewError(CodeScopeDenied, "related task belongs to another project", false)
-			}
-		}
-		if replyToID != "" {
-			repliedTo, err := tx.Message(replyToID)
-			if err != nil {
-				return err
-			}
-			if repliedTo.ProjectID != projectID {
-				return NewError(CodeScopeDenied, "reply message belongs to another project", false)
-			}
+		if err := bossMessageScope(tx, input.projectID, input.relatedTaskID, input.replyTo); err != nil {
+			return err
 		}
 		now := s.nowText()
-		if err := s.acknowledgeForActor(tx, ackIDs, projectID, taskMutationActor{kind: "boss"}, requestID, now); err != nil {
+		actor := taskMutationActor{kind: "boss"}
+		if err := s.acknowledgeForActor(tx, input.ackIDs, input.projectID, actor, input.requestID, now); err != nil {
 			return err
 		}
-		conversation, err := tx.Conversation(projectID, agentID)
-		if IsCode(err, CodeNotFound) {
-			taskID, idErr := s.requiredID("tsk")
-			if idErr != nil {
-				return idErr
-			}
-			status := TaskWaiting
-			if input.Wake {
-				status = TaskQueued
-			}
-			conversation = Task{
-				ID: taskID, ProjectID: projectID, Kind: TaskConversation,
-				CreatedByKind: "boss", AssigneeAgentID: agentID,
-				Title:       "Conversation with " + agent.DisplayName,
-				Description: "Persistent Boss conversation", Status: status,
-				NextRunAt: now, MaxRetries: 3, Version: 1, CreatedAt: now, UpdatedAt: now,
-			}
-			if err := tx.InsertTask(conversation); err != nil {
-				return err
-			}
-			payload := eventPayload(map[string]any{"kind": TaskConversation})
-			if _, err := tx.AppendEvent(event(projectID, "task", conversation.ID, "task.created", "boss", "", "", requestID, "", payload, now)); err != nil {
-				return err
-			}
-		} else if err != nil {
-			return err
-		} else if conversation.Status == TaskFailed {
-			return Conflict(CodeInvalidState, "failed conversation must be retried or cancelled", string(conversation.Status), conversation.Version)
-		} else if conversation.Status == TaskWaiting && input.Wake {
-			expectedVersion := conversation.Version
-			conversation.Status = TaskQueued
-			conversation.Version++
-			conversation.UpdatedAt = now
-			conversation.NextRunAt = now
-			if err := tx.UpdateTask(conversation, expectedVersion, TaskWaiting); err != nil {
-				return err
-			}
-			if _, err := tx.AppendEvent(event(projectID, "task", conversation.ID, "task.requeued", "boss", "", "", requestID, "", `{"reason":"boss_message"}`, now)); err != nil {
-				return err
-			}
-		}
-		messageID, err := s.requiredID("msg")
+		task, input.relatedTaskID, err = s.agentDeliveryTask(tx, input.projectID, "", agent,
+			input.taskID, input.relatedTaskID, input.wake, "boss", "", "", "boss_message", input.requestID, now)
 		if err != nil {
 			return err
 		}
-		message := Message{
-			ID: messageID, ProjectID: projectID, TaskID: conversation.ID,
-			RelatedTaskID: relatedTaskID, SenderKind: "boss",
-			RecipientKind: "agent", RecipientID: agentID, ReplyToMessageID: replyToID,
-			Body: body, Wake: input.Wake, State: MessagePending, MaxDeliveries: 3,
-			NextDeliveryAt: now, IdempotencyKey: requestID, Version: 1, CreatedAt: now,
-		}
-		if err := tx.InsertMessage(message); err != nil {
-			return err
-		}
-		if _, err := tx.AppendEvent(event(projectID, "message", message.ID, "message.created", "boss", "", "", requestID, "", "{}", now)); err != nil {
-			return err
-		}
-		raw, err := encodeDedupe(conversation.ID, message.ID, inputHash)
+		message, err = s.insertMessage(tx, messageInsert{
+			projectID: input.projectID, taskID: task.ID, relatedTaskID: input.relatedTaskID,
+			senderKind: "boss", recipientKind: "agent", recipientID: input.agentID,
+			replyTo: input.replyTo, body: input.body, wake: input.wake, maxDeliveries: 3,
+			idempotencyKey: input.requestID, actor: actor, requestID: input.requestID, now: now,
+		})
 		if err != nil {
 			return err
 		}
-		if err := tx.PutDedupe("boss", "chat.send", requestID, raw, now); err != nil {
-			return err
-		}
-		result = ChatResult{Task: conversation, Message: message}
-		return nil
+		return dedupe.record(tx, message.ID, task.ID, now)
 	})
-	return result, err
+	return task, message, err
+}
+
+func bossMessageScope(tx Transaction, projectID, relatedTaskID, replyTo string) error {
+	if relatedTaskID != "" {
+		task, err := tx.Task(relatedTaskID)
+		if err != nil {
+			return err
+		}
+		if task.ProjectID != projectID {
+			return NewError(CodeScopeDenied, "related task belongs to another project", false)
+		}
+	}
+	if replyTo != "" {
+		message, err := tx.Message(replyTo)
+		if err != nil {
+			return err
+		}
+		if message.ProjectID != projectID {
+			return NewError(CodeScopeDenied, "reply message belongs to another project", false)
+		}
+	}
+	return nil
 }
 
 func (s *Service) AcknowledgeBossMessage(ctx context.Context, messageID, requestID string) (Message, error) {
@@ -165,7 +141,6 @@ func (s *Service) AcknowledgeBossMessage(ctx context.Context, messageID, request
 	}
 	var message Message
 	err = s.repository.Transact(ctx, func(tx Transaction) error {
-		var err error
 		message, err = tx.Message(strings.TrimSpace(messageID))
 		if err != nil {
 			return err
@@ -181,13 +156,12 @@ func (s *Service) AcknowledgeBossMessage(ctx context.Context, messageID, request
 		}
 		now := s.nowText()
 		expectedVersion, expectedState := message.Version, message.State
-		message.State = MessageAcknowledged
-		message.AcknowledgedAt = now
-		message.Version++
+		message.State, message.AcknowledgedAt, message.Version = MessageAcknowledged, now, message.Version+1
 		if err := tx.UpdateMessage(message, expectedVersion, expectedState); err != nil {
 			return err
 		}
-		_, err = tx.AppendEvent(event(message.ProjectID, "message", message.ID, "message.acknowledged", "boss", "", "", requestID, "", "{}", now))
+		_, err = tx.AppendEvent(event(message.ProjectID, "message", message.ID, "message.acknowledged",
+			"boss", "", "", requestID, "", "{}", now))
 		return err
 	})
 	return message, err

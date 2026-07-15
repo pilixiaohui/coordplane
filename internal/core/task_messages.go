@@ -143,26 +143,18 @@ func (s *Service) notifyParentOfChild(
 		"Child task %s is %s. Result: %s. Head: %s. Task ref: %s.",
 		child.ID, child.Status, child.ResultSummary, child.HeadSHA, child.TaskRef,
 	), MaximumMessageBodyBytes)
-	messageID, err := s.requiredID("msg")
-	if err != nil {
-		return err
-	}
 	maxDeliveries := 1
 	if recipientKind == "agent" {
 		maxDeliveries = 3
 	}
-	message := Message{
-		ID: messageID, ProjectID: child.ProjectID, TaskID: deliveryTaskID,
-		RelatedTaskID: child.ID, SenderKind: "system", RecipientKind: recipientKind,
-		RecipientID: recipientID, SystemCode: "child_result", Body: body, Wake: wake,
-		State: MessagePending, MaxDeliveries: maxDeliveries, NextDeliveryAt: now,
-		IdempotencyKey: "child-result:" + child.ID + ":" + string(child.Status),
-		Version:        1, CreatedAt: now,
-	}
-	if err := tx.InsertMessage(message); err != nil {
-		return err
-	}
 	payload := eventPayload(map[string]any{"child_task_id": child.ID, "child_status": child.Status})
-	_, err = tx.AppendEvent(event(child.ProjectID, "message", message.ID, "message.created", actorKind, actorID, runID, requestID, "", payload, now))
+	_, err := s.insertMessage(tx, messageInsert{
+		projectID: child.ProjectID, taskID: deliveryTaskID, relatedTaskID: child.ID,
+		senderKind: "system", recipientKind: recipientKind, recipientID: recipientID,
+		systemCode: "child_result", body: body, wake: wake, maxDeliveries: maxDeliveries,
+		idempotencyKey: "child-result:" + child.ID + ":" + string(child.Status),
+		actor:          taskMutationActor{kind: actorKind, id: actorID, runID: runID},
+		requestID:      requestID, now: now, payload: payload,
+	})
 	return err
 }

@@ -95,6 +95,7 @@ func (s *Service) AcknowledgeAgentMessages(ctx context.Context, input Acknowledg
 	if err != nil {
 		return nil, err
 	}
+	dedupe := requestDedupe{"", "message.ack", requestID, inputHash}
 	var acknowledged []Message
 	err = s.repository.Transact(ctx, func(tx Transaction) error {
 		scope, err := scopedRun(tx, input.Token)
@@ -102,12 +103,10 @@ func (s *Service) AcknowledgeAgentMessages(ctx context.Context, input Acknowledg
 			return err
 		}
 		actorScope := "run:" + scope.ID
-		if raw, ok, err := tx.Dedupe(actorScope, "message.ack", requestID); err != nil {
+		dedupe.scope = actorScope
+		if _, ok, err := dedupe.replay(tx); err != nil {
 			return err
 		} else if ok {
-			if _, err := decodeDedupe(raw, inputHash); err != nil {
-				return err
-			}
 			acknowledged, err = loadMessages(tx, messageIDs)
 			return err
 		}
@@ -120,11 +119,7 @@ func (s *Service) AcknowledgeAgentMessages(ctx context.Context, input Acknowledg
 		if err != nil {
 			return err
 		}
-		raw, err := encodeDedupe("", "", inputHash)
-		if err != nil {
-			return err
-		}
-		return tx.PutDedupe(actorScope, "message.ack", requestID, raw, now)
+		return dedupe.record(tx, scope.ID, "", now)
 	})
 	return acknowledged, err
 }
