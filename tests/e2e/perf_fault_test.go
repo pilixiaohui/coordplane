@@ -248,6 +248,9 @@ func (b *pfBatch) restartAfterKill(delay time.Duration, afterKill func()) int64 
 	b.daemon = startDaemonWithEnv(b.t, b.binary, filepath.Join(b.root, "coordplane.yaml"), b.socket, []string{
 		"COORDPLANE_PERF_OBSERVER_OUTPUT=" + b.observer,
 		"COORDPLANE_PERF_SAMPLE_ID=" + b.id,
+		"COORDPLANE_PERF_DATA_DIR=" + b.dataDir,
+		"GOMAXPROCS=3",
+		"GOMEMLIMIT=384MiB",
 	})
 	waitForReady(b.t, b.ctx, b.binary, b.socket, b.id+" replacement ready")
 	return time.Since(started).Nanoseconds()
