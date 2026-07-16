@@ -17,25 +17,15 @@ func TestPFValidatorRejectsMissingDuplicateAndNegativeEvidence(t *testing.T) {
 		t.Fatalf("valid raw ledger rejected: %v", err)
 	}
 	tests := map[string]func(*pfReport){
-		"missing commit": func(report *pfReport) {
-			report.Observer = append(report.Observer[:2], report.Observer[3:]...)
-		},
-		"missing formal binary digest": func(report *pfReport) {
-			delete(report.Binaries, "coordplane-git-helper")
-		},
+		"missing commit":               func(report *pfReport) { report.Observer = append(report.Observer[:2], report.Observer[3:]...) },
+		"missing formal binary digest": func(report *pfReport) { delete(report.Binaries, "coordplane-git-helper") },
 		"duplicate stage": func(report *pfReport) {
 			record := firstPFRecord(report, "record_type", "stage")
 			report.Observer = append(report.Observer, record)
 		},
-		"negative duration": func(report *pfReport) {
-			report.Samples[0].RunFacts[0].CleanupNS = -1
-		},
-		"illegal terminal": func(report *pfReport) {
-			report.Samples[0].RunFacts[0].TerminalState = "active"
-		},
-		"cleanup before container absent": func(report *pfReport) {
-			report.Samples[0].RunFacts[0].CleanupNS = 0
-		},
+		"negative duration":               func(report *pfReport) { report.Samples[0].RunFacts[0].CleanupNS = -1 },
+		"illegal terminal":                func(report *pfReport) { report.Samples[0].RunFacts[0].TerminalState = "active" },
+		"cleanup before container absent": func(report *pfReport) { report.Samples[0].RunFacts[0].CleanupNS = 0 },
 		"zero capture fault signature": func(report *pfReport) {
 			report.Faults[1].Counts.PeerMessages = 0
 			report.Faults[1].Counts.PeerAcknowledged = 0
@@ -44,31 +34,16 @@ func TestPFValidatorRejectsMissingDuplicateAndNegativeEvidence(t *testing.T) {
 		"progress crosses origin": func(report *pfReport) {
 			firstPFRecord(report, "point_id", "core.progress.committed")["daemon_origin_id"] = "other-origin"
 		},
-		"stage crosses origin": func(report *pfReport) {
-			firstPFRecord(report, "record_type", "stage")["daemon_origin_id"] = "other-origin"
-		},
-		"stage replaces inventory identity": func(report *pfReport) {
-			for _, record := range report.Observer {
-				if record["stage_id"] == "git.clone.prepare" && record["task_id"] == "source-a" {
-					record["task_id"] = "source-b"
-				}
-			}
-		},
 		"interrupted has duration": func(report *pfReport) {
 			record := firstPFRecord(report, "record_type", "stage")
 			record["record_type"] = "stage_interrupted"
 			record["result"] = "interrupted"
 			record["interrupted_by_origin_id"] = "other-origin"
 		},
-		"missing process limit": func(report *pfReport) {
-			dropFirstPFRecord(report, "record_type", "process_limit")
-		},
 		"soft process limit without hard cgroup": func(report *pfReport) {
 			firstPFRecord(report, "record_type", "process_limit")["memory_max_bytes"] = float64(0)
 		},
-		"missing disk boundary": func(report *pfReport) {
-			dropFirstPFRecord(report, "record_type", "disk_boundary_marker")
-		},
+		"missing disk boundary": func(report *pfReport) { dropFirstPFRecord(report, "record_type", "disk_boundary_marker") },
 		"disk response replaces Run identity": func(report *pfReport) {
 			for index := range report.Disk {
 				if report.Disk[index].StageID != "" {
@@ -80,6 +55,24 @@ func TestPFValidatorRejectsMissingDuplicateAndNegativeEvidence(t *testing.T) {
 		"fault duplicates Run identity": func(report *pfReport) {
 			report.Faults[0].RunIDsBefore[1] = report.Faults[0].RunIDsBefore[0]
 			report.Faults[0].RunIDsAfter[1] = report.Faults[0].RunIDsAfter[0]
+		},
+		"fault loses complete stage group": func(report *pfReport) {
+			dropFirstPFRecord(report, "stage_id", "git.capture.ref", "sample_id", "fault-capture")
+			dropFirstPFRecord(report, "stage_id", "git.capture.ref", "sample_id", "fault-capture")
+		},
+		"fault loses complete origin group": func(report *pfReport) {
+			dropFirstPFRecord(report, "daemon_origin_id", "origin-capture-before")
+			dropFirstPFRecord(report, "daemon_origin_id", "origin-capture-before")
+		},
+		"fault names fake replacement origin": func(report *pfReport) {
+			firstPFRecord(report, "record_type", "stage_interrupted")["interrupted_by_origin_id"] = "fake-origin"
+		},
+		"fault adds unknown complete stage group": func(report *pfReport) {
+			start := maps.Clone(firstPFRecord(report, "record_type", "stage_start"))
+			start["task_id"], start["run_id"], start["stage_key_sha256"] = "unknown-task", "unknown-run", "unknown-key"
+			end := maps.Clone(start)
+			end["record_type"], end["duration_ns"], end["result"] = "stage", float64(1), "success"
+			report.Observer = append(report.Observer, start, end)
 		},
 	}
 	for name, mutate := range tests {
@@ -102,9 +95,9 @@ func firstPFRecord(report *pfReport, key, value string) map[string]any {
 	panic("PF fixture record not found: " + key + "=" + value)
 }
 
-func dropFirstPFRecord(report *pfReport, key, value string) {
+func dropFirstPFRecord(report *pfReport, key, value string, identity ...string) {
 	for index, record := range report.Observer {
-		if record[key] == value {
+		if record[key] == value && (len(identity) == 0 || record[identity[0]] == identity[1]) {
 			report.Observer = append(report.Observer[:index], report.Observer[index+1:]...)
 			return
 		}
@@ -152,12 +145,15 @@ func validatorFixture() pfReport {
 	report := pfReport{
 		SchemaVersion: 2, Scenario: "PF-01", Profile: "smoke", Statistics: map[string]int64{}, Resources: map[string]int64{},
 		Binaries: pfBinaryDigestFixture(),
-		Samples: []pfSample{{ID: "concurrent-01-wave-01", BatchID: "concurrent-01", Parallelism: 4,
-			WaveNS: 1, WorkNS: 1, TaskIDs: tasks[:4], RunIDs: runs[:4], IntegrationTaskIDs: tasks[4:], IntegrationRunIDs: runs[4:],
-			QueueNS: []int64{1, 1, 1, 1}, FanoutNS: 1, DirectCASNS: 1, IntegrationNS: []int64{1, 1, 1}, Integrations3NS: 1, DiskBytes: 1, RunFacts: facts}},
+		Samples: []pfSample{
+			{ID: "concurrent-01-wave-01", BatchID: "concurrent-01", Parallelism: 4, WaveNS: 1, WorkNS: 1, TaskIDs: tasks[:4], RunIDs: runs[:4], IntegrationTaskIDs: tasks[4:], IntegrationRunIDs: runs[4:], QueueNS: []int64{1, 1, 1, 1}, FanoutNS: 1, DirectCASNS: 1, IntegrationNS: []int64{1, 1, 1}, Integrations3NS: 1, DiskBytes: 1, RunFacts: facts},
+			{ID: "concurrent-01-warmup", BatchID: "concurrent-01", Parallelism: 4, Warmup: true, TaskIDs: []string{"warm-task"}, RunIDs: []string{"warm-run"}},
+			{ID: "serial-01-wave-01", BatchID: "serial-01", Parallelism: 1, TaskIDs: []string{"serial-task"}, RunIDs: []string{"serial-run"}},
+		},
 		Faults: []pfFaultRow{validFault("live", 1, 4), validFault("capture", 1, 1), validFault("cas", 1, 1)},
 	}
 	report.ObjectCounts = append(report.ObjectCounts, pfObjectCounts{SampleID: "concurrent-01", FreshDataDirID: dataDirID, ProjectID: projectID})
+	report.ObjectCounts = append(report.ObjectCounts, pfObjectCounts{SampleID: "serial-01", FreshDataDirID: "root-serial", ProjectID: "project-serial"})
 	for index := range report.Faults {
 		report.ObjectCounts = append(report.ObjectCounts, report.Faults[index].Counts)
 	}
@@ -185,22 +181,19 @@ func validatorFixture() pfReport {
 		report.Observer = append(report.Observer, point("core.message.created_commit", "pf01-peer-"+message, tasks[0], runs[0], message, 1),
 			point("core.message.acknowledged_commit", "ack-"+message, tasks[3], runs[3], message, 2))
 	}
-	stages := []string{"git.clone.lock_wait", "git.clone.prepare", "runtime.container.create_start", "git.capture.freeze", "git.capture.handoff", "git.capture.lock_wait", "git.capture.import", "git.capture.fsck", "git.capture.ref", "git.advance.lock_wait", "git.advance.ancestry", "git.advance.update_ref", "runtime.cleanup"}
-	for _, stage := range stages {
+	for _, stage := range []string{"git.clone.lock_wait", "git.clone.prepare", "runtime.container.create_start", "git.capture.freeze", "git.capture.handoff", "git.capture.lock_wait", "git.capture.import", "git.capture.fsck", "git.capture.ref", "git.advance.lock_wait", "git.advance.ancestry", "git.advance.update_ref", "runtime.cleanup"} {
 		indices := []int{0, 1, 2, 3, 4, 5, 6}
 		if stage == "git.advance.update_ref" {
 			indices = []int{0, 4, 5, 6}
 		}
 		for _, index := range indices {
-			start, end := pfStageRecord("stage_start", stage, tasks[index], runs[index]), pfStageRecord("stage", stage, tasks[index], runs[index])
-			report.Observer = append(report.Observer,
-				start, end,
-			)
+			start := pfStageRecord("stage_start", stage, tasks[index], runs[index])
+			report.Observer = append(report.Observer, start, pfStageRecord("stage", stage, tasks[index], runs[index]))
 			if stage == "git.capture.freeze" || stage == "git.capture.handoff" || stage == "git.capture.import" {
 				for _, boundary := range []string{"start", "end"} {
 					marker := pfDiskBoundaryRecord(start, boundary)
 					report.Observer = append(report.Observer, marker)
-					report.Disk = append(report.Disk, pfDiskBoundarySample(marker))
+					report.Disk = append(report.Disk, diskSampleFromMarker(marker, 2, 1, ""))
 				}
 			}
 		}
@@ -216,18 +209,36 @@ func validatorFixture() pfReport {
 	report.Observer = append(report.Observer, pfProcessLimitRecord("origin", "concurrent-01", dataDirID),
 		map[string]any{"schema_version": float64(1), "record_type": "resource", "daemon_origin_id": "origin", "sample_id": "concurrent-01", "data_dir_id": dataDirID, "mono_offset_ns": float64(1), "rss_bytes": float64(1), "goroutines": float64(1), "open_fds": float64(1)},
 		map[string]any{"schema_version": float64(1), "record_type": "resource", "daemon_origin_id": "origin", "sample_id": "concurrent-01", "data_dir_id": dataDirID, "mono_offset_ns": float64(100000001), "rss_bytes": float64(1), "goroutines": float64(1), "open_fds": float64(1)})
+	appendPFOrigins(&report, "serial-01", "root-serial", "origin-serial")
 	for _, fault := range report.Faults {
-		origin := "origin-" + fault.Kind
-		report.Observer = append(report.Observer, pfProcessLimitRecord(origin, fault.SampleID, fault.FreshDataDirID),
-			map[string]any{"schema_version": float64(1), "record_type": "resource", "daemon_origin_id": origin, "sample_id": fault.SampleID, "data_dir_id": fault.FreshDataDirID, "mono_offset_ns": float64(1), "rss_bytes": float64(1), "goroutines": float64(1), "open_fds": float64(1)})
+		origins := []string{"origin-" + fault.Kind + "-before", "origin-" + fault.Kind + "-after"}
+		appendPFOrigins(&report, fault.SampleID, fault.FreshDataDirID, origins...)
+		if fault.Kind == "capture" {
+			start := pfStageRecord("stage_start", "git.capture.ref", fault.TaskIDs[0], fault.RunIDs[0])
+			end := pfStageRecord("stage_interrupted", "git.capture.ref", fault.TaskIDs[0], fault.RunIDs[0])
+			for _, record := range []map[string]any{start, end} {
+				record["sample_id"], record["data_dir_id"], record["project_id"] = fault.SampleID, fault.FreshDataDirID, fault.Counts.ProjectID
+				record["daemon_origin_id"] = origins[0]
+			}
+			end["result"], end["interrupted_by_origin_id"] = "interrupted", origins[1]
+			delete(end, "duration_ns")
+			report.Observer = append(report.Observer, start, end)
+		}
 	}
 	return report
 }
 
 func pfBinaryDigestFixture() map[string]string {
-	return map[string]string{
-		"coordplane": strings.Repeat("a", 64), "coordlink": strings.Repeat("b", 64),
-		"coordplane-git-helper": strings.Repeat("c", 64),
+	return map[string]string{"coordplane": strings.Repeat("a", 64), "coordlink": strings.Repeat("b", 64), "coordplane-git-helper": strings.Repeat("c", 64)}
+}
+
+func appendPFOrigins(report *pfReport, sample, dataDir string, origins ...string) {
+	for _, origin := range origins {
+		report.Observer = append(report.Observer, pfProcessLimitRecord(origin, sample, dataDir), map[string]any{
+			"schema_version": float64(1), "record_type": "resource", "daemon_origin_id": origin,
+			"sample_id": sample, "data_dir_id": dataDir, "mono_offset_ns": float64(1),
+			"rss_bytes": float64(1), "goroutines": float64(1), "open_fds": float64(1),
+		})
 	}
 }
 
@@ -257,10 +268,6 @@ func pfDiskBoundaryRecord(stage map[string]any, boundary string) map[string]any 
 	return record
 }
 
-func pfDiskBoundarySample(marker map[string]any) pfDiskSample {
-	return diskSampleFromMarker(marker, 2, 1, "")
-}
-
 func pfProcessLimitRecord(origin, sample, dataDir string) map[string]any {
 	return map[string]any{
 		"schema_version": float64(1), "record_type": "process_limit", "daemon_origin_id": origin, "sample_id": sample, "data_dir_id": dataDir,
@@ -270,9 +277,14 @@ func pfProcessLimitRecord(origin, sample, dataDir string) map[string]any {
 }
 
 func validFault(kind string, index, runs int) pfFaultRow {
-	ids := []string{kind + "a", kind + "b", kind + "c", kind + "d"}[:runs]
+	total := runs + map[string]int{"live": 3}[kind]
+	tasks, ids := make([]string, total), make([]string, total)
+	for position := range ids {
+		tasks[position], ids[position] = kind+"-task-"+strconv.Itoa(position), kind+"-run-"+strconv.Itoa(position)
+	}
 	row := pfFaultRow{SampleID: "fault-" + kind, Kind: kind, Index: index, FreshDataDirID: "root-" + kind, RecoveryNS: 1,
-		RunIDsBefore: ids, RunIDsAfter: append([]string(nil), ids...), PreRestart: "durable", FinalSHA: "sha", GitFSCK: "pass", Cleanup: "absent", Result: "PASS"}
+		TaskIDs: tasks, RunIDs: ids,
+		RunIDsBefore: ids[:runs], RunIDsAfter: append([]string(nil), ids[:runs]...), PreRestart: "durable", FinalSHA: "sha", GitFSCK: "pass", Cleanup: "absent", Result: "PASS"}
 	row.Counts.SampleID, row.Counts.FreshDataDirID, row.Counts.ProjectID = row.SampleID, row.FreshDataDirID, "project-"+kind
 	row.Counts.PeerMessages, row.Counts.PeerAcknowledged, row.Counts.PeerAckEvent = 4, 4, 4
 	if kind == "live" {

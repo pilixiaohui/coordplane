@@ -97,7 +97,9 @@ func (h *dockerCaptureHelper) Inspect(ctx context.Context, request gitrepo.Works
 	if usage+(64<<10) > h.config.MaximumHandoffBytes {
 		return gitrepo.WorkspaceInspectFact{}, errors.New("capture helper: total handoff quota exceeded")
 	}
-	handoff, operationID, err := h.prepareInspectHandoff(request)
+	operationID := inspectOperationID(request)
+	ref := inspectRuntimeRef(request, operationID)
+	handoff, err := h.prepareInspectHandoff(ctx, request, ref, operationID)
 	if err != nil {
 		return gitrepo.WorkspaceInspectFact{}, err
 	}
@@ -105,8 +107,7 @@ func (h *dockerCaptureHelper) Inspect(ctx context.Context, request gitrepo.Works
 	if err != nil {
 		return gitrepo.WorkspaceInspectFact{}, err
 	}
-	ref := inspectRuntimeRef(request, operationID)
-	if err := h.runContainer(ctx, h.inspectContainerSpec(request, handoff, executable, ref), false); err != nil {
+	if err := h.runContainer(ctx, h.inspectContainerSpec(request, handoff, executable, ref), true); err != nil {
 		return gitrepo.WorkspaceInspectFact{}, err
 	}
 	fact, err := h.readyInspectFact(handoff)
@@ -205,22 +206,34 @@ func (h *dockerCaptureHelper) prepareHandoff(path string) error {
 	return os.RemoveAll(filepath.Join(path, gitcapture.PartialName))
 }
 
-func (h *dockerCaptureHelper) prepareInspectHandoff(request gitrepo.WorkspaceInspectRequest) (string, string, error) {
+func (h *dockerCaptureHelper) prepareInspectHandoff(
+	ctx context.Context,
+	request gitrepo.WorkspaceInspectRequest,
+	ref containerruntime.RuntimeRef,
+	operationID string,
+) (string, error) {
 	parent := filepath.Join(h.root, request.ProjectID, request.TaskID)
 	if err := os.MkdirAll(parent, 0o770); err != nil {
-		return "", "", fmt.Errorf("capture helper: create inspect handoff parent: %w", err)
+		return "", fmt.Errorf("capture helper: create inspect handoff parent: %w", err)
 	}
 	if err := os.Chmod(parent, 0o770); err != nil {
-		return "", "", fmt.Errorf("capture helper: set inspect handoff access: %w", err)
+		return "", fmt.Errorf("capture helper: set inspect handoff access: %w", err)
 	}
-	handoff, err := os.MkdirTemp(parent, "inspect-")
-	if err != nil {
-		return "", "", fmt.Errorf("capture helper: create inspect handoff: %w", err)
+	handoff := filepath.Join(parent, "inspect-"+operationID)
+	if _, err := h.executor.Inspect(ctx, ref); errors.Is(err, containerruntime.ErrNotFound) {
+		if err := os.RemoveAll(handoff); err != nil {
+			return "", fmt.Errorf("capture helper: reset inspect handoff: %w", err)
+		}
+	} else if err != nil {
+		return "", fmt.Errorf("capture helper: inspect cleanup identity: %w", err)
+	}
+	if err := os.MkdirAll(handoff, 0o770); err != nil {
+		return "", fmt.Errorf("capture helper: create inspect handoff: %w", err)
 	}
 	if err := os.Chmod(handoff, 0o770); err != nil {
-		return "", "", fmt.Errorf("capture helper: set inspect handoff access: %w", err)
+		return "", fmt.Errorf("capture helper: set inspect handoff access: %w", err)
 	}
-	return handoff, filepath.Base(handoff), nil
+	return handoff, nil
 }
 
 func (h *dockerCaptureHelper) containerSpec(
@@ -282,10 +295,12 @@ func (h *dockerCaptureHelper) runContainer(ctx context.Context, spec containerru
 	if adopt {
 		state, err := h.executor.Inspect(runCtx, ref)
 		switch {
-		case err == nil && state.Running:
+		case err == nil && (state.Running || state.Status == containerruntime.StatusExited):
 			ref, running = state.Ref, true
 		case err == nil:
-			_ = h.removeContainer(runCtx, state.Ref)
+			if err := h.removeContainer(runCtx, state.Ref); err != nil {
+				return err
+			}
 		case !errors.Is(err, containerruntime.ErrNotFound):
 			return fmt.Errorf("capture helper: inspect container: %w", err)
 		}
@@ -297,18 +312,15 @@ func (h *dockerCaptureHelper) runContainer(ctx context.Context, spec containerru
 		}
 		ref, err = h.executor.Start(runCtx, created)
 		if err != nil {
-			_ = h.removeContainer(context.Background(), created)
-			return fmt.Errorf("capture helper: start container: %w", err)
+			return h.cleanupContainerError(fmt.Errorf("capture helper: start container: %w", err), created)
 		}
 	}
 	live, err := h.executor.Inspect(runCtx, ref)
 	if err != nil {
-		_ = h.removeContainer(context.Background(), ref)
-		return fmt.Errorf("capture helper: inspect started container: %w", err)
+		return h.cleanupContainerError(fmt.Errorf("capture helper: inspect started container: %w", err), ref)
 	}
 	if !live.Running && live.Status != containerruntime.StatusExited {
-		_ = h.removeContainer(context.Background(), ref)
-		return errors.New("capture helper: started container is not running")
+		return h.cleanupContainerError(errors.New("capture helper: started container is not running"), ref)
 	}
 	role := "git_capture"
 	if strings.HasPrefix(ref.ContainerName, "coordplane-git-inspect-") {
@@ -319,10 +331,10 @@ func (h *dockerCaptureHelper) runContainer(ctx context.Context, spec containerru
 	logs := h.containerLogs(runCtx, ref)
 	removeErr := h.removeContainer(context.Background(), ref)
 	if waitErr != nil {
-		return fmt.Errorf("capture helper: wait for container: %w", waitErr)
+		return errors.Join(fmt.Errorf("capture helper: wait for container: %w", waitErr), removeErr)
 	}
 	if exit.ExitCode != 0 {
-		return fmt.Errorf("capture helper: container exited %d: %s", exit.ExitCode, logs)
+		return errors.Join(fmt.Errorf("capture helper: container exited %d: %s", exit.ExitCode, logs), removeErr)
 	}
 	return removeErr
 }
@@ -345,6 +357,11 @@ func inspectRuntimeRef(request gitrepo.WorkspaceInspectRequest, operationID stri
 		ProjectID:     request.ProjectID, TaskID: request.TaskID, AgentID: "git-helper",
 		RunID: operationID, Generation: 1, LaunchNonce: short,
 	}
+}
+
+func inspectOperationID(request gitrepo.WorkspaceInspectRequest) string {
+	digest := sha256.Sum256([]byte(request.ProjectID + "\x00" + request.TaskID + "\x00" + filepath.Clean(request.Workspace)))
+	return hex.EncodeToString(digest[:12])
 }
 
 func (h *dockerCaptureHelper) readyFact(path string, request gitrepo.CaptureHelperRequest) (gitrepo.CaptureHelperFact, bool, error) {
@@ -429,6 +446,10 @@ func (h *dockerCaptureHelper) removeContainer(ctx context.Context, ref container
 		return fmt.Errorf("capture helper: remove container: %w", err)
 	}
 	return nil
+}
+
+func (h *dockerCaptureHelper) cleanupContainerError(operation error, ref containerruntime.RuntimeRef) error {
+	return errors.Join(operation, h.removeContainer(context.Background(), ref))
 }
 
 func canonicalHelperExecutable(path string) (string, error) {

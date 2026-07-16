@@ -19,6 +19,8 @@ type pfFaultRow struct {
 	Kind           string         `json:"kind"`
 	Index          int            `json:"index"`
 	FreshDataDirID string         `json:"fresh_data_dir_id"`
+	TaskIDs        []string       `json:"task_ids"`
+	RunIDs         []string       `json:"run_ids"`
 	RecoveryNS     int64          `json:"t_recover_ns"`
 	RunIDsBefore   []string       `json:"run_ids_before"`
 	RunIDsAfter    []string       `json:"run_ids_after"`
@@ -216,8 +218,11 @@ func finishPFFaultBatch(t *testing.T, batch *pfBatch, tasks []core.Task, row *pf
 	for _, task := range tasks {
 		gitDirSucceeds(t, batch.ctx, control, "merge-base", "--is-ancestor", task.HeadSHA, row.FinalSHA)
 		workspaceIDs = append(workspaceIDs, task.ID)
+		row.TaskIDs, row.RunIDs = append(row.TaskIDs, task.ID), append(row.RunIDs, task.HeadRunID)
 		if task.IntegrationTaskID != "" {
+			integration := taskDetail(t, batch.ctx, batch.binary, batch.socket, task.IntegrationTaskID).Task
 			workspaceIDs = append(workspaceIDs, task.IntegrationTaskID)
+			row.TaskIDs, row.RunIDs = append(row.TaskIDs, integration.ID), append(row.RunIDs, integration.HeadRunID)
 		}
 	}
 	gitDirSucceeds(t, batch.ctx, control, "fsck", "--full", "--strict")

@@ -50,17 +50,16 @@ type pfIdleSample struct {
 }
 
 type pfInventory struct {
-	taskWave, taskSample, taskRun, runTask map[string]string
-	sampleDataDir, sampleProject           map[string]string
-	sourceTasks, allTasks, allRuns         map[string]bool
-	advanceTasks, scoredWaves              map[string]bool
+	taskWave, taskSample, taskRun, runTask              map[string]string
+	sampleDataDir, sampleProject                        map[string]string
+	sourceTasks, scoredTasks, advanceTasks, scoredWaves map[string]bool
 }
 
 func validatePFSamples(report *pfReport) (pfInventory, error) {
 	result := pfInventory{
 		taskWave: map[string]string{}, taskSample: map[string]string{}, taskRun: map[string]string{}, runTask: map[string]string{},
-		sampleDataDir: map[string]string{}, sampleProject: map[string]string{}, sourceTasks: map[string]bool{},
-		allTasks: map[string]bool{}, allRuns: map[string]bool{}, advanceTasks: map[string]bool{}, scoredWaves: map[string]bool{},
+		sampleDataDir: map[string]string{}, sampleProject: map[string]string{}, sourceTasks: map[string]bool{}, scoredTasks: map[string]bool{},
+		advanceTasks: map[string]bool{}, scoredWaves: map[string]bool{},
 	}
 	report.RawMetrics = map[string][]int64{}
 	dataDirs := map[string]bool{}
@@ -109,12 +108,12 @@ func validatePFSamples(report *pfReport) (pfInventory, error) {
 		result.scoredWaves[sample.ID] = true
 		wantFacts := map[string]string{}
 		for index, taskID := range sample.TaskIDs {
-			result.sourceTasks[taskID], result.allTasks[taskID], result.allRuns[sample.RunIDs[index]] = true, true, true
+			result.sourceTasks[taskID], result.scoredTasks[taskID] = true, true
 			wantFacts[taskID+"\x00"+sample.RunIDs[index]] = "source"
 		}
 		result.advanceTasks[sample.TaskIDs[0]] = true
 		for index, taskID := range sample.IntegrationTaskIDs {
-			result.allTasks[taskID], result.allRuns[sample.IntegrationRunIDs[index]] = true, true
+			result.scoredTasks[taskID] = true
 			result.advanceTasks[taskID] = true
 			wantFacts[taskID+"\x00"+sample.IntegrationRunIDs[index]] = "integration"
 		}
@@ -123,7 +122,7 @@ func validatePFSamples(report *pfReport) (pfInventory, error) {
 			if wantFacts[key] == "" || wantFacts[key] != fact.Role || !core.IsRunTerminal(core.RunState(fact.TerminalState)) ||
 				fact.ContainerID == "" || !fact.ContainerAbsent || !fact.ResourcesAbsent ||
 				fact.TerminalObservedUnixNS <= 0 || fact.ContainerAbsentNS <= 0 ||
-				fact.CleanupNS < fact.ContainerAbsentNS || !result.allRuns[fact.RunID] {
+				fact.CleanupNS < fact.ContainerAbsentNS || result.runTask[fact.RunID] == "" {
 				return result, fmt.Errorf("%s Run terminal/cleanup fact is missing, duplicate, or invalid", sample.ID)
 			}
 			delete(wantFacts, key)
@@ -147,6 +146,16 @@ func validatePFSamples(report *pfReport) (pfInventory, error) {
 		for _, fact := range sample.RunFacts {
 			report.RawMetrics["T_container_absent"] = append(report.RawMetrics["T_container_absent"], fact.ContainerAbsentNS)
 			report.RawMetrics["T_cleanup"] = append(report.RawMetrics["T_cleanup"], fact.CleanupNS)
+		}
+	}
+	for _, row := range report.Faults {
+		for index, taskID := range row.TaskIDs {
+			runID := row.RunIDs[index]
+			if taskID == "" || runID == "" || result.taskWave[taskID] != "" || result.runTask[runID] != "" {
+				return result, fmt.Errorf("fault Task/Run identity is missing or duplicated")
+			}
+			result.taskWave[taskID], result.taskSample[taskID] = row.SampleID, row.SampleID
+			result.taskRun[taskID], result.runTask[runID] = runID, taskID
 		}
 	}
 	if report.Profile == "release" && len(result.scoredWaves) != 20 {
@@ -315,11 +324,11 @@ func validateObserver(report *pfReport) error {
 	if report.Resources == nil {
 		report.Resources = map[string]int64{}
 	}
-	inventory, err := validatePFSamples(report)
-	if err != nil {
+	if err := validatePFFaults(report); err != nil {
 		return err
 	}
-	if err := validatePFFaults(report); err != nil {
+	inventory, err := validatePFSamples(report)
+	if err != nil {
 		return err
 	}
 	allowedStages := map[string]bool{}
@@ -332,7 +341,7 @@ func validateObserver(report *pfReport) error {
 	}
 	stageExact := map[string]map[string]int{}
 	api, committed, clients := map[string]map[string]any{}, map[string]map[string]any{}, map[string]map[string]any{}
-	taskWave, scoredTasks, scoredWaves := inventory.taskWave, inventory.allTasks, inventory.scoredWaves
+	taskWave, scoredTasks, scoredWaves := inventory.taskWave, inventory.scoredTasks, inventory.scoredWaves
 	for _, idle := range report.Idle {
 		report.RawMetrics["idle_rss_bytes"] = append(report.RawMetrics["idle_rss_bytes"], idle.RSSBytes...)
 		report.RawMetrics["idle_cpu_time"] = append(report.RawMetrics["idle_cpu_time"], idle.CPUNS)
@@ -348,11 +357,14 @@ func validateObserver(report *pfReport) error {
 	stageAttempts := map[string]map[int64]bool{}
 	stageStarts, stageLedger := map[string]map[string]any{}, map[string]map[string]any{}
 	interruptedStages := map[string]bool{}
+	captureInterruptions := map[string]bool{}
 	resourceOffsets := map[string][]int64{}
 	runtimeLimits := map[string]bool{}
 	captureHelperTasks := map[string]int{}
 	processLimits, originIdentity := map[string]map[string]any{}, map[string]map[string]any{}
+	originsBySample := map[string]int{}
 	diskMarkers := map[string]map[string]any{}
+	interruptedOrigins := map[string]string{}
 	var helperFacts []map[string]any
 	helperLimits := 0
 	resourceCount := 0
@@ -369,6 +381,7 @@ func validateObserver(report *pfReport) error {
 			}
 		} else {
 			originIdentity[origin] = record
+			originsBySample[sampleID]++
 		}
 		switch kind {
 		case "client":
@@ -419,12 +432,12 @@ func validateObserver(report *pfReport) error {
 				}
 				bursts[wave] = boundary
 			}
-			if normal && scoredTasks[textField(record, "task_id")] && id == "core.outcome.accepted_commit" {
+			if id == "core.outcome.accepted_commit" && inventory.taskRun[textField(record, "task_id")] != "" {
 				if !storeUnique(outcomes, textField(record, "run_id"), record) {
 					return fmt.Errorf("outcome point identity is missing or duplicate")
 				}
 			}
-			if normal && scoredTasks[textField(record, "task_id")] && id == "git.capture.submitted_commit" {
+			if id == "git.capture.submitted_commit" && inventory.taskRun[textField(record, "task_id")] != "" {
 				if !storeUnique(submissions, textField(record, "run_id"), record) {
 					return fmt.Errorf("capture submission point identity is missing or duplicate")
 				}
@@ -441,11 +454,15 @@ func validateObserver(report *pfReport) error {
 			}
 		case "stage_start", "stage", "stage_interrupted":
 			id, key, duration := textField(record, "stage_id"), textField(record, "stage_key_sha256"), intField(record, "duration_ns")
+			taskID := textField(record, "task_id")
 			attemptValue, attemptOK := record["attempt_index"].(float64)
 			attempt := int64(attemptValue)
 			identity := stageAttemptIdentity(record)
 			if !allowedStages[id] || key == "" || !attemptOK || attempt < 0 || intField(record, "start_unix_ns") <= 0 {
 				return fmt.Errorf("unknown stage or negative duration")
+			}
+			if err := validateStageInventory(inventory, record, id, taskID); err != nil {
+				return err
 			}
 			if kind == "stage_start" {
 				if stageStarts[identity] != nil || stageLedger[identity] != nil {
@@ -466,6 +483,10 @@ func validateObserver(report *pfReport) error {
 					textField(record, "result") != "interrupted" {
 					return fmt.Errorf("interrupted stage is not bound to its original daemon")
 				}
+				interruptedOrigins[interruptedBy] = origin
+				if id == "git.capture.ref" {
+					captureInterruptions[sampleID] = true
+				}
 				if _, exists := record["duration_ns"]; exists {
 					return fmt.Errorf("interrupted stage has a cross-origin duration")
 				}
@@ -480,11 +501,7 @@ func validateObserver(report *pfReport) error {
 				return fmt.Errorf("duplicate stage attempt")
 			}
 			stageAttempts[identity][attempt] = true
-			if kind == "stage" && normalPFSample(sampleID) && scoredTasks[textField(record, "task_id")] {
-				taskID := textField(record, "task_id")
-				if err := validateStageInventory(inventory, record, id, taskID); err != nil {
-					return err
-				}
+			if kind == "stage" && normalPFSample(sampleID) && scoredTasks[taskID] {
 				if stageExact[id] == nil {
 					stageExact[id] = map[string]int{}
 				}
@@ -513,13 +530,13 @@ func validateObserver(report *pfReport) error {
 		case "runtime_limit":
 			taskID, runID := textField(record, "task_id"), textField(record, "run_id")
 			role := textField(record, "runtime_role")
-			if role == "agent" && (runID == "" || runtimeLimits[runID] || intField(record, "memory_bytes") != 512<<20 ||
+			if role == "agent" && (inventory.runTask[runID] == "" || runtimeLimits[runID] || intField(record, "memory_bytes") != 512<<20 ||
 				intField(record, "nano_cpus") != 1_000_000_000 || intField(record, "pids_limit") != 256) {
 				return fmt.Errorf("runtime cgroup fact is missing, duplicate, or incorrect")
 			}
 			if role == "agent" {
-				if inventory.allRuns[runID] && (inventory.runTask[runID] != taskID || inventory.taskSample[taskID] != sampleID ||
-					inventory.sampleProject[sampleID] != textField(record, "project_id")) {
+				if inventory.runTask[runID] != taskID || inventory.taskSample[taskID] != sampleID ||
+					inventory.sampleProject[sampleID] != textField(record, "project_id") {
 					return fmt.Errorf("agent runtime cgroup fact crosses inventory identity")
 				}
 				runtimeLimits[runID] = true
@@ -529,12 +546,15 @@ func validateObserver(report *pfReport) error {
 			} else {
 				helperLimits++
 				helperFacts = append(helperFacts, record)
-				if role == "git_capture" && inventory.allRuns[runID] {
+				if role == "git_capture" {
 					if inventory.runTask[runID] != taskID || inventory.taskSample[taskID] != sampleID ||
 						inventory.sampleProject[sampleID] != textField(record, "project_id") {
 						return fmt.Errorf("capture helper cgroup fact crosses inventory identity")
 					}
 					captureHelperTasks[taskID]++
+				} else if inventory.taskRun[taskID] == "" || inventory.taskSample[taskID] != sampleID ||
+					inventory.sampleProject[sampleID] != textField(record, "project_id") {
+					return fmt.Errorf("inspect helper cgroup fact crosses inventory identity")
 				}
 			}
 		case "process_limit":
@@ -565,13 +585,25 @@ func validateObserver(report *pfReport) error {
 	if len(stageStarts) != 0 {
 		return fmt.Errorf("observer contains unterminated stage starts")
 	}
-	observedSamples := map[string]bool{}
-	for _, record := range originIdentity {
-		observedSamples[textField(record, "sample_id")] = true
-	}
 	for sampleID := range inventory.sampleDataDir {
-		if !observedSamples[sampleID] {
-			return fmt.Errorf("sample %s has no observer origin/data-dir evidence", sampleID)
+		want := 1
+		if strings.HasPrefix(sampleID, "fault-") {
+			want = 2
+		}
+		got := originsBySample[sampleID]
+		if got != want {
+			return fmt.Errorf("sample %s origin exact set = %d, want %d", sampleID, got, want)
+		}
+	}
+	wantOrigins := map[string]int{"smoke": 8, "release": 28}[report.Profile]
+	if wantOrigins == 0 || len(originIdentity) != wantOrigins {
+		return fmt.Errorf("%s profile origin cardinality = %d, want %d", report.Profile, len(originIdentity), wantOrigins)
+	}
+	for replacementID, originalID := range interruptedOrigins {
+		replacement, original := originIdentity[replacementID], originIdentity[originalID]
+		if replacement == nil || textField(replacement, "sample_id") != textField(original, "sample_id") ||
+			textField(replacement, "data_dir_id") != textField(original, "data_dir_id") {
+			return fmt.Errorf("interrupted stage replacement origin is outside its sample/data-dir closure")
 		}
 	}
 	for request, client := range clients {
@@ -589,7 +621,10 @@ func validateObserver(report *pfReport) error {
 		report.RawMetrics["T_progress_burst"] = append(report.RawMetrics["T_progress_burst"], duration)
 		report.RawMetrics["progress_ops_per_second_milli"] = append(report.RawMetrics["progress_ops_per_second_milli"], 200_000_000_000_000/duration)
 	}
-	for runID := range inventory.allRuns {
+	for runID := range inventory.runTask {
+		if !scoredTasks[inventory.runTask[runID]] {
+			continue
+		}
 		start, end := outcomes[runID], submissions[runID]
 		if start == nil || end == nil || textField(start, "daemon_origin_id") != textField(end, "daemon_origin_id") {
 			return fmt.Errorf("capture point join failed for %s", runID)
@@ -606,7 +641,7 @@ func validateObserver(report *pfReport) error {
 	cgroups := map[string]bool{}
 	for origin, limit := range processLimits {
 		cgroupID := textField(limit, "daemon_cgroup_id")
-		if originIdentity[origin] == nil || cgroupID == "" || cgroups[cgroupID] {
+		if originIdentity[origin] == nil || len(resourceOffsets[origin]) == 0 || cgroupID == "" || cgroups[cgroupID] {
 			return fmt.Errorf("Daemon origin is not bound to a distinct cgroup")
 		}
 		cgroups[cgroupID] = true
@@ -618,7 +653,7 @@ func validateObserver(report *pfReport) error {
 			return fmt.Errorf("Daemon/Git helper combined cgroup limit exceeds 4 CPU/512 MiB")
 		}
 	}
-	for taskID := range inventory.allTasks {
+	for taskID := range inventory.scoredTasks {
 		if captureHelperTasks[taskID] != 1 {
 			return fmt.Errorf("Task %s capture helper cgroup exact set = %d", taskID, captureHelperTasks[taskID])
 		}
@@ -678,8 +713,8 @@ func validateObserver(report *pfReport) error {
 			}
 		}
 	}
-	for runID := range inventory.allRuns {
-		if !runtimeLimits[runID] {
+	for runID := range inventory.runTask {
+		if scoredTasks[inventory.runTask[runID]] && !runtimeLimits[runID] {
 			return fmt.Errorf("Run %s has no actual runtime cgroup fact", runID)
 		}
 	}
@@ -705,7 +740,7 @@ func validateObserver(report *pfReport) error {
 		}
 	}
 	for id := range allowedStages {
-		expected := inventory.allTasks
+		expected := inventory.scoredTasks
 		if id == "git.advance.update_ref" {
 			expected = inventory.advanceTasks
 		}
@@ -718,13 +753,16 @@ func validateObserver(report *pfReport) error {
 			}
 		}
 	}
+	for _, row := range report.Faults {
+		if row.Kind == "capture" && !captureInterruptions[row.SampleID] {
+			return fmt.Errorf("capture fault %s lost its interrupted ref stage group", row.SampleID)
+		}
+	}
 	for metric, values := range report.RawMetrics {
 		if len(values) > 0 {
-			report.Statistics[metric+"_p50"] = nearestRank(values, 50)
-			report.Statistics[metric+"_p90"] = nearestRank(values, 90)
-			report.Statistics[metric+"_p95"] = nearestRank(values, 95)
-			report.Statistics[metric+"_p99"] = nearestRank(values, 99)
-			report.Statistics[metric+"_max"] = nearestRank(values, 100)
+			for suffix, rank := range map[string]int{"p50": 50, "p90": 90, "p95": 95, "p99": 99, "max": 100} {
+				report.Statistics[metric+"_"+suffix] = nearestRank(values, rank)
+			}
 		}
 	}
 	return nil
@@ -753,6 +791,7 @@ func validatePFFaults(report *pfReport) error {
 		sort.Strings(after)
 		if expected[row.Kind] == 0 || row.Index < 1 || row.Index > expected[row.Kind] || seen[row.Kind][row.Index] ||
 			row.SampleID == "" || samples[row.SampleID] || row.FreshDataDirID == "" || roots[row.FreshDataDirID] ||
+			len(row.TaskIDs) == 0 || len(row.TaskIDs) != len(row.RunIDs) || !uniqueStrings(row.TaskIDs) || !uniqueStrings(row.RunIDs) ||
 			row.Counts.SampleID != row.SampleID || row.Counts.FreshDataDirID != row.FreshDataDirID || row.Counts.ProjectID == "" ||
 			countsBySample[row.SampleID] != row.Counts || row.RecoveryNS <= 0 || row.RecoveryNS > int64(8*time.Second) ||
 			len(before) != wantRuns || !uniqueStrings(before) || !uniqueStrings(after) || strings.Join(before, "\x00") != strings.Join(after, "\x00") ||
@@ -946,7 +985,7 @@ func sameStageInventory(first, second map[string]any) bool {
 
 func validateStageInventory(inventory pfInventory, record map[string]any, stageID, taskID string) error {
 	sampleID := textField(record, "sample_id")
-	if !inventory.allTasks[taskID] || inventory.taskSample[taskID] != sampleID ||
+	if inventory.taskRun[taskID] == "" || inventory.taskSample[taskID] != sampleID ||
 		inventory.sampleDataDir[sampleID] != textField(record, "data_dir_id") ||
 		inventory.sampleProject[sampleID] != textField(record, "project_id") {
 		return fmt.Errorf("%s stage crosses frozen Task/sample/project inventory", stageID)

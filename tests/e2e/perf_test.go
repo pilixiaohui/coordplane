@@ -1209,13 +1209,11 @@ func (b *pfBatch) recordDiskMarker(raw []byte) {
 }
 
 func diskSampleFromMarker(record map[string]any, observed, bytes int64, sampleErr string) pfDiskSample {
-	text := func(key string) string { value, _ := record[key].(string); return value }
-	number := func(key string) int64 { value, _ := record[key].(float64); return int64(value) }
 	return pfDiskSample{
-		SampleID: text("sample_id"), DataDirID: text("data_dir_id"), DaemonOriginID: text("daemon_origin_id"),
-		StageID: text("stage_id"), StageKeySHA256: text("stage_key_sha256"), Boundary: text("boundary"),
-		ProjectID: text("project_id"), TaskID: text("task_id"), RunID: text("run_id"), OperationID: text("operation_id"),
-		AttemptIndex: number("attempt_index"), ObservedUnixNS: observed, Bytes: bytes, Error: sampleErr,
+		SampleID: textField(record, "sample_id"), DataDirID: textField(record, "data_dir_id"), DaemonOriginID: textField(record, "daemon_origin_id"),
+		StageID: textField(record, "stage_id"), StageKeySHA256: textField(record, "stage_key_sha256"), Boundary: textField(record, "boundary"),
+		ProjectID: textField(record, "project_id"), TaskID: textField(record, "task_id"), RunID: textField(record, "run_id"), OperationID: textField(record, "operation_id"),
+		AttemptIndex: intField(record, "attempt_index"), ObservedUnixNS: observed, Bytes: bytes, Error: sampleErr,
 	}
 }
 

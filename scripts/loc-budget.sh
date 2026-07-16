@@ -41,6 +41,7 @@ file_blockers=$tmp/file-blockers
 function_warnings=$tmp/function-warnings
 function_blockers=$tmp/function-blockers
 gofmt_bad=$tmp/gofmt
+multistatement_blockers=$tmp/multistatement-blockers
 untracked_maintained=$tmp/untracked-maintained
 : >"$records"
 : >"$unknown"
@@ -48,6 +49,7 @@ untracked_maintained=$tmp/untracked-maintained
 : >"$file_blockers"
 : >"$function_warnings"
 : >"$function_blockers"
+: >"$multistatement_blockers"
 : >"$untracked_maintained"
 
 classify() {
@@ -133,6 +135,18 @@ check_functions() {
   ' "$1"
 }
 
+check_multistatements() {
+  awk -v path="$1" -v blockers="$multistatement_blockers" '
+    {
+      code=$0
+      gsub(/"([^"\\]|\\.)*"/, "", code)
+      gsub(/`[^`]*`/, "", code)
+      sub(/\/\/.*/, "", code)
+      if (code ~ /\{[^{};]*;[^{}]*\}/) print path ":" FNR >> blockers
+    }
+  ' "$1"
+}
+
 fixture_bytes=0
 git ls-files --cached --others --exclude-standard | LC_ALL=C sort -u | while IFS= read -r path; do
   [ -f "$path" ] || continue
@@ -146,7 +160,10 @@ git ls-files --cached --others --exclude-standard | LC_ALL=C sort -u | while IFS
 	if ! git ls-files --error-unmatch "$path" >/dev/null 2>&1; then
 		printf '%s\n' "$path" >>"$untracked_maintained"
 	fi
-  case "$path" in *.go) lines=$(count_go "$path") ;; *) lines=$(count_text "$path") ;; esac
+  case "$path" in
+    *.go) lines=$(count_go "$path"); check_multistatements "$path" ;;
+    *) lines=$(count_text "$path") ;;
+  esac
   case "$bucket" in
     generated_*)
       grep -Fq "\"path\": \"$path\"" "$generated_manifest" || printf '%s\n' "$path" >>"$unknown"
@@ -203,6 +220,7 @@ failure=false
 [ ! -s "$file_blockers" ] || failure=true
 [ ! -s "$function_blockers" ] || failure=true
 [ ! -s "$gofmt_bad" ] || failure=true
+[ ! -s "$multistatement_blockers" ] || failure=true
 clean=true
 git diff --quiet -- && git diff --cached --quiet -- || clean=false
 [ ! -s "$untracked_maintained" ] || clean=false
@@ -215,7 +233,7 @@ awk -F'|' \
   -v gsp="$generated_semantic_production" -v gst="$generated_semantic_tests" -v gsi="$generated_semantic_infra" -v gme="$generated_mechanical_excluded" \
   -v production="$production" -v tests="$tests" -v infra="$infra" -v total="$total" \
   -v generated="$generated_total" -v source_total="$first_party_source_total" -v fixture_bytes="$fixture_bytes" \
-  -v unknown="$unknown" -v fw="$file_warnings" -v fb="$file_blockers" -v fnw="$function_warnings" -v fnb="$function_blockers" -v gofmt_bad="$gofmt_bad" -v clean="$clean" -v failed="$failure" '
+  -v unknown="$unknown" -v fw="$file_warnings" -v fb="$file_blockers" -v fnw="$function_warnings" -v fnb="$function_blockers" -v gofmt_bad="$gofmt_bad" -v multi="$multistatement_blockers" -v clean="$clean" -v failed="$failure" '
   function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
   function array(path, line, first) {
     printf "["; first=1
@@ -231,7 +249,7 @@ awk -F'|' \
     printf "  \"generated_total\": %d,\n  \"first_party_source_total\": %d,\n  \"fixture_bytes\": %d,\n", generated,source_total,fixture_bytes
     printf "  \"modules\": {"; n=asorti(module, keys); for(i=1;i<=n;i++){split(keys[i],p,SUBSEP); if(i>1)printf ","; printf "\"%s/%s\":%d",esc(p[1]),esc(p[2]),module[keys[i]]} printf "},\n"
     printf "  \"diff\": {\"raw_added\":%d,\"raw_deleted\":%d},\n", added,deleted
-    printf "  \"quality\": {\"unknown_paths\":"; array(unknown); printf ",\"file_warnings\":"; array(fw); printf ",\"file_blockers\":"; array(fb); printf ",\"function_warnings\":"; array(fnw); printf ",\"function_blockers\":"; array(fnb); printf ",\"gofmt_files\":"; array(gofmt_bad); printf "},\n"
+    printf "  \"quality\": {\"unknown_paths\":"; array(unknown); printf ",\"file_warnings\":"; array(fw); printf ",\"file_blockers\":"; array(fb); printf ",\"function_warnings\":"; array(fnw); printf ",\"function_blockers\":"; array(fnb); printf ",\"gofmt_files\":"; array(gofmt_bad); printf ",\"multistatement_blockers\":"; array(multi); printf "},\n"
     printf "  \"clean_revision\": %s,\n", clean=="true" ? "true" : "false"
     printf "  \"pass\": %s\n}\n", failed=="true" ? "false" : "true"
   }

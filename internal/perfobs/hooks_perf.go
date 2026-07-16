@@ -481,7 +481,10 @@ func intRecord(record map[string]any, key string) int64 {
 }
 
 func fieldsRecord(record map[string]any) Fields {
-	text := func(key string) string { value, _ := record[key].(string); return value }
+	text := func(key string) string {
+		value, _ := record[key].(string)
+		return value
+	}
 	return Fields{ProjectID: text("project_id"), TaskID: text("task_id"), RunID: text("run_id"),
 		MessageID: text("message_id"), OperationID: text("operation_id"), RequestID: text("request_id")}
 }
