@@ -110,6 +110,7 @@ type pfReport struct {
 	Baseline      map[string]string  `json:"baseline"`
 	Idle          []pfIdleSample     `json:"idle_resource_samples"`
 	Disk          []pfDiskSample     `json:"disk_samples"`
+	Manifest      pfProfileManifest  `json:"profile_manifest"`
 }
 
 const pfStatisticsVersion = "pf01-nearest-rank-v2"
@@ -119,6 +120,88 @@ type pfProfile struct {
 	serialBatches, serialWaves                    int
 	liveFaults, captureFaults, casFaults          int
 	timeout                                       time.Duration
+}
+
+type pfProfileManifest struct {
+	SchemaVersion int                 `json:"schema_version"`
+	Profile       string              `json:"profile"`
+	ImageDigest   string              `json:"image_digest"`
+	Samples       []pfManifestSample  `json:"samples"`
+	Durable       []pfManifestDurable `json:"durable_counts"`
+	Origins       int                 `json:"daemon_origins"`
+}
+
+type pfManifestSample struct {
+	ID          string `json:"sample_id"`
+	BatchID     string `json:"batch_id"`
+	Class       string `json:"class"`
+	Parallelism int    `json:"parallelism"`
+	Tasks       int    `json:"tasks"`
+	Runs        int    `json:"runs"`
+}
+
+type pfManifestDurable struct {
+	SampleID     string `json:"sample_id"`
+	Tasks        int    `json:"tasks"`
+	Runs         int    `json:"runs"`
+	Messages     int    `json:"messages,omitempty"`
+	PeerMessages int    `json:"peer_messages"`
+	Origins      int    `json:"daemon_origins"`
+}
+
+func fixedPFProfile(profile, imageDigest string) (pfProfileManifest, pfProfile, bool) {
+	settings := pfProfile{concurrentBatches: 1, concurrentWaves: 3, serialBatches: 1, serialWaves: 1,
+		liveFaults: 1, captureFaults: 1, casFaults: 1, timeout: 25 * time.Minute}
+	serialWarmup := 0
+	if profile == "release" {
+		settings = pfProfile{concurrentBatches: 4, concurrentWaves: 5, soakWaves: 15, serialBatches: 2,
+			serialWaves: 5, liveFaults: 5, captureFaults: 3, casFaults: 3, timeout: 2 * time.Hour}
+		serialWarmup = 1
+	} else if profile != "smoke" {
+		return pfProfileManifest{}, pfProfile{}, false
+	}
+	manifest := pfProfileManifest{SchemaVersion: 1, Profile: profile, ImageDigest: imageDigest}
+	addBatch := func(prefix string, batches, waves, warmup, soak, parallel int) {
+		class := prefix
+		if prefix == "concurrent" {
+			class = "scored"
+		}
+		for batchIndex := 1; batchIndex <= batches; batchIndex++ {
+			batchID := fmt.Sprintf("%s-%02d", prefix, batchIndex)
+			for index := 1; index <= warmup; index++ {
+				manifest.Samples = append(manifest.Samples, pfManifestSample{ID: batchID + "-warmup", BatchID: batchID, Class: prefix + "_warmup", Parallelism: parallel, Tasks: 3 + parallel, Runs: 3 + parallel})
+			}
+			for wave := 1; wave <= waves; wave++ {
+				manifest.Samples = append(manifest.Samples, pfManifestSample{ID: fmt.Sprintf("%s-wave-%02d", batchID, wave), BatchID: batchID, Class: class, Parallelism: parallel, Tasks: 3 + parallel, Runs: 3 + parallel})
+			}
+			batchSoak := 0
+			if batchIndex == 1 {
+				batchSoak = soak
+			}
+			for wave := 1; wave <= batchSoak; wave++ {
+				manifest.Samples = append(manifest.Samples, pfManifestSample{ID: fmt.Sprintf("%s-soak-%02d", batchID, wave), BatchID: batchID, Class: "soak", Parallelism: parallel, Tasks: 3 + parallel, Runs: 3 + parallel})
+			}
+			totalWaves := warmup + waves + batchSoak
+			manifest.Durable = append(manifest.Durable, pfManifestDurable{SampleID: batchID, Tasks: totalWaves * (3 + parallel), Runs: totalWaves * (3 + parallel), Messages: totalWaves * (13 + parallel), PeerMessages: totalWaves * 10, Origins: 1})
+		}
+	}
+	addBatch("concurrent", settings.concurrentBatches, settings.concurrentWaves, 1, settings.soakWaves, 4)
+	addBatch("serial", settings.serialBatches, settings.serialWaves, serialWarmup, 0, 1)
+	for _, fault := range []struct {
+		kind, class  string
+		count, tasks int
+		peers        int
+	}{{"live", "fault_live", settings.liveFaults, 7, 10}, {"capture", "fault_capture", settings.captureFaults, 1, 4}, {"cas", "fault_cas", settings.casFaults, 1, 4}} {
+		for index := 1; index <= fault.count; index++ {
+			id := fmt.Sprintf("fault-%s-%02d", fault.kind, index)
+			manifest.Samples = append(manifest.Samples, pfManifestSample{ID: id, BatchID: id, Class: fault.class, Parallelism: map[string]int{"live": 4, "capture": 1, "cas": 1}[fault.kind], Tasks: fault.tasks, Runs: fault.tasks})
+			manifest.Durable = append(manifest.Durable, pfManifestDurable{SampleID: id, Tasks: fault.tasks, Runs: fault.tasks, PeerMessages: fault.peers, Origins: 2})
+		}
+	}
+	for _, durable := range manifest.Durable {
+		manifest.Origins += durable.Origins
+	}
+	return manifest, settings, true
 }
 
 type pfBatch struct {
@@ -133,6 +216,7 @@ type pfBatch struct {
 	parallel              int
 	trackSoak             bool
 	diskMu                sync.Mutex
+	diskWG                sync.WaitGroup
 	diskStop, diskDone    chan struct{}
 	disk                  []pfDiskSample
 	terminalMu            sync.Mutex
@@ -176,20 +260,24 @@ func (p *pfDaemonProcess) stop(action string, args ...string) error {
 }
 
 type pfDiskSample struct {
-	SampleID       string `json:"sample_id"`
-	DataDirID      string `json:"data_dir_id"`
-	DaemonOriginID string `json:"daemon_origin_id,omitempty"`
-	StageID        string `json:"stage_id,omitempty"`
-	StageKeySHA256 string `json:"stage_key_sha256,omitempty"`
-	Boundary       string `json:"boundary"`
-	ProjectID      string `json:"project_id,omitempty"`
-	TaskID         string `json:"task_id,omitempty"`
-	RunID          string `json:"run_id,omitempty"`
-	OperationID    string `json:"operation_id,omitempty"`
-	AttemptIndex   int64  `json:"attempt_index,omitempty"`
-	ObservedUnixNS int64  `json:"observed_unix_ns"`
-	Bytes          int64  `json:"bytes"`
-	Error          string `json:"error,omitempty"`
+	SampleID        string `json:"sample_id"`
+	DataDirID       string `json:"data_dir_id"`
+	DaemonOriginID  string `json:"daemon_origin_id,omitempty"`
+	StageID         string `json:"stage_id,omitempty"`
+	StageKeySHA256  string `json:"stage_key_sha256,omitempty"`
+	Boundary        string `json:"boundary"`
+	ProjectID       string `json:"project_id,omitempty"`
+	TaskID          string `json:"task_id,omitempty"`
+	RunID           string `json:"run_id,omitempty"`
+	OperationID     string `json:"operation_id,omitempty"`
+	AttemptIndex    int64  `json:"attempt_index,omitempty"`
+	ObservedUnixNS  int64  `json:"observed_unix_ns"`
+	ScheduledUnixNS int64  `json:"scheduled_unix_ns"`
+	StartedUnixNS   int64  `json:"started_unix_ns"`
+	EndedUnixNS     int64  `json:"ended_unix_ns"`
+	OverrunNS       int64  `json:"overrun_ns"`
+	Bytes           int64  `json:"bytes"`
+	Error           string `json:"error,omitempty"`
 }
 
 var pfRoles = [...]string{"A", "B", "C", "D"}
@@ -251,20 +339,13 @@ func TestPF01FourAgentPerformance(t *testing.T) {
 	image := strings.TrimSpace(os.Getenv("E2E_RUNTIME_IMAGE"))
 	output := strings.TrimSpace(os.Getenv("PF01_OUTPUT"))
 	profile := strings.TrimSpace(os.Getenv("PF01_PROFILE"))
-	if image == "" || output == "" || (profile != "smoke" && profile != "release") {
-		t.Fatal("E2E_RUNTIME_IMAGE, PF01_OUTPUT, and PF01_PROFILE=smoke|release are required")
+	imageDigest := strings.TrimSpace(os.Getenv("PF01_IMAGE_DIGEST"))
+	profileManifest, settings, validProfile := fixedPFProfile(profile, imageDigest)
+	if image == "" || image != imageDigest || output == "" || !validProfile || !validImageDigest(imageDigest) {
+		t.Fatal("E2E_RUNTIME_IMAGE=PF01_IMAGE_DIGEST, PF01_OUTPUT, and PF01_PROFILE=smoke|release are required")
 	}
-	settings := pfProfile{
-		concurrentBatches: 1, concurrentWaves: 3,
-		serialBatches: 1, serialWaves: 1, liveFaults: 1, captureFaults: 1, casFaults: 1,
-		timeout: 25 * time.Minute,
-	}
-	if profile == "release" {
-		settings = pfProfile{
-			concurrentBatches: 4, concurrentWaves: 5, soakWaves: 15,
-			serialBatches: 2, serialWaves: 5, liveFaults: 5, captureFaults: 3, casFaults: 3,
-			timeout: 2 * time.Hour,
-		}
+	if actual := commandText(context.Background(), "docker", "image", "inspect", "--format", "{{.Id}}", image); actual != imageDigest {
+		t.Fatalf("formal runtime image identity = %s, want %s", actual, imageDigest)
 	}
 	release, err := testsupport.AcquireSerialResource(testsupport.DockerResource, "tests/e2e-pf01", settings.timeout)
 	requireNoError(t, err)
@@ -275,9 +356,9 @@ func TestPF01FourAgentPerformance(t *testing.T) {
 	root := t.TempDir()
 	report := pfReport{
 		SchemaVersion: 2, Scenario: "PF-01", Profile: profile, Revision: commandText(ctx, "git", "rev-parse", "HEAD"),
-		Environment: perfEnvironment(ctx, image),
-		Binaries:    perfBinaryDigests(t, coordplane, coordlink, gitHelper),
-		Thresholds:  map[string]int64{"t_wave_p50": int64(60 * time.Second), "t_wave_p90": int64(90 * time.Second), "t_wave_max": int64(180 * time.Second)},
+		Environment: perfEnvironment(ctx, imageDigest), Manifest: profileManifest,
+		Binaries:   perfBinaryDigests(t, coordplane, coordlink, gitHelper),
+		Thresholds: map[string]int64{"t_wave_p50": int64(60 * time.Second), "t_wave_p90": int64(90 * time.Second), "t_wave_max": int64(180 * time.Second)},
 	}
 	defer writePerfReport(t, output, &report)
 	if profile == "release" {
@@ -1165,18 +1246,37 @@ func (b *pfBatch) sampleDisk() {
 		select {
 		case <-poll.C:
 			pending = b.drainDiskMarkers(reader, pending)
-		case <-cadence.C:
-			b.recordDisk("interval")
+		case scheduled := <-cadence.C:
+			b.scheduleDisk("interval", scheduled.UnixNano())
 		case <-b.diskStop:
 			b.drainDiskMarkers(reader, pending)
+			b.diskWG.Wait()
 			return
 		}
 	}
 }
 
 func (b *pfBatch) recordDisk(boundary string) {
-	sample := pfDiskSample{SampleID: b.id, DataDirID: pfDataDirID(b.dataDir), Boundary: boundary, ObservedUnixNS: time.Now().UnixNano()}
+	b.recordDiskAt(boundary, time.Now().UnixNano())
+}
+
+func (b *pfBatch) scheduleDisk(boundary string, scheduled int64) {
+	b.diskWG.Add(1)
+	go func() {
+		defer b.diskWG.Done()
+		b.recordDiskAt(boundary, scheduled)
+	}()
+}
+
+func (b *pfBatch) recordDiskAt(boundary string, scheduled int64) {
+	sample := pfDiskSample{SampleID: b.id, DataDirID: pfDataDirID(b.dataDir), Boundary: boundary, ScheduledUnixNS: scheduled}
+	sample.StartedUnixNS = time.Now().UnixNano()
 	sample.Bytes, sample.Error = directoryBytes(b.dataDir)
+	sample.EndedUnixNS = time.Now().UnixNano()
+	sample.ObservedUnixNS = sample.EndedUnixNS
+	if boundary == "interval" && sample.EndedUnixNS > scheduled+int64(time.Second) {
+		sample.OverrunNS = sample.EndedUnixNS - scheduled - int64(time.Second)
+	}
 	b.appendDisk(sample)
 }
 
@@ -1203,9 +1303,16 @@ func (b *pfBatch) recordDiskMarker(raw []byte) {
 	if json.Unmarshal(raw, &record) != nil || record["record_type"] != "disk_boundary_marker" {
 		return
 	}
-	bytes, sampleErr := directoryBytes(b.dataDir)
-	sample := diskSampleFromMarker(record, time.Now().UnixNano(), bytes, sampleErr)
-	b.appendDisk(sample)
+	b.diskWG.Add(1)
+	scheduled := time.Now().UnixNano()
+	go func() {
+		defer b.diskWG.Done()
+		started := time.Now().UnixNano()
+		bytes, sampleErr := directoryBytes(b.dataDir)
+		sample := diskSampleFromMarker(record, time.Now().UnixNano(), bytes, sampleErr)
+		sample.ScheduledUnixNS, sample.StartedUnixNS, sample.EndedUnixNS = scheduled, started, sample.ObservedUnixNS
+		b.appendDisk(sample)
+	}()
 }
 
 func diskSampleFromMarker(record map[string]any, observed, bytes int64, sampleErr string) pfDiskSample {
@@ -1213,7 +1320,8 @@ func diskSampleFromMarker(record map[string]any, observed, bytes int64, sampleEr
 		SampleID: textField(record, "sample_id"), DataDirID: textField(record, "data_dir_id"), DaemonOriginID: textField(record, "daemon_origin_id"),
 		StageID: textField(record, "stage_id"), StageKeySHA256: textField(record, "stage_key_sha256"), Boundary: textField(record, "boundary"),
 		ProjectID: textField(record, "project_id"), TaskID: textField(record, "task_id"), RunID: textField(record, "run_id"), OperationID: textField(record, "operation_id"),
-		AttemptIndex: intField(record, "attempt_index"), ObservedUnixNS: observed, Bytes: bytes, Error: sampleErr,
+		AttemptIndex: intField(record, "attempt_index"), ObservedUnixNS: observed,
+		ScheduledUnixNS: observed, StartedUnixNS: observed, EndedUnixNS: observed, Bytes: bytes, Error: sampleErr,
 	}
 }
 
@@ -1305,18 +1413,26 @@ func commandText(ctx context.Context, command string, args ...string) string {
 	}
 	return strings.TrimSpace(string(raw))
 }
-func perfEnvironment(ctx context.Context, image string) map[string]string {
+func perfEnvironment(ctx context.Context, imageDigest string) map[string]string {
 	return map[string]string{
 		"go": runtime.Version(), "os": runtime.GOOS, "arch": runtime.GOARCH,
 		"kernel":                commandText(ctx, "uname", "-sr"),
 		"docker":                commandText(ctx, "docker", "version", "--format", "{{.Server.Version}}"),
 		"docker_storage_driver": commandText(ctx, "docker", "info", "--format", "{{.Driver}}"),
-		"image_digest":          commandText(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", image),
+		"image_digest":          imageDigest,
 		"git":                   commandText(ctx, "git", "--version"),
 		"runner_id":             strings.TrimSpace(os.Getenv("PF01_RUNNER_ID")),
 		"source_clean":          strings.TrimSpace(os.Getenv("PF01_SOURCE_CLEAN")),
 		"statistics_version":    pfStatisticsVersion,
 	}
+}
+
+func validImageDigest(value string) bool {
+	if !strings.HasPrefix(value, "sha256:") || len(value) != len("sha256:")+sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
+	return err == nil
 }
 
 func perfBinaryDigests(t *testing.T, coordplane, coordlink, gitHelper string) map[string]string {

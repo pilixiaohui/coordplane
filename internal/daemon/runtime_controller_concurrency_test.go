@@ -90,13 +90,23 @@ func TestInspectHelperStableIdentityRecoversInspectRemoveFailure(t *testing.T) {
 	executor.inspectErr, executor.removeErr = inspectErr, removeErr
 	close(executor.allowCreate)
 	close(executor.stopped)
-	helper := dockerCaptureHelper{executor: executor, config: config.GitConfig{CaptureTimeout: time.Second}}
+	helper := dockerCaptureHelper{executor: executor, config: config.GitConfig{CaptureTimeout: time.Second}, root: t.TempDir()}
 	if err := helper.runContainer(context.Background(), containerruntime.ContainerSpec{Ref: ref}, false); !errors.Is(err, inspectErr) || !errors.Is(err, removeErr) || !executor.present {
 		t.Fatalf("Inspect+Remove failure = %v, present=%t", err, executor.present)
 	}
 	executor.removeErr = nil
-	if err := helper.runContainer(context.Background(), containerruntime.ContainerSpec{Ref: ref}, true); err == nil || executor.present || executor.createCalls.Load() != 1 {
+	if err := helper.runContainer(context.Background(), containerruntime.ContainerSpec{Ref: ref}, true); err == nil || executor.present || executor.createCalls.Load() != 2 {
 		t.Fatalf("stable cleanup retry = %v, present=%t creates=%d", err, executor.present, executor.createCalls.Load())
+	}
+	executor.present = true
+	ready := filepath.Join(helper.root, "project", "task", "inspect-"+inspectOperationID(request), "inspect.ready")
+	requireNoError(t, os.MkdirAll(ready, 0o700))
+	handoff, err := helper.prepareInspectHandoff(context.Background(), request, ref, inspectOperationID(request))
+	if err != nil || executor.present {
+		t.Fatalf("prepare exited Inspect residue: %v present=%t", err, executor.present)
+	}
+	if _, err := os.Stat(filepath.Join(handoff, "inspect.ready")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale inspect.ready survived reset: %v", err)
 	}
 }
 
@@ -634,6 +644,7 @@ type blockingLaunchExecutor struct {
 	allowCreate   chan struct{}
 	stopped       chan struct{}
 	stopOnce      sync.Once
+	createOnce    sync.Once
 	ref           containerruntime.RuntimeRef
 	createCalls   atomic.Int32
 	startCalls    atomic.Int32
@@ -656,7 +667,7 @@ func (e *blockingLaunchExecutor) Create(ctx context.Context, spec containerrunti
 	e.ref = spec.Ref
 	e.ref.ContainerID = "container-launch-race"
 	e.present = true
-	close(e.createEntered)
+	e.createOnce.Do(func() { close(e.createEntered) })
 	select {
 	case <-e.allowCreate:
 		return e.ref, nil

@@ -16,7 +16,12 @@ func TestCT02ConcurrentClaimAcrossSQLiteConnectionsCreatesOneRun(t *testing.T) {
 	project := h.addProject(t, "cross-connection-project", "")
 	task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
 		ProjectID: project.ID, Kind: core.TaskWork, AssigneeAgentID: agent.ID,
-		Title: "claim once", RequestID: "cross-connection-task",
+		Title: "claim once", Priority: 100, RequestID: "cross-connection-task",
+	})
+	requireNoError(t, err)
+	_, err = h.service.CreateTask(context.Background(), core.CreateTaskInput{
+		ProjectID: project.ID, Kind: core.TaskWork, AssigneeAgentID: agent.ID,
+		Title: "blocked while Agent is busy", Priority: 1, RequestID: "cross-connection-blocked-task",
 	})
 	requireNoError(t, err)
 
@@ -68,12 +73,16 @@ func TestCT02ConcurrentClaimAcrossSQLiteConnectionsCreatesOneRun(t *testing.T) {
 	snapshot, err := h.database.Snapshot(context.Background(), project.ID)
 	requireNoError(t, err)
 	claimedTask := taskWithID(t, snapshot, task.ID)
-	if len(snapshot.Runs) != 1 || claimedTask.Generation != 1 || claimedTask.CurrentRunID != snapshot.Runs[0].ID {
+	if len(snapshot.Runs) != 1 || claimedTask.Generation != 1 || claimedTask.CurrentRunID != snapshot.Runs[0].ID ||
+		snapshot.Runs[0].IsolationSpecVersion != core.RunIsolationSpecCurrent {
 		t.Fatalf("durable claim did not converge: Task=%#v Runs=%#v", claimedTask, snapshot.Runs)
 	}
 	events, err := h.database.Events(context.Background(), core.EventFilter{ProjectID: project.ID})
 	requireNoError(t, err)
 	if countEvent(events, "task.claimed") != 1 || countEvent(events, "run.created") != 1 {
 		t.Fatalf("claim Events were duplicated: %#v", events)
+	}
+	if _, ok, err := secondService.ClaimNext(context.Background(), project.ID); err != nil || ok {
+		t.Fatalf("same Agent claimed a second live Run: ok=%t err=%v", ok, err)
 	}
 }

@@ -56,9 +56,7 @@ func TestGT07DiscardRespectsRetentionBeforeAndAtBoundary(t *testing.T) {
 	}); err == nil || result.Discarded {
 		t.Fatalf("workspace age < retention discarded: result=%#v err=%v", result, err)
 	}
-	if after := h.durableSignature(t, project.ID); after != earlySignature {
-		t.Fatal("early workspace discard changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, earlySignature)
 	h.git.mu.Lock()
 	workspaceCalls := h.git.discardWorkspaceCalls
 	h.git.mu.Unlock()
@@ -91,9 +89,7 @@ func TestGT07DiscardRespectsRetentionBeforeAndAtBoundary(t *testing.T) {
 	}); err == nil || result.Discarded {
 		t.Fatalf("task ref age < retention discarded: result=%#v err=%v", result, err)
 	}
-	if after := h.durableSignature(t, project.ID); after != earlySignature {
-		t.Fatal("early task-ref discard changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, earlySignature)
 	setNextClock(closedAt.Add(retention))
 	if result, err := service.GCDiscardTaskRef(context.Background(), core.GCDiscardTaskRefInput{
 		TaskID: task.ID, RunID: task.HeadRunID, ExpectedSHA: task.HeadSHA, RequestID: "retention-ref-boundary",

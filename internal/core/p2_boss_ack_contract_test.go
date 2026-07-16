@@ -83,9 +83,7 @@ func TestP2BossChatFailureRollsBackBundledAcknowledgement(t *testing.T) {
 	}); !core.IsCode(err, core.CodeInvalidState) {
 		t.Fatalf("failed conversation reply error = %v", err)
 	}
-	if after := h.durableSignature(t, project.ID); after != before {
-		t.Fatal("failed Boss reply committed its bundled acknowledgement")
-	}
+	h.requireDurableSignature(t, project.ID, before)
 	assertMessageState(t, h, message.ID, core.MessagePending)
 }
 

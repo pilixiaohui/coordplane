@@ -10,14 +10,7 @@ func TestCanonicalProjectAgentAndMessageFSMCompleteMatrices(t *testing.T) {
 			ProjectActive:   {ProjectError, ProjectArchived},
 			ProjectError:    {ProjectCreating, ProjectArchived},
 		}
-		for _, from := range states {
-			for _, to := range states {
-				gotAllowed := ValidateProjectTransition(from, to) == nil
-				if gotAllowed != allowed.has(from, to) {
-					t.Errorf("project transition %s -> %s allowed=%v", from, to, gotAllowed)
-				}
-			}
-		}
+		assertTransitionMatrix(t, states, allowed, ValidateProjectTransition)
 	})
 
 	t.Run("agent", func(t *testing.T) {
@@ -26,14 +19,7 @@ func TestCanonicalProjectAgentAndMessageFSMCompleteMatrices(t *testing.T) {
 			AgentActive: {AgentPaused, AgentArchived},
 			AgentPaused: {AgentActive, AgentArchived},
 		}
-		for _, from := range states {
-			for _, to := range states {
-				gotAllowed := ValidateAgentTransition(from, to) == nil
-				if gotAllowed != allowed.has(from, to) {
-					t.Errorf("agent transition %s -> %s allowed=%v", from, to, gotAllowed)
-				}
-			}
-		}
+		assertTransitionMatrix(t, states, allowed, ValidateAgentTransition)
 	})
 
 	t.Run("message", func(t *testing.T) {
@@ -42,14 +28,7 @@ func TestCanonicalProjectAgentAndMessageFSMCompleteMatrices(t *testing.T) {
 			MessagePending:   {MessageDelivered, MessageAcknowledged, MessageCancelled},
 			MessageDelivered: {MessagePending, MessageAcknowledged, MessageCancelled},
 		}
-		for _, from := range states {
-			for _, to := range states {
-				gotAllowed := ValidateMessageTransition(from, to) == nil
-				if gotAllowed != allowed.has(from, to) {
-					t.Errorf("message transition %s -> %s allowed=%v", from, to, gotAllowed)
-				}
-			}
-		}
+		assertTransitionMatrix(t, states, allowed, ValidateMessageTransition)
 	})
 }
 
@@ -82,17 +61,9 @@ func TestCanonicalTaskFSMCompleteMatrix(t *testing.T) {
 		{kind: TaskIntegration, allowed: ordinary},
 	}
 	for _, test := range tests {
-		for _, from := range states {
-			for _, to := range states {
-				name := string(test.kind) + "/" + string(from) + "_to_" + string(to)
-				t.Run(name, func(t *testing.T) {
-					gotAllowed := ValidateTaskTransition(test.kind, from, to) == nil
-					if gotAllowed != test.allowed.has(from, to) {
-						t.Fatalf("transition %s %s -> %s allowed=%v", test.kind, from, to, gotAllowed)
-					}
-				})
-			}
-		}
+		assertTransitionMatrix(t, states, test.allowed, func(from, to TaskStatus) error {
+			return ValidateTaskTransition(test.kind, from, to)
+		})
 	}
 }
 
@@ -102,16 +73,7 @@ func TestCanonicalRunFSMCompleteMatrix(t *testing.T) {
 		RunStarting: {RunActive, RunExited, RunFailed, RunInterrupted, RunCancelled, RunTimedOut},
 		RunActive:   {RunExited, RunInterrupted, RunCancelled, RunTimedOut},
 	}
-	for _, from := range states {
-		for _, to := range states {
-			t.Run(string(from)+"_to_"+string(to), func(t *testing.T) {
-				gotAllowed := ValidateRunTransition(from, to) == nil
-				if gotAllowed != allowed.has(from, to) {
-					t.Fatalf("run transition %s -> %s allowed=%v", from, to, gotAllowed)
-				}
-			})
-		}
-	}
+	assertTransitionMatrix(t, states, allowed, ValidateRunTransition)
 }
 
 func TestRuntimeRetryDecisionHonorsZeroAndExactBoundary(t *testing.T) {
@@ -166,6 +128,17 @@ func TestCanonicalTaskOperationMatrix(t *testing.T) {
 }
 
 type transitionPairs[T comparable] map[T][]T
+
+func assertTransitionMatrix[T comparable](t *testing.T, states []T, allowed transitionPairs[T], validate func(T, T) error) {
+	t.Helper()
+	for _, from := range states {
+		for _, to := range states {
+			if got := validate(from, to) == nil; got != allowed.has(from, to) {
+				t.Errorf("transition %v -> %v allowed=%v", from, to, got)
+			}
+		}
+	}
+}
 
 func (pairs transitionPairs[T]) has(from, to T) bool {
 	for _, candidate := range pairs[from] {

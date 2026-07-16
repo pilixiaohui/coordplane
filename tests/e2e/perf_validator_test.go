@@ -4,11 +4,14 @@ package e2e_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"maps"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPFValidatorRejectsMissingDuplicateAndNegativeEvidence(t *testing.T) {
@@ -44,6 +47,27 @@ func TestPFValidatorRejectsMissingDuplicateAndNegativeEvidence(t *testing.T) {
 			firstPFRecord(report, "record_type", "process_limit")["memory_max_bytes"] = float64(0)
 		},
 		"missing disk boundary": func(report *pfReport) { dropFirstPFRecord(report, "record_type", "disk_boundary_marker") },
+		"disk interval overrun": func(report *pfReport) {
+			for index := range report.Disk {
+				if report.Disk[index].Boundary == "interval" {
+					report.Disk[index].EndedUnixNS += int64(2 * time.Second)
+					report.Disk[index].ObservedUnixNS = report.Disk[index].EndedUnixNS
+					report.Disk[index].OverrunNS = int64(time.Second)
+					break
+				}
+			}
+		},
+		"complete scored wave deleted": func(report *pfReport) {
+			dropPFSampleGroup(report, "concurrent-01-wave-02")
+		},
+		"complete warmup deleted": func(report *pfReport) { dropPFSampleGroup(report, "concurrent-01-warmup") },
+		"complete serial group deleted": func(report *pfReport) {
+			dropPFSampleGroup(report, "serial-01-wave-01")
+		},
+		"complete fault group deleted": func(report *pfReport) { dropPFFaultGroup(report, "fault-live-01") },
+		"complete durable group deleted": func(report *pfReport) {
+			report.ObjectCounts = slices.DeleteFunc(report.ObjectCounts, func(counts pfObjectCounts) bool { return counts.SampleID == "serial-01" })
+		},
 		"disk response replaces Run identity": func(report *pfReport) {
 			for index := range report.Disk {
 				if report.Disk[index].StageID != "" {
@@ -57,12 +81,13 @@ func TestPFValidatorRejectsMissingDuplicateAndNegativeEvidence(t *testing.T) {
 			report.Faults[0].RunIDsAfter[1] = report.Faults[0].RunIDsAfter[0]
 		},
 		"fault loses complete stage group": func(report *pfReport) {
-			dropFirstPFRecord(report, "stage_id", "git.capture.ref", "sample_id", "fault-capture")
-			dropFirstPFRecord(report, "stage_id", "git.capture.ref", "sample_id", "fault-capture")
+			dropFirstPFRecord(report, "stage_id", "git.capture.ref", "sample_id", "fault-capture-01")
+			dropFirstPFRecord(report, "stage_id", "git.capture.ref", "sample_id", "fault-capture-01")
 		},
 		"fault loses complete origin group": func(report *pfReport) {
-			dropFirstPFRecord(report, "daemon_origin_id", "origin-capture-before")
-			dropFirstPFRecord(report, "daemon_origin_id", "origin-capture-before")
+			report.Observer = slices.DeleteFunc(report.Observer, func(record map[string]any) bool {
+				return record["daemon_origin_id"] == "origin-fault-capture-01-before"
+			})
 		},
 		"fault names fake replacement origin": func(report *pfReport) {
 			firstPFRecord(report, "record_type", "stage_interrupted")["interrupted_by_origin_id"] = "fake-origin"
@@ -86,6 +111,17 @@ func TestPFValidatorRejectsMissingDuplicateAndNegativeEvidence(t *testing.T) {
 	}
 }
 
+func TestPFValidatorRejectsCompleteSoakWaveDeletion(t *testing.T) {
+	report := validatorFixtureProfile("release")
+	if err := validateObserver(&report); err != nil {
+		t.Fatalf("valid release ledger rejected: %v", err)
+	}
+	dropPFSampleGroup(&report, "concurrent-01-soak-08")
+	if err := validateObserver(&report); err == nil {
+		t.Fatal("release ledger without a complete soak wave passed")
+	}
+}
+
 func firstPFRecord(report *pfReport, key, value string) map[string]any {
 	for _, record := range report.Observer {
 		if record[key] == value {
@@ -103,6 +139,27 @@ func dropFirstPFRecord(report *pfReport, key, value string, identity ...string) 
 		}
 	}
 	panic("PF fixture record not found: " + key + "=" + value)
+}
+
+func dropPFSampleGroup(report *pfReport, sampleID string) {
+	tasks := map[string]bool{}
+	for _, sample := range report.Samples {
+		if sample.ID == sampleID {
+			for _, task := range append(sample.TaskIDs, sample.IntegrationTaskIDs...) {
+				tasks[task] = true
+			}
+		}
+	}
+	report.Samples = slices.DeleteFunc(report.Samples, func(sample pfSample) bool { return sample.ID == sampleID })
+	report.Observer = slices.DeleteFunc(report.Observer, func(record map[string]any) bool { return tasks[textField(record, "task_id")] })
+	report.Disk = slices.DeleteFunc(report.Disk, func(sample pfDiskSample) bool { return tasks[sample.TaskID] })
+}
+
+func dropPFFaultGroup(report *pfReport, sampleID string) {
+	report.Faults = slices.DeleteFunc(report.Faults, func(row pfFaultRow) bool { return row.SampleID == sampleID })
+	report.ObjectCounts = slices.DeleteFunc(report.ObjectCounts, func(counts pfObjectCounts) bool { return counts.SampleID == sampleID })
+	report.Observer = slices.DeleteFunc(report.Observer, func(record map[string]any) bool { return record["sample_id"] == sampleID })
+	report.Disk = slices.DeleteFunc(report.Disk, func(sample pfDiskSample) bool { return sample.SampleID == sampleID })
 }
 
 func TestPFBaselineRequiresCompleteKeysButAllowsNewRevision(t *testing.T) {
@@ -132,44 +189,95 @@ func TestPFBaselineRequiresCompleteKeysButAllowsNewRevision(t *testing.T) {
 }
 
 func validatorFixture() pfReport {
-	const projectID, dataDirID = "project", "root-concurrent"
-	tasks := []string{"source-a", "source-b", "source-c", "source-d", "integration-b", "integration-c", "integration-d"}
-	runs := []string{"run-a", "run-b", "run-c", "run-d", "run-ib", "run-ic", "run-id"}
-	facts := make([]pfRunFact, len(tasks))
-	for index := range tasks {
-		role := []string{"source", "integration"}[index/4]
-		facts[index] = pfRunFact{TaskID: tasks[index], RunID: runs[index], Role: role, TerminalState: "exited",
-			TerminalObservedUnixNS: int64(index + 1), ContainerID: "container-" + runs[index],
-			ContainerAbsentNS: 1, CleanupNS: 2, ContainerAbsent: true, ResourcesAbsent: true}
-	}
+	return validatorFixtureProfile("smoke")
+}
+
+func validatorFixtureProfile(profile string) pfReport {
+	digest := "sha256:" + strings.Repeat("d", 64)
+	manifest, _, _ := fixedPFProfile(profile, digest)
 	report := pfReport{
-		SchemaVersion: 2, Scenario: "PF-01", Profile: "smoke", Statistics: map[string]int64{}, Resources: map[string]int64{},
-		Binaries: pfBinaryDigestFixture(),
-		Samples: []pfSample{
-			{ID: "concurrent-01-wave-01", BatchID: "concurrent-01", Parallelism: 4, WaveNS: 1, WorkNS: 1, TaskIDs: tasks[:4], RunIDs: runs[:4], IntegrationTaskIDs: tasks[4:], IntegrationRunIDs: runs[4:], QueueNS: []int64{1, 1, 1, 1}, FanoutNS: 1, DirectCASNS: 1, IntegrationNS: []int64{1, 1, 1}, Integrations3NS: 1, DiskBytes: 1, RunFacts: facts},
-			{ID: "concurrent-01-warmup", BatchID: "concurrent-01", Parallelism: 4, Warmup: true, TaskIDs: []string{"warm-task"}, RunIDs: []string{"warm-run"}},
-			{ID: "serial-01-wave-01", BatchID: "serial-01", Parallelism: 1, TaskIDs: []string{"serial-task"}, RunIDs: []string{"serial-run"}},
-		},
-		Faults: []pfFaultRow{validFault("live", 1, 4), validFault("capture", 1, 1), validFault("cas", 1, 1)},
+		SchemaVersion: 2, Scenario: "PF-01", Profile: profile, Statistics: map[string]int64{}, Resources: map[string]int64{}, Manifest: manifest,
+		Environment: map[string]string{"image_digest": digest}, Binaries: pfBinaryDigestFixture(),
 	}
-	report.ObjectCounts = append(report.ObjectCounts, pfObjectCounts{SampleID: "concurrent-01", FreshDataDirID: dataDirID, ProjectID: projectID})
-	report.ObjectCounts = append(report.ObjectCounts, pfObjectCounts{SampleID: "serial-01", FreshDataDirID: "root-serial", ProjectID: "project-serial"})
-	for index := range report.Faults {
-		report.ObjectCounts = append(report.ObjectCounts, report.Faults[index].Counts)
+	faultIndex := map[string]int{}
+	for _, want := range manifest.Samples {
+		if strings.HasPrefix(want.Class, "fault_") {
+			kind := strings.TrimPrefix(want.Class, "fault_")
+			faultIndex[kind]++
+			report.Faults = append(report.Faults, validFault(kind, faultIndex[kind], map[string]int{"fault_live": 4, "fault_capture": 1, "fault_cas": 1}[want.Class]))
+			continue
+		}
+		tasks, runs := make([]string, want.Tasks), make([]string, want.Runs)
+		for index := range tasks {
+			tasks[index], runs[index] = want.ID+"-task-"+strconv.Itoa(index), want.ID+"-run-"+strconv.Itoa(index)
+		}
+		sample := pfSample{ID: want.ID, BatchID: want.BatchID, Parallelism: want.Parallelism, Warmup: strings.HasSuffix(want.Class, "_warmup"), Soak: want.Class == "soak",
+			TaskIDs: tasks[:4], RunIDs: runs[:4], IntegrationTaskIDs: tasks[4:], IntegrationRunIDs: runs[4:]}
+		if want.Class == "scored" {
+			sample.WaveNS, sample.WorkNS, sample.QueueNS = 1, 1, []int64{1, 1, 1, 1}
+			sample.FanoutNS, sample.DirectCASNS, sample.IntegrationNS, sample.Integrations3NS, sample.DiskBytes = 1, 1, []int64{1, 1, 1}, 1, 1
+			for index := range tasks {
+				role := []string{"source", "integration"}[index/4]
+				sample.RunFacts = append(sample.RunFacts, pfRunFact{TaskID: tasks[index], RunID: runs[index], Role: role, TerminalState: "exited", TerminalObservedUnixNS: int64(index + 1), ContainerID: "container-" + runs[index], ContainerAbsentNS: 1, CleanupNS: 2, ContainerAbsent: true, ResourcesAbsent: true})
+			}
+			appendPFScoredEvidence(&report, sample, "root-"+want.BatchID, "project-"+want.BatchID, "origin-"+want.BatchID)
+		}
+		report.Samples = append(report.Samples, sample)
 	}
-	for _, counts := range report.ObjectCounts {
-		report.Disk = append(report.Disk,
-			pfDiskSample{SampleID: counts.SampleID, DataDirID: counts.FreshDataDirID, Boundary: "daemon_ready", ObservedUnixNS: 1, Bytes: 1},
-			pfDiskSample{SampleID: counts.SampleID, DataDirID: counts.FreshDataDirID, Boundary: "gc_complete", ObservedUnixNS: 2, Bytes: 1})
+	for _, want := range manifest.Durable {
+		counts := pfObjectCounts{SampleID: want.SampleID, FreshDataDirID: "root-" + want.SampleID, ProjectID: "project-" + want.SampleID,
+			Tasks: want.Tasks, Runs: want.Runs, Messages: want.Messages, PeerMessages: want.PeerMessages, PeerAcknowledged: want.PeerMessages, PeerAckEvent: want.PeerMessages}
+		for index := range report.Faults {
+			if report.Faults[index].SampleID == want.SampleID {
+				counts = report.Faults[index].Counts
+			}
+		}
+		report.ObjectCounts = append(report.ObjectCounts, counts)
+		for index, boundary := range []string{"daemon_ready", "interval", "gc_complete"} {
+			observed := int64(index + 1)
+			report.Disk = append(report.Disk, pfDiskSample{SampleID: counts.SampleID, DataDirID: counts.FreshDataDirID, Boundary: boundary,
+				ObservedUnixNS: observed, ScheduledUnixNS: observed, StartedUnixNS: observed, EndedUnixNS: observed, Bytes: 1})
+		}
+		origins := []string{"origin-" + want.SampleID}
+		if want.Origins == 2 {
+			origins = []string{"origin-" + want.SampleID + "-before", "origin-" + want.SampleID + "-after"}
+		}
+		appendPFOrigins(&report, want.SampleID, counts.FreshDataDirID, origins...)
 	}
+	for _, fault := range report.Faults {
+		if fault.Kind != "capture" {
+			continue
+		}
+		origins := []string{"origin-" + fault.SampleID + "-before", "origin-" + fault.SampleID + "-after"}
+		start := pfStageRecord("stage_start", "git.capture.ref", fault.TaskIDs[0], fault.RunIDs[0])
+		end := pfStageRecord("stage_interrupted", "git.capture.ref", fault.TaskIDs[0], fault.RunIDs[0])
+		for _, record := range []map[string]any{start, end} {
+			record["sample_id"], record["data_dir_id"], record["project_id"], record["daemon_origin_id"] = fault.SampleID, fault.FreshDataDirID, fault.Counts.ProjectID, origins[0]
+		}
+		end["result"], end["interrupted_by_origin_id"] = "interrupted", origins[1]
+		delete(end, "duration_ns")
+		report.Observer = append(report.Observer, start, end)
+	}
+	for index := range report.Samples {
+		if len(report.Samples[index].RunFacts) > 0 {
+			report.Samples[0], report.Samples[index] = report.Samples[index], report.Samples[0]
+			break
+		}
+	}
+	return report
+}
+
+func appendPFScoredEvidence(report *pfReport, sample pfSample, dataDirID, projectID, origin string) {
 	point := func(id, request, task, run, message string, offset int64) map[string]any {
-		return map[string]any{"schema_version": float64(1), "record_type": "point", "daemon_origin_id": "origin", "sample_id": "concurrent-01", "data_dir_id": dataDirID,
+		return map[string]any{"schema_version": float64(1), "record_type": "point", "daemon_origin_id": origin, "sample_id": sample.BatchID, "data_dir_id": dataDirID,
 			"project_id": projectID, "request_id": request, "task_id": task, "run_id": run, "message_id": message, "point_id": id, "mono_offset_ns": float64(offset), "result": "success"}
 	}
+	tasks := append(append([]string(nil), sample.TaskIDs...), sample.IntegrationTaskIDs...)
+	runs := append(append([]string(nil), sample.RunIDs...), sample.IntegrationRunIDs...)
 	for index := 0; index < 200; index++ {
-		task, run, request := tasks[index%4], runs[index%4], "p5-progress-"+strconv.Itoa(index)
+		task, run, request := tasks[index%4], runs[index%4], "p5-progress-"+sample.ID+"-"+strconv.Itoa(index)
 		report.Observer = append(report.Observer,
-			map[string]any{"schema_version": float64(1), "record_type": "client", "daemon_origin_id": "origin", "sample_id": "concurrent-01", "data_dir_id": dataDirID, "project_id": projectID, "request_id": request, "task_id": task, "run_id": run, "operation": "post progress", "duration_ns": float64(1), "result": "success"},
+			map[string]any{"schema_version": float64(1), "record_type": "client", "daemon_origin_id": origin, "sample_id": sample.BatchID, "data_dir_id": dataDirID, "project_id": projectID, "request_id": request, "task_id": task, "run_id": run, "operation": "post progress", "duration_ns": float64(1), "result": "success"},
 			point("api.progress.received", request, task, run, "", int64(index+1)), point("core.progress.committed", request, task, run, "", int64(index+201)))
 	}
 	for index := range tasks {
@@ -177,7 +285,7 @@ func validatorFixture() pfReport {
 			point("git.capture.submitted_commit", "submit-"+tasks[index], tasks[index], runs[index], "", 2))
 	}
 	for index := 0; index < 10; index++ {
-		message := "message-" + string(rune('a'+index))
+		message := sample.ID + "-message-" + strconv.Itoa(index)
 		report.Observer = append(report.Observer, point("core.message.created_commit", "pf01-peer-"+message, tasks[0], runs[0], message, 1),
 			point("core.message.acknowledged_commit", "ack-"+message, tasks[3], runs[3], message, 2))
 	}
@@ -188,7 +296,11 @@ func validatorFixture() pfReport {
 		}
 		for _, index := range indices {
 			start := pfStageRecord("stage_start", stage, tasks[index], runs[index])
-			report.Observer = append(report.Observer, start, pfStageRecord("stage", stage, tasks[index], runs[index]))
+			end := pfStageRecord("stage", stage, tasks[index], runs[index])
+			for _, record := range []map[string]any{start, end} {
+				record["daemon_origin_id"], record["sample_id"], record["data_dir_id"], record["project_id"] = origin, sample.BatchID, dataDirID, projectID
+			}
+			report.Observer = append(report.Observer, start, end)
 			if stage == "git.capture.freeze" || stage == "git.capture.handoff" || stage == "git.capture.import" {
 				for _, boundary := range []string{"start", "end"} {
 					marker := pfDiskBoundaryRecord(start, boundary)
@@ -199,33 +311,13 @@ func validatorFixture() pfReport {
 		}
 	}
 	for index := range runs {
-		report.Observer = append(report.Observer, map[string]any{"schema_version": float64(1), "record_type": "runtime_limit", "daemon_origin_id": "origin", "sample_id": "concurrent-01", "data_dir_id": dataDirID, "project_id": projectID,
+		report.Observer = append(report.Observer, map[string]any{"schema_version": float64(1), "record_type": "runtime_limit", "daemon_origin_id": origin, "sample_id": sample.BatchID, "data_dir_id": dataDirID, "project_id": projectID,
 			"task_id": tasks[index], "run_id": runs[index], "runtime_role": "agent", "memory_bytes": float64(512 << 20), "nano_cpus": float64(1_000_000_000), "pids_limit": float64(256)})
 	}
 	for index := range runs {
-		report.Observer = append(report.Observer, map[string]any{"schema_version": float64(1), "record_type": "runtime_limit", "daemon_origin_id": "origin", "sample_id": "concurrent-01", "data_dir_id": dataDirID, "project_id": projectID,
+		report.Observer = append(report.Observer, map[string]any{"schema_version": float64(1), "record_type": "runtime_limit", "daemon_origin_id": origin, "sample_id": sample.BatchID, "data_dir_id": dataDirID, "project_id": projectID,
 			"task_id": tasks[index], "run_id": runs[index], "runtime_role": "git_capture", "memory_bytes": float64(128 << 20), "nano_cpus": float64(1_000_000_000), "pids_limit": float64(64)})
 	}
-	report.Observer = append(report.Observer, pfProcessLimitRecord("origin", "concurrent-01", dataDirID),
-		map[string]any{"schema_version": float64(1), "record_type": "resource", "daemon_origin_id": "origin", "sample_id": "concurrent-01", "data_dir_id": dataDirID, "mono_offset_ns": float64(1), "rss_bytes": float64(1), "goroutines": float64(1), "open_fds": float64(1)},
-		map[string]any{"schema_version": float64(1), "record_type": "resource", "daemon_origin_id": "origin", "sample_id": "concurrent-01", "data_dir_id": dataDirID, "mono_offset_ns": float64(100000001), "rss_bytes": float64(1), "goroutines": float64(1), "open_fds": float64(1)})
-	appendPFOrigins(&report, "serial-01", "root-serial", "origin-serial")
-	for _, fault := range report.Faults {
-		origins := []string{"origin-" + fault.Kind + "-before", "origin-" + fault.Kind + "-after"}
-		appendPFOrigins(&report, fault.SampleID, fault.FreshDataDirID, origins...)
-		if fault.Kind == "capture" {
-			start := pfStageRecord("stage_start", "git.capture.ref", fault.TaskIDs[0], fault.RunIDs[0])
-			end := pfStageRecord("stage_interrupted", "git.capture.ref", fault.TaskIDs[0], fault.RunIDs[0])
-			for _, record := range []map[string]any{start, end} {
-				record["sample_id"], record["data_dir_id"], record["project_id"] = fault.SampleID, fault.FreshDataDirID, fault.Counts.ProjectID
-				record["daemon_origin_id"] = origins[0]
-			}
-			end["result"], end["interrupted_by_origin_id"] = "interrupted", origins[1]
-			delete(end, "duration_ns")
-			report.Observer = append(report.Observer, start, end)
-		}
-	}
-	return report
 }
 
 func pfBinaryDigestFixture() map[string]string {
@@ -277,15 +369,17 @@ func pfProcessLimitRecord(origin, sample, dataDir string) map[string]any {
 }
 
 func validFault(kind string, index, runs int) pfFaultRow {
+	id := fmt.Sprintf("fault-%s-%02d", kind, index)
 	total := runs + map[string]int{"live": 3}[kind]
 	tasks, ids := make([]string, total), make([]string, total)
 	for position := range ids {
-		tasks[position], ids[position] = kind+"-task-"+strconv.Itoa(position), kind+"-run-"+strconv.Itoa(position)
+		tasks[position], ids[position] = id+"-task-"+strconv.Itoa(position), id+"-run-"+strconv.Itoa(position)
 	}
-	row := pfFaultRow{SampleID: "fault-" + kind, Kind: kind, Index: index, FreshDataDirID: "root-" + kind, RecoveryNS: 1,
+	row := pfFaultRow{SampleID: id, Kind: kind, Index: index, FreshDataDirID: "root-" + id, RecoveryNS: 1,
 		TaskIDs: tasks, RunIDs: ids,
 		RunIDsBefore: ids[:runs], RunIDsAfter: append([]string(nil), ids[:runs]...), PreRestart: "durable", FinalSHA: "sha", GitFSCK: "pass", Cleanup: "absent", Result: "PASS"}
 	row.Counts.SampleID, row.Counts.FreshDataDirID, row.Counts.ProjectID = row.SampleID, row.FreshDataDirID, "project-"+kind
+	row.Counts.Tasks, row.Counts.Runs = total, total
 	row.Counts.PeerMessages, row.Counts.PeerAcknowledged, row.Counts.PeerAckEvent = 4, 4, 4
 	if kind == "live" {
 		row.DurableUnacked, row.Counts.PeerMessages, row.Counts.PeerAcknowledged, row.Counts.PeerAckEvent = 4, 10, 10, 10

@@ -41,9 +41,7 @@ func TestP2OutcomeAckBundleRollsBackAsAUnit(t *testing.T) {
 	}); !core.IsCode(err, core.CodeScopeDenied) {
 		t.Fatalf("foreign bundled ack error = %v", err)
 	}
-	if after := h.durableSignature(t, project.ID); after != before {
-		t.Fatal("failed bundled outcome changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, before)
 
 	result, err := h.service.RequestOutcome(context.Background(), core.OutcomeInput{
 		Token: claim.Token, Outcome: core.OutcomeWait, Reason: "waiting",

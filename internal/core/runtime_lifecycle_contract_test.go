@@ -79,9 +79,7 @@ func TestP3RuntimeFactsAdvanceMonotonicallyAndFenceEveryExternalFact(t *testing.
 	if _, err := h.service.RecordRunStartIssued(context.Background(), wrongNonce); !core.IsCode(err, core.CodeStaleRun) {
 		t.Fatalf("wrong nonce error = %v, want %s", err, core.CodeStaleRun)
 	}
-	if after := h.durableSignature(t, project.ID); after != beforeWrongNonce {
-		t.Fatal("wrong nonce changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, beforeWrongNonce)
 	tooEarly := fact
 	tooEarly.RequestID = "too-early-observation"
 	if _, err := h.service.ObserveProcessAndActivateRun(context.Background(), tooEarly); !core.IsCode(err, core.CodeInvalidState) {
@@ -94,9 +92,7 @@ func TestP3RuntimeFactsAdvanceMonotonicallyAndFenceEveryExternalFact(t *testing.
 	if _, err := h.service.RecordRunStartIssued(context.Background(), missingContainer); !core.IsCode(err, core.CodeStaleRun) {
 		t.Fatalf("missing container error = %v, want %s", err, core.CodeStaleRun)
 	}
-	if after := h.durableSignature(t, project.ID); after != beforeMissingContainer {
-		t.Fatal("missing container fact changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, beforeMissingContainer)
 
 	fact.RequestID = "start-runtime-facts"
 	started, err := h.service.RecordRunStartIssued(context.Background(), fact)
@@ -136,9 +132,7 @@ func TestP3SessionFactIsImmediateImmutableAndReplaySafe(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("session replay: %v", err)
 	}
-	if after := h.durableSignature(t, project.ID); after != beforeReplay {
-		t.Fatal("session replay added durable side effects")
-	}
+	h.requireDurableSignature(t, project.ID, beforeReplay)
 	if _, err := h.service.RecordRunSession(context.Background(), core.RunSessionInput{
 		RunRuntimeFactInput: fact, NativeSessionID: "session-native-2",
 	}); !core.IsCode(err, core.CodeInvalidState) {
@@ -202,9 +196,7 @@ func TestP3CleanupRequiresTerminalAndStableOperationFence(t *testing.T) {
 	}); !core.IsCode(err, core.CodeStaleRun) {
 		t.Fatalf("wrong cleanup operation error = %v, want %s", err, core.CodeStaleRun)
 	}
-	if after := h.durableSignature(t, project.ID); after != beforeWrongOperation {
-		t.Fatal("wrong cleanup operation changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, beforeWrongOperation)
 }
 
 func TestP3CleanupOwnershipBlocksNextAgentRunUntilEveryRuntimeResourceIsRemoved(t *testing.T) {
@@ -262,9 +254,7 @@ func assertAgentCannotClaimUntilCleanupRemoved(t *testing.T, h *harness, project
 	if claim, ok, err := h.service.ClaimNext(context.Background(), projectID); err != nil || ok {
 		t.Fatalf("claim while prior Run cleanup owns Agent: claim=%#v ok=%v err=%v", claim, ok, err)
 	}
-	if after := h.durableSignature(t, projectID); after != before {
-		t.Fatal("rejected cleanup-blocked claim changed durable state")
-	}
+	h.requireDurableSignature(t, projectID, before)
 }
 
 func TestP3TerminalCleanupDoesNotConsumeAnotherAgentsGlobalRunSlot(t *testing.T) {
@@ -326,9 +316,7 @@ func TestP3RuntimeTerminalIngressRejectsEveryStaleOwnershipFact(t *testing.T) {
 			if _, err := h.service.RecordRuntimeRunTerminal(context.Background(), input); !core.IsCode(err, core.CodeStaleRun) {
 				t.Fatalf("stale %s error = %v, want %s", name, err, core.CodeStaleRun)
 			}
-			if after := h.durableSignature(t, project.ID); after != before {
-				t.Fatalf("stale %s changed durable state", name)
-			}
+			h.requireDurableSignature(t, project.ID, before)
 		})
 	}
 
@@ -349,9 +337,7 @@ func TestP3RuntimeTerminalIngressAllowsOnlyNarrowPreLaunchFailure(t *testing.T) 
 	if _, err := h.service.RecordRuntimeRunTerminal(context.Background(), input); !core.IsCode(err, core.CodeStaleRun) {
 		t.Fatalf("pre-launch exited error = %v, want %s", err, core.CodeStaleRun)
 	}
-	if after := h.durableSignature(t, project.ID); after != before {
-		t.Fatal("rejected pre-launch terminal fact changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, before)
 
 	input.State = core.RunFailed
 	input.RequestID = "prelaunch-failed"
@@ -366,9 +352,7 @@ func TestP3RuntimeTerminalIngressAllowsOnlyNarrowPreLaunchFailure(t *testing.T) 
 	if _, err := h.service.RecordRuntimeRunTerminal(context.Background(), input); err != nil {
 		t.Fatalf("replay pre-launch failure: %v", err)
 	}
-	if after := h.durableSignature(t, project.ID); after != beforeReplay {
-		t.Fatal("pre-launch failure replay changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, beforeReplay)
 }
 
 func prepareAndActivateRuntimeRun(t *testing.T, h *harness, claim core.Claim, root, prefix string) core.Run {

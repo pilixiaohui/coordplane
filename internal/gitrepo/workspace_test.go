@@ -262,6 +262,24 @@ func TestGT01VerifyNeverCreatesMissingWorkspace(t *testing.T) {
 	}
 }
 
+func TestGT07DiscardRejectsWorkspaceMutationAfterFingerprint(t *testing.T) {
+	ctx := context.Background()
+	_, manager, project, _, initial := newWorkspaceFixture(t)
+	spec := WorkspaceSpec{ProjectID: project.ID, TaskID: "discard-mutated", BaseSHA: initial}
+	workspace, err := manager.Materialize(ctx, spec)
+	requireNoError(t, err)
+	state, err := manager.State(ctx, spec, initial, 1)
+	requireNoError(t, err)
+	requireNoError(t, os.WriteFile(filepath.Join(workspace.Path, "mutation"), []byte("new\n"), 0o600))
+	discarded, err := manager.Discard(ctx, spec, initial, 1, state.Fingerprint, func() (bool, error) { return true, nil })
+	if discarded || err == nil || !strings.Contains(err.Error(), "fingerprint changed") {
+		t.Fatalf("Discard mutated workspace = %t, %v", discarded, err)
+	}
+	if _, err := os.Stat(workspace.Path); err != nil {
+		t.Fatalf("Discard removed mutated workspace: %v", err)
+	}
+}
+
 func TestProjectMaintenanceLockIsPerProjectAndHonorsCancellation(t *testing.T) {
 	var locks projectLocks
 	unlock, err := locks.lock(context.Background(), "project-a")

@@ -42,6 +42,7 @@ function_warnings=$tmp/function-warnings
 function_blockers=$tmp/function-blockers
 gofmt_bad=$tmp/gofmt
 multistatement_blockers=$tmp/multistatement-blockers
+go_files=$tmp/go-files
 untracked_maintained=$tmp/untracked-maintained
 : >"$records"
 : >"$unknown"
@@ -50,6 +51,7 @@ untracked_maintained=$tmp/untracked-maintained
 : >"$function_warnings"
 : >"$function_blockers"
 : >"$multistatement_blockers"
+: >"$go_files"
 : >"$untracked_maintained"
 
 classify() {
@@ -135,18 +137,6 @@ check_functions() {
   ' "$1"
 }
 
-check_multistatements() {
-  awk -v path="$1" -v blockers="$multistatement_blockers" '
-    {
-      code=$0
-      gsub(/"([^"\\]|\\.)*"/, "", code)
-      gsub(/`[^`]*`/, "", code)
-      sub(/\/\/.*/, "", code)
-      if (code ~ /\{[^{};]*;[^{}]*\}/) print path ":" FNR >> blockers
-    }
-  ' "$1"
-}
-
 fixture_bytes=0
 git ls-files --cached --others --exclude-standard | LC_ALL=C sort -u | while IFS= read -r path; do
   [ -f "$path" ] || continue
@@ -161,7 +151,7 @@ git ls-files --cached --others --exclude-standard | LC_ALL=C sort -u | while IFS
 		printf '%s\n' "$path" >>"$untracked_maintained"
 	fi
   case "$path" in
-    *.go) lines=$(count_go "$path"); check_multistatements "$path" ;;
+    *.go) lines=$(count_go "$path"); printf '%s\n' "$path" >>"$go_files" ;;
     *) lines=$(count_text "$path") ;;
   esac
   case "$bucket" in
@@ -182,6 +172,7 @@ git ls-files --cached --others --exclude-standard | LC_ALL=C sort -u | while IFS
     case "$path" in *.go) check_functions "$path" ;; esac
   fi
 done
+go run ./scripts/locguard <"$go_files" >"$multistatement_blockers"
 
 # The pipeline loop runs in a subshell; fixture bytes are calculated separately.
 fixture_bytes=$(git ls-files --cached --others --exclude-standard | awk '/(^|\/)testdata\//{print}' | xargs -r wc -c | awk 'END{print $1+0}')

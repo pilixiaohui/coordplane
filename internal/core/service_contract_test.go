@@ -24,95 +24,6 @@ func requireNoError(t *testing.T, err error) {
 	}
 }
 
-func TestCT02ConcurrentClaimCreatesExactlyOneRun(t *testing.T) {
-	h := newHarness(t)
-	agent := h.addAgent(t, "agent-one")
-	project := h.addProject(t, "project-one", "")
-	chat, err := h.service.Chat(context.Background(), core.ChatInput{
-		ProjectID: project.ID, AgentID: agent.ID, Body: "start", Wake: true, RequestID: "chat-1",
-	})
-	requireNoError(t, err)
-
-	start := make(chan struct{})
-	type result struct {
-		claim core.Claim
-		ok    bool
-		err   error
-	}
-	results := make(chan result, 2)
-	for range 2 {
-		go func() {
-			<-start
-			claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
-			results <- result{claim: claim, ok: ok, err: err}
-		}()
-	}
-	close(start)
-	var winners []core.Claim
-	for range 2 {
-		result := <-results
-		if result.err != nil {
-			t.Fatal(result.err)
-		}
-		if result.ok {
-			winners = append(winners, result.claim)
-		}
-	}
-	if len(winners) != 1 {
-		t.Fatalf("claim winners = %d, want 1", len(winners))
-	}
-	snapshot, err := h.database.Snapshot(context.Background(), project.ID)
-	requireNoError(t, err)
-	if len(snapshot.Runs) != 1 || snapshot.Tasks[0].Generation != 1 {
-		t.Fatalf("snapshot after claim = %#v", snapshot)
-	}
-	if snapshot.Runs[0].IsolationSpecVersion != core.RunIsolationSpecCurrent {
-		t.Fatalf("new Run isolation spec = %d, want current v%d", snapshot.Runs[0].IsolationSpecVersion, core.RunIsolationSpecCurrent)
-	}
-	if snapshot.Tasks[0].ID != chat.Task.ID || snapshot.Tasks[0].CurrentRunID != snapshot.Runs[0].ID {
-		t.Fatalf("task/run claim fence mismatch: task=%#v run=%#v", snapshot.Tasks[0], snapshot.Runs[0])
-	}
-	events, err := h.database.Events(context.Background(), core.EventFilter{ProjectID: project.ID})
-	requireNoError(t, err)
-	if countEvent(events, "task.claimed") != 1 || countEvent(events, "run.created") != 1 {
-		t.Fatalf("claim events = %#v", events)
-	}
-	before := len(events)
-	if _, ok, err := h.service.ClaimNext(context.Background(), project.ID); err != nil || ok {
-		t.Fatalf("second claim while agent busy: ok=%v err=%v", ok, err)
-	}
-	events, _ = h.database.Events(context.Background(), core.EventFilter{ProjectID: project.ID})
-	if len(events) != before {
-		t.Fatalf("losing claim wrote events: before=%d after=%d", before, len(events))
-	}
-}
-
-func TestCT02ClaimOrderingAndOneLiveRunPerAgent(t *testing.T) {
-	h := newHarness(t)
-	agent := h.addAgent(t, "ordered-agent")
-	project := h.addProject(t, "ordered-project", "")
-	if _, err := h.service.Chat(context.Background(), core.ChatInput{
-		ProjectID: project.ID, AgentID: agent.ID, Body: "conversation", Wake: true, RequestID: "chat-order",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	high, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
-		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
-		Title: "high priority", Priority: 100, RequestID: "task-high",
-	})
-	requireNoError(t, err)
-	claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
-	if err != nil || !ok {
-		t.Fatalf("claim: ok=%v err=%v", ok, err)
-	}
-	if claim.Task.ID != high.ID {
-		t.Fatalf("claimed task %s, want high-priority %s", claim.Task.ID, high.ID)
-	}
-	if _, ok, err := h.service.ClaimNext(context.Background(), project.ID); err != nil || ok {
-		t.Fatalf("second task for same live agent claimed: ok=%v err=%v", ok, err)
-	}
-}
-
 func TestCT03StaleRunCannotWriteThroughAgentEntry(t *testing.T) {
 	h := newHarness(t)
 	agent := h.addAgent(t, "fenced-agent")
@@ -173,9 +84,7 @@ func TestCT03StaleRunCannotWriteThroughAgentEntry(t *testing.T) {
 			if !core.IsCode(err, core.CodeStaleRun) {
 				t.Fatalf("error = %v, want STALE_RUN", err)
 			}
-			if after := h.durableSignature(t, project.ID); after != before {
-				t.Fatalf("stale request changed durable state\nbefore=%s\nafter=%s", before, after)
-			}
+			h.requireDurableSignature(t, project.ID, before)
 		})
 	}
 	if _, err := h.service.Progress(context.Background(), core.ProgressInput{Token: run2.Token, Summary: "current", RequestID: "progress-current"}); err != nil {
@@ -215,12 +124,8 @@ func TestAgentMessageReplyCannotCrossProject(t *testing.T) {
 	if !core.IsCode(err, core.CodeScopeDenied) {
 		t.Fatalf("cross-project reply error = %v, want SCOPE_DENIED", err)
 	}
-	if after := h.durableSignature(t, firstProject.ID); after != beforeFirst {
-		t.Fatal("cross-project reply changed the sender project")
-	}
-	if after := h.durableSignature(t, secondProject.ID); after != beforeSecond {
-		t.Fatal("cross-project reply changed the referenced project")
-	}
+	h.requireDurableSignature(t, firstProject.ID, beforeFirst)
+	h.requireDurableSignature(t, secondProject.ID, beforeSecond)
 }
 
 func TestAgentMessageRelatedTaskCannotEscapeRunScope(t *testing.T) {
@@ -262,12 +167,8 @@ func TestAgentMessageRelatedTaskCannotEscapeRunScope(t *testing.T) {
 		if !core.IsCode(err, core.CodeScopeDenied) {
 			t.Fatalf("related task %s error = %v, want SCOPE_DENIED", candidate.ID, err)
 		}
-		if after := h.durableSignature(t, project.ID); after != beforeProject {
-			t.Fatal("rejected related task changed the sender project")
-		}
-		if after := h.durableSignature(t, foreignProject.ID); after != beforeForeign {
-			t.Fatal("rejected related task changed the foreign project")
-		}
+		h.requireDurableSignature(t, project.ID, beforeProject)
+		h.requireDurableSignature(t, foreignProject.ID, beforeForeign)
 	}
 
 	privateMessage, err := h.service.SendBossMessage(context.Background(), core.BossMessageInput{
@@ -283,9 +184,7 @@ func TestAgentMessageRelatedTaskCannotEscapeRunScope(t *testing.T) {
 	if !core.IsCode(err, core.CodeScopeDenied) {
 		t.Fatalf("private reply error = %v, want SCOPE_DENIED", err)
 	}
-	if after := h.durableSignature(t, project.ID); after != beforeProject {
-		t.Fatal("rejected private reply changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, beforeProject)
 }
 
 func TestCT07ConversationIsDurableReusedAndKindSafe(t *testing.T) {
@@ -324,9 +223,7 @@ func TestCT07ConversationIsDurableReusedAndKindSafe(t *testing.T) {
 	}); !core.IsCode(err, core.CodeVersionConflict) {
 		t.Fatalf("conflicting idempotency replay error = %v, want VERSION_CONFLICT", err)
 	}
-	if after := h.durableSignature(t, project.ID); after != beforeConflict {
-		t.Fatal("conflicting idempotency replay changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, beforeConflict)
 	work, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
 		ProjectID: project.ID, AssigneeAgentID: agent.ID, Title: "work", Kind: core.TaskWork, RequestID: "chat-work",
 	})
@@ -335,9 +232,7 @@ func TestCT07ConversationIsDurableReusedAndKindSafe(t *testing.T) {
 	if _, err := h.service.CloseConversation(context.Background(), work.ID, "close-work"); !core.IsCode(err, core.CodeInvalidState) {
 		t.Fatalf("work close error = %v", err)
 	}
-	if after := h.durableSignature(t, project.ID); after != before {
-		t.Fatal("invalid work close changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, before)
 
 	requireNoError(t, h.database.Close())
 	reopened, err := store.Open(context.Background(), h.path)
@@ -449,15 +344,11 @@ func TestCT07LegacyBossMessageDedupesSurviveSQLiteReopen(t *testing.T) {
 			if replayedTask.ID != task.ID || replayedMessage.ID != message.ID {
 				t.Fatalf("legacy replay = task %s message %s, want %s/%s", replayedTask.ID, replayedMessage.ID, task.ID, message.ID)
 			}
-			if after := h.durableSignature(t, project.ID); after != before {
-				t.Fatal("same-input legacy replay changed durable state")
-			}
+			h.requireDurableSignature(t, project.ID, before)
 			if _, _, err := test.replay(context.Background(), h.service, project, agent, task, requestID, message.Body+" changed"); !core.IsCode(err, core.CodeVersionConflict) {
 				t.Fatalf("different-input legacy replay error = %v, want VERSION_CONFLICT", err)
 			}
-			if after := h.durableSignature(t, project.ID); after != before {
-				t.Fatal("different-input legacy replay changed durable state")
-			}
+			h.requireDurableSignature(t, project.ID, before)
 		})
 	}
 }
@@ -486,9 +377,7 @@ func TestCT07KindErrorsRemainStableWhileTaskIsFinishing(t *testing.T) {
 		if _, err := h.service.CloseConversation(context.Background(), claim.Task.ID, "finishing-work-kind-close"); !core.IsCode(err, core.CodeInvalidState) {
 			t.Fatalf("finishing work close error = %v, want INVALID_STATE", err)
 		}
-		if after := h.durableSignature(t, project.ID); after != before {
-			t.Fatal("invalid finishing work close changed durable state")
-		}
+		h.requireDurableSignature(t, project.ID, before)
 	})
 
 	t.Run("conversation accept and rework", func(t *testing.T) {
@@ -530,9 +419,7 @@ func TestCT07KindErrorsRemainStableWhileTaskIsFinishing(t *testing.T) {
 			if err := action.call(); !core.IsCode(err, core.CodeInvalidState) {
 				t.Fatalf("finishing conversation %s error = %v, want INVALID_STATE", action.name, err)
 			}
-			if after := h.durableSignature(t, project.ID); after != before {
-				t.Fatalf("invalid finishing conversation %s changed durable state", action.name)
-			}
+			h.requireDurableSignature(t, project.ID, before)
 		}
 	})
 }
@@ -610,9 +497,7 @@ func TestCT09LifecycleGuardsAndRepair(t *testing.T) {
 		if _, err := h.service.Chat(context.Background(), core.ChatInput{ProjectID: project.ID, AgentID: agent.ID, Body: "orphan", Wake: true, RequestID: "archived-chat"}); !core.IsCode(err, core.CodeInvalidState) {
 			t.Fatalf("archived chat error = %v", err)
 		}
-		if after := h.durableSignature(t, project.ID); after != before {
-			t.Fatal("archived recipient created orphan message")
-		}
+		h.requireDurableSignature(t, project.ID, before)
 		project, err = h.service.ArchiveProject(context.Background(), project.ID, "archive-clean-project")
 		if err != nil || project.Status != core.ProjectArchived {
 			t.Fatalf("archive clean project = %#v err=%v", project, err)
@@ -643,9 +528,7 @@ func TestCT09LifecycleGuardsAndRepair(t *testing.T) {
 		if err != nil || replayed.ID != repaired.ID || replayed.Status != core.ProjectActive {
 			t.Fatalf("repair replay = %#v err=%v", replayed, err)
 		}
-		if after := h.durableSignature(t, persisted.ID); after != beforeReplay {
-			t.Fatal("successful repair replay changed durable state")
-		}
+		h.requireDurableSignature(t, persisted.ID, beforeReplay)
 	})
 
 	t.Run("failed repair replay remains a stable failure", func(t *testing.T) {
@@ -665,9 +548,7 @@ func TestCT09LifecycleGuardsAndRepair(t *testing.T) {
 		if _, err := h.service.RepairProject(context.Background(), project.ID, "repair-failure-request"); !core.IsCode(err, core.CodeGitInvariantViolation) {
 			t.Fatalf("failed repair replay error = %v", err)
 		}
-		if after := h.durableSignature(t, project.ID); after != beforeReplay {
-			t.Fatal("failed repair replay changed durable state")
-		}
+		h.requireDurableSignature(t, project.ID, beforeReplay)
 	})
 }
 
@@ -847,9 +728,7 @@ func TestUnknownAdapterIsRejectedBeforeDurableMutation(t *testing.T) {
 	if !core.IsCode(err, core.CodeInvalidArgument) {
 		t.Fatalf("unknown adapter error = %v, want %s", err, core.CodeInvalidArgument)
 	}
-	if after := h.durableSignature(t, ""); after != before {
-		t.Fatal("unknown adapter changed durable state")
-	}
+	h.requireDurableSignature(t, "", before)
 }
 
 func TestQueuedTaskWithUnknownPersistedAdapterFailsClosed(t *testing.T) {
@@ -870,9 +749,7 @@ func TestQueuedTaskWithUnknownPersistedAdapterFailsClosed(t *testing.T) {
 	if _, ok, err := service.ClaimNext(context.Background(), project.ID); ok || !core.IsCode(err, core.CodeRuntimeInvariantViolation) {
 		t.Fatalf("claim unknown persisted adapter: ok=%t err=%v", ok, err)
 	}
-	if after := h.durableSignature(t, project.ID); after != before {
-		t.Fatal("unknown persisted adapter changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, before)
 }
 
 func newHarness(t *testing.T) *harness {
@@ -923,6 +800,13 @@ func (h *harness) durableSignature(t *testing.T, projectID string) string {
 	}{snapshot, events})
 	requireNoError(t, err)
 	return string(raw)
+}
+
+func (h *harness) requireDurableSignature(t *testing.T, projectID, want string) {
+	t.Helper()
+	if got := h.durableSignature(t, projectID); got != want {
+		t.Fatalf("durable state changed\nbefore=%s\nafter=%s", want, got)
+	}
 }
 
 func prepareTestRun(t *testing.T, h *harness, ctx context.Context, runID, requestID string) (core.Run, error) {

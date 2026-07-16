@@ -45,9 +45,7 @@ func TestP2OutcomeIntentReplaysAfterRevocationAndTerminalAppliesOnce(t *testing.
 	if _, err := h.service.RequestOutcome(context.Background(), input); err != nil {
 		t.Fatalf("dedupe replay after token revocation: %v", err)
 	}
-	if after := h.durableSignature(t, project.ID); after != beforeReplay {
-		t.Fatal("outcome replay changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, beforeReplay)
 
 	terminalInput := core.RunTerminalInput{
 		RunID: claim.Run.ID, State: core.RunExited, ExitCode: intPointer(0),
@@ -62,9 +60,7 @@ func TestP2OutcomeIntentReplaysAfterRevocationAndTerminalAppliesOnce(t *testing.
 	if _, err := recordRunTerminal(h, context.Background(), terminalInput); err != nil {
 		t.Fatalf("terminal replay: %v", err)
 	}
-	if after := h.durableSignature(t, project.ID); after != beforeTerminalReplay {
-		t.Fatal("terminal replay changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, beforeTerminalReplay)
 }
 
 func TestP2UnackedDeliveryRedeliversWithBackoffWhileAckWins(t *testing.T) {
@@ -274,9 +270,7 @@ func TestP2ChildCreateReplaysAfterOutcomeAndFinishingBlocksCancel(t *testing.T) 
 	}); !core.IsCode(err, core.CodeActionInProgress) {
 		t.Fatalf("finishing cancel error=%v", err)
 	}
-	if after := h.durableSignature(t, project.ID); after != before {
-		t.Fatal("rejected finishing mutation changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, before)
 }
 
 func TestP2PendingAckWinsDelayedDeliveryRecord(t *testing.T) {

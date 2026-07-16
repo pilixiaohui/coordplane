@@ -72,60 +72,6 @@ func TestInitializeUsesSavedInitialSHANotMovedSourceBranch(t *testing.T) {
 	assertSourceSnapshot(t, source, before)
 }
 
-func TestInitializeReconcilesEveryCompletedPhase(t *testing.T) {
-	phases := []Phase{
-		PhasePartialPrepared,
-		PhaseBareInitialized,
-		PhaseObjectsImported,
-		PhaseCanonicalWritten,
-		PhaseIntegrityVerified,
-		PhasePromoted,
-	}
-	for _, phase := range phases {
-		t.Run(string(phase), func(t *testing.T) {
-			ctx := context.Background()
-			source, initial := newSourceRepository(t)
-			initializer := newTestInitializer(t)
-			preflight, err := initializer.Preflight(ctx, source, "refs/heads/main")
-			if err != nil {
-				t.Fatalf("Preflight: %v", err)
-			}
-			project := testProject(t, initializer, preflight, "project-phase", "operation-phase")
-			injected := errors.New("injected daemon interruption")
-			fired := false
-			initializer.phaseHook = func(_ context.Context, got Phase, _ phaseFact) error {
-				if got == phase && !fired {
-					fired = true
-					return injected
-				}
-				return nil
-			}
-
-			if _, err := initializer.Initialize(ctx, project); !errors.Is(err, injected) {
-				t.Fatalf("Initialize interruption error = %v, want %v", err, injected)
-			}
-			if !fired {
-				t.Fatalf("phase hook %s did not fire", phase)
-			}
-			initializer.phaseHook = nil
-			fact, err := initializer.Initialize(ctx, project)
-			if err != nil {
-				t.Fatalf("reconciled Initialize: %v", err)
-			}
-			if fact.CanonicalSHA != initial || !fact.Bare {
-				t.Fatalf("reconciled fact = %+v, want bare canonical %s", fact, initial)
-			}
-			verified, err := initializer.Verify(ctx, project)
-			if err != nil {
-				t.Fatalf("Verify reconciled repository: %v", err)
-			}
-			if verified != fact {
-				t.Fatalf("Verify fact = %+v, want %+v", verified, fact)
-			}
-		})
-	}
-}
-
 func TestVerifyAndRepeatedInitializeNeverResetActualCanonical(t *testing.T) {
 	ctx := context.Background()
 	source, initial := newSourceRepository(t)

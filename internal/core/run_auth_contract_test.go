@@ -41,9 +41,7 @@ func TestRunScopeAuthorizationAllowsStartingAndRejectsCrossScopeWithoutWrites(t 
 	if _, err := h.service.CurrentTask(context.Background(), claimA.Token); !core.IsCode(err, core.CodeRunStarting) {
 		t.Fatalf("starting operation error = %v, want %s", err, core.CodeRunStarting)
 	}
-	if after := h.durableSignature(t, project.ID); after != before {
-		t.Fatal("Run scope authorization changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, before)
 }
 
 func TestStartingOutcomeDoesNotConsumeRequestIDBeforeActiveRetry(t *testing.T) {
@@ -74,9 +72,7 @@ func TestStartingOutcomeDoesNotConsumeRequestIDBeforeActiveRetry(t *testing.T) {
 	} else if typed := core.AsError(err); !typed.Retryable || typed.State != string(core.RunStarting) || typed.Version != claim.Run.Version {
 		t.Fatalf("starting outcome error fields = %#v", typed)
 	}
-	if after := h.durableSignature(t, project.ID); after != before {
-		t.Fatal("RUN_STARTING outcome changed durable state or consumed its request ID")
-	}
+	h.requireDurableSignature(t, project.ID, before)
 
 	active, err := activateRun(t, h, context.Background(), claim.Run.ID, "starting-outcome-active")
 	requireNoError(t, err)

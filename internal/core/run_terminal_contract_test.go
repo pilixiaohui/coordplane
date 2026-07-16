@@ -89,15 +89,11 @@ func TestRuntimeTerminalBoundsReasonAndReplaysWithoutDurableSideEffects(t *testi
 	if _, err := recordInterruptedRun(h, claim.Run, largeReason, "bounded-interrupt-replay"); err != nil {
 		t.Fatalf("idempotent interrupt replay: %v", err)
 	}
-	if afterReplay := h.durableSignature(t, project.ID); afterReplay != beforeReplay {
-		t.Fatalf("interrupt replay changed durable state\nbefore=%s\nafter=%s", beforeReplay, afterReplay)
-	}
+	h.requireDurableSignature(t, project.ID, beforeReplay)
 	if _, err := recordInterruptedRun(h, claim.Run, "different reason", "changed-interrupt"); !core.IsCode(err, core.CodeInvalidState) {
 		t.Fatalf("changed terminal fact error = %v, want %s", err, core.CodeInvalidState)
 	}
-	if afterConflict := h.durableSignature(t, project.ID); afterConflict != beforeReplay {
-		t.Fatalf("conflicting interrupt changed durable state\nbefore=%s\nafter=%s", beforeReplay, afterConflict)
-	}
+	h.requireDurableSignature(t, project.ID, beforeReplay)
 }
 
 func createClaimedWorkRun(t *testing.T, h *harness, name string, maxRetries int) (core.Project, core.Claim) {

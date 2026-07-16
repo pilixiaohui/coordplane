@@ -220,12 +220,24 @@ func (h *dockerCaptureHelper) prepareInspectHandoff(
 		return "", fmt.Errorf("capture helper: set inspect handoff access: %w", err)
 	}
 	handoff := filepath.Join(parent, "inspect-"+operationID)
-	if _, err := h.executor.Inspect(ctx, ref); errors.Is(err, containerruntime.ErrNotFound) {
-		if err := os.RemoveAll(handoff); err != nil {
+	state, err := h.executor.Inspect(ctx, ref)
+	reset := errors.Is(err, containerruntime.ErrNotFound)
+	if err != nil && !reset {
+		return "", fmt.Errorf("capture helper: inspect cleanup identity: %w", err)
+	}
+	if err == nil && !state.Running {
+		if state.Ref.ContainerName == "" {
+			state.Ref = ref
+		}
+		if err := h.removeContainer(ctx, state.Ref); err != nil {
+			return "", err
+		}
+		reset = true
+	}
+	if reset {
+		if err := h.quarantineIfPresent(handoff); err != nil {
 			return "", fmt.Errorf("capture helper: reset inspect handoff: %w", err)
 		}
-	} else if err != nil {
-		return "", fmt.Errorf("capture helper: inspect cleanup identity: %w", err)
 	}
 	if err := os.MkdirAll(handoff, 0o770); err != nil {
 		return "", fmt.Errorf("capture helper: create inspect handoff: %w", err)
@@ -234,6 +246,15 @@ func (h *dockerCaptureHelper) prepareInspectHandoff(
 		return "", fmt.Errorf("capture helper: set inspect handoff access: %w", err)
 	}
 	return handoff, nil
+}
+
+func (h *dockerCaptureHelper) quarantineIfPresent(path string) error {
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return h.quarantine(path)
 }
 
 func (h *dockerCaptureHelper) containerSpec(
@@ -295,7 +316,7 @@ func (h *dockerCaptureHelper) runContainer(ctx context.Context, spec containerru
 	if adopt {
 		state, err := h.executor.Inspect(runCtx, ref)
 		switch {
-		case err == nil && (state.Running || state.Status == containerruntime.StatusExited):
+		case err == nil && state.Running:
 			ref, running = state.Ref, true
 		case err == nil:
 			if err := h.removeContainer(runCtx, state.Ref); err != nil {
@@ -308,7 +329,7 @@ func (h *dockerCaptureHelper) runContainer(ctx context.Context, spec containerru
 	if !running {
 		created, err := h.executor.Create(runCtx, spec)
 		if err != nil {
-			return fmt.Errorf("capture helper: create container: %w", err)
+			return h.cleanupContainerError(fmt.Errorf("capture helper: create container: %w", err), spec.Ref)
 		}
 		ref, err = h.executor.Start(runCtx, created)
 		if err != nil {

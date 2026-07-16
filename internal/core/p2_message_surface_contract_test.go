@@ -66,9 +66,7 @@ func TestP2BossReadMarksDeliveredWithoutPretendingAcknowledgement(t *testing.T) 
 	if _, err := h.service.ReadBossMessage(context.Background(), message.ID, "boss-read"); err != nil {
 		t.Fatal(err)
 	}
-	if after := h.durableSignature(t, project.ID); after != beforeReplay {
-		t.Fatal("Boss read replay changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, beforeReplay)
 }
 
 func TestP2AgentInboxReadUsesCurrentRunScope(t *testing.T) {

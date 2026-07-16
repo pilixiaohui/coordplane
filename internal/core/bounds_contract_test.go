@@ -20,9 +20,7 @@ func TestMessageAndProgressLimitPlusOneHaveNoDurableSideEffects(t *testing.T) {
 	}); !core.IsCode(err, core.CodeInvalidArgument) {
 		t.Fatalf("oversized request ID error = %v, want INVALID_ARGUMENT", err)
 	}
-	if after := h.durableSignature(t, project.ID); after != before {
-		t.Fatalf("oversized request ID wrote a row, Event, or dedupe\nbefore=%s\nafter=%s", before, after)
-	}
+	h.requireDurableSignature(t, project.ID, before)
 	if _, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
 		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
 		Title: "oversized", Description: strings.Repeat("d", core.MaximumTaskDescriptionBytes+1),
@@ -30,9 +28,7 @@ func TestMessageAndProgressLimitPlusOneHaveNoDurableSideEffects(t *testing.T) {
 	}); !core.IsCode(err, core.CodeInvalidArgument) {
 		t.Fatalf("oversized task description error = %v, want INVALID_ARGUMENT", err)
 	}
-	if after := h.durableSignature(t, project.ID); after != before {
-		t.Fatalf("oversized task description wrote durable state\nbefore=%s\nafter=%s", before, after)
-	}
+	h.requireDurableSignature(t, project.ID, before)
 
 	chatRequestID := "bounded-chat"
 	if _, err := h.service.Chat(context.Background(), core.ChatInput{
@@ -41,9 +37,7 @@ func TestMessageAndProgressLimitPlusOneHaveNoDurableSideEffects(t *testing.T) {
 	}); !core.IsCode(err, core.CodeInvalidArgument) {
 		t.Fatalf("oversized Boss message error = %v, want INVALID_ARGUMENT", err)
 	}
-	if after := h.durableSignature(t, project.ID); after != before {
-		t.Fatalf("oversized Boss message wrote a row, Event, or dedupe\nbefore=%s\nafter=%s", before, after)
-	}
+	h.requireDurableSignature(t, project.ID, before)
 	chat, err := h.service.Chat(context.Background(), core.ChatInput{
 		ProjectID: project.ID, AgentID: agent.ID,
 		Body: strings.Repeat("m", core.MaximumMessageBodyBytes), Wake: true, RequestID: chatRequestID,
@@ -67,9 +61,7 @@ func TestMessageAndProgressLimitPlusOneHaveNoDurableSideEffects(t *testing.T) {
 	}); !core.IsCode(err, core.CodeInvalidArgument) {
 		t.Fatalf("oversized progress error = %v, want INVALID_ARGUMENT", err)
 	}
-	if after := h.durableSignature(t, project.ID); after != before {
-		t.Fatalf("oversized progress wrote an Event\nbefore=%s\nafter=%s", before, after)
-	}
+	h.requireDurableSignature(t, project.ID, before)
 	if _, err := h.service.Progress(context.Background(), core.ProgressInput{
 		Token: claim.Token, Summary: strings.Repeat("p", core.MaximumProgressSummaryBytes), RequestID: progressRequestID,
 	}); err != nil {
@@ -83,9 +75,7 @@ func TestMessageAndProgressLimitPlusOneHaveNoDurableSideEffects(t *testing.T) {
 	}); !core.IsCode(err, core.CodeInvalidArgument) {
 		t.Fatalf("oversized Agent message error = %v, want INVALID_ARGUMENT", err)
 	}
-	if after := h.durableSignature(t, project.ID); after != before {
-		t.Fatalf("oversized Agent message wrote a row, Event, or dedupe\nbefore=%s\nafter=%s", before, after)
-	}
+	h.requireDurableSignature(t, project.ID, before)
 	if _, err := h.service.SendAgentMessage(context.Background(), core.SendMessageInput{
 		Token: claim.Token, RecipientKind: "boss", Body: strings.Repeat("a", core.MaximumMessageBodyBytes), RequestID: agentMessageRequestID,
 	}); err != nil {

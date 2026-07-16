@@ -44,9 +44,7 @@ func TestCT08AcceptIntentFreezesDecisionWithoutAdvancingGit(t *testing.T) {
 	if err != nil || replayed.ID != accepted.ID || replayed.PendingActionID != accepted.PendingActionID {
 		t.Fatalf("accept replay = %#v err=%v", replayed, err)
 	}
-	if after := h.durableSignature(t, project.ID); after != beforeReplay {
-		t.Fatal("accept replay changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, beforeReplay)
 }
 
 func TestCT08ReadableAssignmentDoesNotAuthorizeAgentAcceptOrRework(t *testing.T) {
@@ -83,9 +81,7 @@ func TestCT08ReadableAssignmentDoesNotAuthorizeAgentAcceptOrRework(t *testing.T)
 	}); !core.IsCode(err, core.CodeScopeDenied) {
 		t.Fatalf("assigned task rework error = %v", err)
 	}
-	if after := h.durableSignature(t, project.ID); after != before {
-		t.Fatal("scope-denied accept/rework changed durable state")
-	}
+	h.requireDurableSignature(t, project.ID, before)
 }
 
 func makeSubmittedTask(t *testing.T, h *harness, task core.Task, head string) core.Task {

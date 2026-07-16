@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strconv"
@@ -53,6 +54,7 @@ type pfInventory struct {
 	taskWave, taskSample, taskRun, runTask              map[string]string
 	sampleDataDir, sampleProject                        map[string]string
 	sourceTasks, scoredTasks, advanceTasks, scoredWaves map[string]bool
+	manifest                                            pfProfileManifest
 }
 
 func validatePFSamples(report *pfReport) (pfInventory, error) {
@@ -61,21 +63,47 @@ func validatePFSamples(report *pfReport) (pfInventory, error) {
 		sampleDataDir: map[string]string{}, sampleProject: map[string]string{}, sourceTasks: map[string]bool{}, scoredTasks: map[string]bool{},
 		advanceTasks: map[string]bool{}, scoredWaves: map[string]bool{},
 	}
+	expected, _, ok := fixedPFProfile(report.Profile, report.Environment["image_digest"])
+	if !ok || !reflect.DeepEqual(report.Manifest, expected) || !validImageDigest(expected.ImageDigest) {
+		return result, fmt.Errorf("PF profile manifest is missing or does not match the fixed profile")
+	}
+	result.manifest = expected
+	expectedSamples := map[string]pfManifestSample{}
+	for _, sample := range expected.Samples {
+		expectedSamples[sample.ID] = sample
+	}
+	expectedDurable := map[string]pfManifestDurable{}
+	for _, durable := range expected.Durable {
+		expectedDurable[durable.SampleID] = durable
+	}
 	report.RawMetrics = map[string][]int64{}
 	dataDirs := map[string]bool{}
+	if len(report.ObjectCounts) != len(expectedDurable) {
+		return result, fmt.Errorf("durable count exact set = %d, want %d", len(report.ObjectCounts), len(expectedDurable))
+	}
 	for _, counts := range report.ObjectCounts {
+		want, known := expectedDurable[counts.SampleID]
 		if counts.SampleID == "" || counts.FreshDataDirID == "" || counts.ProjectID == "" ||
-			result.sampleDataDir[counts.SampleID] != "" || dataDirs[counts.FreshDataDirID] {
+			!known || result.sampleDataDir[counts.SampleID] != "" || dataDirs[counts.FreshDataDirID] ||
+			counts.Tasks != want.Tasks || counts.Runs != want.Runs || counts.PeerMessages != want.PeerMessages ||
+			(want.Messages > 0 && counts.Messages != want.Messages) || counts.PeerAcknowledged != want.PeerMessages ||
+			counts.PeerAckEvent != want.PeerMessages || counts.OpenRuns != 0 || counts.OwnedResidue != 0 {
 			return result, fmt.Errorf("durable count sample/data-dir identity is missing or duplicate")
 		}
 		result.sampleDataDir[counts.SampleID], result.sampleProject[counts.SampleID] = counts.FreshDataDirID, counts.ProjectID
 		dataDirs[counts.FreshDataDirID] = true
 	}
+	seenSamples := map[string]bool{}
 	for _, sample := range report.Samples {
+		want, known := expectedSamples[sample.ID]
 		if sample.ID == "" || sample.BatchID == "" || result.sampleDataDir[sample.BatchID] == "" ||
+			!known || strings.HasPrefix(want.Class, "fault_") || seenSamples[sample.ID] || sample.BatchID != want.BatchID ||
+			sample.Parallelism != want.Parallelism || sample.Warmup != strings.HasSuffix(want.Class, "_warmup") || sample.Soak != (want.Class == "soak") ||
+			len(sample.TaskIDs)+len(sample.IntegrationTaskIDs) != want.Tasks || len(sample.RunIDs)+len(sample.IntegrationRunIDs) != want.Runs ||
 			len(sample.TaskIDs) != len(sample.RunIDs) || len(sample.IntegrationTaskIDs) != len(sample.IntegrationRunIDs) {
 			return result, fmt.Errorf("sample inventory identity is incomplete")
 		}
+		seenSamples[sample.ID] = true
 		allTasks := append(append([]string(nil), sample.TaskIDs...), sample.IntegrationTaskIDs...)
 		allRuns := append(append([]string(nil), sample.RunIDs...), sample.IntegrationRunIDs...)
 		for index, taskID := range allTasks {
@@ -148,6 +176,11 @@ func validatePFSamples(report *pfReport) (pfInventory, error) {
 			report.RawMetrics["T_cleanup"] = append(report.RawMetrics["T_cleanup"], fact.CleanupNS)
 		}
 	}
+	for _, want := range expected.Samples {
+		if !strings.HasPrefix(want.Class, "fault_") && !seenSamples[want.ID] {
+			return result, fmt.Errorf("profile sample %s is missing", want.ID)
+		}
+	}
 	for _, row := range report.Faults {
 		for index, taskID := range row.TaskIDs {
 			runID := row.RunIDs[index]
@@ -158,15 +191,31 @@ func validatePFSamples(report *pfReport) (pfInventory, error) {
 			result.taskRun[taskID], result.runTask[runID] = runID, taskID
 		}
 	}
-	if report.Profile == "release" && len(result.scoredWaves) != 20 {
-		return result, fmt.Errorf("release scored wave exact set is not 20")
+	wantScored := 0
+	for _, sample := range expected.Samples {
+		if sample.Class == "scored" {
+			wantScored++
+		}
+	}
+	if len(result.scoredWaves) != wantScored {
+		return result, fmt.Errorf("%s scored wave exact set is not %d", report.Profile, wantScored)
 	}
 	diskBySample := map[string]map[string]bool{}
 	diskCadence := map[string][]int64{}
 	for _, sample := range report.Disk {
 		if sample.SampleID == "" || sample.DataDirID == "" || result.sampleDataDir[sample.SampleID] != sample.DataDirID ||
-			sample.Boundary == "" || sample.ObservedUnixNS <= 0 || sample.Bytes < 0 || sample.Error != "" {
+			sample.Boundary == "" || sample.ScheduledUnixNS <= 0 || sample.StartedUnixNS < sample.ScheduledUnixNS ||
+			sample.EndedUnixNS < sample.StartedUnixNS || sample.ObservedUnixNS != sample.EndedUnixNS || sample.OverrunNS < 0 ||
+			sample.Bytes < 0 || sample.Error != "" {
 			return result, fmt.Errorf("disk sample is incomplete")
+		}
+		if sample.Boundary == "interval" {
+			wantOverrun := max(int64(0), sample.EndedUnixNS-sample.ScheduledUnixNS-int64(time.Second))
+			if sample.OverrunNS != wantOverrun || sample.OverrunNS > 0 {
+				return result, fmt.Errorf("disk interval sampling overran schedule for %s", sample.SampleID)
+			}
+		} else if sample.OverrunNS != 0 {
+			return result, fmt.Errorf("disk boundary sample has an interval overrun")
 		}
 		if diskBySample[sample.SampleID] == nil {
 			diskBySample[sample.SampleID] = map[string]bool{}
@@ -174,7 +223,7 @@ func validatePFSamples(report *pfReport) (pfInventory, error) {
 		diskBySample[sample.SampleID][sample.Boundary] = true
 		report.RawMetrics["disk_bytes"] = append(report.RawMetrics["disk_bytes"], sample.Bytes)
 		if sample.Boundary == "daemon_ready" || sample.Boundary == "interval" || sample.Boundary == "gc_complete" {
-			diskCadence[sample.SampleID] = append(diskCadence[sample.SampleID], sample.ObservedUnixNS)
+			diskCadence[sample.SampleID] = append(diskCadence[sample.SampleID], sample.ScheduledUnixNS)
 		}
 	}
 	for sampleID, times := range diskCadence {
@@ -585,17 +634,12 @@ func validateObserver(report *pfReport) error {
 	if len(stageStarts) != 0 {
 		return fmt.Errorf("observer contains unterminated stage starts")
 	}
-	for sampleID := range inventory.sampleDataDir {
-		want := 1
-		if strings.HasPrefix(sampleID, "fault-") {
-			want = 2
-		}
-		got := originsBySample[sampleID]
-		if got != want {
-			return fmt.Errorf("sample %s origin exact set = %d, want %d", sampleID, got, want)
+	for _, durable := range inventory.manifest.Durable {
+		if got := originsBySample[durable.SampleID]; got != durable.Origins {
+			return fmt.Errorf("sample %s origin exact set = %d, want %d", durable.SampleID, got, durable.Origins)
 		}
 	}
-	wantOrigins := map[string]int{"smoke": 8, "release": 28}[report.Profile]
+	wantOrigins := inventory.manifest.Origins
 	if wantOrigins == 0 || len(originIdentity) != wantOrigins {
 		return fmt.Errorf("%s profile origin cardinality = %d, want %d", report.Profile, len(originIdentity), wantOrigins)
 	}
@@ -769,9 +813,16 @@ func validateObserver(report *pfReport) error {
 }
 
 func validatePFFaults(report *pfReport) error {
-	expected := map[string]int{"live": 1, "capture": 1, "cas": 1}
-	if report.Profile == "release" {
-		expected = map[string]int{"live": 5, "capture": 3, "cas": 3}
+	manifest, _, ok := fixedPFProfile(report.Profile, report.Environment["image_digest"])
+	if !ok {
+		return fmt.Errorf("unknown PF profile %q", report.Profile)
+	}
+	expected, expectedSamples := map[string]int{}, map[string]pfManifestSample{}
+	for _, sample := range manifest.Samples {
+		if strings.HasPrefix(sample.Class, "fault_") {
+			expected[strings.TrimPrefix(sample.Class, "fault_")]++
+			expectedSamples[sample.ID] = sample
+		}
 	}
 	seen, samples, roots := map[string]map[int]bool{}, map[string]bool{}, map[string]bool{}
 	countsBySample := map[string]pfObjectCounts{}
@@ -779,6 +830,7 @@ func validatePFFaults(report *pfReport) error {
 		countsBySample[counts.SampleID] = counts
 	}
 	for _, row := range report.Faults {
+		want, known := expectedSamples[row.SampleID]
 		if seen[row.Kind] == nil {
 			seen[row.Kind] = map[int]bool{}
 		}
@@ -789,9 +841,10 @@ func validatePFFaults(report *pfReport) error {
 		before, after := append([]string(nil), row.RunIDsBefore...), append([]string(nil), row.RunIDsAfter...)
 		sort.Strings(before)
 		sort.Strings(after)
-		if expected[row.Kind] == 0 || row.Index < 1 || row.Index > expected[row.Kind] || seen[row.Kind][row.Index] ||
+		if !known || want.Class != "fault_"+row.Kind || row.SampleID != fmt.Sprintf("fault-%s-%02d", row.Kind, row.Index) ||
+			expected[row.Kind] == 0 || row.Index < 1 || row.Index > expected[row.Kind] || seen[row.Kind][row.Index] ||
 			row.SampleID == "" || samples[row.SampleID] || row.FreshDataDirID == "" || roots[row.FreshDataDirID] ||
-			len(row.TaskIDs) == 0 || len(row.TaskIDs) != len(row.RunIDs) || !uniqueStrings(row.TaskIDs) || !uniqueStrings(row.RunIDs) ||
+			len(row.TaskIDs) != want.Tasks || len(row.RunIDs) != want.Runs || !uniqueStrings(row.TaskIDs) || !uniqueStrings(row.RunIDs) ||
 			row.Counts.SampleID != row.SampleID || row.Counts.FreshDataDirID != row.FreshDataDirID || row.Counts.ProjectID == "" ||
 			countsBySample[row.SampleID] != row.Counts || row.RecoveryNS <= 0 || row.RecoveryNS > int64(8*time.Second) ||
 			len(before) != wantRuns || !uniqueStrings(before) || !uniqueStrings(after) || strings.Join(before, "\x00") != strings.Join(after, "\x00") ||
