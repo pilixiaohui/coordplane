@@ -303,9 +303,11 @@ func (h *dockerCaptureHelper) runContainer(ctx context.Context, spec containerru
 	}
 	live, err := h.executor.Inspect(runCtx, ref)
 	if err != nil {
+		_ = h.removeContainer(context.Background(), ref)
 		return fmt.Errorf("capture helper: inspect started container: %w", err)
 	}
-	if !live.Running {
+	if !live.Running && live.Status != containerruntime.StatusExited {
+		_ = h.removeContainer(context.Background(), ref)
 		return errors.New("capture helper: started container is not running")
 	}
 	role := "git_capture"
