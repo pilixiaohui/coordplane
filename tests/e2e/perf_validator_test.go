@@ -57,6 +57,20 @@ func TestPFValidatorRejectsMissingDuplicateAndNegativeEvidence(t *testing.T) {
 				}
 			}
 		},
+		"disk sampler rejection": func(report *pfReport) {
+			report.Disk[0].Rejected, report.Disk[0].FailureReason = true, "queue_full"
+		},
+		"normal Events differ from manifest": func(report *pfReport) {
+			pfCounts(report, "serial-01").Events++
+		},
+		"fault Messages self-consistently differ from manifest": func(report *pfReport) {
+			report.Faults[0].Counts.Messages++
+			pfCounts(report, "fault-live-01").Messages++
+		},
+		"fault Events self-consistently differ from manifest": func(report *pfReport) {
+			report.Faults[0].Counts.Events++
+			pfCounts(report, "fault-live-01").Events++
+		},
 		"complete scored wave deleted": func(report *pfReport) {
 			dropPFSampleGroup(report, "concurrent-01-wave-02")
 		},
@@ -131,6 +145,15 @@ func firstPFRecord(report *pfReport, key, value string) map[string]any {
 	panic("PF fixture record not found: " + key + "=" + value)
 }
 
+func pfCounts(report *pfReport, sampleID string) *pfObjectCounts {
+	for index := range report.ObjectCounts {
+		if report.ObjectCounts[index].SampleID == sampleID {
+			return &report.ObjectCounts[index]
+		}
+	}
+	panic("PF fixture counts not found: " + sampleID)
+}
+
 func dropFirstPFRecord(report *pfReport, key, value string, identity ...string) {
 	for index, record := range report.Observer {
 		if record[key] == value && (len(identity) == 0 || record[identity[0]] == identity[1]) {
@@ -200,11 +223,15 @@ func validatorFixtureProfile(profile string) pfReport {
 		Environment: map[string]string{"image_digest": digest}, Binaries: pfBinaryDigestFixture(),
 	}
 	faultIndex := map[string]int{}
+	durable := map[string]pfManifestDurable{}
+	for _, want := range manifest.Durable {
+		durable[want.SampleID] = want
+	}
 	for _, want := range manifest.Samples {
 		if strings.HasPrefix(want.Class, "fault_") {
 			kind := strings.TrimPrefix(want.Class, "fault_")
 			faultIndex[kind]++
-			report.Faults = append(report.Faults, validFault(kind, faultIndex[kind], map[string]int{"fault_live": 4, "fault_capture": 1, "fault_cas": 1}[want.Class]))
+			report.Faults = append(report.Faults, validFault(kind, faultIndex[kind], map[string]int{"fault_live": 4, "fault_capture": 1, "fault_cas": 1}[want.Class], durable[want.ID]))
 			continue
 		}
 		tasks, runs := make([]string, want.Tasks), make([]string, want.Runs)
@@ -226,7 +253,7 @@ func validatorFixtureProfile(profile string) pfReport {
 	}
 	for _, want := range manifest.Durable {
 		counts := pfObjectCounts{SampleID: want.SampleID, FreshDataDirID: "root-" + want.SampleID, ProjectID: "project-" + want.SampleID,
-			Tasks: want.Tasks, Runs: want.Runs, Messages: want.Messages, PeerMessages: want.PeerMessages, PeerAcknowledged: want.PeerMessages, PeerAckEvent: want.PeerMessages}
+			Tasks: want.Tasks, Runs: want.Runs, Messages: want.Messages, Events: want.Events, PeerMessages: want.PeerMessages, PeerAcknowledged: want.PeerMessages, PeerAckEvent: want.PeerMessages}
 		for index := range report.Faults {
 			if report.Faults[index].SampleID == want.SampleID {
 				counts = report.Faults[index].Counts
@@ -236,7 +263,8 @@ func validatorFixtureProfile(profile string) pfReport {
 		for index, boundary := range []string{"daemon_ready", "interval", "gc_complete"} {
 			observed := int64(index + 1)
 			report.Disk = append(report.Disk, pfDiskSample{SampleID: counts.SampleID, DataDirID: counts.FreshDataDirID, Boundary: boundary,
-				ObservedUnixNS: observed, ScheduledUnixNS: observed, StartedUnixNS: observed, EndedUnixNS: observed, Bytes: 1})
+				ObservedUnixNS: observed, ScheduledUnixNS: observed, StartedUnixNS: observed, EndedUnixNS: observed,
+				ActiveWorkers: 1, MaxActiveWorkers: 1, Bytes: 1})
 		}
 		origins := []string{"origin-" + want.SampleID}
 		if want.Origins == 2 {
@@ -368,7 +396,7 @@ func pfProcessLimitRecord(origin, sample, dataDir string) map[string]any {
 	}
 }
 
-func validFault(kind string, index, runs int) pfFaultRow {
+func validFault(kind string, index, runs int, want pfManifestDurable) pfFaultRow {
 	id := fmt.Sprintf("fault-%s-%02d", kind, index)
 	total := runs + map[string]int{"live": 3}[kind]
 	tasks, ids := make([]string, total), make([]string, total)
@@ -379,7 +407,7 @@ func validFault(kind string, index, runs int) pfFaultRow {
 		TaskIDs: tasks, RunIDs: ids,
 		RunIDsBefore: ids[:runs], RunIDsAfter: append([]string(nil), ids[:runs]...), PreRestart: "durable", FinalSHA: "sha", GitFSCK: "pass", Cleanup: "absent", Result: "PASS"}
 	row.Counts.SampleID, row.Counts.FreshDataDirID, row.Counts.ProjectID = row.SampleID, row.FreshDataDirID, "project-"+kind
-	row.Counts.Tasks, row.Counts.Runs = total, total
+	row.Counts.Tasks, row.Counts.Runs, row.Counts.Messages, row.Counts.Events = want.Tasks, want.Runs, want.Messages, want.Events
 	row.Counts.PeerMessages, row.Counts.PeerAcknowledged, row.Counts.PeerAckEvent = 4, 4, 4
 	if kind == "live" {
 		row.DurableUnacked, row.Counts.PeerMessages, row.Counts.PeerAcknowledged, row.Counts.PeerAckEvent = 4, 10, 10, 10

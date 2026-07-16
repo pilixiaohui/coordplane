@@ -85,10 +85,10 @@ func validatePFSamples(report *pfReport) (pfInventory, error) {
 		want, known := expectedDurable[counts.SampleID]
 		if counts.SampleID == "" || counts.FreshDataDirID == "" || counts.ProjectID == "" ||
 			!known || result.sampleDataDir[counts.SampleID] != "" || dataDirs[counts.FreshDataDirID] ||
-			counts.Tasks != want.Tasks || counts.Runs != want.Runs || counts.PeerMessages != want.PeerMessages ||
-			(want.Messages > 0 && counts.Messages != want.Messages) || counts.PeerAcknowledged != want.PeerMessages ||
+			counts.Tasks != want.Tasks || counts.Runs != want.Runs || counts.Messages != want.Messages || counts.Events != want.Events ||
+			counts.PeerMessages != want.PeerMessages || counts.PeerAcknowledged != want.PeerMessages ||
 			counts.PeerAckEvent != want.PeerMessages || counts.OpenRuns != 0 || counts.OwnedResidue != 0 {
-			return result, fmt.Errorf("durable count sample/data-dir identity is missing or duplicate")
+			return result, fmt.Errorf("durable count %s differs from canonical row: got=%+v want=%+v", counts.SampleID, counts, want)
 		}
 		result.sampleDataDir[counts.SampleID], result.sampleProject[counts.SampleID] = counts.FreshDataDirID, counts.ProjectID
 		dataDirs[counts.FreshDataDirID] = true
@@ -205,8 +205,10 @@ func validatePFSamples(report *pfReport) (pfInventory, error) {
 	for _, sample := range report.Disk {
 		if sample.SampleID == "" || sample.DataDirID == "" || result.sampleDataDir[sample.SampleID] != sample.DataDirID ||
 			sample.Boundary == "" || sample.ScheduledUnixNS <= 0 || sample.StartedUnixNS < sample.ScheduledUnixNS ||
-			sample.EndedUnixNS < sample.StartedUnixNS || sample.ObservedUnixNS != sample.EndedUnixNS || sample.OverrunNS < 0 ||
-			sample.Bytes < 0 || sample.Error != "" {
+			sample.EndedUnixNS < sample.StartedUnixNS || sample.ObservedUnixNS != sample.EndedUnixNS ||
+			sample.QueueDelayNS != sample.StartedUnixNS-sample.ScheduledUnixNS || sample.OverrunNS < 0 || sample.Rejected ||
+			sample.ActiveWorkers < 1 || sample.ActiveWorkers > pfDiskWorkerLimit || sample.MaxActiveWorkers < sample.ActiveWorkers ||
+			sample.MaxActiveWorkers > pfDiskWorkerLimit || sample.FailureReason != "" || sample.Bytes < 0 || sample.Error != "" {
 			return result, fmt.Errorf("disk sample is incomplete")
 		}
 		if sample.Boundary == "interval" {
@@ -818,6 +820,10 @@ func validatePFFaults(report *pfReport) error {
 		return fmt.Errorf("unknown PF profile %q", report.Profile)
 	}
 	expected, expectedSamples := map[string]int{}, map[string]pfManifestSample{}
+	expectedDurable := map[string]pfManifestDurable{}
+	for _, durable := range manifest.Durable {
+		expectedDurable[durable.SampleID] = durable
+	}
 	for _, sample := range manifest.Samples {
 		if strings.HasPrefix(sample.Class, "fault_") {
 			expected[strings.TrimPrefix(sample.Class, "fault_")]++
@@ -831,6 +837,7 @@ func validatePFFaults(report *pfReport) error {
 	}
 	for _, row := range report.Faults {
 		want, known := expectedSamples[row.SampleID]
+		wantCounts, knownCounts := expectedDurable[row.SampleID]
 		if seen[row.Kind] == nil {
 			seen[row.Kind] = map[int]bool{}
 		}
@@ -841,11 +848,13 @@ func validatePFFaults(report *pfReport) error {
 		before, after := append([]string(nil), row.RunIDsBefore...), append([]string(nil), row.RunIDsAfter...)
 		sort.Strings(before)
 		sort.Strings(after)
-		if !known || want.Class != "fault_"+row.Kind || row.SampleID != fmt.Sprintf("fault-%s-%02d", row.Kind, row.Index) ||
+		if !known || !knownCounts || want.Class != "fault_"+row.Kind || row.SampleID != fmt.Sprintf("fault-%s-%02d", row.Kind, row.Index) ||
 			expected[row.Kind] == 0 || row.Index < 1 || row.Index > expected[row.Kind] || seen[row.Kind][row.Index] ||
 			row.SampleID == "" || samples[row.SampleID] || row.FreshDataDirID == "" || roots[row.FreshDataDirID] ||
 			len(row.TaskIDs) != want.Tasks || len(row.RunIDs) != want.Runs || !uniqueStrings(row.TaskIDs) || !uniqueStrings(row.RunIDs) ||
 			row.Counts.SampleID != row.SampleID || row.Counts.FreshDataDirID != row.FreshDataDirID || row.Counts.ProjectID == "" ||
+			row.Counts.Tasks != wantCounts.Tasks || row.Counts.Runs != wantCounts.Runs || row.Counts.Messages != wantCounts.Messages ||
+			row.Counts.Events != wantCounts.Events || row.Counts.PeerMessages != wantCounts.PeerMessages ||
 			countsBySample[row.SampleID] != row.Counts || row.RecoveryNS <= 0 || row.RecoveryNS > int64(8*time.Second) ||
 			len(before) != wantRuns || !uniqueStrings(before) || !uniqueStrings(after) || strings.Join(before, "\x00") != strings.Join(after, "\x00") ||
 			row.PreRestart == "" || row.FinalSHA == "" || row.GitFSCK != "pass" || row.Cleanup != "absent" || row.Result != "PASS" ||

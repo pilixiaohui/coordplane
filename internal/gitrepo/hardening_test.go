@@ -47,17 +47,13 @@ func TestGitCommandsIgnoreAmbientRepositoryObjectAndConfigOverrides(t *testing.T
 
 	initializer := newTestInitializer(t)
 	preflight, err := initializer.Preflight(ctx, source, "refs/heads/main")
-	if err != nil {
-		t.Fatalf("Preflight with poisoned process environment: %v", err)
-	}
+	requireNoError(t, err)
 	if preflight.InitialSHA != initial || preflight.SourcePath != source {
 		t.Fatalf("poisoned preflight = %+v, want source commit %s", preflight, initial)
 	}
 	project := testProject(t, initializer, preflight, "project-poison", "operation-poison")
 	fact, err := initializer.Initialize(ctx, project)
-	if err != nil {
-		t.Fatalf("Initialize with poisoned process environment: %v", err)
-	}
+	requireNoError(t, err)
 	if fact.CanonicalSHA != initial {
 		t.Fatalf("canonical SHA = %s, want %s", fact.CanonicalSHA, initial)
 	}
@@ -77,11 +73,7 @@ func TestGitCommandsIgnoreAmbientRepositoryObjectAndConfigOverrides(t *testing.T
 }
 
 func TestInitializeRejectsNonEmptyGitTemplateBeforeHooksCanRun(t *testing.T) {
-	ctx := context.Background()
-	source, _ := newSourceRepository(t)
-	initializer := newTestInitializer(t)
-	preflight, err := initializer.Preflight(ctx, source, "refs/heads/main")
-	requireNoError(t, err)
+	ctx, _, _, initializer, preflight := preflightFixture(t)
 	project := testProject(t, initializer, preflight, "project-template", "operation-template")
 	templateHooks := filepath.Join(initializer.root, ".empty-git-template", "hooks")
 	requireNoError(t, os.MkdirAll(templateHooks, 0o700))
@@ -181,11 +173,7 @@ func TestInitializeRejectsSymlinkedPartialRepositoryAndParent(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			ctx := context.Background()
-			source, _ := newSourceRepository(t)
-			initializer := newTestInitializer(t)
-			preflight, err := initializer.Preflight(ctx, source, "refs/heads/main")
-			requireNoError(t, err)
+			ctx, _, _, initializer, preflight := preflightFixture(t)
 			project := testProject(t, initializer, preflight, "project-partial-link", "operation-partial-link")
 			paths, err := initializer.Paths(project.ID, project.OperationID)
 			requireNoError(t, err)
@@ -206,11 +194,7 @@ func TestInitializeRejectsSymlinkedPartialRepositoryAndParent(t *testing.T) {
 }
 
 func TestInitializeRejectsRepositoryRootReplacedBySymlink(t *testing.T) {
-	ctx := context.Background()
-	source, _ := newSourceRepository(t)
-	initializer := newTestInitializer(t)
-	preflight, err := initializer.Preflight(ctx, source, "refs/heads/main")
-	requireNoError(t, err)
+	ctx, _, _, initializer, preflight := preflightFixture(t)
 	project := testProject(t, initializer, preflight, "project-root-link", "operation-root-link")
 	originalRoot := initializer.root + ".moved"
 	requireNoError(t, os.Rename(initializer.root, originalRoot))

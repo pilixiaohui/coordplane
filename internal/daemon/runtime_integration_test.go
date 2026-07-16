@@ -571,13 +571,7 @@ func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
 		remove.Env = append(os.Environ(), "DOCKER_CONFIG="+dockerConfig)
 		_ = remove.Run()
 	})
-	configPath := writeTestConfig(t, root)
-	rawConfig, err := os.ReadFile(configPath)
-	requireNoError(t, err)
-	rawConfig = []byte(strings.ReplaceAll(string(rawConfig),
-		"  docker_network: coordplane\n",
-		"  docker_network: none\n",
-	))
+	configPath, rawConfig := noneNetworkConfig(t, root)
 	requireNoError(t, os.WriteFile(configPath, rawConfig, 0o600))
 	instructions := filepath.Join(root, "instructions.md")
 	requireNoError(t, os.WriteFile(instructions, []byte("Work only on the assigned Task."), 0o600))
@@ -841,13 +835,7 @@ func TestCT04RealDockerExitZeroAndDoneTextCannotCompleteTask(t *testing.T) {
 		_ = remove.Run()
 	})
 
-	configPath := writeTestConfig(t, root)
-	rawConfig, err := os.ReadFile(configPath)
-	requireNoError(t, err)
-	rawConfig = []byte(strings.ReplaceAll(string(rawConfig),
-		"  docker_network: coordplane\n",
-		"  docker_network: none\n",
-	))
+	configPath, rawConfig := noneNetworkConfig(t, root)
 	requireNoError(t, os.WriteFile(configPath, rawConfig, 0o600))
 	instructions := filepath.Join(root, "instructions.md")
 	requireNoError(t, os.WriteFile(instructions, []byte("Work only on the assigned Task."), 0o600))
@@ -1128,6 +1116,14 @@ func waitForOperatorRun(t *testing.T, client *transport.Client, taskID string, r
 	return core.Run{}
 }
 
+func noneNetworkConfig(t *testing.T, root string) (string, []byte) {
+	t.Helper()
+	path := writeTestConfig(t, root)
+	raw, err := os.ReadFile(path)
+	requireNoError(t, err)
+	return path, []byte(strings.ReplaceAll(string(raw), "  docker_network: coordplane\n", "  docker_network: none\n"))
+}
+
 func newP3DockerFixture(t *testing.T) *p3DockerFixture {
 	return newP3DockerFixtureWithRunTimeout(t, 0)
 }
@@ -1160,13 +1156,7 @@ func newP3DockerFixtureWithRunTimeout(t *testing.T, runTimeout time.Duration) *p
 	if raw, err := buildImage.CombinedOutput(); err != nil {
 		t.Fatalf("build deterministic one-shot image: %v\n%s", err, raw)
 	}
-	configPath := writeTestConfig(t, root)
-	rawConfig, err := os.ReadFile(configPath)
-	requireNoError(t, err)
-	rawConfig = []byte(strings.ReplaceAll(string(rawConfig),
-		"  docker_network: coordplane\n",
-		"  docker_network: none\n",
-	))
+	configPath, rawConfig := noneNetworkConfig(t, root)
 	if runTimeout > 0 {
 		rawConfig = []byte(strings.Replace(string(rawConfig),
 			"  default_image:", "  run_timeout: "+runTimeout.String()+"\n  default_image:", 1))

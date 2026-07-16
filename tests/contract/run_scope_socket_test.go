@@ -1,28 +1,17 @@
 package contract_test
 
 import (
-	"context"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"coordplane/internal/core"
-	"coordplane/internal/store"
 	"coordplane/internal/transport"
 )
 
 func TestRT01PerRunSocketsRequireMatchingTokenScope(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	database, err := store.Open(ctx, filepath.Join(root, "coordplane.db"))
-	requireNoError(t, err)
-	t.Cleanup(func() { _ = database.Close() })
-	service, err := core.NewService(database, &contractGit{
-		sha: strings.Repeat("a", 40), root: filepath.Join(root, "repos"),
-	}, core.ServiceOptions{MaxParallelRuns: 2, AdapterIDs: []string{"one-shot"}})
-	requireNoError(t, err)
+	ctx, root, database, _, service := newContractServiceFixture(t, core.ServiceOptions{MaxParallelRuns: 2, AdapterIDs: []string{"one-shot"}})
 	agentA, err := service.AddAgent(ctx, core.AddAgentInput{
 		DisplayName: "Socket A", AdapterID: "one-shot", Image: "agent:latest",
 		InstructionsFile: "/instructions/a", RequestID: "socket-agent-a",

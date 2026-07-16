@@ -135,12 +135,6 @@ func TestGT07DockerGCPreviewAndDiscardNeverExecuteWorkspaceGitConfigOnHost(t *te
 	}
 	assertHostFSMonitorDidNotRun(t, marker)
 	requireNoError(t, os.WriteFile(filepath.Join(workspace.Path, "dirty.txt"), []byte("dirty\n"), 0o660))
-	if discarded, err := manager.Discard(ctx, spec, workspace.HeadSHA, 1, preview.Fingerprint, func() (bool, error) {
-		return true, nil
-	}); err == nil || discarded || !strings.Contains(err.Error(), "fingerprint changed") {
-		t.Fatalf("stale GC discard discarded=%t err=%v", discarded, err)
-	}
-	assertHostFSMonitorDidNotRun(t, marker)
 	dirty, err := manager.State(ctx, spec, workspace.HeadSHA, 1)
 	requireNoError(t, err)
 	if dirty.Clean || dirty.Fingerprint == preview.Fingerprint {

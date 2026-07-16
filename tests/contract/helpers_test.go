@@ -2,10 +2,13 @@ package contract_test
 
 import (
 	"context"
+	"net/http"
 	"path/filepath"
 	"testing"
 
 	"coordplane/internal/core"
+	"coordplane/internal/store"
+	"coordplane/internal/transport"
 )
 
 func requireNoError(t *testing.T, err error) {
@@ -13,6 +16,41 @@ func requireNoError(t *testing.T, err error) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func newContractServiceFixture(t *testing.T, options core.ServiceOptions) (context.Context, string, *store.Store, *contractGit, *core.Service) {
+	t.Helper()
+	ctx, root := context.Background(), t.TempDir()
+	database, err := store.Open(ctx, filepath.Join(root, "coordplane.db"))
+	requireNoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	git := &contractGit{sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", root: filepath.Join(root, "repos")}
+	service, err := core.NewService(database, git, options)
+	requireNoError(t, err)
+	return ctx, root, database, git, service
+}
+
+func startContractServer(t *testing.T, root, socket string, handler http.Handler) {
+	t.Helper()
+	server, err := transport.NewUnixServer(root, socket, handler)
+	requireNoError(t, err)
+	done := make(chan error, 1)
+	go func() { done <- server.Serve() }()
+	t.Cleanup(func() {
+		_ = server.Close()
+		<-done
+	})
+}
+
+func contractConfigPaths(t *testing.T, extra string, roots ...string) (string, string, string, string) {
+	t.Helper()
+	root := t.TempDir()
+	if len(roots) > 0 {
+		root = roots[0]
+	}
+	dataDir := filepath.Join(root, "data")
+	socket := filepath.Join(dataDir, "operator.sock")
+	return root, dataDir, socket, writeConfig(t, root, dataDir, socket, extra)
 }
 
 func activateContractRuntimeRun(t *testing.T, ctx context.Context, service *core.Service, claim core.Claim, prefix string) core.Run {

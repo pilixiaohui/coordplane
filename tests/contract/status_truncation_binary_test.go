@@ -15,10 +15,7 @@ import (
 )
 
 func TestStatusHumanBinaryReportsTruncatedTasksAndAgents(t *testing.T) {
-	root := t.TempDir()
-	dataDir := filepath.Join(root, "data")
-	socket := filepath.Join(dataDir, "operator.sock")
-	configPath := writeConfig(t, root, dataDir, socket, "")
+	root, _, socket, configPath := contractConfigPaths(t, "")
 	source := createRepository(t, root)
 	daemon := startDaemon(t, configPath, socket)
 	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
@@ -77,9 +74,7 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 	root, err := os.MkdirTemp("/tmp", "cp-field-trunc-")
 	requireNoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	dataDir := filepath.Join(root, "data")
-	socket := filepath.Join(dataDir, "operator.sock")
-	configPath := writeConfig(t, root, dataDir, socket, "")
+	_, dataDir, socket, configPath := contractConfigPaths(t, "", root)
 	source := createRepository(t, root)
 	daemon := startDaemon(t, configPath, socket)
 	t.Cleanup(func() { stopDaemon(t, daemon, socket) })

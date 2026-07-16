@@ -144,7 +144,8 @@ type pfManifestDurable struct {
 	SampleID     string `json:"sample_id"`
 	Tasks        int    `json:"tasks"`
 	Runs         int    `json:"runs"`
-	Messages     int    `json:"messages,omitempty"`
+	Messages     int    `json:"messages"`
+	Events       int    `json:"events"`
 	PeerMessages int    `json:"peer_messages"`
 	Origins      int    `json:"daemon_origins"`
 }
@@ -161,7 +162,7 @@ func fixedPFProfile(profile, imageDigest string) (pfProfileManifest, pfProfile, 
 		return pfProfileManifest{}, pfProfile{}, false
 	}
 	manifest := pfProfileManifest{SchemaVersion: 1, Profile: profile, ImageDigest: imageDigest}
-	addBatch := func(prefix string, batches, waves, warmup, soak, parallel int) {
+	addBatch := func(prefix string, batches, waves, warmup, soak, parallel, eventsPerWave, eventOffset int) {
 		class := prefix
 		if prefix == "concurrent" {
 			class = "scored"
@@ -182,20 +183,21 @@ func fixedPFProfile(profile, imageDigest string) (pfProfileManifest, pfProfile, 
 				manifest.Samples = append(manifest.Samples, pfManifestSample{ID: fmt.Sprintf("%s-soak-%02d", batchID, wave), BatchID: batchID, Class: "soak", Parallelism: parallel, Tasks: 3 + parallel, Runs: 3 + parallel})
 			}
 			totalWaves := warmup + waves + batchSoak
-			manifest.Durable = append(manifest.Durable, pfManifestDurable{SampleID: batchID, Tasks: totalWaves * (3 + parallel), Runs: totalWaves * (3 + parallel), Messages: totalWaves * (13 + parallel), PeerMessages: totalWaves * 10, Origins: 1})
+			events := totalWaves*eventsPerWave + eventOffset
+			manifest.Durable = append(manifest.Durable, pfManifestDurable{SampleID: batchID, Tasks: totalWaves * (3 + parallel), Runs: totalWaves * (3 + parallel), Messages: totalWaves * (13 + parallel), Events: events, PeerMessages: totalWaves * 10, Origins: 1})
 		}
 	}
-	addBatch("concurrent", settings.concurrentBatches, settings.concurrentWaves, 1, settings.soakWaves, 4)
-	addBatch("serial", settings.serialBatches, settings.serialWaves, serialWarmup, 0, 1)
+	addBatch("concurrent", settings.concurrentBatches, settings.concurrentWaves, 1, settings.soakWaves, 4, 400, -1)
+	addBatch("serial", settings.serialBatches, settings.serialWaves, serialWarmup, 0, 1, 314, 2)
 	for _, fault := range []struct {
-		kind, class  string
-		count, tasks int
-		peers        int
-	}{{"live", "fault_live", settings.liveFaults, 7, 10}, {"capture", "fault_capture", settings.captureFaults, 1, 4}, {"cas", "fault_cas", settings.casFaults, 1, 4}} {
+		kind, class            string
+		count, tasks, messages int
+		peers, events          int
+	}{{"live", "fault_live", settings.liveFaults, 7, 21, 10, 215}, {"capture", "fault_capture", settings.captureFaults, 1, 5, 4, 36}, {"cas", "fault_cas", settings.casFaults, 1, 5, 4, 37}} {
 		for index := 1; index <= fault.count; index++ {
 			id := fmt.Sprintf("fault-%s-%02d", fault.kind, index)
 			manifest.Samples = append(manifest.Samples, pfManifestSample{ID: id, BatchID: id, Class: fault.class, Parallelism: map[string]int{"live": 4, "capture": 1, "cas": 1}[fault.kind], Tasks: fault.tasks, Runs: fault.tasks})
-			manifest.Durable = append(manifest.Durable, pfManifestDurable{SampleID: id, Tasks: fault.tasks, Runs: fault.tasks, PeerMessages: fault.peers, Origins: 2})
+			manifest.Durable = append(manifest.Durable, pfManifestDurable{SampleID: id, Tasks: fault.tasks, Runs: fault.tasks, Messages: fault.messages, Events: fault.events, PeerMessages: fault.peers, Origins: 2})
 		}
 	}
 	for _, durable := range manifest.Durable {
@@ -216,8 +218,11 @@ type pfBatch struct {
 	parallel              int
 	trackSoak             bool
 	diskMu                sync.Mutex
-	diskWG                sync.WaitGroup
+	diskWorkers           sync.WaitGroup
 	diskStop, diskDone    chan struct{}
+	diskJobs              chan pfDiskJob
+	diskWalk              func(string) (int64, string)
+	diskActive, diskMax   int
 	disk                  []pfDiskSample
 	terminalMu            sync.Mutex
 	terminalWG            sync.WaitGroup
@@ -260,24 +265,38 @@ func (p *pfDaemonProcess) stop(action string, args ...string) error {
 }
 
 type pfDiskSample struct {
-	SampleID        string `json:"sample_id"`
-	DataDirID       string `json:"data_dir_id"`
-	DaemonOriginID  string `json:"daemon_origin_id,omitempty"`
-	StageID         string `json:"stage_id,omitempty"`
-	StageKeySHA256  string `json:"stage_key_sha256,omitempty"`
-	Boundary        string `json:"boundary"`
-	ProjectID       string `json:"project_id,omitempty"`
-	TaskID          string `json:"task_id,omitempty"`
-	RunID           string `json:"run_id,omitempty"`
-	OperationID     string `json:"operation_id,omitempty"`
-	AttemptIndex    int64  `json:"attempt_index,omitempty"`
-	ObservedUnixNS  int64  `json:"observed_unix_ns"`
-	ScheduledUnixNS int64  `json:"scheduled_unix_ns"`
-	StartedUnixNS   int64  `json:"started_unix_ns"`
-	EndedUnixNS     int64  `json:"ended_unix_ns"`
-	OverrunNS       int64  `json:"overrun_ns"`
-	Bytes           int64  `json:"bytes"`
-	Error           string `json:"error,omitempty"`
+	SampleID         string `json:"sample_id"`
+	DataDirID        string `json:"data_dir_id"`
+	DaemonOriginID   string `json:"daemon_origin_id,omitempty"`
+	StageID          string `json:"stage_id,omitempty"`
+	StageKeySHA256   string `json:"stage_key_sha256,omitempty"`
+	Boundary         string `json:"boundary"`
+	ProjectID        string `json:"project_id,omitempty"`
+	TaskID           string `json:"task_id,omitempty"`
+	RunID            string `json:"run_id,omitempty"`
+	OperationID      string `json:"operation_id,omitempty"`
+	AttemptIndex     int64  `json:"attempt_index,omitempty"`
+	ObservedUnixNS   int64  `json:"observed_unix_ns"`
+	ScheduledUnixNS  int64  `json:"scheduled_unix_ns"`
+	StartedUnixNS    int64  `json:"started_unix_ns"`
+	EndedUnixNS      int64  `json:"ended_unix_ns"`
+	QueueDelayNS     int64  `json:"queue_delay_ns"`
+	OverrunNS        int64  `json:"overrun_ns"`
+	ActiveWorkers    int    `json:"active_workers"`
+	MaxActiveWorkers int    `json:"max_active_workers"`
+	Rejected         bool   `json:"rejected"`
+	FailureReason    string `json:"failure_reason,omitempty"`
+	Bytes            int64  `json:"bytes"`
+	Error            string `json:"error,omitempty"`
+}
+
+const pfDiskWorkerLimit, pfDiskQueueDepth = 4, 4
+
+type pfDiskJob struct {
+	boundary  string
+	scheduled int64
+	marker    map[string]any
+	done      chan struct{}
 }
 
 var pfRoles = [...]string{"A", "B", "C", "D"}
@@ -329,6 +348,39 @@ func TestPFOwnedResidueRejectsUnknownDirectChildren(t *testing.T) {
 	requireNoError(t, err)
 	if absent {
 		t.Fatal("per-Run handoff escaped Run-owned cleanup")
+	}
+}
+
+func TestPFDiskSamplerBoundsSlowTraversalAndJoins(t *testing.T) {
+	release, started := make(chan struct{}), make(chan struct{}, pfDiskWorkerLimit)
+	batch := &pfBatch{ctx: context.Background(), id: "slow", dataDir: t.TempDir(), diskJobs: make(chan pfDiskJob, pfDiskQueueDepth)}
+	batch.diskWalk = func(string) (int64, string) {
+		started <- struct{}{}
+		<-release
+		return 1, ""
+	}
+	batch.startDiskWorkers()
+	for range pfDiskWorkerLimit {
+		batch.scheduleDisk("interval", time.Now().UnixNano())
+	}
+	for range pfDiskWorkerLimit {
+		<-started
+	}
+	for range pfDiskQueueDepth + 1 {
+		batch.scheduleDisk("interval", time.Now().UnixNano())
+	}
+	close(release)
+	close(batch.diskJobs)
+	batch.diskWorkers.Wait()
+	maximum, rejected := 0, 0
+	for _, sample := range batch.diskFacts() {
+		maximum = max(maximum, sample.MaxActiveWorkers)
+		if sample.Rejected {
+			rejected++
+		}
+	}
+	if maximum != pfDiskWorkerLimit || rejected != 1 || batch.diskActive != 0 {
+		t.Fatalf("slow sampler max=%d rejected=%d active=%d", maximum, rejected, batch.diskActive)
 	}
 }
 
@@ -487,6 +539,7 @@ func newPFBatchWithEnv(
 		root: root, dataDir: dataDir, socket: socket, daemon: daemon,
 		initialSHA: initial, parallel: parallel, observer: observer,
 		diskStop: make(chan struct{}), diskDone: make(chan struct{}),
+		diskJobs: make(chan pfDiskJob, pfDiskQueueDepth), diskWalk: directoryBytes,
 		terminals: make(map[string]*pfTerminalObservation),
 	}
 	go batch.sampleDisk()
@@ -1229,7 +1282,12 @@ func directoryBytesExcept(t *testing.T, root, excluded string) int64 {
 }
 
 func (b *pfBatch) sampleDisk() {
-	defer close(b.diskDone)
+	b.startDiskWorkers()
+	defer func() {
+		close(b.diskJobs)
+		b.diskWorkers.Wait()
+		close(b.diskDone)
+	}()
 	file, err := os.Open(b.observer)
 	if err != nil {
 		b.appendDisk(pfDiskSample{SampleID: b.id, DataDirID: pfDataDirID(b.dataDir), Boundary: "sampler_error", ObservedUnixNS: time.Now().UnixNano(), Error: err.Error()})
@@ -1250,7 +1308,6 @@ func (b *pfBatch) sampleDisk() {
 			b.scheduleDisk("interval", scheduled.UnixNano())
 		case <-b.diskStop:
 			b.drainDiskMarkers(reader, pending)
-			b.diskWG.Wait()
 			return
 		}
 	}
@@ -1261,23 +1318,13 @@ func (b *pfBatch) recordDisk(boundary string) {
 }
 
 func (b *pfBatch) scheduleDisk(boundary string, scheduled int64) {
-	b.diskWG.Add(1)
-	go func() {
-		defer b.diskWG.Done()
-		b.recordDiskAt(boundary, scheduled)
-	}()
+	b.submitDisk(pfDiskJob{boundary: boundary, scheduled: scheduled}, false)
 }
 
 func (b *pfBatch) recordDiskAt(boundary string, scheduled int64) {
-	sample := pfDiskSample{SampleID: b.id, DataDirID: pfDataDirID(b.dataDir), Boundary: boundary, ScheduledUnixNS: scheduled}
-	sample.StartedUnixNS = time.Now().UnixNano()
-	sample.Bytes, sample.Error = directoryBytes(b.dataDir)
-	sample.EndedUnixNS = time.Now().UnixNano()
-	sample.ObservedUnixNS = sample.EndedUnixNS
-	if boundary == "interval" && sample.EndedUnixNS > scheduled+int64(time.Second) {
-		sample.OverrunNS = sample.EndedUnixNS - scheduled - int64(time.Second)
-	}
-	b.appendDisk(sample)
+	done := make(chan struct{})
+	b.submitDisk(pfDiskJob{boundary: boundary, scheduled: scheduled, done: done}, true)
+	<-done
 }
 
 func (b *pfBatch) drainDiskMarkers(reader *bufio.Reader, pending []byte) []byte {
@@ -1303,16 +1350,79 @@ func (b *pfBatch) recordDiskMarker(raw []byte) {
 	if json.Unmarshal(raw, &record) != nil || record["record_type"] != "disk_boundary_marker" {
 		return
 	}
-	b.diskWG.Add(1)
-	scheduled := time.Now().UnixNano()
-	go func() {
-		defer b.diskWG.Done()
-		started := time.Now().UnixNano()
-		bytes, sampleErr := directoryBytes(b.dataDir)
-		sample := diskSampleFromMarker(record, time.Now().UnixNano(), bytes, sampleErr)
-		sample.ScheduledUnixNS, sample.StartedUnixNS, sample.EndedUnixNS = scheduled, started, sample.ObservedUnixNS
-		b.appendDisk(sample)
-	}()
+	b.submitDisk(pfDiskJob{boundary: textField(record, "boundary"), scheduled: time.Now().UnixNano(), marker: record}, false)
+}
+
+func (b *pfBatch) startDiskWorkers() {
+	for range pfDiskWorkerLimit {
+		b.diskWorkers.Add(1)
+		go func() {
+			defer b.diskWorkers.Done()
+			for job := range b.diskJobs {
+				b.recordDiskJob(job)
+			}
+		}()
+	}
+}
+
+func (b *pfBatch) submitDisk(job pfDiskJob, required bool) {
+	if required {
+		b.diskJobs <- job
+		return
+	}
+	select {
+	case b.diskJobs <- job:
+	default:
+		b.rejectDisk(job, "queue_full")
+	}
+}
+
+func (b *pfBatch) recordDiskJob(job pfDiskJob) {
+	started := time.Now().UnixNano()
+	b.diskMu.Lock()
+	b.diskActive++
+	b.diskMax = max(b.diskMax, b.diskActive)
+	active, maximum := b.diskActive, b.diskMax
+	b.diskMu.Unlock()
+	bytes, sampleErr := b.diskWalk(b.dataDir)
+	ended := time.Now().UnixNano()
+	sample := b.diskSample(job, ended, bytes, sampleErr)
+	sample.StartedUnixNS, sample.EndedUnixNS, sample.ObservedUnixNS = started, ended, ended
+	sample.QueueDelayNS, sample.ActiveWorkers, sample.MaxActiveWorkers = started-job.scheduled, active, maximum
+	if sampleErr != "" {
+		sample.FailureReason = "traversal_error"
+	}
+	if job.boundary == "interval" && ended > job.scheduled+int64(time.Second) {
+		sample.OverrunNS, sample.FailureReason = ended-job.scheduled-int64(time.Second), "interval_overrun"
+	}
+	b.diskMu.Lock()
+	b.diskActive--
+	b.disk = append(b.disk, sample)
+	b.diskMu.Unlock()
+	if job.done != nil {
+		close(job.done)
+	}
+}
+
+func (b *pfBatch) diskSample(job pfDiskJob, observed, bytes int64, sampleErr string) pfDiskSample {
+	if job.marker != nil {
+		sample := diskSampleFromMarker(job.marker, observed, bytes, sampleErr)
+		sample.ScheduledUnixNS = job.scheduled
+		return sample
+	}
+	return pfDiskSample{SampleID: b.id, DataDirID: pfDataDirID(b.dataDir), Boundary: job.boundary,
+		ScheduledUnixNS: job.scheduled, Bytes: bytes, Error: sampleErr}
+}
+
+func (b *pfBatch) rejectDisk(job pfDiskJob, reason string) {
+	now := time.Now().UnixNano()
+	sample := b.diskSample(job, now, 0, "")
+	sample.StartedUnixNS, sample.EndedUnixNS, sample.ObservedUnixNS = now, now, now
+	b.diskMu.Lock()
+	sample.QueueDelayNS, sample.ActiveWorkers, sample.MaxActiveWorkers = now-job.scheduled, b.diskActive, b.diskMax
+	sample.Rejected, sample.FailureReason = true, reason
+	b.disk = append(b.disk, sample)
+	b.diskMu.Unlock()
 }
 
 func diskSampleFromMarker(record map[string]any, observed, bytes int64, sampleErr string) pfDiskSample {
@@ -1321,7 +1431,8 @@ func diskSampleFromMarker(record map[string]any, observed, bytes int64, sampleEr
 		StageID: textField(record, "stage_id"), StageKeySHA256: textField(record, "stage_key_sha256"), Boundary: textField(record, "boundary"),
 		ProjectID: textField(record, "project_id"), TaskID: textField(record, "task_id"), RunID: textField(record, "run_id"), OperationID: textField(record, "operation_id"),
 		AttemptIndex: intField(record, "attempt_index"), ObservedUnixNS: observed,
-		ScheduledUnixNS: observed, StartedUnixNS: observed, EndedUnixNS: observed, Bytes: bytes, Error: sampleErr,
+		ScheduledUnixNS: observed, StartedUnixNS: observed, EndedUnixNS: observed,
+		ActiveWorkers: 1, MaxActiveWorkers: 1, Bytes: bytes, Error: sampleErr,
 	}
 }
 

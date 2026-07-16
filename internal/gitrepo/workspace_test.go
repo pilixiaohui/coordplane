@@ -36,9 +36,7 @@ func TestGT01MaterializeCreatesExactPrivateClone(t *testing.T) {
 	t.Setenv("GIT_CONFIG_VALUE_0", hookRoot)
 
 	fact, err := manager.Materialize(ctx, spec)
-	if err != nil {
-		t.Fatalf("Materialize: %v", err)
-	}
+	requireNoError(t, err)
 	if _, err := os.Stat(sentinel); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("workspace preparation executed an ambient host hook: %v", err)
 	}
@@ -63,16 +61,12 @@ func TestGT01MaterializeCreatesExactPrivateClone(t *testing.T) {
 		t.Fatalf("ownership marker %s is inside mounted workspace %s", markerPath, fact.Path)
 	}
 	markerRaw, err := os.ReadFile(markerPath)
-	if err != nil {
-		t.Fatalf("read workspace marker: %v", err)
-	}
+	requireNoError(t, err)
 	if strings.Contains(string(markerRaw), project.ControlRepoPath) || strings.Contains(string(markerRaw), initializer.root) {
 		t.Fatalf("workspace marker leaked control path: %s", markerRaw)
 	}
 	partialEntries, err := os.ReadDir(filepath.Join(manager.root, ".partial", project.ID))
-	if err != nil {
-		t.Fatalf("read partial workspace root: %v", err)
-	}
+	requireNoError(t, err)
 	if len(partialEntries) != 0 {
 		t.Fatalf("published workspace left partial entries: %v", partialEntries)
 	}
@@ -109,9 +103,7 @@ func TestGT01TaskWorkspacesAreIndependentAndVerifyDoesNotReset(t *testing.T) {
 	requireNoError(t, os.WriteFile(dirtyPath, []byte("preserve me\n"), 0o600))
 	before := workspaceSnapshot(t, factA.Path)
 	verified, err := manager.Verify(ctx, specA)
-	if err != nil {
-		t.Fatalf("Verify reusable workspace: %v", err)
-	}
+	requireNoError(t, err)
 	if verified.HeadSHA != aHead {
 		t.Fatalf("verified HEAD = %s, want %s", verified.HeadSHA, aHead)
 	}
@@ -216,9 +208,7 @@ func TestGT01MaterializeImportsExactSourceThroughMovableConvenienceRef(t *testin
 	}
 
 	fact, err := manager.Materialize(ctx, spec)
-	if err != nil {
-		t.Fatalf("Materialize with source: %v", err)
-	}
+	requireNoError(t, err)
 	if fact.SourceRef != "refs/heads/coordplane/source/source-task" {
 		t.Fatalf("source convenience ref = %s", fact.SourceRef)
 	}
@@ -262,24 +252,6 @@ func TestGT01VerifyNeverCreatesMissingWorkspace(t *testing.T) {
 	}
 }
 
-func TestGT07DiscardRejectsWorkspaceMutationAfterFingerprint(t *testing.T) {
-	ctx := context.Background()
-	_, manager, project, _, initial := newWorkspaceFixture(t)
-	spec := WorkspaceSpec{ProjectID: project.ID, TaskID: "discard-mutated", BaseSHA: initial}
-	workspace, err := manager.Materialize(ctx, spec)
-	requireNoError(t, err)
-	state, err := manager.State(ctx, spec, initial, 1)
-	requireNoError(t, err)
-	requireNoError(t, os.WriteFile(filepath.Join(workspace.Path, "mutation"), []byte("new\n"), 0o600))
-	discarded, err := manager.Discard(ctx, spec, initial, 1, state.Fingerprint, func() (bool, error) { return true, nil })
-	if discarded || err == nil || !strings.Contains(err.Error(), "fingerprint changed") {
-		t.Fatalf("Discard mutated workspace = %t, %v", discarded, err)
-	}
-	if _, err := os.Stat(workspace.Path); err != nil {
-		t.Fatalf("Discard removed mutated workspace: %v", err)
-	}
-}
-
 func TestProjectMaintenanceLockIsPerProjectAndHonorsCancellation(t *testing.T) {
 	var locks projectLocks
 	unlock, err := locks.lock(context.Background(), "project-a")
@@ -287,9 +259,7 @@ func TestProjectMaintenanceLockIsPerProjectAndHonorsCancellation(t *testing.T) {
 	defer unlock()
 
 	unlockOther, err := locks.lock(context.Background(), "project-b")
-	if err != nil {
-		t.Fatalf("different project lock blocked: %v", err)
-	}
+	requireNoError(t, err)
 	unlockOther()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -301,15 +271,10 @@ func TestProjectMaintenanceLockIsPerProjectAndHonorsCancellation(t *testing.T) {
 
 func newWorkspaceFixture(t *testing.T) (*Initializer, *WorkspaceManager, Project, string, string) {
 	t.Helper()
-	ctx := context.Background()
-	sourceRepo, initial := newSourceRepository(t)
-	initializer := newTestInitializer(t)
-	preflight, err := initializer.Preflight(ctx, sourceRepo, "refs/heads/main")
-	requireNoError(t, err)
+	ctx, sourceRepo, initial, initializer, preflight := preflightFixture(t)
 	project := testProject(t, initializer, preflight, "project-workspace", "operation-workspace")
-	if _, err := initializer.Initialize(ctx, project); err != nil {
-		t.Fatal(err)
-	}
+	_, err := initializer.Initialize(ctx, project)
+	requireNoError(t, err)
 	manager, err := NewWorkspaceManager(initializer, filepath.Join(t.TempDir(), "workspaces"), testCaptureHelper{root: t.TempDir()})
 	requireNoError(t, err)
 	return initializer, manager, project, sourceRepo, initial

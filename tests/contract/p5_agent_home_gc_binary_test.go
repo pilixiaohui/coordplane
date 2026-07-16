@@ -14,9 +14,7 @@ import (
 
 func TestGT07FormalOperatorGCDeletesOnlyArchivedAgentHome(t *testing.T) {
 	root := t.TempDir()
-	dataDir := filepath.Join(root, "data")
-	socket := filepath.Join(dataDir, "operator.sock")
-	configPath := writeConfig(t, root, dataDir, socket, "")
+	_, dataDir, socket, configPath := contractConfigPaths(t, "", root)
 	daemon := startDaemon(t, configPath, socket)
 	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
 

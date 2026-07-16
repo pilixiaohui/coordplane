@@ -2,7 +2,10 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +20,7 @@ import (
 	"coordplane/internal/adapter"
 	"coordplane/internal/config"
 	"coordplane/internal/core"
+	"coordplane/internal/gitcapture"
 	"coordplane/internal/gitrepo"
 	containerruntime "coordplane/internal/runtime"
 	"coordplane/internal/store"
@@ -83,9 +87,6 @@ func TestInspectHelperStableIdentityRecoversInspectRemoveFailure(t *testing.T) {
 	inspectErr, removeErr := errors.New("inspect unavailable"), errors.New("remove unavailable")
 	request := gitrepo.WorkspaceInspectRequest{ProjectID: "project", TaskID: "task", Workspace: "/workspace/task"}
 	ref := inspectRuntimeRef(request, inspectOperationID(request))
-	if ref != inspectRuntimeRef(request, inspectOperationID(request)) {
-		t.Fatal("inspect operation identity is not stable")
-	}
 	executor := newBlockingLaunchExecutor()
 	executor.inspectErr, executor.removeErr = inspectErr, removeErr
 	close(executor.allowCreate)
@@ -95,10 +96,6 @@ func TestInspectHelperStableIdentityRecoversInspectRemoveFailure(t *testing.T) {
 		t.Fatalf("Inspect+Remove failure = %v, present=%t", err, executor.present)
 	}
 	executor.removeErr = nil
-	if err := helper.runContainer(context.Background(), containerruntime.ContainerSpec{Ref: ref}, true); err == nil || executor.present || executor.createCalls.Load() != 2 {
-		t.Fatalf("stable cleanup retry = %v, present=%t creates=%d", err, executor.present, executor.createCalls.Load())
-	}
-	executor.present = true
 	ready := filepath.Join(helper.root, "project", "task", "inspect-"+inspectOperationID(request), "inspect.ready")
 	requireNoError(t, os.MkdirAll(ready, 0o700))
 	handoff, err := helper.prepareInspectHandoff(context.Background(), request, ref, inspectOperationID(request))
@@ -107,6 +104,35 @@ func TestInspectHelperStableIdentityRecoversInspectRemoveFailure(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(handoff, "inspect.ready")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stale inspect.ready survived reset: %v", err)
+	}
+}
+
+func TestInspectHelperDiscardRetryReinspectsMutatedWorkspace(t *testing.T) {
+	ctx, fixture := context.Background(), newRealP4Harness(t)
+	root, head := fixture.root, fixture.project.InitialSHA
+	executable := filepath.Join(root, "coordplane-git-helper")
+	requireNoError(t, os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o700))
+	executor := &staleInspectExecutor{head: head}
+	helper, err := newDockerCaptureHelper(executor, config.GitConfig{CaptureHelperImage: "helper", CaptureTimeout: 20 * time.Millisecond,
+		MaximumObjects: 100, MaximumBundleBytes: 1 << 20, MaximumHandoffBytes: 2 << 20}, filepath.Join(root, "handoff"), executable)
+	requireNoError(t, err)
+	manager, err := gitrepo.NewWorkspaceManager(fixture.initializer, filepath.Join(root, "retry-workspaces"), helper)
+	requireNoError(t, err)
+	spec := gitrepo.WorkspaceSpec{ProjectID: fixture.project.ID, TaskID: "task-inspect-retry", BaseSHA: head}
+	workspace, err := manager.Materialize(ctx, spec)
+	requireNoError(t, err)
+	preview, err := manager.State(ctx, spec, workspace.HeadSHA, 1)
+	requireNoError(t, err)
+	if discarded, err := manager.Discard(ctx, spec, workspace.HeadSHA, 1, preview.Fingerprint, func() (bool, error) { return true, nil }); discarded || err == nil {
+		t.Fatalf("first discard discarded=%t err=%v", discarded, err)
+	}
+	requireNoError(t, os.WriteFile(filepath.Join(workspace.Path, "mutation"), []byte("new\n"), 0o600))
+	discarded, err := manager.Discard(ctx, spec, workspace.HeadSHA, 1, preview.Fingerprint, func() (bool, error) { return true, nil })
+	if discarded || err == nil || !strings.Contains(err.Error(), "fingerprint changed") || executor.createCalls.Load() != 3 || executor.stopCalls.Load() != 1 {
+		t.Fatalf("retry discarded=%t err=%v creates=%d stops=%d", discarded, err, executor.createCalls.Load(), executor.stopCalls.Load())
+	}
+	if _, err := os.Stat(workspace.Path); err != nil {
+		t.Fatalf("retry removed mutated workspace: %v", err)
 	}
 }
 
@@ -654,6 +680,97 @@ type blockingLaunchExecutor struct {
 	inspectErr    error
 	removeErr     error
 	present       bool
+}
+
+type staleInspectExecutor struct {
+	runtimeTestExecutor
+	ref                      containerruntime.RuntimeRef
+	workspace, handoff, head string
+	generation               int
+	present, stopped         bool
+	timedOut, removeFailed   bool
+	captured                 gitcapture.Fact
+	createCalls              atomic.Int32
+}
+
+func (e *staleInspectExecutor) Create(_ context.Context, spec containerruntime.ContainerSpec) (containerruntime.RuntimeRef, error) {
+	e.generation++
+	e.createCalls.Add(1)
+	e.ref, e.ref.ContainerID = spec.Ref, "inspect-container"
+	e.present, e.stopped = true, false
+	for _, mount := range spec.Mounts {
+		if mount.Target == "/workspace" {
+			e.workspace = mount.Source
+		}
+		if mount.Target == "/handoff" {
+			e.handoff = mount.Source
+		}
+	}
+	return e.ref, nil
+}
+
+func (e *staleInspectExecutor) Start(context.Context, containerruntime.RuntimeRef) (containerruntime.RuntimeRef, error) {
+	return e.ref, nil
+}
+
+func (e *staleInspectExecutor) Inspect(context.Context, containerruntime.RuntimeRef) (containerruntime.LiveState, error) {
+	if !e.present {
+		return containerruntime.LiveState{}, containerruntime.ErrNotFound
+	}
+	return containerruntime.LiveState{Ref: e.ref, Status: containerruntime.StatusRunning, Running: true, MemoryBytes: 1, NanoCPUs: 1, PIDsLimit: 1}, nil
+}
+
+func (e *staleInspectExecutor) Wait(ctx context.Context, _ containerruntime.RuntimeRef) (containerruntime.ExitFact, error) {
+	if e.generation == 2 && !e.timedOut && !e.stopped {
+		e.captured, e.timedOut = e.inspectFact(), true
+		<-ctx.Done()
+		return containerruntime.ExitFact{}, ctx.Err()
+	}
+	if e.stopped {
+		return containerruntime.ExitFact{Ref: e.ref, ExitCode: 143}, nil
+	}
+	fact, handoff := e.inspectFact(), e.handoff
+	if e.generation == 2 {
+		fact = e.captured
+	}
+	ready := filepath.Join(handoff, gitcapture.InspectReadyName)
+	if err := os.MkdirAll(ready, 0o700); err != nil {
+		return containerruntime.ExitFact{}, err
+	}
+	raw, _ := json.Marshal(fact)
+	if err := os.WriteFile(filepath.Join(ready, gitcapture.FactsName), raw, 0o600); err != nil {
+		return containerruntime.ExitFact{}, err
+	}
+	return containerruntime.ExitFact{Ref: e.ref}, nil
+}
+
+func (e *staleInspectExecutor) inspectFact() gitcapture.Fact {
+	status := []byte(nil)
+	clean := true
+	if _, err := os.Stat(filepath.Join(e.workspace, "mutation")); err == nil {
+		status, clean = []byte("mutation"), false
+	}
+	digest := sha256.Sum256(status)
+	return gitcapture.Fact{HeadSHA: e.head, StatusDigest: fmt.Sprintf("%x", digest), ObjectCount: 1, Clean: clean}
+}
+
+func (e *staleInspectExecutor) Stop(context.Context, containerruntime.RuntimeRef, time.Duration) (containerruntime.StopResult, error) {
+	e.stopCalls.Add(1)
+	e.stopped = true
+	return containerruntime.StopResult{}, nil
+}
+
+func (e *staleInspectExecutor) Remove(context.Context, containerruntime.RuntimeRef) (containerruntime.RemoveResult, error) {
+	if e.generation == 2 && e.timedOut && !e.removeFailed {
+		e.removeFailed = true
+		return containerruntime.RemoveResult{}, errors.New("remove failed")
+	}
+	e.present = false
+	return containerruntime.RemoveResult{}, nil
+}
+
+func (*staleInspectExecutor) Logs(context.Context, containerruntime.RuntimeRef, bool) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
 }
 
 func newBlockingLaunchExecutor() *blockingLaunchExecutor {

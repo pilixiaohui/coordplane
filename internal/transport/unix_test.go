@@ -71,16 +71,7 @@ func TestUnixClientForwardsBearerAndDecodesCoreError(t *testing.T) {
 	dataDir := t.TempDir()
 	socketPath := filepath.Join(dataDir, "api.sock")
 	operations := &runFake{err: core.Conflict(core.CodeStaleRun, "stale", "exited", 4)}
-	server, err := transport.NewUnixServer(dataDir, socketPath, transport.NewRunHandler(operations))
-	if err != nil {
-		t.Fatalf("NewUnixServer: %v", err)
-	}
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve() }()
-	t.Cleanup(func() {
-		_ = server.Close()
-		<-serveDone
-	})
+	startUnixTestServer(t, dataDir, socketPath, transport.NewRunHandler(operations))
 	client, err := transport.NewUnixClient(socketPath, transport.WithBearerToken("old-run-token"))
 	if err != nil {
 		t.Fatalf("NewUnixClient: %v", err)
@@ -113,16 +104,7 @@ func TestUnixServerAndClientSupportLongFilesystemPaths(t *testing.T) {
 		t.Fatalf("test socket path is only %d bytes", len(socketPath))
 	}
 	operations := &operatorFake{}
-	server, err := transport.NewUnixServer(dataDir, socketPath, transport.NewOperatorHandler(operations))
-	if err != nil {
-		t.Fatalf("listen on long Unix path: %v", err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- server.Serve() }()
-	t.Cleanup(func() {
-		_ = server.Close()
-		<-done
-	})
+	startUnixTestServer(t, dataDir, socketPath, transport.NewOperatorHandler(operations))
 	if duplicate, err := transport.NewUnixServer(dataDir, socketPath, transport.NewOperatorHandler(&operatorFake{})); err == nil {
 		_ = duplicate.Close()
 		t.Fatal("second listener replaced an active long-path socket")
@@ -141,6 +123,20 @@ func TestUnixServerAndClientSupportLongFilesystemPaths(t *testing.T) {
 	if len(operations.calls) != 1 || operations.calls[0].value != "prj-long" {
 		t.Fatalf("operator calls = %#v", operations.calls)
 	}
+}
+
+func startUnixTestServer(t *testing.T, dataDir, socket string, handler http.Handler) {
+	t.Helper()
+	server, err := transport.NewUnixServer(dataDir, socket, handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- server.Serve() }()
+	t.Cleanup(func() {
+		_ = server.Close()
+		<-done
+	})
 }
 
 func TestListenUnixReplacesOnlyAStaleSocketInsideOwnedDataDir(t *testing.T) {

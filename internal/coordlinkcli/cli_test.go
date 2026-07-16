@@ -22,30 +22,12 @@ func TestScopedClientReadsTokenFile(t *testing.T) {
 	root := t.TempDir()
 	socket := filepath.Join(root, "api.sock")
 	operations := &runOperations{wantToken: "file-token"}
-	server, err := transport.NewUnixServer(root, socket, transport.NewRunHandler(operations))
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- server.Serve() }()
-	t.Cleanup(func() {
-		_ = server.Close()
-		<-done
-	})
+	startCLIServer(t, root, socket, transport.NewRunHandler(operations))
 	tokenFile := filepath.Join(root, "token")
 	if err := os.WriteFile(tokenFile, []byte("file-token\n"), 0o440); err != nil {
 		t.Fatal(err)
 	}
-	getenv := func(name string) string {
-		switch name {
-		case socketEnvironment:
-			return socket
-		case tokenFileEnvironment:
-			return tokenFile
-		default:
-			return ""
-		}
-	}
+	getenv := scopedEnvironment(socket, tokenFile)
 	var stdout, stderr bytes.Buffer
 	code := Run(context.Background(), []string{
 		"progress", "--summary", "from file", "--request-id", "token-file-progress", "--output", "json",
@@ -141,27 +123,9 @@ func TestProgressUsesPerRunSocketAndBearerToken(t *testing.T) {
 	root := t.TempDir()
 	socket := filepath.Join(root, "api.sock")
 	operations := &runOperations{wantToken: "run-token"}
-	server, err := transport.NewUnixServer(root, socket, transport.NewRunHandler(operations))
-	if err != nil {
-		t.Fatal(err)
-	}
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve() }()
-	t.Cleanup(func() {
-		_ = server.Close()
-		<-serveDone
-	})
+	startCLIServer(t, root, socket, transport.NewRunHandler(operations))
 	tokenFile := writeRunTokenFile(t, "run-token")
-	getenv := func(name string) string {
-		switch name {
-		case socketEnvironment:
-			return socket
-		case tokenFileEnvironment:
-			return tokenFile
-		default:
-			return ""
-		}
-	}
+	getenv := scopedEnvironment(socket, tokenFile)
 	var stdout, stderr bytes.Buffer
 	code := Run(context.Background(), []string{"progress", "--summary", "must-not-commit", "--request-id", "req-invalid", "--output", "xml"}, getenv, nil, &stdout, &stderr)
 	if code == 0 || !bytes.Contains(stderr.Bytes(), []byte("--output must be human or json")) {
@@ -289,16 +253,7 @@ func TestMessageSendRejectsAmbiguousRecipientBeforeMutation(t *testing.T) {
 		{"message", "send", "--to-boss", "--to-agent", "agent-b", "--body", "ambiguous"},
 	} {
 		var stdout, stderr bytes.Buffer
-		code := Run(context.Background(), args, func(name string) string {
-			switch name {
-			case socketEnvironment:
-				return filepath.Join(t.TempDir(), "missing.sock")
-			case tokenFileEnvironment:
-				return tokenFile
-			default:
-				return ""
-			}
-		}, nil, &stdout, &stderr)
+		code := Run(context.Background(), args, scopedEnvironment(filepath.Join(t.TempDir(), "missing.sock"), tokenFile), nil, &stdout, &stderr)
 		if code == 0 || !strings.Contains(stderr.String(), "exactly one of --to-boss or --to-agent") {
 			t.Fatalf("args=%v code=%d stderr=%s", args, code, stderr.String())
 		}
@@ -337,18 +292,18 @@ func runRecordedCommand(t *testing.T, args []string) recordedRequest {
 		}
 		_, _ = io.WriteString(writer, `{"ok":true,"data":`+data+`,"error":null}`)
 	})
-	server, err := transport.NewUnixServer(root, socket, handler)
-	if err != nil {
-		t.Fatal(err)
-	}
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve() }()
-	t.Cleanup(func() {
-		_ = server.Close()
-		<-serveDone
-	})
+	startCLIServer(t, root, socket, handler)
 	tokenFile := writeRunTokenFile(t, "run-token")
-	getenv := func(name string) string {
+	getenv := scopedEnvironment(socket, tokenFile)
+	var stdout, stderr bytes.Buffer
+	if code := Run(context.Background(), args, getenv, nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("Run(%v) code=%d stderr=%s", args, code, stderr.String())
+	}
+	return <-requests
+}
+
+func scopedEnvironment(socket, tokenFile string) func(string) string {
+	return func(name string) string {
 		switch name {
 		case socketEnvironment:
 			return socket
@@ -358,11 +313,20 @@ func runRecordedCommand(t *testing.T, args []string) recordedRequest {
 			return ""
 		}
 	}
-	var stdout, stderr bytes.Buffer
-	if code := Run(context.Background(), args, getenv, nil, &stdout, &stderr); code != 0 {
-		t.Fatalf("Run(%v) code=%d stderr=%s", args, code, stderr.String())
+}
+
+func startCLIServer(t *testing.T, root, socket string, handler http.Handler) {
+	t.Helper()
+	server, err := transport.NewUnixServer(root, socket, handler)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return <-requests
+	done := make(chan error, 1)
+	go func() { done <- server.Serve() }()
+	t.Cleanup(func() {
+		_ = server.Close()
+		<-done
+	})
 }
 
 func writeRunTokenFile(t *testing.T, token string) string {

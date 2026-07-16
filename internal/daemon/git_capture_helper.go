@@ -107,7 +107,7 @@ func (h *dockerCaptureHelper) Inspect(ctx context.Context, request gitrepo.Works
 	if err != nil {
 		return gitrepo.WorkspaceInspectFact{}, err
 	}
-	if err := h.runContainer(ctx, h.inspectContainerSpec(request, handoff, executable, ref), true); err != nil {
+	if err := h.runContainer(ctx, h.inspectContainerSpec(request, handoff, executable, ref), false); err != nil {
 		return gitrepo.WorkspaceInspectFact{}, err
 	}
 	fact, err := h.readyInspectFact(handoff)
@@ -221,23 +221,19 @@ func (h *dockerCaptureHelper) prepareInspectHandoff(
 	}
 	handoff := filepath.Join(parent, "inspect-"+operationID)
 	state, err := h.executor.Inspect(ctx, ref)
-	reset := errors.Is(err, containerruntime.ErrNotFound)
-	if err != nil && !reset {
+	if err != nil && !errors.Is(err, containerruntime.ErrNotFound) {
 		return "", fmt.Errorf("capture helper: inspect cleanup identity: %w", err)
 	}
-	if err == nil && !state.Running {
+	if err == nil {
 		if state.Ref.ContainerName == "" {
 			state.Ref = ref
 		}
-		if err := h.removeContainer(ctx, state.Ref); err != nil {
+		if err := h.cleanupInspectContainer(state); err != nil {
 			return "", err
 		}
-		reset = true
 	}
-	if reset {
-		if err := h.quarantineIfPresent(handoff); err != nil {
-			return "", fmt.Errorf("capture helper: reset inspect handoff: %w", err)
-		}
+	if err := h.quarantineIfPresent(handoff); err != nil {
+		return "", fmt.Errorf("capture helper: reset inspect handoff: %w", err)
 	}
 	if err := os.MkdirAll(handoff, 0o770); err != nil {
 		return "", fmt.Errorf("capture helper: create inspect handoff: %w", err)
@@ -246,6 +242,24 @@ func (h *dockerCaptureHelper) prepareInspectHandoff(
 		return "", fmt.Errorf("capture helper: set inspect handoff access: %w", err)
 	}
 	return handoff, nil
+}
+
+func (h *dockerCaptureHelper) cleanupInspectContainer(state containerruntime.LiveState) error {
+	ref := state.Ref
+	ctx, cancel := context.WithTimeout(context.Background(), h.config.CaptureTimeout)
+	defer cancel()
+	var stopErr, waitErr error
+	if state.Running {
+		_, stopErr = h.executor.Stop(ctx, ref, 5*time.Second)
+	}
+	if stopErr == nil {
+		_, waitErr = h.executor.Wait(ctx, ref)
+	}
+	removeErr := h.removeContainer(context.Background(), ref)
+	if err := errors.Join(stopErr, waitErr, removeErr); err != nil {
+		return fmt.Errorf("capture helper: clean previous inspect container: %w", err)
+	}
+	return nil
 }
 
 func (h *dockerCaptureHelper) quarantineIfPresent(path string) error {

@@ -12,15 +12,7 @@ import (
 )
 
 func TestP2CoordlinkBinaryFixedSurfacePersistsSuccessfulCoordination(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	database, err := store.Open(ctx, filepath.Join(root, "coordplane.db"))
-	requireNoError(t, err)
-	defer database.Close()
-
-	gitFacts := &contractGit{sha: strings.Repeat("a", 40), root: filepath.Join(root, "repos")}
-	service, err := core.NewService(database, gitFacts, core.ServiceOptions{MaxParallelRuns: 4, AdapterIDs: []string{"one-shot"}})
-	requireNoError(t, err)
+	ctx, root, database, _, service := newContractServiceFixture(t, core.ServiceOptions{MaxParallelRuns: 4, AdapterIDs: []string{"one-shot"}})
 	addAgent := func(name string) core.Agent {
 		t.Helper()
 		agent, err := service.AddAgent(ctx, core.AddAgentInput{
@@ -55,14 +47,7 @@ func TestP2CoordlinkBinaryFixedSurfacePersistsSuccessfulCoordination(t *testing.
 	activateContractRuntimeRun(t, ctx, service, claim, "p2-surface")
 
 	socket := filepath.Join(root, "run.sock")
-	server, err := transport.NewUnixServer(root, socket, transport.NewRunHandler(service))
-	requireNoError(t, err)
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve() }()
-	defer func() {
-		_ = server.Close()
-		<-serveDone
-	}()
+	startContractServer(t, root, socket, transport.NewRunHandler(service))
 
 	currentRaw := runP2SurfaceCoordlink(t, socket, claim.Token,
 		"task", "current", "--output", "json")

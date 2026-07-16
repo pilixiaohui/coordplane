@@ -101,9 +101,7 @@ func TestGT00DaemonBinaryRecoversEveryInitializationPhase(t *testing.T) {
 			root, err := os.MkdirTemp("/tmp", "cp-gt00-")
 			requireNoError(t, err)
 			t.Cleanup(func() { _ = os.RemoveAll(root) })
-			dataDir := filepath.Join(root, "data")
-			socket := filepath.Join(dataDir, "operator.sock")
-			configPath := writeConfig(t, root, dataDir, socket, "")
+			_, dataDir, socket, configPath := contractConfigPaths(t, "", root)
 			source := createRepository(t, root)
 			initial := strings.TrimSpace(git(t, source, "rev-parse", "refs/heads/main"))
 			readyPath := filepath.Join(root, "git-phase-ready")
@@ -187,10 +185,7 @@ func TestGT00DaemonBinaryRecoversEveryInitializationPhase(t *testing.T) {
 }
 
 func TestGT00ProductionBinaryHasNoContractFaultControl(t *testing.T) {
-	root := t.TempDir()
-	dataDir := filepath.Join(root, "data")
-	socket := filepath.Join(dataDir, "operator.sock")
-	configPath := writeConfig(t, root, dataDir, socket, "")
+	root, _, socket, configPath := contractConfigPaths(t, "")
 	source := createRepository(t, root)
 	readyPath := filepath.Join(root, "must-not-exist")
 	daemon := startDaemonBinaryWithEnv(t, testBinaries.coordplane, configPath, socket, []string{
@@ -220,10 +215,7 @@ func TestGT00ProductionBinaryHasNoContractFaultControl(t *testing.T) {
 }
 
 func TestP3ProductionBinaryRejectsUnknownAdapterWithoutDurableWrites(t *testing.T) {
-	root := t.TempDir()
-	dataDir := filepath.Join(root, "data")
-	socket := filepath.Join(dataDir, "operator.sock")
-	configPath := writeConfig(t, root, dataDir, socket, "")
+	root, dataDir, socket, configPath := contractConfigPaths(t, "")
 	daemon := startDaemon(t, configPath, socket)
 
 	command := exec.Command(testBinaries.coordplane,
@@ -250,10 +242,7 @@ func TestP3ProductionBinaryRejectsUnknownAdapterWithoutDurableWrites(t *testing.
 }
 
 func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
-	root := t.TempDir()
-	dataDir := filepath.Join(root, "data")
-	socket := filepath.Join(dataDir, "operator.sock")
-	configPath := writeConfig(t, root, dataDir, socket, "")
+	root, dataDir, socket, configPath := contractConfigPaths(t, "")
 	source := createRepository(t, root)
 	sourceRefBefore := git(t, source, "rev-parse", "refs/heads/main")
 	sourceStatusBefore := git(t, source, "status", "--porcelain=v1", "--untracked-files=all")
@@ -433,10 +422,7 @@ func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 }
 
 func TestGT07FormalOperatorBinaryChecksOutExactControllerTaskRef(t *testing.T) {
-	root := t.TempDir()
-	dataDir := filepath.Join(root, "data")
-	socket := filepath.Join(dataDir, "operator.sock")
-	configPath := writeConfig(t, root, dataDir, socket, "")
+	root, dataDir, socket, configPath := contractConfigPaths(t, "")
 	configRaw, err := os.ReadFile(configPath)
 	requireNoError(t, err)
 	configRaw = bytes.ReplaceAll(configRaw, []byte("completed_workspace: 24h"), []byte("completed_workspace: 0"))
@@ -642,10 +628,7 @@ func TestGT07FormalOperatorBinaryChecksOutExactControllerTaskRef(t *testing.T) {
 }
 
 func TestGT07FormalOperatorBinaryCreatesRetryLineageFromClosedSameProjectTask(t *testing.T) {
-	root := t.TempDir()
-	dataDir := filepath.Join(root, "data")
-	socket := filepath.Join(dataDir, "operator.sock")
-	configPath := writeConfig(t, root, dataDir, socket, "")
+	root, dataDir, socket, configPath := contractConfigPaths(t, "")
 	source := createRepository(t, root)
 	daemon := startDaemon(t, configPath, socket)
 	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
@@ -757,10 +740,7 @@ func TestGT07FormalOperatorBinaryCreatesRetryLineageFromClosedSameProjectTask(t 
 }
 
 func TestP1ServeRejectsUnknownConfigBeforeCreatingDatabase(t *testing.T) {
-	root := t.TempDir()
-	dataDir := filepath.Join(root, "data")
-	socket := filepath.Join(dataDir, "operator.sock")
-	configPath := writeConfig(t, root, dataDir, socket, "unknown_field: true\n")
+	_, dataDir, _, configPath := contractConfigPaths(t, "unknown_field: true\n")
 	command := exec.Command(testBinaries.coordplane, "serve", "--config", configPath)
 	raw, err := command.CombinedOutput()
 	if err == nil || !bytes.Contains(raw, []byte("field unknown_field not found")) {
@@ -775,9 +755,7 @@ func TestP1BinaryReadSurfacesStayBoundedPastTwoMiBLedger(t *testing.T) {
 	root, err := os.MkdirTemp("/tmp", "cp-bounded-")
 	requireNoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	dataDir := filepath.Join(root, "data")
-	socket := filepath.Join(dataDir, "operator.sock")
-	configPath := writeConfig(t, root, dataDir, socket, "")
+	_, dataDir, socket, configPath := contractConfigPaths(t, "", root)
 	source := createRepository(t, root)
 	daemon := startDaemon(t, configPath, socket)
 	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
@@ -841,15 +819,8 @@ func TestP1BinaryReadSurfacesStayBoundedPastTwoMiBLedger(t *testing.T) {
 		t.Fatalf("seed bounded run: claim=%#v ok=%t err=%v", claim, ok, err)
 	}
 	activateContractRuntimeRun(t, context.Background(), service, claim, "bounded-run")
-	operatorServer, err := transport.NewUnixServer(dataDir, socket, transport.NewOperatorHandler(service))
-	requireNoError(t, err)
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- operatorServer.Serve() }()
-	defer func() {
-		_ = operatorServer.Close()
-		<-serveDone
-		_ = database.Close()
-	}()
+	t.Cleanup(func() { _ = database.Close() })
+	startContractServer(t, dataDir, socket, transport.NewOperatorHandler(service))
 
 	statusRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"status", "--socket", socket, "--project", project.ID, "--output", "json")
@@ -999,18 +970,11 @@ func TestP1BinaryReadSurfacesStayBoundedPastTwoMiBLedger(t *testing.T) {
 }
 
 func TestCT03CoordlinkBinaryRejectsStaleRunWithoutSideEffects(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	database, err := store.Open(ctx, filepath.Join(root, "coordplane.db"))
-	requireNoError(t, err)
-	defer database.Close()
-	gitFacts := &contractGit{sha: strings.Repeat("a", 40), root: filepath.Join(root, "repos")}
 	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
-	service, err := core.NewService(database, gitFacts, core.ServiceOptions{
+	ctx, _, database, gitFacts, service := newContractServiceFixture(t, core.ServiceOptions{
 		MaxParallelRuns: 2, AdapterIDs: []string{"one-shot"},
 		Now: func() time.Time { return now },
 	})
-	requireNoError(t, err)
 	agent, err := service.AddAgent(ctx, core.AddAgentInput{DisplayName: "Agent", AdapterID: "one-shot", Image: "agent:latest", InstructionsFile: "/instructions", RequestID: "agent"})
 	requireNoError(t, err)
 	project, err := service.AddProject(ctx, core.AddProjectInput{Name: "Project", Source: "/source", SourceRef: "refs/heads/main", RequestID: "project"})
@@ -1033,14 +997,7 @@ func TestCT03CoordlinkBinaryRejectsStaleRunWithoutSideEffects(t *testing.T) {
 	requireNoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(controlRoot) })
 	socket := filepath.Join(controlRoot, "api.sock")
-	server, err := transport.NewUnixServer(controlRoot, socket, transport.NewRunHandler(service))
-	requireNoError(t, err)
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve() }()
-	defer func() {
-		_ = server.Close()
-		<-serveDone
-	}()
+	startContractServer(t, controlRoot, socket, transport.NewRunHandler(service))
 	before := durableSignature(t, database, project.ID)
 	staleCalls := [][]string{
 		{"task", "current", "--output", "json"},
@@ -1104,14 +1061,7 @@ func TestP2CoordlinkBinaryPersistsOutcomeIntentBeforeTerminalFact(t *testing.T) 
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			ctx := context.Background()
-			root := t.TempDir()
-			database, err := store.Open(ctx, filepath.Join(root, "coordplane.db"))
-			requireNoError(t, err)
-			defer database.Close()
-			gitFacts := &contractGit{sha: strings.Repeat("a", 40), root: filepath.Join(root, "repos")}
-			service, err := core.NewService(database, gitFacts, core.ServiceOptions{MaxParallelRuns: 1, AdapterIDs: []string{"one-shot"}})
-			requireNoError(t, err)
+			ctx, _, database, gitFacts, service := newContractServiceFixture(t, core.ServiceOptions{MaxParallelRuns: 1, AdapterIDs: []string{"one-shot"}})
 			agent, err := service.AddAgent(ctx, core.AddAgentInput{
 				DisplayName: "Agent", AdapterID: "one-shot", Image: "agent:latest",
 				InstructionsFile: "/instructions", RequestID: "agent-" + test.name,
@@ -1137,14 +1087,7 @@ func TestP2CoordlinkBinaryPersistsOutcomeIntentBeforeTerminalFact(t *testing.T) 
 			requireNoError(t, err)
 			t.Cleanup(func() { _ = os.RemoveAll(controlRoot) })
 			socket := filepath.Join(controlRoot, "api.sock")
-			server, err := transport.NewUnixServer(controlRoot, socket, transport.NewRunHandler(service))
-			requireNoError(t, err)
-			serveDone := make(chan error, 1)
-			go func() { serveDone <- server.Serve() }()
-			defer func() {
-				_ = server.Close()
-				<-serveDone
-			}()
+			startContractServer(t, controlRoot, socket, transport.NewRunHandler(service))
 
 			args := test.args(gitFacts.sha)
 			raw, err := runCoordlink(t, socket, claim.Token, args...)

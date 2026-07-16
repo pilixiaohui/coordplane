@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -81,20 +82,20 @@ func TestTaskRunAndMessageHistoryUseStableOpaqueCursorPages(t *testing.T) {
 	requireNoError(t, err)
 	projects2, err := database.Projects(ctx, core.ProjectFilter{Limit: 2, Cursor: projects1.NextCursor})
 	requireNoError(t, err)
-	assertIDs(t, projectIDs(append(projects1.Items, projects2.Items...)), []string{"prj_a", "prj_b", "prj_c"})
+	assertIDs(t, itemIDs(append(projects1.Items, projects2.Items...)), []string{"prj_a", "prj_b", "prj_c"})
 
 	agents1, err := database.Agents(ctx, core.AgentFilter{Limit: 2})
 	requireNoError(t, err)
 	agents2, err := database.Agents(ctx, core.AgentFilter{Limit: 2, Cursor: agents1.NextCursor})
 	requireNoError(t, err)
-	assertIDs(t, agentIDs(append(agents1.Items, agents2.Items...)), []string{"agt_a", "agt_b", "agt_c"})
+	assertIDs(t, itemIDs(append(agents1.Items, agents2.Items...)), []string{"agt_a", "agt_b", "agt_c"})
 
 	tasks1, err := database.Tasks(ctx, core.TaskFilter{Limit: 2})
 	requireNoError(t, err)
 	tasks2, err := database.Tasks(ctx, core.TaskFilter{Limit: 2, Cursor: tasks1.NextCursor})
 	requireNoError(t, err)
-	assertIDs(t, taskIDs(tasks1.Items), []string{"tsk_a", "tsk_b"})
-	assertIDs(t, taskIDs(tasks2.Items), []string{"tsk_c"})
+	assertIDs(t, itemIDs(tasks1.Items), []string{"tsk_a", "tsk_b"})
+	assertIDs(t, itemIDs(tasks2.Items), []string{"tsk_c"})
 	if tasks1.NextCursor == "" || strings.Contains(tasks1.NextCursor, "2026-") || tasks2.NextCursor != "" {
 		t.Fatalf("task cursors are not opaque/terminal: first=%q second=%q", tasks1.NextCursor, tasks2.NextCursor)
 	}
@@ -103,13 +104,13 @@ func TestTaskRunAndMessageHistoryUseStableOpaqueCursorPages(t *testing.T) {
 	requireNoError(t, err)
 	runs2, err := database.Runs(ctx, core.RunFilter{Limit: 2, Cursor: runs1.NextCursor})
 	requireNoError(t, err)
-	assertIDs(t, runIDs(append(runs1.Items, runs2.Items...)), []string{"run_a", "run_b", "run_c"})
+	assertIDs(t, itemIDs(append(runs1.Items, runs2.Items...)), []string{"run_a", "run_b", "run_c"})
 
 	messages1, err := database.Messages(ctx, core.MessageFilter{Limit: 2})
 	requireNoError(t, err)
 	messages2, err := database.Messages(ctx, core.MessageFilter{Limit: 2, Cursor: messages1.NextCursor})
 	requireNoError(t, err)
-	assertIDs(t, messageIDs(append(messages1.Items, messages2.Items...)), []string{"msg_a", "msg_b", "msg_c"})
+	assertIDs(t, itemIDs(append(messages1.Items, messages2.Items...)), []string{"msg_a", "msg_b", "msg_c"})
 
 	if _, err := database.Tasks(ctx, core.TaskFilter{Cursor: "created-at-and-id-are-not-public"}); !core.IsCode(err, core.CodeInvalidArgument) {
 		t.Fatalf("invalid cursor error = %v, want INVALID_ARGUMENT", err)
@@ -520,42 +521,11 @@ func snapshotFamilySizes(snapshot core.Snapshot) [6]int {
 	return [6]int{len(snapshot.Projects), len(snapshot.Agents), len(snapshot.Tasks), len(snapshot.Runs), len(snapshot.Messages), len(snapshot.Events)}
 }
 
-func projectIDs(items []core.ProjectSummary) []string {
-	ids := make([]string, len(items))
-	for index := range items {
-		ids[index] = items[index].ID
-	}
-	return ids
-}
-
-func agentIDs(items []core.AgentSummary) []string {
-	ids := make([]string, len(items))
-	for index := range items {
-		ids[index] = items[index].ID
-	}
-	return ids
-}
-
-func taskIDs(items []core.TaskSummary) []string {
-	ids := make([]string, len(items))
-	for index := range items {
-		ids[index] = items[index].ID
-	}
-	return ids
-}
-
-func runIDs(items []core.RunSummary) []string {
-	ids := make([]string, len(items))
-	for index := range items {
-		ids[index] = items[index].ID
-	}
-	return ids
-}
-
-func messageIDs(items []core.Message) []string {
-	ids := make([]string, len(items))
-	for index := range items {
-		ids[index] = items[index].ID
+func itemIDs(items any) []string {
+	values := reflect.ValueOf(items)
+	ids := make([]string, values.Len())
+	for index := range ids {
+		ids[index] = values.Index(index).FieldByName("ID").String()
 	}
 	return ids
 }

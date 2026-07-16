@@ -26,9 +26,7 @@ func TestPreflightRequiresFullBranchRefAndDoesNotModifySource(t *testing.T) {
 	}
 
 	fact, err := initializer.Preflight(ctx, source, "refs/heads/main")
-	if err != nil {
-		t.Fatalf("Preflight: %v", err)
-	}
+	requireNoError(t, err)
 	if fact.SourcePath != source || fact.SourceRef != "refs/heads/main" || fact.InitialSHA != initial {
 		t.Fatalf("Preflight fact = %+v, want source/main/%s", fact, initial)
 	}
@@ -36,13 +34,7 @@ func TestPreflightRequiresFullBranchRefAndDoesNotModifySource(t *testing.T) {
 }
 
 func TestInitializeUsesSavedInitialSHANotMovedSourceBranch(t *testing.T) {
-	ctx := context.Background()
-	source, initial := newSourceRepository(t)
-	initializer := newTestInitializer(t)
-	preflight, err := initializer.Preflight(ctx, source, "refs/heads/main")
-	if err != nil {
-		t.Fatalf("Preflight: %v", err)
-	}
+	ctx, source, initial, initializer, preflight := preflightFixture(t)
 	moved := commitFile(t, source, "moved.txt", "moved\n", "move source branch")
 	if moved == initial {
 		t.Fatal("source branch did not move")
@@ -51,9 +43,7 @@ func TestInitializeUsesSavedInitialSHANotMovedSourceBranch(t *testing.T) {
 	project := testProject(t, initializer, preflight, "project-a", "operation-a")
 
 	fact, err := initializer.Initialize(ctx, project)
-	if err != nil {
-		t.Fatalf("Initialize: %v", err)
-	}
+	requireNoError(t, err)
 	if fact.CanonicalSHA != initial {
 		t.Fatalf("canonical SHA = %s, want saved initial %s (source now %s)", fact.CanonicalSHA, initial, moved)
 	}
@@ -63,9 +53,7 @@ func TestInitializeUsesSavedInitialSHANotMovedSourceBranch(t *testing.T) {
 	assertSourceSnapshot(t, source, before)
 
 	again, err := initializer.Initialize(ctx, project)
-	if err != nil {
-		t.Fatalf("idempotent Initialize: %v", err)
-	}
+	requireNoError(t, err)
 	if again != fact {
 		t.Fatalf("second Initialize fact = %+v, want %+v", again, fact)
 	}
@@ -73,13 +61,7 @@ func TestInitializeUsesSavedInitialSHANotMovedSourceBranch(t *testing.T) {
 }
 
 func TestVerifyAndRepeatedInitializeNeverResetActualCanonical(t *testing.T) {
-	ctx := context.Background()
-	source, initial := newSourceRepository(t)
-	initializer := newTestInitializer(t)
-	preflight, err := initializer.Preflight(ctx, source, "refs/heads/main")
-	if err != nil {
-		t.Fatalf("Preflight: %v", err)
-	}
+	ctx, source, initial, initializer, preflight := preflightFixture(t)
 	project := testProject(t, initializer, preflight, "project-repair", "operation-initialize")
 	if _, err := initializer.Initialize(ctx, project); err != nil {
 		t.Fatalf("Initialize: %v", err)
@@ -92,9 +74,7 @@ func TestVerifyAndRepeatedInitializeNeverResetActualCanonical(t *testing.T) {
 	repair := project
 	repair.OperationID = "operation-repair"
 	fact, err := initializer.Verify(ctx, repair)
-	if err != nil {
-		t.Fatalf("Verify repair: %v", err)
-	}
+	requireNoError(t, err)
 	if fact.CanonicalSHA != advanced {
 		t.Fatalf("Verify canonical = %s, want actual advanced %s", fact.CanonicalSHA, advanced)
 	}
@@ -102,17 +82,13 @@ func TestVerifyAndRepeatedInitializeNeverResetActualCanonical(t *testing.T) {
 		t.Fatalf("canonical after Verify = %s, want %s", got, advanced)
 	}
 	verifiedAgain, err := initializer.Verify(ctx, repair)
-	if err != nil {
-		t.Fatalf("idempotent Verify repair: %v", err)
-	}
+	requireNoError(t, err)
 	if verifiedAgain != fact {
 		t.Fatalf("second Verify fact = %+v, want %+v", verifiedAgain, fact)
 	}
 
 	again, err := initializer.Initialize(ctx, project)
-	if err != nil {
-		t.Fatalf("Initialize replay after canonical advance: %v", err)
-	}
+	requireNoError(t, err)
 	if again.CanonicalSHA != advanced {
 		t.Fatalf("Initialize replay canonical = %s, want %s", again.CanonicalSHA, advanced)
 	}
@@ -122,18 +98,10 @@ func TestVerifyAndRepeatedInitializeNeverResetActualCanonical(t *testing.T) {
 }
 
 func TestInitializeRefusesUnmarkedPartialRepository(t *testing.T) {
-	ctx := context.Background()
-	source, _ := newSourceRepository(t)
-	initializer := newTestInitializer(t)
-	preflight, err := initializer.Preflight(ctx, source, "refs/heads/main")
-	if err != nil {
-		t.Fatalf("Preflight: %v", err)
-	}
+	ctx, _, _, initializer, preflight := preflightFixture(t)
 	project := testProject(t, initializer, preflight, "project-foreign", "operation-foreign")
 	paths, err := initializer.Paths(project.ID, project.OperationID)
-	if err != nil {
-		t.Fatalf("Paths: %v", err)
-	}
+	requireNoError(t, err)
 	if err := os.MkdirAll(paths.Partial, 0o700); err != nil {
 		t.Fatalf("create foreign partial: %v", err)
 	}
@@ -149,13 +117,7 @@ func TestInitializeRefusesUnmarkedPartialRepository(t *testing.T) {
 }
 
 func TestExistsOnlyAcceptsDirectDeterministicFinalPath(t *testing.T) {
-	ctx := context.Background()
-	source, _ := newSourceRepository(t)
-	initializer := newTestInitializer(t)
-	preflight, err := initializer.Preflight(ctx, source, "refs/heads/main")
-	if err != nil {
-		t.Fatalf("Preflight: %v", err)
-	}
+	ctx, _, _, initializer, preflight := preflightFixture(t)
 	project := testProject(t, initializer, preflight, "project-exists", "operation-exists")
 	if _, err := initializer.Initialize(ctx, project); err != nil {
 		t.Fatalf("Initialize: %v", err)
@@ -197,42 +159,26 @@ func TestExistsOnlyAcceptsDirectDeterministicFinalPath(t *testing.T) {
 }
 
 func TestResolveReadsActualCanonicalWithoutMutatingMarker(t *testing.T) {
-	ctx := context.Background()
-	source, initial := newSourceRepository(t)
-	initializer := newTestInitializer(t)
-	preflight, err := initializer.Preflight(ctx, source, "refs/heads/main")
-	if err != nil {
-		t.Fatalf("Preflight: %v", err)
-	}
+	ctx, source, initial, initializer, preflight := preflightFixture(t)
 	project := testProject(t, initializer, preflight, "project-resolve", "operation-resolve")
 	if _, err := initializer.Initialize(ctx, project); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
 	markerPath := filepath.Join(project.ControlRepoPath, markerFilename)
 	markerBefore, err := os.ReadFile(markerPath)
-	if err != nil {
-		t.Fatalf("read marker before Resolve: %v", err)
-	}
+	requireNoError(t, err)
 	markerInfoBefore, err := os.Stat(markerPath)
-	if err != nil {
-		t.Fatalf("stat marker before Resolve: %v", err)
-	}
+	requireNoError(t, err)
 
 	sha, err := initializer.Resolve(ctx, project.ControlRepoPath, project.CanonicalRef)
-	if err != nil {
-		t.Fatalf("Resolve: %v", err)
-	}
+	requireNoError(t, err)
 	if sha != initial {
 		t.Fatalf("Resolve SHA = %s, want %s", sha, initial)
 	}
 	markerAfter, err := os.ReadFile(markerPath)
-	if err != nil {
-		t.Fatalf("read marker after Resolve: %v", err)
-	}
+	requireNoError(t, err)
 	markerInfoAfter, err := os.Stat(markerPath)
-	if err != nil {
-		t.Fatalf("stat marker after Resolve: %v", err)
-	}
+	requireNoError(t, err)
 	if !reflect.DeepEqual(markerAfter, markerBefore) || !markerInfoAfter.ModTime().Equal(markerInfoBefore.ModTime()) {
 		t.Fatal("Resolve mutated the ownership marker")
 	}
@@ -261,12 +207,20 @@ type sourceState struct {
 	Config []byte
 }
 
+func preflightFixture(t *testing.T) (context.Context, string, string, *Initializer, SourceFact) {
+	t.Helper()
+	ctx := context.Background()
+	source, initial := newSourceRepository(t)
+	initializer := newTestInitializer(t)
+	preflight, err := initializer.Preflight(ctx, source, "refs/heads/main")
+	requireNoError(t, err)
+	return ctx, source, initial, initializer, preflight
+}
+
 func newTestInitializer(t *testing.T) *Initializer {
 	t.Helper()
 	initializer, err := New(filepath.Join(t.TempDir(), "repos"))
-	if err != nil {
-		t.Fatalf("New initializer: %v", err)
-	}
+	requireNoError(t, err)
 	return initializer
 }
 
@@ -278,9 +232,7 @@ func newSourceRepository(t *testing.T) (string, string) {
 	gitOutput(t, path, "config", "user.email", "coordplane@example.invalid")
 	initial := commitFile(t, path, "README.md", "initial\n", "initial")
 	canonical, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		t.Fatalf("canonicalize source: %v", err)
-	}
+	requireNoError(t, err)
 	return canonical, initial
 }
 
@@ -297,9 +249,7 @@ func commitFile(t *testing.T, repoPath, name, content, message string) string {
 func testProject(t *testing.T, initializer *Initializer, source SourceFact, projectID, operationID string) Project {
 	t.Helper()
 	paths, err := initializer.Paths(projectID, operationID)
-	if err != nil {
-		t.Fatalf("Paths: %v", err)
-	}
+	requireNoError(t, err)
 	return Project{
 		ID:              projectID,
 		OperationID:     operationID,
@@ -314,13 +264,9 @@ func testProject(t *testing.T, initializer *Initializer, source SourceFact, proj
 func snapshotSource(t *testing.T, repoPath string) sourceState {
 	t.Helper()
 	head, err := os.ReadFile(filepath.Join(repoPath, ".git", "HEAD"))
-	if err != nil {
-		t.Fatalf("read source HEAD: %v", err)
-	}
+	requireNoError(t, err)
 	config, err := os.ReadFile(filepath.Join(repoPath, ".git", "config"))
-	if err != nil {
-		t.Fatalf("read source config: %v", err)
-	}
+	requireNoError(t, err)
 	return sourceState{
 		Status: gitOutput(t, repoPath, "status", "--porcelain=v1", "--untracked-files=all"),
 		Refs:   gitOutput(t, repoPath, "for-each-ref", "--format=%(refname)%00%(objectname)"),
