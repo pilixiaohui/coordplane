@@ -4,9 +4,7 @@ package e2e_test
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -245,7 +243,7 @@ func (b *pfBatch) restartAfterKill(delay time.Duration, afterKill func()) int64 
 	}
 	_ = os.Remove(b.socket)
 	started := time.Now()
-	b.daemon = startDaemonWithEnv(b.t, b.binary, filepath.Join(b.root, "coordplane.yaml"), b.socket, []string{
+	b.daemon = startPerfDaemon(b.t, b.binary, b.image, b.root, filepath.Join(b.root, "coordplane.yaml"), b.socket, b.id, []string{
 		"COORDPLANE_PERF_OBSERVER_OUTPUT=" + b.observer,
 		"COORDPLANE_PERF_SAMPLE_ID=" + b.id,
 		"COORDPLANE_PERF_DATA_DIR=" + b.dataDir,
@@ -283,8 +281,7 @@ func assertPFFaultBoundary(t *testing.T, batch *pfBatch, task core.Task, runID, 
 }
 
 func newPFFaultRow(id, kind string, index int, batch *pfBatch) pfFaultRow {
-	sum := sha256.Sum256([]byte(batch.dataDir))
-	return pfFaultRow{SampleID: id, Kind: kind, Index: index, FreshDataDirID: hex.EncodeToString(sum[:8])}
+	return pfFaultRow{SampleID: id, Kind: kind, Index: index, FreshDataDirID: pfDataDirID(batch.dataDir)}
 }
 
 func waitForPFPath(t *testing.T, ctx context.Context, path string) {

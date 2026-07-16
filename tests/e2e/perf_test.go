@@ -11,11 +11,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -72,6 +75,7 @@ type pfRunFact struct {
 
 type pfObjectCounts struct {
 	SampleID         string `json:"sample_id"`
+	FreshDataDirID   string `json:"fresh_data_dir_id"`
 	ProjectID        string `json:"project_id"`
 	Tasks            int    `json:"tasks"`
 	Runs             int    `json:"runs"`
@@ -92,6 +96,7 @@ type pfReport struct {
 	Reason        string             `json:"reason,omitempty"`
 	Revision      string             `json:"revision"`
 	Environment   map[string]string  `json:"environment"`
+	Binaries      map[string]string  `json:"binary_sha256"`
 	Fixture       map[string]any     `json:"fixture"`
 	Samples       []pfSample         `json:"samples"`
 	Statistics    map[string]int64   `json:"nearest_rank_ns"`
@@ -121,7 +126,7 @@ type pfBatch struct {
 	ctx                   context.Context
 	binary, image, id     string
 	root, dataDir, socket string
-	daemon                *daemonProcess
+	daemon                *pfDaemonProcess
 	agents                []core.Agent
 	project               core.Project
 	initialSHA, observer  string
@@ -131,24 +136,64 @@ type pfBatch struct {
 	diskStop, diskDone    chan struct{}
 	disk                  []pfDiskSample
 	terminalMu            sync.Mutex
-	terminals             map[string]pfTerminalObservation
+	terminalWG            sync.WaitGroup
+	terminals             map[string]*pfTerminalObservation
 }
 
 type pfTerminalObservation struct {
-	state       core.RunState
-	containerID string
-	observedNS  int64
+	taskID, containerID                string
+	state                              core.RunState
+	observedNS, containerNS, cleanupNS int64
+	containerAbsent, resourcesAbsent   bool
+	err                                string
+	done                               chan struct{}
+}
+
+type pfDaemonProcess struct {
+	containerID, logPath string
+	pid                  int
+	stopOnce             sync.Once
+	stopErr              error
+}
+
+func (p *pfDaemonProcess) PID() int    { return p.pid }
+func (p *pfDaemonProcess) Kill() error { return p.stop("kill") }
+func (p *pfDaemonProcess) Stop() error { return p.stop("stop", "--time", "20") }
+func (p *pfDaemonProcess) stop(action string, args ...string) error {
+	p.stopOnce.Do(func() {
+		commandArgs := append(append([]string{action}, args...), p.containerID)
+		raw, actionErr := exec.Command("docker", commandArgs...).CombinedOutput()
+		logs, _ := exec.Command("docker", "logs", p.containerID).CombinedOutput()
+		_ = os.WriteFile(p.logPath, logs, 0o600)
+		removeRaw, removeErr := exec.Command("docker", "rm", "-f", p.containerID).CombinedOutput()
+		if actionErr != nil {
+			p.stopErr = fmt.Errorf("docker %s daemon: %w: %s", action, actionErr, raw)
+		} else if removeErr != nil {
+			p.stopErr = fmt.Errorf("remove daemon container: %w: %s", removeErr, removeRaw)
+		}
+	})
+	return p.stopErr
 }
 
 type pfDiskSample struct {
 	SampleID       string `json:"sample_id"`
+	DataDirID      string `json:"data_dir_id"`
+	DaemonOriginID string `json:"daemon_origin_id,omitempty"`
+	StageID        string `json:"stage_id,omitempty"`
+	StageKeySHA256 string `json:"stage_key_sha256,omitempty"`
 	Boundary       string `json:"boundary"`
+	ProjectID      string `json:"project_id,omitempty"`
+	TaskID         string `json:"task_id,omitempty"`
+	RunID          string `json:"run_id,omitempty"`
+	OperationID    string `json:"operation_id,omitempty"`
+	AttemptIndex   int64  `json:"attempt_index,omitempty"`
 	ObservedUnixNS int64  `json:"observed_unix_ns"`
 	Bytes          int64  `json:"bytes"`
 	Error          string `json:"error,omitempty"`
 }
 
 var pfRoles = [...]string{"A", "B", "C", "D"}
+var pfDockerSocketGroups sync.Map
 
 func TestPFDirectorySampleTreatsRemovedTreeAsAbsent(t *testing.T) {
 	if size := directoryBytesExcept(t, filepath.Join(t.TempDir(), "removed"), ""); size != 0 {
@@ -182,11 +227,27 @@ func TestPFOwnedResidueRejectsUnknownDirectChildren(t *testing.T) {
 	if residue := ownedResidue(t, dataDir, projectID); len(residue) != 2 {
 		t.Fatalf("unknown direct children escaped residue scan: %v", residue)
 	}
+	taskID, runID := "task", "run"
+	batch := &pfBatch{dataDir: dataDir, project: core.Project{ID: projectID}}
+	requireNoError(t, os.MkdirAll(filepath.Join(dataDir, "workspaces", projectID, taskID), 0o700))
+	absent, err := batch.runPathsAbsent(taskID, runID)
+	requireNoError(t, err)
+	if !absent {
+		t.Fatal("Task workspace incorrectly delayed Run-owned cleanup")
+	}
+	handoff := filepath.Join(dataDir, "handoff", projectID, taskID, runID)
+	requireNoError(t, os.MkdirAll(handoff, 0o700))
+	absent, err = batch.runPathsAbsent(taskID, runID)
+	requireNoError(t, err)
+	if absent {
+		t.Fatal("per-Run handoff escaped Run-owned cleanup")
+	}
 }
 
 func TestPF01FourAgentPerformance(t *testing.T) {
 	coordplane := requireExecutable(t, "E2E_COORDPLANE_BIN")
-	requireExecutable(t, "E2E_COORDLINK_BIN")
+	coordlink := requireExecutable(t, "E2E_COORDLINK_BIN")
+	gitHelper := requireExecutable(t, "E2E_GIT_HELPER_BIN")
 	image := strings.TrimSpace(os.Getenv("E2E_RUNTIME_IMAGE"))
 	output := strings.TrimSpace(os.Getenv("PF01_OUTPUT"))
 	profile := strings.TrimSpace(os.Getenv("PF01_PROFILE"))
@@ -215,6 +276,7 @@ func TestPF01FourAgentPerformance(t *testing.T) {
 	report := pfReport{
 		SchemaVersion: 2, Scenario: "PF-01", Profile: profile, Revision: commandText(ctx, "git", "rev-parse", "HEAD"),
 		Environment: perfEnvironment(ctx, image),
+		Binaries:    perfBinaryDigests(t, coordplane, coordlink, gitHelper),
 		Thresholds:  map[string]int64{"t_wave_p50": int64(60 * time.Second), "t_wave_p90": int64(90 * time.Second), "t_wave_max": int64(180 * time.Second)},
 	}
 	defer writePerfReport(t, output, &report)
@@ -336,7 +398,7 @@ func newPFBatchWithEnv(
 		"GOMAXPROCS=3",
 		"GOMEMLIMIT=384MiB",
 	}, extraEnvironment...)
-	daemon := startDaemonWithEnv(t, binary, config, socket, environment)
+	daemon := startPerfDaemon(t, binary, image, root, config, socket, id, environment)
 	registerLiveHomeCleanup(t, image, dataDir)
 	waitForReady(t, ctx, binary, socket, id+" startup")
 	batch := &pfBatch{
@@ -344,7 +406,7 @@ func newPFBatchWithEnv(
 		root: root, dataDir: dataDir, socket: socket, daemon: daemon,
 		initialSHA: initial, parallel: parallel, observer: observer,
 		diskStop: make(chan struct{}), diskDone: make(chan struct{}),
-		terminals: make(map[string]pfTerminalObservation),
+		terminals: make(map[string]*pfTerminalObservation),
 	}
 	go batch.sampleDisk()
 	batch.agents = make([]core.Agent, len(pfRoles))
@@ -360,6 +422,7 @@ func newPFBatchWithEnv(
 
 func (b *pfBatch) close() {
 	b.t.Helper()
+	b.terminalWG.Wait()
 	close(b.diskStop)
 	<-b.diskDone
 	if err := b.daemon.Stop(); err != nil {
@@ -481,19 +544,17 @@ func (b *pfBatch) runWave(name string, warmup, soak bool) pfSample {
 		}
 	}
 	runFacts := b.terminalRunFacts(taskIDs, runIDs, integrationTaskIDs, integrationRunIDs)
-	b.waitForRunContainersAbsent(runFacts)
 	pfJSON[core.GCPreview](b, "gc", "preview", "--socket", b.socket, "--output", "json")
 	b.recordDisk("gc_preview")
 	pfJSON[core.GCRunResult](b, "gc", "run", "--socket", b.socket, "--confirm", "--request-id", waveID+"-gc", "--output", "json")
 	waitForWorkspacesRemoved(b.t, b.ctx, b.dataDir, b.project.ID, append(taskIDs, integrationTaskIDs...)...)
 	b.recordDisk("gc_complete")
-	b.finishRunFacts(runFacts)
 	var stableRSS, stableGoroutines, stableFDs, externalRSS, externalFDs int64
 	if b.trackSoak && !warmup {
 		time.Sleep(5 * time.Second)
 		stableRSS, stableGoroutines, stableFDs = medianPFResource(b.t, b.observer)
-		externalRSS, _ = readPFProcess(b.t, b.daemon.command.Process.Pid)
-		externalFDs = pfProcessFDs(b.t, b.daemon.command.Process.Pid)
+		externalRSS, _ = readPFProcess(b.t, b.daemon.PID())
+		externalFDs = pfProcessFDs(b.t, b.daemon.PID())
 	}
 	integrationTasks := 0
 	if b.parallel == 4 {
@@ -586,66 +647,20 @@ func (b *pfBatch) terminalRunFacts(sourceTasks, sourceRuns, integrationTasks, in
 		}
 		for index, runID := range runs {
 			run := pfJSON[core.Run](b, "run", "show", runID, "--socket", b.socket, "--output", "json")
-			observation, ok := b.terminalObservation(runID)
-			if run.TaskID != tasks[index] || !core.IsRunTerminal(run.State) || run.EndedAt == "" || !ok || observation.state != run.State {
+			observation, ok := b.waitTerminalCleanup(runID)
+			if run.TaskID != tasks[index] || !core.IsRunTerminal(run.State) || run.EndedAt == "" || !ok || observation.state != run.State || observation.err != "" {
 				b.t.Fatalf("%s terminal Run fact is incomplete: %#v", role, run)
 			}
 			facts = append(facts, pfRunFact{TaskID: tasks[index], RunID: runID, Role: role,
-				TerminalState: string(run.State), TerminalObservedUnixNS: observation.observedNS, ContainerID: observation.containerID})
+				TerminalState: string(run.State), TerminalObservedUnixNS: observation.observedNS,
+				ContainerAbsentNS: observation.containerNS, CleanupNS: observation.cleanupNS,
+				ContainerAbsent: observation.containerAbsent, ResourcesAbsent: observation.resourcesAbsent,
+				ContainerID: observation.containerID})
 		}
 	}
 	add("source", sourceTasks, sourceRuns)
 	add("integration", integrationTasks, integrationRuns)
 	return facts
-}
-
-func (b *pfBatch) waitForRunContainersAbsent(facts []pfRunFact) {
-	b.t.Helper()
-	eventually(b.t, b.ctx, 20*time.Second, "each PF-01 Run container absent", func() (bool, bool, string) {
-		all := true
-		for index := range facts {
-			fact := &facts[index]
-			if fact.ContainerAbsent {
-				continue
-			}
-			if _, err := commandOutput(b.ctx, "", "docker", "inspect", fact.ContainerID); err == nil {
-				all = false
-				continue
-			}
-			listed, err := commandOutput(b.ctx, "", "docker", "ps", "-aq", "--no-trunc", "--filter", "id="+fact.ContainerID)
-			if err != nil || strings.TrimSpace(string(listed)) != "" {
-				all = false
-				continue
-			}
-			fact.ContainerAbsent = true
-			fact.ContainerAbsentNS = time.Now().UnixNano() - fact.TerminalObservedUnixNS
-		}
-		return all, all, "containers remain"
-	})
-}
-
-func (b *pfBatch) finishRunFacts(facts []pfRunFact) {
-	b.t.Helper()
-	for index := range facts {
-		fact := &facts[index]
-		paths := []string{
-			filepath.Join(b.dataDir, "workspaces", b.project.ID, fact.TaskID),
-			filepath.Join(b.dataDir, "handoff", b.project.ID, fact.TaskID, fact.RunID),
-			filepath.Join(b.dataDir, "run-control", fact.RunID), filepath.Join(b.dataDir, "logs", fact.RunID),
-		}
-		eventually(b.t, b.ctx, 20*time.Second, "all Run-owned resources absent", func() (bool, bool, string) {
-			for _, path := range paths {
-				if _, err := os.Lstat(path); err == nil {
-					return false, false, path
-				} else if !errors.Is(err, os.ErrNotExist) {
-					return false, false, err.Error()
-				}
-			}
-			return true, true, ""
-		})
-		fact.ResourcesAbsent = true
-		fact.CleanupNS = time.Now().UnixNano() - fact.TerminalObservedUnixNS
-	}
 }
 
 func (b *pfBatch) objectCounts() pfObjectCounts {
@@ -655,7 +670,7 @@ func (b *pfBatch) objectCounts() pfObjectCounts {
 		b.t.Fatal(err)
 	}
 	defer database.Close()
-	counts := pfObjectCounts{SampleID: b.id, ProjectID: b.project.ID}
+	counts := pfObjectCounts{SampleID: b.id, FreshDataDirID: pfDataDirID(b.dataDir), ProjectID: b.project.ID}
 	query := `WITH selected(id) AS (VALUES (?)) SELECT
 		(SELECT count(*) FROM tasks WHERE project_id=selected.id),
 		(SELECT count(*) FROM runs WHERE project_id=selected.id),
@@ -807,17 +822,121 @@ func (b *pfBatch) observeTerminal(runID string) {
 		return
 	}
 	b.terminalMu.Lock()
-	if _, exists := b.terminals[run.ID]; !exists {
-		b.terminals[run.ID] = pfTerminalObservation{state: run.State, containerID: run.ContainerID, observedNS: time.Now().UnixNano()}
+	if _, exists := b.terminals[run.ID]; exists {
+		b.terminalMu.Unlock()
+		return
 	}
+	observation := &pfTerminalObservation{
+		taskID: run.TaskID, state: run.State, containerID: run.ContainerID,
+		observedNS: time.Now().UnixNano(), done: make(chan struct{}),
+	}
+	b.terminals[run.ID] = observation
+	b.terminalWG.Add(1)
 	b.terminalMu.Unlock()
+	go b.observeRunCleanup(run.ID, observation)
 }
 
-func (b *pfBatch) terminalObservation(runID string) (pfTerminalObservation, bool) {
+func (b *pfBatch) terminalObservation(runID string) (*pfTerminalObservation, bool) {
 	b.terminalMu.Lock()
 	defer b.terminalMu.Unlock()
 	observation, ok := b.terminals[runID]
 	return observation, ok
+}
+
+func (b *pfBatch) waitTerminalCleanup(runID string) (pfTerminalObservation, bool) {
+	observation, ok := b.terminalObservation(runID)
+	if !ok {
+		return pfTerminalObservation{}, false
+	}
+	select {
+	case <-observation.done:
+	case <-b.ctx.Done():
+		return pfTerminalObservation{}, false
+	}
+	b.terminalMu.Lock()
+	result := *observation
+	result.done = nil
+	b.terminalMu.Unlock()
+	return result, true
+}
+
+func (b *pfBatch) observeRunCleanup(runID string, observation *pfTerminalObservation) {
+	defer b.terminalWG.Done()
+	defer close(observation.done)
+	ticker := time.NewTicker(20 * time.Millisecond)
+	timeout := time.NewTimer(30 * time.Second)
+	defer ticker.Stop()
+	defer timeout.Stop()
+	for {
+		containerAbsent, containerErr := dockerContainerAbsent(b.ctx, observation.containerID)
+		pathsAbsent, pathErr := b.runPathsAbsent(observation.taskID, runID)
+		now := time.Now().UnixNano()
+		b.terminalMu.Lock()
+		if containerAbsent && !observation.containerAbsent {
+			observation.containerAbsent = true
+			observation.containerNS = now - observation.observedNS
+		}
+		if observation.containerAbsent && pathsAbsent {
+			observation.resourcesAbsent = true
+			observation.cleanupNS = now - observation.observedNS
+		}
+		done := observation.resourcesAbsent
+		b.terminalMu.Unlock()
+		if done {
+			return
+		}
+		if containerErr != nil || pathErr != nil {
+			b.terminalMu.Lock()
+			observation.err = errors.Join(containerErr, pathErr).Error()
+			b.terminalMu.Unlock()
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-timeout.C:
+			b.terminalMu.Lock()
+			observation.err = "Run cleanup observation exceeded 30s"
+			b.terminalMu.Unlock()
+			return
+		case <-b.ctx.Done():
+			b.terminalMu.Lock()
+			observation.err = b.ctx.Err().Error()
+			b.terminalMu.Unlock()
+			return
+		}
+	}
+}
+
+func dockerContainerAbsent(ctx context.Context, containerID string) (bool, error) {
+	if containerID == "" {
+		return false, errors.New("Run container identity is empty")
+	}
+	if _, err := commandOutput(ctx, "", "docker", "inspect", containerID); err == nil {
+		return false, nil
+	}
+	listed, err := commandOutput(ctx, "", "docker", "ps", "-aq", "--no-trunc", "--filter", "id="+containerID)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(listed)) == "", nil
+}
+
+func (b *pfBatch) runPathsAbsent(taskID, runID string) (bool, error) {
+	paths := []string{
+		filepath.Join(b.dataDir, "handoff", b.project.ID, taskID, runID),
+		filepath.Join(b.dataDir, "run-control", runID),
+		filepath.Join(b.dataDir, "logs", runID),
+	}
+	for _, path := range paths {
+		_, err := os.Lstat(path)
+		if err == nil {
+			return false, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 func (b *pfBatch) waitRun(taskID, reason string) core.Run {
@@ -883,6 +1002,68 @@ func writePerfConfig(t *testing.T, root, dataDir, socket, image string, parallel
 	content := fmt.Sprintf("data_dir: %s\noperator_socket: %s\nmax_parallel_runs: %d\nretention:\n  completed_workspace: 0\n  terminal_task_ref: 24h\n  run_log: 0\nruntime:\n  docker_network: none\n  workspace_root: %s\n  agent_home_root: %s\n  log_root: %s\n  default_image: %s\n  provider_env_allowlist: []\n  run_timeout: 3m\n  shutdown_grace: 3s\ngit:\n  capture_helper_image: %s\n  capture_timeout: 30s\n  maximum_bundle_bytes: 67108864\n  maximum_objects: 250000\n  maximum_handoff_bytes: 268435456\n", dataDir, socket, parallel, filepath.Join(dataDir, "workspaces"), filepath.Join(dataDir, "agent-homes"), filepath.Join(dataDir, "logs"), image, image)
 	writeFile(t, path, []byte(content), 0o600)
 	return path
+}
+
+func startPerfDaemon(t *testing.T, binary, image, root, config, socket, sampleID string, environment []string) *pfDaemonProcess {
+	t.Helper()
+	logPath := filepath.Join(root, fmt.Sprintf("daemon-%d.log", time.Now().UnixNano()))
+	sum := sha256.Sum256([]byte(sampleID + "\x00" + logPath))
+	name := "coordplane-pf-daemon-" + hex.EncodeToString(sum[:12])
+	commonRoot, binaryDir := filepath.Dir(root), filepath.Dir(binary)
+	args := []string{
+		"run", "--detach", "--name", name,
+		"--label", "coordplane.managed=true", "--label", "coordplane.pf-daemon=true",
+		"--label", "coordplane.perf.sample=" + sampleID,
+		"--cpus", "3", "--memory", "384m", "--memory-swap", "384m", "--pids-limit", "256",
+		"--network", "none", "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
+		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+		"--group-add", pfDockerSocketGroup(t, image),
+		"--mount", "type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock",
+		"--mount", "type=bind,src=" + commonRoot + ",dst=" + commonRoot,
+		"--mount", "type=bind,src=" + binaryDir + ",dst=" + binaryDir + ",readonly",
+		"--workdir", commonRoot, "--env", "HOME=/tmp", "--env", "COORDPLANE_PERF_DAEMON_CGROUP_ID=" + name,
+	}
+	for _, value := range environment {
+		args = append(args, "--env", value)
+	}
+	args = append(args, "--entrypoint", binary, image, "serve", "--config", config)
+	raw, err := exec.Command("docker", args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("start cgrouped PF daemon: %v\n%s", err, raw)
+	}
+	containerID := strings.TrimSpace(string(raw))
+	limits := strings.Fields(commandText(context.Background(), "docker", "inspect", "--format", "{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}", containerID))
+	pid, pidErr := strconv.Atoi(commandText(context.Background(), "docker", "inspect", "--format", "{{.State.Pid}}", containerID))
+	if len(limits) != 2 || limits[0] != "3000000000" || limits[1] != strconv.FormatInt(384<<20, 10) || pidErr != nil || pid <= 0 {
+		_, _ = exec.Command("docker", "rm", "-f", containerID).CombinedOutput()
+		t.Fatalf("PF daemon cgroup readback = %v pid=%d err=%v", limits, pid, pidErr)
+	}
+	process := &pfDaemonProcess{logPath: logPath, containerID: containerID, pid: pid}
+	t.Cleanup(func() { _ = process.Stop() })
+	eventually(t, context.Background(), 20*time.Second, "cgrouped PF daemon socket", func() (bool, bool, string) {
+		if info, err := os.Lstat(socket); err == nil && info.Mode()&os.ModeSocket != 0 {
+			return true, true, ""
+		}
+		return false, false, commandText(context.Background(), "docker", "inspect", "--format", "{{.State.Status}}", containerID)
+	})
+	return process
+}
+
+func pfDockerSocketGroup(t *testing.T, image string) string {
+	t.Helper()
+	if value, ok := pfDockerSocketGroups.Load(image); ok {
+		return value.(string)
+	}
+	raw, err := commandOutput(context.Background(), "", "docker", "run", "--rm", "--network", "none",
+		"--mount", "type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock,readonly",
+		"--entrypoint", "/usr/bin/stat", image, "-c", "%g", "/var/run/docker.sock")
+	requireNoError(t, err)
+	group := strings.TrimSpace(string(raw))
+	if _, err := strconv.ParseUint(group, 10, 32); err != nil {
+		t.Fatalf("container Docker socket group = %q: %v", group, err)
+	}
+	pfDockerSocketGroups.Store(image, group)
+	return group
 }
 
 func createPerfRepository(t *testing.T, ctx context.Context, root string) (string, string, map[string]any) {
@@ -968,25 +1149,85 @@ func directoryBytesExcept(t *testing.T, root, excluded string) int64 {
 
 func (b *pfBatch) sampleDisk() {
 	defer close(b.diskDone)
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+	file, err := os.Open(b.observer)
+	if err != nil {
+		b.appendDisk(pfDiskSample{SampleID: b.id, DataDirID: pfDataDirID(b.dataDir), Boundary: "sampler_error", ObservedUnixNS: time.Now().UnixNano(), Error: err.Error()})
+		return
+	}
+	defer file.Close()
+	reader := bufio.NewReader(file)
+	poll, cadence := time.NewTicker(25*time.Millisecond), time.NewTicker(time.Second)
+	defer poll.Stop()
+	defer cadence.Stop()
 	b.recordDisk("daemon_ready")
+	var pending []byte
 	for {
 		select {
-		case <-ticker.C:
+		case <-poll.C:
+			pending = b.drainDiskMarkers(reader, pending)
+		case <-cadence.C:
 			b.recordDisk("interval")
 		case <-b.diskStop:
+			b.drainDiskMarkers(reader, pending)
 			return
 		}
 	}
 }
 
 func (b *pfBatch) recordDisk(boundary string) {
-	sample := pfDiskSample{SampleID: b.id, Boundary: boundary, ObservedUnixNS: time.Now().UnixNano()}
+	sample := pfDiskSample{SampleID: b.id, DataDirID: pfDataDirID(b.dataDir), Boundary: boundary, ObservedUnixNS: time.Now().UnixNano()}
 	sample.Bytes, sample.Error = directoryBytes(b.dataDir)
+	b.appendDisk(sample)
+}
+
+func (b *pfBatch) drainDiskMarkers(reader *bufio.Reader, pending []byte) []byte {
+	for {
+		part, err := reader.ReadBytes('\n')
+		pending = append(pending, part...)
+		if len(pending) > 0 && pending[len(pending)-1] == '\n' {
+			b.recordDiskMarker(pending)
+			pending = nil
+		}
+		if errors.Is(err, io.EOF) {
+			return pending
+		}
+		if err != nil {
+			b.appendDisk(pfDiskSample{SampleID: b.id, DataDirID: pfDataDirID(b.dataDir), Boundary: "sampler_error", ObservedUnixNS: time.Now().UnixNano(), Error: err.Error()})
+			return pending
+		}
+	}
+}
+
+func (b *pfBatch) recordDiskMarker(raw []byte) {
+	var record map[string]any
+	if json.Unmarshal(raw, &record) != nil || record["record_type"] != "disk_boundary_marker" {
+		return
+	}
+	bytes, sampleErr := directoryBytes(b.dataDir)
+	sample := diskSampleFromMarker(record, time.Now().UnixNano(), bytes, sampleErr)
+	b.appendDisk(sample)
+}
+
+func diskSampleFromMarker(record map[string]any, observed, bytes int64, sampleErr string) pfDiskSample {
+	text := func(key string) string { value, _ := record[key].(string); return value }
+	number := func(key string) int64 { value, _ := record[key].(float64); return int64(value) }
+	return pfDiskSample{
+		SampleID: text("sample_id"), DataDirID: text("data_dir_id"), DaemonOriginID: text("daemon_origin_id"),
+		StageID: text("stage_id"), StageKeySHA256: text("stage_key_sha256"), Boundary: text("boundary"),
+		ProjectID: text("project_id"), TaskID: text("task_id"), RunID: text("run_id"), OperationID: text("operation_id"),
+		AttemptIndex: number("attempt_index"), ObservedUnixNS: observed, Bytes: bytes, Error: sampleErr,
+	}
+}
+
+func (b *pfBatch) appendDisk(sample pfDiskSample) {
 	b.diskMu.Lock()
 	b.disk = append(b.disk, sample)
 	b.diskMu.Unlock()
+}
+
+func pfDataDirID(path string) string {
+	sum := sha256.Sum256([]byte(path))
+	return hex.EncodeToString(sum[:8])
 }
 
 func directoryBytes(root string) (int64, string) {
@@ -1075,8 +1316,37 @@ func perfEnvironment(ctx context.Context, image string) map[string]string {
 		"image_digest":          commandText(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", image),
 		"git":                   commandText(ctx, "git", "--version"),
 		"runner_id":             strings.TrimSpace(os.Getenv("PF01_RUNNER_ID")),
+		"source_clean":          strings.TrimSpace(os.Getenv("PF01_SOURCE_CLEAN")),
 		"statistics_version":    pfStatisticsVersion,
 	}
+}
+
+func perfBinaryDigests(t *testing.T, coordplane, coordlink, gitHelper string) map[string]string {
+	t.Helper()
+	paths := map[string]string{"coordplane": coordplane, "coordlink": coordlink, "coordplane-git-helper": gitHelper}
+	result := make(map[string]string, len(paths))
+	for name, path := range paths {
+		file, err := os.Open(path)
+		requireNoError(t, err)
+		digest := sha256.New()
+		_, copyErr := io.Copy(digest, file)
+		closeErr := file.Close()
+		requireNoError(t, errors.Join(copyErr, closeErr))
+		result[name] = hex.EncodeToString(digest.Sum(nil))
+	}
+	manifest, err := os.ReadFile(filepath.Join(filepath.Dir(coordplane), "build-manifest.sha256"))
+	requireNoError(t, err)
+	want := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(manifest)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 {
+			want[filepath.Base(fields[1])] = fields[0]
+		}
+	}
+	if !reflect.DeepEqual(result, want) {
+		t.Fatalf("PF binary digest manifest mismatch: actual=%v manifest=%v", result, want)
+	}
+	return result
 }
 func writePerfReport(t *testing.T, path string, report *pfReport) {
 	t.Helper()

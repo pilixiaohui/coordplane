@@ -26,7 +26,8 @@ const (
 	sampleEnvironment = "COORDPLANE_PERF_SAMPLE_ID"
 	faultEnvironment  = "COORDPLANE_PERF_FAULT"
 	readyEnvironment  = "COORDPLANE_PERF_FAULT_READY"
-	diskEnvironment   = "COORDPLANE_PERF_DATA_DIR"
+	dataEnvironment   = "COORDPLANE_PERF_DATA_DIR"
+	cgroupEnvironment = "COORDPLANE_PERF_DAEMON_CGROUP_ID"
 )
 
 type stageStart struct {
@@ -55,15 +56,15 @@ type clientRecord struct {
 
 var observer struct {
 	sync.Mutex
-	file           *os.File
-	start          time.Time
-	origin, sample string
-	stages         map[string]stageStart
-	attempts       map[string]int64
-	received       map[string]receivedPoint
-	clients        map[string]string
-	cancel         context.CancelFunc
-	samplerDone    chan struct{}
+	file                      *os.File
+	start                     time.Time
+	origin, sample, dataDirID string
+	stages                    map[string]stageStart
+	attempts                  map[string]int64
+	received                  map[string]receivedPoint
+	clients                   map[string]string
+	cancel                    context.CancelFunc
+	samplerDone               chan struct{}
 }
 
 func Start(ctx context.Context) error {
@@ -95,6 +96,7 @@ func Start(ctx context.Context) error {
 	sampleCtx, cancel := context.WithCancel(ctx)
 	observer.file, observer.start, observer.origin = file, time.Now(), origin
 	observer.sample, observer.cancel = strings.TrimSpace(os.Getenv(sampleEnvironment)), cancel
+	observer.dataDirID = pathIdentity(strings.TrimSpace(os.Getenv(dataEnvironment)))
 	observer.received = map[string]receivedPoint{}
 	observer.clients, observer.attempts, observer.stages = loadObserverState(file)
 	interrupted := observer.stages
@@ -132,6 +134,7 @@ func Stop() error {
 	file := observer.file
 	observer.file, observer.cancel, observer.samplerDone = nil, nil, nil
 	observer.stages, observer.attempts, observer.received, observer.clients = nil, nil, nil, nil
+	observer.dataDirID = ""
 	observer.Unlock()
 	return file.Close()
 }
@@ -210,7 +213,7 @@ func StartStage(id, key string, fields Fields) {
 	record["stage_id"], record["stage_key_sha256"], record["attempt_index"] = id, strings.Split(stageKey, "\x00")[1], attempt
 	record["start_offset_ns"], record["start_unix_ns"] = started.offset, started.unixNS
 	emit(record)
-	emitDiskBoundary(id, "start", fields)
+	emitDiskBoundaryMarker(stageKey, attempt, "start", fields)
 	emitResource()
 }
 
@@ -234,7 +237,7 @@ func emitStage(stageKey string, started stageStart, result string) {
 	duration := offset() - started.offset
 	record["start_offset_ns"], record["start_unix_ns"], record["duration_ns"], record["result"] = started.offset, started.unixNS, duration, result
 	emit(record)
-	emitDiskBoundary(identity[0], "end", started.fields)
+	emitDiskBoundaryMarker(stageKey, started.attempt, "end", started.fields)
 	emitResource()
 }
 
@@ -269,37 +272,26 @@ func RuntimeLimit(fields Fields, role string, memoryBytes, nanoCPUs, pids int64)
 
 func emitProcessLimit() {
 	record := baseRecord("process_limit", Fields{})
+	record["daemon_cgroup_id"] = strings.TrimSpace(os.Getenv(cgroupEnvironment))
 	record["gomaxprocs"] = runtime.GOMAXPROCS(0)
-	record["memory_limit_bytes"] = debug.SetMemoryLimit(-1)
-	emit(record)
-}
-
-func emitDiskBoundary(stageID, boundary string, fields Fields) {
-	if stageID != "git.capture.freeze" && stageID != "git.capture.handoff" && stageID != "git.capture.import" {
-		return
-	}
-	root := strings.TrimSpace(os.Getenv(diskEnvironment))
-	if root == "" {
-		return
-	}
-	var bytes int64
-	err := filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if info.Mode().IsRegular() {
-			bytes += info.Size()
-		}
-		return nil
-	})
-	record := baseRecord("disk_boundary", fields)
-	record["stage_id"], record["boundary"], record["observed_unix_ns"], record["bytes"] = stageID, boundary, time.Now().UnixNano(), bytes
+	record["go_memory_limit_bytes"] = debug.SetMemoryLimit(-1)
+	path, quota, period, memory, err := processCgroupLimits()
+	record["cgroup_path"], record["cpu_quota_us"], record["cpu_period_us"], record["memory_max_bytes"] = path, quota, period, memory
 	if err != nil {
 		record["error"] = err.Error()
 	}
+	emit(record)
+}
+
+func emitDiskBoundaryMarker(stageKey string, attempt int64, boundary string, fields Fields) {
+	identity := strings.SplitN(stageKey, "\x00", 2)
+	stageID := identity[0]
+	if stageID != "git.capture.freeze" && stageID != "git.capture.handoff" && stageID != "git.capture.import" {
+		return
+	}
+	record := baseRecord("disk_boundary_marker", fields)
+	record["stage_id"], record["stage_key_sha256"] = stageID, identity[1]
+	record["attempt_index"], record["boundary"], record["marker_unix_ns"] = attempt, boundary, time.Now().UnixNano()
 	emit(record)
 }
 
@@ -367,14 +359,48 @@ func Fault(ctx context.Context, id string) error {
 
 func baseRecord(kind string, fields Fields) map[string]any {
 	observer.Lock()
-	origin, sample := observer.origin, observer.sample
+	origin, sample, dataDirID := observer.origin, observer.sample, observer.dataDirID
 	observer.Unlock()
 	return map[string]any{
 		"schema_version": 1, "record_type": kind, "daemon_origin_id": origin, "sample_id": nullable(sample),
-		"request_id": nullable(fields.RequestID), "operation_id": nullable(fields.OperationID),
+		"data_dir_id": nullable(dataDirID),
+		"request_id":  nullable(fields.RequestID), "operation_id": nullable(fields.OperationID),
 		"project_id": nullable(fields.ProjectID), "task_id": nullable(fields.TaskID),
 		"run_id": nullable(fields.RunID), "message_id": nullable(fields.MessageID),
 	}
+}
+
+func processCgroupLimits() (string, int64, int64, int64, error) {
+	raw, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return "", 0, 0, 0, err
+	}
+	path, unified := strings.CutPrefix(strings.TrimSpace(string(raw)), "0::")
+	if !unified || path == "" || !strings.HasPrefix(path, "/") {
+		return path, 0, 0, 0, errors.New("unified cgroup path is unavailable")
+	}
+	root := filepath.Join("/sys/fs/cgroup", strings.TrimPrefix(filepath.Clean(path), "/"))
+	cpuRaw, cpuErr := os.ReadFile(filepath.Join(root, "cpu.max"))
+	memoryRaw, memoryErr := os.ReadFile(filepath.Join(root, "memory.max"))
+	if cpuErr != nil || memoryErr != nil {
+		return path, 0, 0, 0, errors.Join(cpuErr, memoryErr)
+	}
+	cpu := strings.Fields(string(cpuRaw))
+	if len(cpu) != 2 || cpu[0] == "max" || strings.TrimSpace(string(memoryRaw)) == "max" {
+		return path, 0, 0, 0, errors.New("Daemon cgroup limits are unbounded")
+	}
+	quota, quotaErr := strconv.ParseInt(cpu[0], 10, 64)
+	period, periodErr := strconv.ParseInt(cpu[1], 10, 64)
+	memory, memoryErr := strconv.ParseInt(strings.TrimSpace(string(memoryRaw)), 10, 64)
+	return path, quota, period, memory, errors.Join(quotaErr, periodErr, memoryErr)
+}
+
+func pathIdentity(path string) string {
+	if path == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(path))
+	return hex.EncodeToString(sum[:8])
 }
 
 func emitResource() {
