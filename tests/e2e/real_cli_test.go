@@ -4,8 +4,11 @@ package e2e_test
 
 import (
 	"context"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,7 +18,43 @@ import (
 	"coordplane/tests/testsupport"
 )
 
-const liveE2ETimeout = 15 * time.Minute
+const (
+	liveE2ETimeout    = 15 * time.Minute
+	realClaudeVersion = "2.1.126 (Claude Code)"
+)
+
+func TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests(t *testing.T) {
+	releaseLiveDocker(t)
+	dockerConfig := t.TempDir()
+	build := exec.Command("docker", "build", "-q", "testdata/runtime")
+	build.Env = append(os.Environ(), "DOCKER_CONFIG="+dockerConfig)
+	raw, err := build.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build scripted runtime: %v\n%s", err, raw)
+	}
+	scripted := strings.TrimSpace(string(raw))
+	t.Cleanup(func() {
+		remove := exec.Command("docker", "image", "rm", "-f", scripted)
+		remove.Env = append(os.Environ(), "DOCKER_CONFIG="+dockerConfig)
+		_ = remove.Run()
+	})
+	tests := []struct{ name, image, want string }{
+		{name: "mutable tag", image: "agent:latest", want: "explicit immutable sha256 image is required"},
+		{name: "missing digest", image: "sha256:" + strings.Repeat("0", 64), want: "runtime image identity does not match"},
+		{name: "scripted fixture", image: scripted, want: "runtime image must contain Claude Code 2.1.126"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			command := exec.Command(filepath.Clean("../../scripts/e2e-real-cli.sh"))
+			command.Env = append(os.Environ(), "E2E_RUNTIME_IMAGE="+test.image, "ANTHROPIC_API_KEY=not-a-real-key")
+			output, runErr := command.CombinedOutput()
+			var exitErr *exec.ExitError
+			if !errors.As(runErr, &exitErr) || exitErr.ExitCode() != 77 || !strings.Contains(string(output), test.want) || strings.Contains(string(output), "PASS(") {
+				t.Fatalf("gate err=%v output=%s", runErr, output)
+			}
+		})
+	}
+}
 
 func TestRealClaudeAdapterSmoke(t *testing.T) {
 	requireRealCLI(t)
@@ -253,9 +292,14 @@ func liveRuntimeConfig(t *testing.T) (string, string, []string) {
 	t.Helper()
 	image := strings.TrimSpace(os.Getenv("E2E_RUNTIME_IMAGE"))
 	network := strings.TrimSpace(os.Getenv("E2E_DOCKER_NETWORK"))
-	if image == "" || network == "" {
-		t.Fatal("E2E_RUNTIME_IMAGE and E2E_DOCKER_NETWORK are required")
+	digest, digestErr := hex.DecodeString(strings.TrimPrefix(image, "sha256:"))
+	if !strings.HasPrefix(image, "sha256:") || digestErr != nil || len(digest) != 32 || network == "" {
+		t.Fatal("immutable E2E_RUNTIME_IMAGE digest and E2E_DOCKER_NETWORK are required")
 	}
+	if version := strings.TrimSpace(os.Getenv("E2E_CLAUDE_VERSION")); version != realClaudeVersion {
+		t.Fatalf("E2E_CLAUDE_VERSION = %q, want %q", version, realClaudeVersion)
+	}
+	t.Logf("real runtime image=%s claude=%s", image, realClaudeVersion)
 	var providerEnv []string
 	for _, name := range strings.Split(os.Getenv("E2E_PROVIDER_ENV_ALLOWLIST"), ",") {
 		if name = strings.TrimSpace(name); name != "" {

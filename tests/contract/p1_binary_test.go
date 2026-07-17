@@ -214,30 +214,31 @@ func TestGT00ProductionBinaryHasNoContractFaultControl(t *testing.T) {
 	}
 }
 
-func TestP3ProductionBinaryRejectsUnknownAdapterWithoutDurableWrites(t *testing.T) {
+func TestP3ProductionBinaryRejectsRetiredCodexWithoutDurableWrites(t *testing.T) {
 	root, dataDir, socket, configPath := contractConfigPaths(t, "")
 	daemon := startDaemon(t, configPath, socket)
-
-	command := exec.Command(testBinaries.coordplane,
-		"agent", "add", "--socket", socket, "--display-name", "Unknown Adapter",
-		"--adapter", "not-registered", "--image", "agent:latest",
-		"--instructions-file", filepath.Join(root, "agent.md"),
-		"--request-id", "unknown-adapter", "--output", "json")
-	raw, err := command.CombinedOutput()
-	if err == nil || !bytes.Contains(raw, []byte("adapter_id is not registered")) {
-		t.Fatalf("unknown adapter err=%v output=%s", err, raw)
-	}
-	stopDaemon(t, daemon, socket)
-
+	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
 	database, err := store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
 	requireNoError(t, err)
 	defer database.Close()
+	before := durableSignature(t, database, "")
+
+	command := exec.Command(testBinaries.coordplane,
+		"agent", "add", "--socket", socket, "--display-name", "Retired Adapter",
+		"--adapter", "codex", "--image", "agent:latest",
+		"--instructions-file", filepath.Join(root, "agent.md"),
+		"--request-id", "retired-adapter", "--output", "json")
+	raw, err := command.CombinedOutput()
+	if err == nil || !bytes.Contains(raw, []byte("adapter_id is not registered")) {
+		t.Fatalf("retired adapter err=%v output=%s", err, raw)
+	}
 	snapshot, err := database.Snapshot(context.Background(), "")
 	requireNoError(t, err)
 	events, err := database.Events(context.Background(), core.EventFilter{EntityType: "agent"})
 	requireNoError(t, err)
-	if len(snapshot.Agents) != 0 || len(events) != 0 {
-		t.Fatalf("unknown adapter wrote durable state: agents=%#v events=%#v", snapshot.Agents, events)
+	after := durableSignature(t, database, "")
+	if len(snapshot.Agents) != 0 || len(events) != 0 || after != before {
+		t.Fatalf("retired adapter wrote durable state: agents=%#v events=%#v signature_changed=%t", snapshot.Agents, events, after != before)
 	}
 }
 

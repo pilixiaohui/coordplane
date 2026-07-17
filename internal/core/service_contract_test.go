@@ -718,19 +718,6 @@ type harness struct {
 	ids      *testIDs
 }
 
-func TestRetiredCodexAdapterIsRejectedBeforeDurableMutation(t *testing.T) {
-	h := newHarness(t)
-	before := h.durableSignature(t, "")
-	_, err := h.service.AddAgent(context.Background(), core.AddAgentInput{
-		DisplayName: "Retired adapter", AdapterID: "codex", Image: "agent:latest",
-		InstructionsFile: "/instructions/retired.md", RequestID: "retired-adapter",
-	})
-	if !core.IsCode(err, core.CodeInvalidArgument) {
-		t.Fatalf("retired adapter error = %v, want %s", err, core.CodeInvalidArgument)
-	}
-	h.requireDurableSignature(t, "", before)
-}
-
 func TestQueuedTaskWithUnknownPersistedAdapterFailsClosed(t *testing.T) {
 	h := newHarness(t)
 	agent := h.addAgent(t, "persisted-adapter-agent")
