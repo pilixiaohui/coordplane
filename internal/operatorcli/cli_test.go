@@ -62,9 +62,9 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 		},
 		{
 			name:   "agent add",
-			args:   []string{"agent", "add", "--id", "agent-1", "--display-name", "Agent One", "--adapter", "codex", "--image", "coordplane:test", "--instructions-file", "/instructions/one.md", "--request-id", "req-agent-add", "--output", "json"},
+			args:   []string{"agent", "add", "--id", "agent-1", "--display-name", "Agent One", "--adapter", "claude", "--image", "coordplane:test", "--instructions-file", "/instructions/one.md", "--request-id", "req-agent-add", "--output", "json"},
 			method: http.MethodPost, path: "/v1/agents",
-			input:     core.AddAgentInput{ID: "agent-1", DisplayName: "Agent One", AdapterID: "codex", Image: "coordplane:test", InstructionsFile: "/instructions/one.md", RequestID: "req-agent-add"},
+			input:     core.AddAgentInput{ID: "agent-1", DisplayName: "Agent One", AdapterID: "claude", Image: "coordplane:test", InstructionsFile: "/instructions/one.md", RequestID: "req-agent-add"},
 			outputHas: `"id":"agent-1"`,
 		},
 		{
@@ -579,7 +579,7 @@ func testStatus() core.Status {
 				{ID: "project-2", Name: "Two", Status: core.ProjectError, CanonicalSHA: "sha-two"},
 			},
 			Agents: []core.Agent{
-				{ID: "agent-1", DisplayName: "Agent One", Status: core.AgentActive, AdapterID: "codex"},
+				{ID: "agent-1", DisplayName: "Agent One", Status: core.AgentActive, AdapterID: "claude"},
 				{ID: "agent-2", DisplayName: "Agent Two", Status: core.AgentPaused, AdapterID: "claude"},
 			},
 			Tasks: []core.Task{

@@ -1,16 +1,28 @@
 #!/bin/sh
 set -eu
 
-echo '{"type":"thread.started","thread_id":"scripted-session-p3"}'
+resuming=false
+[ "${1:-}" = "-p" ] && [ "${2:-}" = "--bare" ] && [ "${3:-}" = "--verbose" ]
+[ "${4:-}" = "--output-format" ] && [ "${5:-}" = "stream-json" ]
+[ "${6:-}" = "--dangerously-skip-permissions" ]
+shift 6
+if [ "${1:-}" = "--resume" ]; then
+    resuming=true
+    [ -n "${2:-}" ]
+    shift 2
+fi
+[ "${1:-}" = "--" ] && [ "$#" -eq 2 ]
+
+echo '{"type":"system","subtype":"init","session_id":"scripted-session-p3"}'
 bootstrap=/run/coordplane/bootstrap
 if grep -q "crash matrix" "$bootstrap"; then
     sleep 0.3
 fi
 /usr/local/bin/coordlink progress --summary "provider process is live" --request-id scripted-progress --output json >/dev/null
 
-if grep -q "resume fallback" "$bootstrap"; then
-    if [ "${2:-}" = "resume" ]; then
-      echo '{"type":"turn.failed","error":{"message":"session not found"}}'
+if grep -q "resume error" "$bootstrap"; then
+    if [ "$resuming" = true ]; then
+      echo '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"scripted resume failure"}'
       exit 2
     fi
     if [ ! -f /home/agent/.resume-fallback-started ]; then
@@ -41,5 +53,5 @@ elif grep -q "hold until stopped" "$bootstrap"; then
     sleep 30
 fi
 
-echo '{"type":"turn.completed"}'
+echo '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
 echo 'done completed'

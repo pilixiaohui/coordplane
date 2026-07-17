@@ -25,7 +25,7 @@ func TestStatusHumanBinaryReportsTruncatedTasksAndAgents(t *testing.T) {
 		raw := runBinaryJSON(t, testBinaries.coordplane,
 			"agent", "add", "--socket", socket,
 			"--display-name", fmt.Sprintf("Status Agent %02d", index),
-			"--adapter", "codex", "--image", "agent:latest",
+			"--adapter", "claude", "--image", "agent:latest",
 			"--instructions-file", filepath.Join(root, "agent.md"),
 			"--request-id", fmt.Sprintf("status-agent-%02d", index), "--output", "json")
 		var agent core.Agent
@@ -82,7 +82,7 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"agent", "add", "--socket", socket,
 		"--display-name", "Field truncation agent",
-		"--adapter", "codex", "--image", "agent:latest",
+		"--adapter", "claude", "--image", "agent:latest",
 		"--instructions-file", filepath.Join(root, "agent.md"),
 		"--request-id", "field-truncation-agent", "--output", "json")
 	var agent core.Agent
@@ -119,7 +119,7 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 	stopDaemon(t, daemon, socket)
 	database, err := store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
 	requireNoError(t, err)
-	service, err := core.NewService(database, &contractGit{sha: project.InitialSHA, root: filepath.Join(dataDir, "repos")}, core.ServiceOptions{MaxParallelRuns: 1, AdapterIDs: []string{"codex"}})
+	service, err := core.NewService(database, &contractGit{sha: project.InitialSHA, root: filepath.Join(dataDir, "repos")}, core.ServiceOptions{MaxParallelRuns: 1, AdapterIDs: []string{"claude"}})
 	if err != nil {
 		_ = database.Close()
 		t.Fatal(err)

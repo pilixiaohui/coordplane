@@ -164,17 +164,17 @@ func TestRT02RealDockerLaunchPreservesAllMessageIDsWithoutOversizedArgv(t *testi
 	}
 }
 
-func TestRT03ResumeUnavailableCreatesMarkedFreshFallbackRun(t *testing.T) {
+func TestRT03UnprovenResumeErrorFailsClosedWithoutFallback(t *testing.T) {
 	fixture := newP3DockerFixture(t)
 	agent := fixture.addAgent(t, "Resume Agent")
 	project := fixture.addProject(t, agent.ID)
-	task := fixture.addTask(t, project.ID, agent.ID, "resume fallback", 4)
+	task := fixture.addTask(t, project.ID, agent.ID, "resume error", 1)
 	fixture.components.runtime.Start(fixture.ctx)
 	deadline := time.Now().Add(35 * time.Second)
 	for time.Now().Before(deadline) {
 		persisted, err := fixture.components.store.Task(fixture.ctx, task.ID)
 		requireNoError(t, err)
-		if persisted.Status == core.TaskWaiting {
+		if persisted.Status == core.TaskFailed {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -188,36 +188,31 @@ func TestRT03ResumeUnavailableCreatesMarkedFreshFallbackRun(t *testing.T) {
 		}
 	}
 	sort.Slice(runs, func(left, right int) bool { return runs[left].CreatedAt < runs[right].CreatedAt })
-	if len(runs) != 3 {
-		t.Fatalf("resume fallback Runs = %#v, want exactly 3", runs)
+	if len(runs) != 2 {
+		t.Fatalf("resume error Runs = %#v, want exactly 2", runs)
 	}
-	first, resume, fallback := runs[0], runs[1], runs[2]
-	if fallback.CleanupState != core.CleanupRemoved {
-		fallback = waitForRun(t, fixture, task.ID, func(run core.Run, task core.Task) bool {
-			return run.ID == fallback.ID && core.IsRunTerminal(run.State) &&
-				run.CleanupState == core.CleanupRemoved && task.Status == core.TaskWaiting
+	first, resume := runs[0], runs[1]
+	if resume.CleanupState != core.CleanupRemoved {
+		resume = waitForRun(t, fixture, task.ID, func(run core.Run, task core.Task) bool {
+			return run.ID == resume.ID && core.IsRunTerminal(run.State) &&
+				run.CleanupState == core.CleanupRemoved && task.Status == core.TaskFailed
 		})
 	}
 	if first.LaunchMode != "start" || first.NativeSessionID == "" || first.ResumedFromRunID != "" {
 		t.Fatalf("first start Run = %#v", first)
 	}
 	if resume.LaunchMode != "resume" || resume.ResumedFromRunID != first.ID ||
-		resume.ResumeNativeSessionID != first.NativeSessionID || resume.RuntimeErrorCode != string(core.CodeResumeUnavailable) {
+		resume.ResumeNativeSessionID != first.NativeSessionID || resume.RuntimeErrorCode != "PROVIDER_ERROR" {
 		t.Fatalf("failed resume Run = %#v", resume)
 	}
-	if fallback.LaunchMode != "start" || fallback.ResumedFromRunID != resume.ID ||
-		fallback.ResumeNativeSessionID != "" || fallback.RequestedOutcome != string(core.OutcomeWait) ||
-		fallback.CleanupState != core.CleanupRemoved {
-		t.Fatalf("fresh fallback Run = %#v", fallback)
-	}
 	persisted, err := fixture.components.store.Task(fixture.ctx, task.ID)
-	if err != nil || persisted.Status != core.TaskWaiting || persisted.CurrentRunID != "" {
-		t.Fatalf("fallback Task = %#v err=%v", persisted, err)
+	if err != nil || persisted.Status != core.TaskFailed || persisted.CurrentRunID != "" {
+		t.Fatalf("failed resume Task = %#v err=%v", persisted, err)
 	}
-	events, err := fixture.components.store.Events(fixture.ctx, core.EventFilter{ProjectID: project.ID, RunID: fallback.ID})
+	events, err := fixture.components.store.Events(fixture.ctx, core.EventFilter{ProjectID: project.ID})
 	requireNoError(t, err)
-	if countDaemonEvent(events, "run.resume_fallback") != 1 {
-		t.Fatalf("fallback Events = %#v", events)
+	if countDaemonEvent(events, "run.resume_fallback") != 0 {
+		t.Fatalf("unproven resume error created fallback Events: %#v", events)
 	}
 }
 
@@ -498,7 +493,7 @@ func TestRT05ReconcilePreservesOutcomeRecordedBeforeRestart(t *testing.T) {
 	}
 }
 
-func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
+func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveClaudeContainer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 	executor, err := containerruntime.NewDockerExecutorFromEnvironment()
@@ -510,47 +505,29 @@ func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
 	requireNoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	repositoryRoot := daemonRepositoryRoot(t)
-	legacySource := filepath.Join(root, "legacy-source")
-	requireNoError(t, os.MkdirAll(legacySource, 0o700))
-	archive := filepath.Join(root, "legacy.tar")
-	archiveCommand := exec.CommandContext(ctx, "git", "archive", "--format=tar", "--output", archive, "c8b1a3a")
-	archiveCommand.Dir = repositoryRoot
-	if raw, err := archiveCommand.CombinedOutput(); err != nil {
-		t.Fatalf("archive legacy revision c8b1a3a: %v\n%s", err, raw)
-	}
-	extract := exec.CommandContext(ctx, "tar", "-xf", archive, "-C", legacySource)
-	if raw, err := extract.CombinedOutput(); err != nil {
-		t.Fatalf("extract legacy revision: %v\n%s", err, raw)
-	}
-	legacyBin := filepath.Join(root, "bin")
-	currentBin := filepath.Join(root, "current-bin")
-	for _, directory := range []string{legacyBin, currentBin} {
-		requireNoError(t, os.MkdirAll(directory, 0o700))
-	}
+	bin := filepath.Join(root, "bin")
+	requireNoError(t, os.MkdirAll(bin, 0o700))
 	for _, build := range []struct {
-		source, output, command string
+		output, command string
 	}{
-		{legacySource, filepath.Join(legacyBin, "coordplane"), "./cmd/coordplane"},
-		{legacySource, filepath.Join(legacyBin, "coordlink"), "./cmd/coordlink"},
-		{repositoryRoot, filepath.Join(currentBin, "coordplane"), "./cmd/coordplane"},
-		{repositoryRoot, filepath.Join(currentBin, "coordlink"), "./cmd/coordlink"},
+		{filepath.Join(bin, "coordplane"), "./cmd/coordplane"},
+		{filepath.Join(bin, "coordlink"), "./cmd/coordlink"},
 	} {
 		command := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-o", build.output, build.command)
-		command.Dir = build.source
+		command.Dir = repositoryRoot
 		if strings.HasSuffix(build.output, "coordlink") {
 			command.Env = append(os.Environ(), "CGO_ENABLED=0")
 		}
 		if raw, err := command.CombinedOutput(); err != nil {
-			t.Fatalf("build %s from %s: %v\n%s", build.command, build.source, err, raw)
+			t.Fatalf("build %s: %v\n%s", build.command, err, raw)
 		}
 	}
-	legacyDaemon := filepath.Join(legacyBin, "coordplane")
-	daemonBinary := legacyDaemon
+	daemonBinary := filepath.Join(bin, "coordplane")
 	image := "coordplane-p3-process-test:" + fmt.Sprintf("%x", time.Now().UnixNano())
 	dockerConfig := filepath.Join(root, "docker-config")
 	requireNoError(t, os.MkdirAll(dockerConfig, 0o700))
 	buildImage := exec.CommandContext(ctx, "docker", "build", "-q", "-t", image,
-		filepath.Join(repositoryRoot, "internal", "daemon", "testdata", "codex-runtime"))
+		filepath.Join(repositoryRoot, "internal", "daemon", "testdata", "claude-runtime"))
 	buildImage.Env = append(os.Environ(), "DOCKER_CONFIG="+dockerConfig)
 	if raw, err := buildImage.CombinedOutput(); err != nil {
 		t.Fatalf("build deterministic one-shot image: %v\n%s", err, raw)
@@ -576,25 +553,25 @@ func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
 	instructions := filepath.Join(root, "instructions.md")
 	requireNoError(t, os.WriteFile(instructions, []byte("Work only on the assigned Task."), 0o600))
 	socket := filepath.Join(root, "data", "operator.sock")
-	first := startP3DaemonProcess(t, legacyDaemon, configPath, socket, filepath.Join(root, "daemon-first.log"))
+	first := startP3DaemonProcess(t, daemonBinary, configPath, socket, filepath.Join(root, "daemon-first.log"))
 	t.Cleanup(func() { stopP3DaemonProcess(t, first) })
 	client, err := transport.NewUnixClient(socket)
 	requireNoError(t, err)
 	var agent core.Agent
 	err = client.JSON(ctx, http.MethodPost, "/v1/agents", core.AddAgentInput{
-		DisplayName: "Process Recovery Agent", AdapterID: "codex", Image: image,
+		DisplayName: "Process Recovery Agent", AdapterID: "claude", Image: image,
 		InstructionsFile: instructions, RequestID: "process-recovery-agent",
 	}, &agent)
 	requireNoError(t, err)
 	var outcomeAgent core.Agent
 	err = client.JSON(ctx, http.MethodPost, "/v1/agents", core.AddAgentInput{
-		DisplayName: "Shutdown Outcome Agent", AdapterID: "codex", Image: image,
+		DisplayName: "Shutdown Outcome Agent", AdapterID: "claude", Image: image,
 		InstructionsFile: instructions, RequestID: "shutdown-outcome-agent",
 	}, &outcomeAgent)
 	requireNoError(t, err)
 	var queuedAgent core.Agent
 	err = client.JSON(ctx, http.MethodPost, "/v1/agents", core.AddAgentInput{
-		DisplayName: "Shutdown Claim Fence Agent", AdapterID: "codex", Image: image,
+		DisplayName: "Shutdown Claim Fence Agent", AdapterID: "claude", Image: image,
 		InstructionsFile: instructions, RequestID: "shutdown-claim-fence-agent",
 	}, &queuedAgent)
 	requireNoError(t, err)
@@ -613,9 +590,9 @@ func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
 	active := waitForOperatorRun(t, client, task.ID, func(run core.Run) bool {
 		return run.State == core.RunActive && run.ContainerID != ""
 	})
-	legacyState, err := executor.Inspect(ctx, runtimeRef(active))
-	if err != nil || legacyState.MemoryBytes != 1<<30 {
-		t.Fatalf("legacy container memory = %d, want 1 GiB: %v", legacyState.MemoryBytes, err)
+	initialState, err := executor.Inspect(ctx, runtimeRef(active))
+	if err != nil || initialState.MemoryBytes != 512<<20 {
+		t.Fatalf("initial container memory = %d, want 512 MiB: %v", initialState.MemoryBytes, err)
 	}
 	runSocket := filepath.Join(root, "data", "run-control", active.ID, "api.sock")
 	if info, err := os.Lstat(runSocket); err != nil || info.Mode()&os.ModeSocket == 0 {
@@ -627,19 +604,13 @@ func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
 	var schemaVersion int
 	requireNoError(t, database.QueryRowContext(ctx, `SELECT max(version) FROM schema_migrations`).Scan(&schemaVersion))
 	requireNoError(t, database.Close())
-	if schemaVersion != 1 {
-		t.Fatalf("legacy daemon created schema version %d, want 1", schemaVersion)
+	if schemaVersion != 2 {
+		t.Fatalf("daemon created schema version %d, want 2", schemaVersion)
 	}
 	state, err := executor.Inspect(ctx, runtimeRef(active))
 	if err != nil || !state.Running || state.Ref.ContainerID != active.ContainerID {
 		t.Fatalf("SIGKILL did not preserve the owned container: state=%#v err=%v", state, err)
 	}
-	for _, name := range []string{"coordplane", "coordlink"} {
-		if err := os.Rename(filepath.Join(currentBin, name), filepath.Join(legacyBin, name)); err != nil {
-			t.Fatalf("install current %s over legacy binary: %v", name, err)
-		}
-	}
-
 	second := startP3DaemonProcess(t, daemonBinary, configPath, socket, filepath.Join(root, "daemon-second.log"))
 	t.Cleanup(func() { stopP3DaemonProcess(t, second) })
 	client, err = transport.NewUnixClient(socket)
@@ -648,8 +619,8 @@ func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
 		return run.ID == active.ID && run.State == core.RunActive && run.ContainerID == active.ContainerID
 	})
 	adoptedState, err := executor.Inspect(ctx, runtimeRef(adopted))
-	if err != nil || adopted.IsolationSpecVersion != core.RunIsolationSpecV1 || adoptedState.MemoryBytes != 1<<30 {
-		t.Fatalf("upgrade did not adopt legacy isolation: Run=%#v memory=%d err=%v", adopted, adoptedState.MemoryBytes, err)
+	if err != nil || adopted.IsolationSpecVersion != core.RunIsolationSpecCurrent || adoptedState.MemoryBytes != 512<<20 {
+		t.Fatalf("restart did not adopt current isolation: Run=%#v memory=%d err=%v", adopted, adoptedState.MemoryBytes, err)
 	}
 	newSocketInfo, err := os.Lstat(runSocket)
 	if err != nil || newSocketInfo.Mode()&os.ModeSocket == 0 {
@@ -675,7 +646,7 @@ func TestRT05ProcessCrashReopensSQLiteAndAdoptsActiveContainer(t *testing.T) {
 	})
 	newState, err := executor.Inspect(ctx, runtimeRef(outcomeRun))
 	if err != nil || outcomeRun.IsolationSpecVersion != core.RunIsolationSpecCurrent || newState.MemoryBytes != 512<<20 {
-		t.Fatalf("post-upgrade Run did not use v2/512 MiB: Run=%#v memory=%d err=%v", outcomeRun, newState.MemoryBytes, err)
+		t.Fatalf("post-restart Run did not use v2/512 MiB: Run=%#v memory=%d err=%v", outcomeRun, newState.MemoryBytes, err)
 	}
 	outcomeToken, err := os.ReadFile(filepath.Join(root, "data", "run-control", outcomeRun.ID, "token"))
 	requireNoError(t, err)
@@ -819,7 +790,7 @@ func TestCT04RealDockerExitZeroAndDoneTextCannotCompleteTask(t *testing.T) {
 		t.Fatalf("build coordlink: %v\n%s", err, raw)
 	}
 	image := "coordplane-p3-test:" + fmt.Sprintf("%x", time.Now().UnixNano())
-	imageRoot := filepath.Join(repositoryRoot, "internal", "daemon", "testdata", "codex-runtime")
+	imageRoot := filepath.Join(repositoryRoot, "internal", "daemon", "testdata", "claude-runtime")
 	dockerConfig := filepath.Join(root, "docker-config")
 	requireNoError(t, os.MkdirAll(dockerConfig, 0o700))
 	buildImage := exec.CommandContext(ctx, "docker", "build", "-q", "-t", image, imageRoot)
@@ -845,7 +816,7 @@ func TestCT04RealDockerExitZeroAndDoneTextCannotCompleteTask(t *testing.T) {
 	components.runtime.coordlink = coordlinkPath
 	t.Cleanup(func() { _ = components.Close() })
 	agent, err := components.service.AddAgent(ctx, core.AddAgentInput{
-		DisplayName: "P3 Docker Agent", AdapterID: "codex", Image: image,
+		DisplayName: "P3 Docker Agent", AdapterID: "claude", Image: image,
 		InstructionsFile: instructions, RequestID: "p3-agent",
 	})
 	requireNoError(t, err)
@@ -1150,7 +1121,7 @@ func newP3DockerFixtureWithRunTimeout(t *testing.T, runTimeout time.Duration) *p
 	image := "coordplane-p3-test:" + fmt.Sprintf("%x", time.Now().UnixNano())
 	dockerConfig := filepath.Join(root, "docker-config")
 	requireNoError(t, os.MkdirAll(dockerConfig, 0o700))
-	imageRoot := filepath.Join(repositoryRoot, "internal", "daemon", "testdata", "codex-runtime")
+	imageRoot := filepath.Join(repositoryRoot, "internal", "daemon", "testdata", "claude-runtime")
 	buildImage := exec.CommandContext(ctx, "docker", "build", "-q", "-t", image, imageRoot)
 	buildImage.Env = append(os.Environ(), "DOCKER_CONFIG="+dockerConfig)
 	if raw, err := buildImage.CombinedOutput(); err != nil {
@@ -1247,7 +1218,7 @@ func prepareCreatedRunForReconcile(t *testing.T, fixture *p3DockerFixture, claim
 func (f *p3DockerFixture) addAgent(t *testing.T, name string) core.Agent {
 	t.Helper()
 	agent, err := f.components.service.AddAgent(f.ctx, core.AddAgentInput{
-		DisplayName: name, AdapterID: "codex", Image: f.image,
+		DisplayName: name, AdapterID: "claude", Image: f.image,
 		InstructionsFile: f.instructions, RequestID: "agent-" + strings.ReplaceAll(name, " ", "-"),
 	})
 	requireNoError(t, err)

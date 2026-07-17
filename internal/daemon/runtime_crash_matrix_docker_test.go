@@ -84,7 +84,7 @@ func TestRT05EarlyOwnerFallbackIsSoleContainerCleanup(t *testing.T) {
 		seed, err := buildComponents(ctx, configPath)
 		requireNoError(t, err)
 		agent, err := seed.service.AddAgent(ctx, core.AddAgentInput{
-			DisplayName: "RT-05 owner fallback", AdapterID: "codex", Image: artifacts.image,
+			DisplayName: "RT-05 owner fallback", AdapterID: "claude", Image: artifacts.image,
 			InstructionsFile: instructions, RequestID: "rt05-owner-fallback-agent",
 		})
 		if err != nil {
@@ -189,7 +189,7 @@ func buildRT05ProcessArtifacts(t *testing.T, ctx context.Context) rt05ProcessArt
 		}
 	}
 	build := exec.CommandContext(ctx, "docker", "build", "-q", "-t", artifacts.image,
-		filepath.Join(repositoryRoot, "internal", "daemon", "testdata", "codex-runtime"))
+		filepath.Join(repositoryRoot, "internal", "daemon", "testdata", "claude-runtime"))
 	build.Env = append(os.Environ(), "DOCKER_CONFIG="+artifacts.dockerConf)
 	if raw, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build RT-05 image: %v\n%s", err, raw)
@@ -231,7 +231,7 @@ func runRT05ProcessCase(
 	requireNoError(t, err)
 	agent, err := seed.service.AddAgent(ctx, core.AddAgentInput{
 		DisplayName: "RT-05 " + string(phase) + " " + intent,
-		AdapterID:   "codex", Image: artifacts.image, InstructionsFile: instructions,
+		AdapterID:   "claude", Image: artifacts.image, InstructionsFile: instructions,
 		RequestID: "rt05-agent-" + string(phase) + "-" + intent,
 	})
 	if err != nil {

@@ -61,10 +61,10 @@ func TestDeterministicTwoAgentConvergence(t *testing.T) {
 	waitForReady(t, ctx, coordplane, socket, "initial daemon startup")
 
 	agentA := runJSON[core.Agent](t, ctx, coordplane,
-		"agent", "add", "--socket", socket, "--display-name", "P5 Agent A", "--adapter", "codex",
+		"agent", "add", "--socket", socket, "--display-name", "P5 Agent A", "--adapter", "claude",
 		"--image", image, "--instructions-file", instructions, "--request-id", "p5-agent-a", "--output", "json")
 	agentB := runJSON[core.Agent](t, ctx, coordplane,
-		"agent", "add", "--socket", socket, "--display-name", "P5 Agent B", "--adapter", "codex",
+		"agent", "add", "--socket", socket, "--display-name", "P5 Agent B", "--adapter", "claude",
 		"--image", image, "--instructions-file", instructions, "--request-id", "p5-agent-b", "--output", "json")
 	project := runJSON[core.Project](t, ctx, coordplane,
 		"project", "add", "--socket", socket, "--name", "P5 deterministic", "--repo", source,

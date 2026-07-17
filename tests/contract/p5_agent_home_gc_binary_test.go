@@ -20,7 +20,7 @@ func TestGT07FormalOperatorGCDeletesOnlyArchivedAgentHome(t *testing.T) {
 
 	raw := runBinaryJSON(t, testBinaries.coordplane,
 		"agent", "add", "--socket", socket, "--display-name", "Home GC Agent",
-		"--adapter", "codex", "--image", "agent:latest", "--instructions-file", filepath.Join(root, "agent.md"),
+		"--adapter", "claude", "--image", "agent:latest", "--instructions-file", filepath.Join(root, "agent.md"),
 		"--request-id", "home-gc-agent", "--output", "json")
 	var agent core.Agent
 	decodeJSON(t, raw, &agent)

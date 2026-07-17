@@ -316,7 +316,7 @@ func runGT03CoreGitWorker(t *testing.T) {
 		controller = killAfterAdvanceProjectGit{projectGitAdapter: adapter, ready: os.Getenv("COORDPLANE_GT03_READY")}
 	}
 	service, err := core.NewService(database, controller, core.ServiceOptions{
-		Now: time.Now, NewID: (&realP4IDs{}).New, MaxParallelRuns: 4, AdapterIDs: []string{"codex"},
+		Now: time.Now, NewID: (&realP4IDs{}).New, MaxParallelRuns: 4, AdapterIDs: []string{"claude"},
 	})
 	requireNoError(t, err)
 	switch os.Getenv("COORDPLANE_GT03_MODE") {
@@ -372,7 +372,7 @@ func reopenRealP4Service(t *testing.T, h *realP4Harness) (*store.Store, *core.Se
 	requireNoError(t, err)
 	t.Cleanup(func() { _ = database.Close() })
 	service, err := core.NewService(database, projectGitAdapter{initializer: h.initializer, workspaces: h.workspaces}, core.ServiceOptions{
-		Now: time.Now, NewID: (&realP4IDs{}).New, MaxParallelRuns: 4, AdapterIDs: []string{"codex"},
+		Now: time.Now, NewID: (&realP4IDs{}).New, MaxParallelRuns: 4, AdapterIDs: []string{"claude"},
 	})
 	requireNoError(t, err)
 	service.SetReady(true, "")

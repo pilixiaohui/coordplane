@@ -91,7 +91,7 @@ type Registry struct {
 }
 
 var productionAdapters = []CLI{
-	Codex{},
+	Claude{},
 }
 
 func Production() Registry {

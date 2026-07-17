@@ -288,7 +288,7 @@ func (c *Config) Validate() error {
 
 func reservedRuntimeEnvironment(name string) bool {
 	switch name {
-	case "HOME", "CODEX_HOME", "COORDPLANE_RUN_SOCKET", "COORDPLANE_RUN_TOKEN_FILE":
+	case "HOME", "COORDPLANE_RUN_SOCKET", "COORDPLANE_RUN_TOKEN_FILE":
 		return true
 	default:
 		return false

@@ -456,7 +456,7 @@ func TestShutdownReplaysTailLogsBeforeTerminalConvergence(t *testing.T) {
 	active, ref := activateRuntimeTestRun(t, service, claim)
 	executor := &shutdownReplayExecutor{
 		runtimeTestExecutor: runtimeTestExecutor{},
-		payload:             "{\"type\":\"thread.started\",\"thread_id\":\"shutdown-tail-session\"}\n",
+		payload:             "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"shutdown-tail-session\"}\n",
 		ref:                 ref,
 		firstLogStarted:     make(chan struct{}),
 		stopped:             make(chan struct{}),
@@ -834,7 +834,7 @@ func (e *blockingLaunchExecutor) Wait(ctx context.Context, _ containerruntime.Ru
 
 func (e *blockingLaunchExecutor) Logs(context.Context, containerruntime.RuntimeRef, bool) (io.ReadCloser, error) {
 	e.logCalls.Add(1)
-	return io.NopCloser(strings.NewReader("{\"type\":\"thread.started\",\"thread_id\":\"launch-race-session\"}\n")), nil
+	return io.NopCloser(strings.NewReader("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"launch-race-session\"}\n")), nil
 }
 
 func (e *blockingLaunchExecutor) Stop(context.Context, containerruntime.RuntimeRef, time.Duration) (containerruntime.StopResult, error) {
@@ -907,7 +907,7 @@ func newRuntimeTestService(t *testing.T) *core.Service {
 	t.Helper()
 	database := requireRuntimeValue(store.Open(context.Background(), filepath.Join(t.TempDir(), "coordplane.db")))
 	t.Cleanup(func() { _ = database.Close() })
-	service := requireRuntimeValue(core.NewService(database, &runtimeTestGit{sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, core.ServiceOptions{MaxParallelRuns: 4, AdapterIDs: []string{"codex"}}))
+	service := requireRuntimeValue(core.NewService(database, &runtimeTestGit{sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, core.ServiceOptions{MaxParallelRuns: 4, AdapterIDs: []string{"claude"}}))
 	service.SetReady(true, "")
 	return service
 }
@@ -944,7 +944,7 @@ func addRuntimeTestTask(t *testing.T, service *core.Service) core.Task {
 func addRuntimeTestProject(service *core.Service, instructions string) (core.Agent, core.Project) {
 	ctx := context.Background()
 	agent := requireRuntimeValue(service.AddAgent(ctx, core.AddAgentInput{
-		DisplayName: "Runtime Agent", AdapterID: "codex", Image: "agent:test", InstructionsFile: instructions, RequestID: "add-runtime-agent",
+		DisplayName: "Runtime Agent", AdapterID: "claude", Image: "agent:test", InstructionsFile: instructions, RequestID: "add-runtime-agent",
 	}))
 	project := requireRuntimeValue(service.AddProject(ctx, core.AddProjectInput{
 		Name: "Runtime Project", Source: "/source", SourceRef: "refs/heads/main", IntegrationAgentID: agent.ID, RequestID: "add-runtime-project",

@@ -1,12 +1,24 @@
 #!/bin/sh
 set -eu
 
+resuming=false
+[ "${1:-}" = "-p" ] && [ "${2:-}" = "--bare" ] && [ "${3:-}" = "--verbose" ]
+[ "${4:-}" = "--output-format" ] && [ "${5:-}" = "stream-json" ]
+[ "${6:-}" = "--dangerously-skip-permissions" ]
+shift 6
+if [ "${1:-}" = "--resume" ]; then
+	resuming=true
+	[ -n "${2:-}" ]
+	shift 2
+fi
+[ "${1:-}" = "--" ] && [ "$#" -eq 2 ]
+
 bootstrap=/run/coordplane/bootstrap
 run_id=$(sed -n 's/^Run: //p' "$bootstrap")
 kind=$(sed -n 's/^Kind: //p' "$bootstrap")
 description=$(sed -n 's/^Description: //p' "$bootstrap")
 
-echo "{\"type\":\"thread.started\",\"thread_id\":\"p5-$run_id\"}"
+echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"p5-$run_id\"}"
 /usr/local/bin/coordlink progress --summary "P5-READY" --request-id "p5-ready-$run_id" --output json
 
 inbox() {
@@ -137,4 +149,4 @@ else
 	sleep 30
 fi
 
-echo '{"type":"turn.completed"}'
+echo '{"type":"result","subtype":"success","is_error":false,"result":"done"}'

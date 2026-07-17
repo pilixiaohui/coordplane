@@ -353,8 +353,8 @@ func newRealP4Harness(t *testing.T) *realP4Harness {
 		CanonicalSHA: preflight.InitialSHA, IntegrationAgentID: "agent-real-integrator",
 		Status: core.ProjectActive, Version: 1,
 	}
-	worker := core.Agent{ID: "agent-real-worker", DisplayName: "Worker", AdapterID: "codex", Image: "agent:test", Status: core.AgentActive, Version: 1}
-	integrator := core.Agent{ID: "agent-real-integrator", DisplayName: "Integrator", AdapterID: "codex", Image: "agent:test", Status: core.AgentActive, Version: 1}
+	worker := core.Agent{ID: "agent-real-worker", DisplayName: "Worker", AdapterID: "claude", Image: "agent:test", Status: core.AgentActive, Version: 1}
+	integrator := core.Agent{ID: "agent-real-integrator", DisplayName: "Integrator", AdapterID: "claude", Image: "agent:test", Status: core.AgentActive, Version: 1}
 	now := clock.Now().UTC().Format(time.RFC3339Nano)
 	project.CreatedAt, project.UpdatedAt = now, now
 	worker.CreatedAt, worker.UpdatedAt = now, now
@@ -372,7 +372,7 @@ func newRealP4Harness(t *testing.T) *realP4Harness {
 	}
 	ids := &realP4IDs{}
 	service, err := core.NewService(database, projectGitAdapter{initializer: initializer, workspaces: workspaces}, core.ServiceOptions{
-		Now: clock.Now, NewID: ids.New, MaxParallelRuns: 4, AdapterIDs: []string{"codex"},
+		Now: clock.Now, NewID: ids.New, MaxParallelRuns: 4, AdapterIDs: []string{"claude"},
 	})
 	requireNoError(t, err)
 	service.SetReady(true, "")
@@ -742,7 +742,7 @@ func waitP4File(t *testing.T, path string) {
 func newRealP4Service(t *testing.T, database *store.Store, controller core.ProjectGit) *core.Service {
 	t.Helper()
 	service, err := core.NewService(database, controller, core.ServiceOptions{
-		Now: time.Now, NewID: (&realP4IDs{}).New, MaxParallelRuns: 4, AdapterIDs: []string{"codex"},
+		Now: time.Now, NewID: (&realP4IDs{}).New, MaxParallelRuns: 4, AdapterIDs: []string{"claude"},
 	})
 	requireNoError(t, err)
 	service.SetReady(true, "")

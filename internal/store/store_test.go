@@ -63,9 +63,9 @@ func TestCT01V1RunMigrationPreservesLegacyIsolationSpec(t *testing.T) {
 	statements := []string{
 		`INSERT INTO schema_migrations VALUES(1,'coordplane_v1_six_objects','2026-07-12T00:00:00Z')`,
 		`INSERT INTO projects(id,name,source,source_ref,initial_sha,control_repo_path,canonical_ref,canonical_sha,status,version,created_at,updated_at) VALUES('prj_v1','v1','/source','main','abc','/control','refs/heads/main','abc','active',1,'` + now + `','` + now + `')`,
-		`INSERT INTO agents(id,display_name,adapter_id,image,instructions_file,status,version,created_at,updated_at) VALUES('agt_v1','v1','codex','image','/instructions','active',1,'` + now + `','` + now + `')`,
+		`INSERT INTO agents(id,display_name,adapter_id,image,instructions_file,status,version,created_at,updated_at) VALUES('agt_v1','v1','claude','image','/instructions','active',1,'` + now + `','` + now + `')`,
 		`INSERT INTO tasks(id,project_id,kind,created_by_kind,assignee_agent_id,title,description,status,current_run_id,generation,next_run_at,version,created_at,updated_at) VALUES('tsk_v1','prj_v1','work','boss','agt_v1','v1','','running','run_v1',1,'` + now + `',1,'` + now + `','` + now + `')`,
-		`INSERT INTO runs(id,project_id,task_id,agent_id,generation,adapter_id,image,state,token_hash,cleanup_state,container_name,launch_mode,version,created_at) VALUES('run_v1','prj_v1','tsk_v1','agt_v1',1,'codex','image','active','token-v1','not_needed','coordplane-run-v1','start',1,'` + now + `')`,
+		`INSERT INTO runs(id,project_id,task_id,agent_id,generation,adapter_id,image,state,token_hash,cleanup_state,container_name,launch_mode,version,created_at) VALUES('run_v1','prj_v1','tsk_v1','agt_v1',1,'claude','image','active','token-v1','not_needed','coordplane-run-v1','start',1,'` + now + `')`,
 	}
 	_, err = db.ExecContext(ctx, strings.Join(statements, ";"))
 	requireNoError(t, err)

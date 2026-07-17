@@ -545,7 +545,7 @@ func newPFBatchWithEnv(
 	go batch.sampleDisk()
 	batch.agents = make([]core.Agent, len(pfRoles))
 	for index, role := range pfRoles {
-		batch.agents[index] = pfJSON[core.Agent](batch, "agent", "add", "--socket", socket, "--display-name", "PF01 "+role, "--adapter", "codex", "--image", image, "--instructions-file", instructions, "--request-id", id+"-agent-"+role, "--output", "json")
+		batch.agents[index] = pfJSON[core.Agent](batch, "agent", "add", "--socket", socket, "--display-name", "PF01 "+role, "--adapter", "claude", "--image", image, "--instructions-file", instructions, "--request-id", id+"-agent-"+role, "--output", "json")
 	}
 	batch.project = pfJSON[core.Project](batch, "project", "add", "--socket", socket, "--name", "PF01 "+id, "--repo", source, "--ref", "refs/heads/main", "--integration-agent", batch.agents[0].ID, "--request-id", id+"-project", "--output", "json")
 	if batch.project.InitialSHA != initial || batch.project.CanonicalSHA != initial {

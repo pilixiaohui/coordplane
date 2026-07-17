@@ -63,7 +63,7 @@ func TestRuntimeRedactionRemovesEveryLineOfMultilineSecret(t *testing.T) {
 func TestRuntimeLogBoundaryRedactsBoundsAndReplaysFromZero(t *testing.T) {
 	root := t.TempDir()
 	const (
-		providerName = "COORDPLANE_TEST_PROVIDER_SECRET"
+		providerName = "ANTHROPIC_API_KEY"
 		secretLineA  = "provider-secret-line-a"
 		secretLineB  = "provider-secret-line-b"
 		runToken     = "run-token-log-boundary"
@@ -94,9 +94,9 @@ func TestRuntimeLogBoundaryRedactsBoundsAndReplaysFromZero(t *testing.T) {
 		executor: executor, controlRoot: controlRoot,
 	}
 	monitor := &runMonitor{redact: controller.runtimeRedaction(run)}
-	entry, ok := adapter.Production().Lookup("codex")
+	entry, ok := adapter.Production().Lookup("claude")
 	if !ok {
-		t.Fatal("codex adapter is not registered")
+		t.Fatal("Claude adapter is not registered")
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		requireNoError(t, controller.streamLogs(context.Background(), run, containerruntime.RuntimeRef{}, entry, monitor))

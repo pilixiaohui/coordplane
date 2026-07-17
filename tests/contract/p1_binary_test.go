@@ -252,7 +252,7 @@ func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 
 	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"agent", "add", "--socket", socket, "--display-name", "Developer",
-		"--adapter", "codex", "--image", "agent:latest",
+		"--adapter", "claude", "--image", "agent:latest",
 		"--instructions-file", filepath.Join(root, "agent.md"),
 		"--request-id", "binary-agent", "--output", "json")
 	var agent core.Agent
@@ -432,7 +432,7 @@ func TestGT07FormalOperatorBinaryChecksOutExactControllerTaskRef(t *testing.T) {
 	daemon := startDaemon(t, configPath, socket)
 	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"agent", "add", "--socket", socket, "--display-name", "Checkout reviewer",
-		"--adapter", "codex", "--image", "agent:latest", "--instructions-file", filepath.Join(root, "agent.md"),
+		"--adapter", "claude", "--image", "agent:latest", "--instructions-file", filepath.Join(root, "agent.md"),
 		"--request-id", "checkout-agent", "--output", "json")
 	var agent core.Agent
 	decodeJSON(t, agentRaw, &agent)
@@ -476,7 +476,7 @@ func TestGT07FormalOperatorBinaryChecksOutExactControllerTaskRef(t *testing.T) {
 		persisted.Version++
 		if err := tx.InsertRun(core.Run{
 			ID: "run-checkout-contract", ProjectID: project.ID, TaskID: task.ID, AgentID: agent.ID,
-			Generation: 1, AdapterID: "codex", Image: "agent:latest", State: core.RunExited,
+			Generation: 1, AdapterID: "claude", Image: "agent:latest", State: core.RunExited,
 			TokenHash: "checkout-contract-token", CleanupState: "removed", LaunchPhase: "process_observed",
 			ContainerName: "checkout-contract", LaunchMode: "start", Version: 1,
 			CreatedAt: persisted.SubmittedAt, EndedAt: persisted.SubmittedAt,
@@ -633,7 +633,7 @@ func TestGT07FormalOperatorBinaryCreatesRetryLineageFromClosedSameProjectTask(t 
 	daemon := startDaemon(t, configPath, socket)
 	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"agent", "add", "--socket", socket, "--display-name", "Retry worker",
-		"--adapter", "codex", "--image", "agent:latest", "--instructions-file", filepath.Join(root, "agent.md"),
+		"--adapter", "claude", "--image", "agent:latest", "--instructions-file", filepath.Join(root, "agent.md"),
 		"--request-id", "retry-agent", "--output", "json")
 	var agent core.Agent
 	decodeJSON(t, agentRaw, &agent)
@@ -762,7 +762,7 @@ func TestP1BinaryReadSurfacesStayBoundedPastTwoMiBLedger(t *testing.T) {
 
 	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"agent", "add", "--socket", socket, "--display-name", "Bounded Agent",
-		"--adapter", "codex", "--image", "agent:latest", "--instructions-file", filepath.Join(root, "agent.md"),
+		"--adapter", "claude", "--image", "agent:latest", "--instructions-file", filepath.Join(root, "agent.md"),
 		"--request-id", "bounded-agent", "--output", "json")
 	var agent core.Agent
 	decodeJSON(t, agentRaw, &agent)
@@ -804,7 +804,7 @@ func TestP1BinaryReadSurfacesStayBoundedPastTwoMiBLedger(t *testing.T) {
 	stopDaemon(t, daemon, socket)
 	database, err := store.Open(context.Background(), filepath.Join(dataDir, "coordplane.db"))
 	requireNoError(t, err)
-	service, err := core.NewService(database, &contractGit{sha: project.InitialSHA, root: filepath.Join(dataDir, "repos")}, core.ServiceOptions{MaxParallelRuns: 1, AdapterIDs: []string{"codex"}})
+	service, err := core.NewService(database, &contractGit{sha: project.InitialSHA, root: filepath.Join(dataDir, "repos")}, core.ServiceOptions{MaxParallelRuns: 1, AdapterIDs: []string{"claude"}})
 	if err != nil {
 		_ = database.Close()
 		t.Fatal(err)

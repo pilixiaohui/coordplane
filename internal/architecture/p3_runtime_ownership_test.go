@@ -131,8 +131,8 @@ func TestP3ProductionAdapterRegistryIsOneStaticOneShotList(t *testing.T) {
 	}
 	registry := adapter.Production()
 	names := registry.Names()
-	if len(names) != 1 {
-		t.Fatalf("production registry names = %v", names)
+	if len(names) != 1 || names[0] != "claude" {
+		t.Fatalf("production registry names = %v, want [claude]", names)
 	}
 	production, ok := registry.Lookup(names[0])
 	if !ok || production.Metadata().ExecutionModel != adapter.ExecutionOneShot {

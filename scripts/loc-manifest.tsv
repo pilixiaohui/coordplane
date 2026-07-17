@@ -24,7 +24,7 @@ internal/core/git_capture_contract.go|handwritten_tests|git_component
 internal/gitrepo/*phase_contract.go|handwritten_tests|git_component
 internal/daemon/runtime_phase_contract.go|handwritten_tests|docker_runtime
 internal/runtime/testdata/*|handwritten_tests|docker_runtime
-internal/daemon/testdata/codex-runtime/codex|handwritten_tests|docker_runtime
+internal/daemon/testdata/claude-runtime/claude|handwritten_tests|docker_runtime
 cmd/*|handwritten_production|cmd
 internal/operatorcli/*|handwritten_production|cmd
 internal/coordlinkcli/*|handwritten_production|cmd
