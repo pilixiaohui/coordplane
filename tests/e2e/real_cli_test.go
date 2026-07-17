@@ -17,7 +17,7 @@ import (
 
 const liveE2ETimeout = 15 * time.Minute
 
-func TestRealCodexAdapterSmoke(t *testing.T) {
+func TestRealClaudeAdapterSmoke(t *testing.T) {
 	requireRealCLI(t)
 	coordplane := requireExecutable(t, "E2E_COORDPLANE_BIN")
 	requireExecutable(t, "E2E_COORDLINK_BIN")
@@ -33,7 +33,6 @@ func TestRealCodexAdapterSmoke(t *testing.T) {
 	registerLiveHomeCleanup(t, image, dataDir)
 	instructions := filepath.Join(root, "smoke-instructions.md")
 	writeFile(t, instructions, []byte(realSmokeInstructions), 0o600)
-	seedCodexAuth(t, dataDir, "agt_live_smoke")
 	configPath := writeLiveConfig(t, root, dataDir, socket, image, network, providerEnv, 1)
 
 	daemon := startDaemon(t, coordplane, configPath, socket)
@@ -41,7 +40,7 @@ func TestRealCodexAdapterSmoke(t *testing.T) {
 	waitForReady(t, ctx, coordplane, socket, "live smoke daemon startup")
 	agent := runJSON[core.Agent](t, ctx, coordplane,
 		"agent", "add", "--socket", socket, "--id", "agt_live_smoke", "--display-name", "Live smoke Agent",
-		"--adapter", "codex", "--image", image, "--instructions-file", instructions,
+		"--adapter", "claude", "--image", image, "--instructions-file", instructions,
 		"--request-id", "live-smoke-agent", "--output", "json")
 	project := runJSON[core.Project](t, ctx, coordplane,
 		"project", "add", "--socket", socket, "--name", "Live adapter smoke", "--repo", source,
@@ -98,7 +97,7 @@ func TestRealCodexAdapterSmoke(t *testing.T) {
 	assertAgentBossMessages(t, ctx, coordplane, socket, project.ID, agent.ID, 2)
 }
 
-func TestRealCodexTwoAgentConvergence(t *testing.T) {
+func TestRealClaudeTwoAgentConvergence(t *testing.T) {
 	requireRealCLI(t)
 	coordplane := requireExecutable(t, "E2E_COORDPLANE_BIN")
 	requireExecutable(t, "E2E_COORDLINK_BIN")
@@ -114,7 +113,6 @@ func TestRealCodexTwoAgentConvergence(t *testing.T) {
 	registerLiveHomeCleanup(t, image, dataDir)
 	instructions := filepath.Join(root, "live-instructions.md")
 	writeFile(t, instructions, []byte(realWorkInstructions), 0o600)
-	seedCodexAuth(t, dataDir, "agt_live_a", "agt_live_b")
 	configPath := writeLiveConfig(t, root, dataDir, socket, image, network, providerEnv, 2)
 
 	daemon := startDaemon(t, coordplane, configPath, socket)
@@ -122,14 +120,14 @@ func TestRealCodexTwoAgentConvergence(t *testing.T) {
 	waitForReady(t, ctx, coordplane, socket, "live E2E daemon startup")
 	agentA := runJSON[core.Agent](t, ctx, coordplane,
 		"agent", "add", "--socket", socket, "--id", "agt_live_a", "--display-name", "Live Agent A",
-		"--adapter", "codex", "--image", image, "--instructions-file", instructions,
+		"--adapter", "claude", "--image", image, "--instructions-file", instructions,
 		"--request-id", "live-agent-a", "--output", "json")
 	agentB := runJSON[core.Agent](t, ctx, coordplane,
 		"agent", "add", "--socket", socket, "--id", "agt_live_b", "--display-name", "Live Agent B",
-		"--adapter", "codex", "--image", image, "--instructions-file", instructions,
+		"--adapter", "claude", "--image", image, "--instructions-file", instructions,
 		"--request-id", "live-agent-b", "--output", "json")
 	project := runJSON[core.Project](t, ctx, coordplane,
-		"project", "add", "--socket", socket, "--name", "Real Codex two-Agent E2E", "--repo", source,
+		"project", "add", "--socket", socket, "--name", "Real Claude two-Agent E2E", "--repo", source,
 		"--ref", "refs/heads/main", "--integration-agent", agentA.ID,
 		"--request-id", "live-project", "--output", "json")
 	if project.InitialSHA != initialSHA || project.CanonicalSHA != initialSHA {
@@ -264,8 +262,12 @@ func liveRuntimeConfig(t *testing.T) (string, string, []string) {
 			providerEnv = append(providerEnv, name)
 		}
 	}
-	if len(providerEnv) == 0 && strings.TrimSpace(os.Getenv("E2E_CODEX_AUTH_FILE")) == "" {
-		t.Fatal("a provider environment allowlist or E2E_CODEX_AUTH_FILE is required")
+	foundKey := false
+	for _, name := range providerEnv {
+		foundKey = foundKey || name == "ANTHROPIC_API_KEY"
+	}
+	if !foundKey || strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")) == "" {
+		t.Fatal("ANTHROPIC_API_KEY must be present in the provider environment allowlist")
 	}
 	return image, network, providerEnv
 }
@@ -306,26 +308,6 @@ git:
 `, dataDir, socket, parallel, network, filepath.Join(dataDir, "workspaces"), filepath.Join(dataDir, "agent-homes"), filepath.Join(dataDir, "logs"), image, allowlist.String(), image)
 	writeFile(t, path, []byte(content), 0o600)
 	return path
-}
-
-func seedCodexAuth(t *testing.T, dataDir string, agentIDs ...string) {
-	t.Helper()
-	path := strings.TrimSpace(os.Getenv("E2E_CODEX_AUTH_FILE"))
-	if path == "" {
-		return
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read E2E_CODEX_AUTH_FILE: %v", err)
-	}
-	for _, agentID := range agentIDs {
-		home := filepath.Join(dataDir, "agent-homes", agentID)
-		requireNoError(t, os.MkdirAll(home, 0o770))
-		requireNoError(t, os.Chmod(home, 0o770))
-		auth := filepath.Join(home, "auth.json")
-		requireNoError(t, os.WriteFile(auth, raw, 0o640))
-		requireNoError(t, os.Chmod(auth, 0o640))
-	}
 }
 
 func registerLiveHomeCleanup(t *testing.T, image, dataDir string) {
@@ -431,7 +413,7 @@ func assertAgentBossMessages(t *testing.T, ctx context.Context, binary, socket, 
 	}
 }
 
-const realSmokeInstructions = `You are running the real Codex adapter smoke for CoordPlane.
+const realSmokeInstructions = `You are running the real Claude adapter smoke for CoordPlane.
 Read the complete run bootstrap first. Use only the current Run's coordlink and never infer Task completion from text.
 Immediately call coordlink progress with summary LIVE-SMOKE-READY, using a request ID containing the current Run ID.
 List the inbox. Acknowledge every Message you process.
@@ -439,7 +421,7 @@ If the inbox contains LIVE-SMOKE-CANCEL, call progress with summary LIVE-CANCEL-
 Otherwise send a Message to Boss with body LIVE-SMOKE-AGENT and a unique request ID. Poll the inbox until a Message containing LIVE-SMOKE-FINISH arrives, acknowledge it, then call coordlink task wait with a short reason and unique request ID. Remain alive briefly so the Daemon can stop the container from the durable outcome.
 `
 
-const realWorkInstructions = `You are running the real Codex two-Agent acceptance gate for CoordPlane.
+const realWorkInstructions = `You are running the real Claude two-Agent acceptance gate for CoordPlane.
 Read the complete run bootstrap before acting. Use native Git only inside /workspace/project and use coordlink for every coordination action. Never treat your own text or process exit as Task completion.
 Configure Git safe.directory=/workspace/project and a local test user before committing.
 
