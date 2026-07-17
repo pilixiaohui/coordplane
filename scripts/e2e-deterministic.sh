@@ -34,9 +34,9 @@ fi
 if ! E2E_COORDPLANE_BIN="$root/build/bin/coordplane" \
 	E2E_COORDLINK_BIN="$root/build/bin/coordlink" \
 	E2E_RUNTIME_IMAGE="$image" \
-	go test -tags=e2e ./tests/e2e -run '^TestDeterministicTwoAgentConvergence$' -count=1 -v; then
-	echo "FAIL(deterministic two-Agent E2E)"
+	go test -tags=e2e ./tests/e2e -run '^(TestDeterministicTwoAgentConvergence|TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests)$' -count=1 -v; then
+	echo "FAIL(deterministic two-Agent E2E or real image admission negatives)"
 	exit 1
 fi
 
-echo "PASS(deterministic two-Agent E2E)"
+echo "PASS(deterministic two-Agent E2E and real image admission negatives)"
