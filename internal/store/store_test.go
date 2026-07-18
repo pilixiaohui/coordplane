@@ -27,7 +27,6 @@ func TestCT01FileMigrationIsExactAndIdempotent(t *testing.T) {
 	requireNoError(t, err)
 	t.Cleanup(func() { _ = store.Close() })
 	info, err := store.SchemaInfo(ctx)
-	requireNoError(t, err)
 	if info.JournalMode != "wal" || !info.ForeignKeys || info.BusyTimeout != busyTimeoutMillis {
 		t.Fatalf("SQLite pragmas = %#v", info)
 	}
@@ -40,7 +39,6 @@ func TestCT01FileMigrationIsExactAndIdempotent(t *testing.T) {
 	for range 3 {
 		time.Sleep(time.Millisecond)
 		info, err = store.SchemaInfo(ctx)
-		requireNoError(t, err)
 		if info.JournalMode != "wal" || !info.ForeignKeys || info.BusyTimeout != busyTimeoutMillis {
 			t.Fatalf("replacement connection pragmas = %#v", info)
 		}

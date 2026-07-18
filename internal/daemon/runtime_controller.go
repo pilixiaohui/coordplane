@@ -81,8 +81,8 @@ type runMonitor struct {
 	control *runControl
 	redact  runtimeRedaction
 
-	waitCancel    context.CancelFunc
-	wait          chan waitResult
+	waitCancel context.CancelFunc
+	wait       chan waitResult
 	// waitDelivered is test-only observation of supervisor receipt of Wait.
 	waitDelivered chan struct{}
 	logs          chan error

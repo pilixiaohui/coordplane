@@ -474,7 +474,10 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 				monitor := controller.newMonitor(active, ref, adapter.Claude{}, nil)
 				monitor.wait, monitor.waitDelivered = make(chan waitResult), make(chan struct{})
 				done := make(chan struct{})
-				go func() { controller.supervise(monitor); close(done) }()
+				go func() {
+					defer close(done)
+					controller.supervise(monitor)
+				}()
 				close(executor.releaseWait)
 				select {
 				case <-monitor.waitDelivered:
