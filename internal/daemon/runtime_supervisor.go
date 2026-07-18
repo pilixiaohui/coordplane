@@ -123,11 +123,7 @@ func (m *runMonitor) outcome() <-chan struct{} {
 }
 
 func (c *runtimeController) stopForLogFailure(monitor *runMonitor, failure error) {
-	code := runtimeLogFailureCode
-	if errors.Is(failure, errRuntimeSessionPersist) {
-		code = runtimeSessionFailureCode
-	}
-	monitor.setRuntimeError(code, monitor.redact.Text(failure.Error()))
+	monitor.setLogFailure(failure)
 
 	run, err := c.service.Run(context.Background(), monitor.runID)
 	if err != nil || core.IsRunTerminal(run.State) {
@@ -232,6 +228,9 @@ func (c *runtimeController) finishObservedRunContext(
 	logErr := monitor.collectLogs(runtimeLogDrainTimeout)
 	if errors.Is(logErr, errRuntimeLogDrainTimeout) {
 		return logErr
+	}
+	if logErr != nil {
+		monitor.setLogFailure(logErr)
 	}
 	runtimeCode, providerError := monitor.errorFact()
 	if providerError != "" {

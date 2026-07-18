@@ -54,6 +54,53 @@ func TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests(t *testing.T)
 			}
 		})
 	}
+
+	realGo, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stubDir, fixture := t.TempDir(), filepath.Join(t.TempDir(), "go-test.json")
+	writeFile(t, filepath.Join(stubDir, "docker"), []byte("#!/bin/sh\ncase \"$1\" in version) exit 0;; image) printf '%s\\n' \"$5\";; run) printf '%s\\n' '"+realClaudeVersion+"';; *) exit 2;; esac\n"), 0o700)
+	writeFile(t, filepath.Join(stubDir, "make"), []byte("#!/bin/sh\nexit 0\n"), 0o700)
+	writeFile(t, filepath.Join(stubDir, "go"), []byte("#!/bin/sh\ncase \"$1\" in test) cat \"$E2E_GATE_FIXTURE\";; run) exec \"$E2E_REAL_GO\" \"$@\";; *) exit 2;; esac\n"), 0o700)
+	const smoke, agents = "TestRealClaudeAdapterSmoke", "TestRealClaudeTwoAgentConvergence"
+	exact := `{"Action":"run","Test":"` + smoke + `"}
+{"Action":"run","Test":"` + smoke + `/resume"}
+{"Action":"pass","Test":"` + smoke + `/resume"}
+{"Action":"pass","Test":"` + smoke + `"}
+{"Action":"run","Test":"` + agents + `"}
+{"Action":"pass","Test":"` + agents + `"}`
+	mutants := []struct {
+		name, input string
+		pass        bool
+	}{
+		{name: "exact set", input: exact, pass: true},
+		{name: "zero matches", input: `{"Action":"pass"}`},
+		{name: "missing test", input: `{"Action":"run","Test":"` + smoke + `"}
+{"Action":"pass","Test":"` + smoke + `"}`},
+		{name: "top skip", input: exact + `
+{"Action":"skip","Test":"` + agents + `"}`},
+		{name: "child skip", input: exact + `
+{"Action":"skip","Test":"` + smoke + `/child"}`},
+		{name: "failure", input: `{"Action":"fail","Test":"` + smoke + `"}`},
+		{name: "unexpected top level", input: exact + `
+{"Action":"run","Test":"TestRenamedLiveGate"}`},
+		{name: "duplicate run", input: exact + `
+{"Action":"run","Test":"` + agents + `"}`},
+	}
+	for _, test := range mutants {
+		t.Run("checker/"+test.name, func(t *testing.T) {
+			writeFile(t, fixture, []byte(test.input), 0o600)
+			command := exec.Command(filepath.Clean("../../scripts/e2e-real-cli.sh"))
+			command.Env = append(os.Environ(), "PATH="+stubDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"E2E_RUNTIME_IMAGE=sha256:"+strings.Repeat("a", 64), "ANTHROPIC_API_KEY=not-a-real-key",
+				"E2E_GATE_FIXTURE="+fixture, "E2E_REAL_GO="+realGo)
+			output, runErr := command.CombinedOutput()
+			if (runErr == nil) != test.pass || (!test.pass && (!strings.Contains(string(output), "real gate evidence:") || strings.Contains(string(output), "PASS("))) {
+				t.Fatalf("shell gate err=%v want_pass=%t output=%s", runErr, test.pass, output)
+			}
+		})
+	}
 }
 
 func TestRealClaudeAdapterSmoke(t *testing.T) {

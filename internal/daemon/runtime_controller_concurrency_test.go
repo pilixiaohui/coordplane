@@ -452,8 +452,11 @@ func TestSupervisorStopsRunAfterSessionPersistenceFailure(t *testing.T) {
 }
 
 func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
-	for _, test := range []struct{ name, frame string }{
-		{name: "malformed", frame: "{"},
+	for _, test := range []struct {
+		name, frame string
+		waitFirst   bool
+	}{
+		{name: "malformed wait first", frame: "{", waitFirst: true},
 		{name: "init without session", frame: `{"type":"system","subtype":"init"}`},
 		{name: "success without is_error", frame: `{"type":"result","subtype":"success"}`},
 	} {
@@ -466,9 +469,15 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 			active, ref := activateRuntimeTestRun(t, service, claim)
 			executor := &monitorFailureExecutor{payload: test.frame, stopped: make(chan struct{})}
 			controller := newRuntimeTestController(t, service, executor)
-			monitor := controller.newMonitor(active, ref, adapter.Claude{}, nil)
-			controller.monitors[active.ID] = monitor
-			controller.supervise(monitor)
+			if test.waitFirst {
+				monitor := &runMonitor{runID: active.ID, ref: ref, logs: make(chan error, 1), redact: controller.runtimeRedaction(active)}
+				monitor.logs <- controller.streamLogs(context.Background(), active, ref, adapter.Claude{}, monitor)
+				requireNoError(t, controller.finishObservedRun(active, monitor, waitResult{fact: containerruntime.ExitFact{Ref: ref, ExitCode: 1}}))
+			} else {
+				monitor := controller.newMonitor(active, ref, adapter.Claude{}, nil)
+				controller.monitors[active.ID] = monitor
+				controller.supervise(monitor)
+			}
 			persisted := requireRuntimeValue(service.Run(context.Background(), active.ID))
 			task := requireRuntimeValue(service.Task(context.Background(), claim.Task.ID)).Task
 			if persisted.State != core.RunInterrupted || persisted.RuntimeErrorCode != runtimeLogFailureCode ||

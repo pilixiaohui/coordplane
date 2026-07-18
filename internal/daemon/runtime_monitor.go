@@ -112,6 +112,16 @@ func (m *runMonitor) setRuntimeError(code, message string) {
 	}
 }
 
+func (m *runMonitor) setLogFailure(failure error) {
+	code := runtimeLogFailureCode
+	if errors.Is(failure, errRuntimeSessionPersist) {
+		code = runtimeSessionFailureCode
+	}
+	m.mu.Lock()
+	m.runtimeCode, m.lastError = code, m.redact.Text(failure.Error())
+	m.mu.Unlock()
+}
+
 func (m *runMonitor) errorFact() (string, string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

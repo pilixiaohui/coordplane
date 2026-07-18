@@ -3,6 +3,7 @@ package contract_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -255,27 +256,26 @@ func TestP3ProductionBinaryRejectsRetiredCodexResidueBeforeStartupSideEffects(t 
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, dataDir, socket, configPath := contractConfigPaths(t, "")
+			_, dataDir, _, configPath := contractConfigPaths(t, "")
 			databasePath := filepath.Join(dataDir, "coordplane.db")
-			seedRetiredCodexState(t, databasePath, test.agentAdapter, test.taskState, test.runState)
-			before, err := os.ReadFile(databasePath)
-			requireNoError(t, err)
+			database := seedRetiredCodexState(t, databasePath, test.agentAdapter, test.taskState, test.runState)
+			before := dataDirSignature(t, dataDir)
+			if _, err := os.Stat(databasePath + "-wal"); err != nil {
+				t.Fatalf("v1 fixture did not retain -wal: %v", err)
+			}
+			if _, err := os.Stat(databasePath + "-shm"); err != nil {
+				t.Fatalf("v1 fixture did not retain -shm: %v", err)
+			}
 			command := exec.Command(testBinaries.coordplane, "serve", "--config", configPath)
 			raw, runErr := command.CombinedOutput()
 			if runErr == nil || !bytes.Contains(raw, []byte(string(core.CodeLegacySchemaRebuildRequired))) ||
 				!bytes.Contains(raw, []byte("backup")) || !bytes.Contains(raw, []byte("fresh data_dir")) {
 				t.Fatalf("legacy startup err=%v output=%s", runErr, raw)
 			}
-			after, err := os.ReadFile(databasePath)
-			requireNoError(t, err)
-			if !bytes.Equal(after, before) {
-				t.Fatal("legacy startup changed the durable SQLite database")
+			if after := dataDirSignature(t, dataDir); after != before {
+				t.Fatal("legacy startup changed the complete data-dir signature")
 			}
-			for _, path := range []string{socket, filepath.Join(dataDir, "locks"), filepath.Join(dataDir, "repos"), filepath.Join(dataDir, "handoff"), filepath.Join(dataDir, "run-control")} {
-				if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-					t.Fatalf("legacy startup created side effect %s: %v", path, err)
-				}
-			}
+			_ = database.Close()
 		})
 	}
 }
@@ -1330,22 +1330,35 @@ func durableSignature(t *testing.T, database *store.Store, projectID string) str
 	return string(raw)
 }
 
-func seedRetiredCodexState(t *testing.T, path, agentAdapter, taskState, runState string) {
+func seedRetiredCodexState(t *testing.T, path, agentAdapter, taskState, runState string) *sql.DB {
 	t.Helper()
 	requireNoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
-	database, err := store.Open(context.Background(), path)
+	fixture, err := os.ReadFile(filepath.Join(repositoryRoot(), "tests", "contract", "fixtures", "coordplane-v1.db"))
 	requireNoError(t, err)
-	requireNoError(t, database.Close())
+	requireNoError(t, os.WriteFile(path, fixture, 0o600))
 	db, err := sql.Open("sqlite", path)
 	requireNoError(t, err)
-	defer db.Close()
+	requireNoError(t, db.Ping())
+	_, err = db.Exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA foreign_keys=ON")
+	requireNoError(t, err)
+	var version, isolationColumns int
+	requireNoError(t, db.QueryRow(`SELECT max(version) FROM schema_migrations`).Scan(&version))
+	requireNoError(t, db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name='isolation_spec_version'`).Scan(&isolationColumns))
+	if version != 1 || isolationColumns != 0 {
+		t.Fatalf("fixture is not v1: version=%d isolation_columns=%d", version, isolationColumns)
+	}
+	for _, relative := range []string{"workspaces/legacy/marker", "agent-homes/legacy/marker", "logs/legacy/marker", "locks/marker", "repos/marker", "handoff/marker", "run-control/marker"} {
+		marker := filepath.Join(filepath.Dir(path), relative)
+		requireNoError(t, os.MkdirAll(filepath.Dir(marker), 0o700))
+		requireNoError(t, os.WriteFile(marker, []byte(relative), 0o600))
+	}
 	const now = "2026-07-18T00:00:00Z"
 	_, err = db.Exec(`INSERT INTO projects(id,name,source,source_ref,initial_sha,control_repo_path,canonical_ref,canonical_sha,status,version,created_at,updated_at) VALUES('prj_legacy','legacy','/source','main','abc','/control','refs/heads/main','abc','active',1,?,?)`, now, now)
 	requireNoError(t, err)
 	_, err = db.Exec(`INSERT INTO agents(id,display_name,adapter_id,image,instructions_file,status,version,created_at,updated_at) VALUES('agt_legacy','legacy',?,'image','/instructions','active',1,?,?)`, agentAdapter, now, now)
 	requireNoError(t, err)
 	if taskState == "" {
-		return
+		return db
 	}
 	currentRun := ""
 	if runState == "starting" || runState == "active" {
@@ -1354,7 +1367,7 @@ func seedRetiredCodexState(t *testing.T, path, agentAdapter, taskState, runState
 	_, err = db.Exec(`INSERT INTO tasks(id,project_id,kind,created_by_kind,assignee_agent_id,title,description,status,current_run_id,generation,next_run_at,version,created_at,updated_at) VALUES('tsk_legacy','prj_legacy','work','boss','agt_legacy','legacy','',?,?,1,?,1,?,?)`, taskState, currentRun, now, now, now)
 	requireNoError(t, err)
 	if runState == "" {
-		return
+		return db
 	}
 	cleanup := "not_needed"
 	if runState == "active" {
@@ -1364,6 +1377,43 @@ func seedRetiredCodexState(t *testing.T, path, agentAdapter, taskState, runState
 	}
 	_, err = db.Exec(`INSERT INTO runs(id,project_id,task_id,agent_id,generation,adapter_id,image,state,token_hash,cleanup_state,container_name,launch_mode,version,created_at) VALUES('run_legacy','prj_legacy','tsk_legacy','agt_legacy',1,'codex','image',?,'legacy-token',?,'coordplane-run-legacy','start',1,?)`, runState, cleanup, now)
 	requireNoError(t, err)
+	return db
+}
+
+func dataDirSignature(t *testing.T, root string) string {
+	t.Helper()
+	var entries []string
+	requireNoError(t, filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		content := ""
+		if entry.Type().IsRegular() && strings.HasSuffix(path, "-shm") {
+			content = fmt.Sprintf("sqlite-shm-size=%d", info.Size()) // WAL index bytes are process-local.
+		} else if entry.Type().IsRegular() {
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			content = fmt.Sprintf("%x", sha256.Sum256(raw))
+		} else if entry.Type()&os.ModeSymlink != 0 {
+			content, err = os.Readlink(path)
+			if err != nil {
+				return err
+			}
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, fmt.Sprintf("%s|%s|%o|%d|%s", filepath.ToSlash(rel), entry.Type(), info.Mode().Perm(), info.Size(), content))
+		return nil
+	}))
+	return strings.Join(entries, "\n")
 }
 
 func writeConfig(t *testing.T, root, dataDir, socket, suffix string) string {

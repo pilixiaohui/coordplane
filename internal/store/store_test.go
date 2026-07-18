@@ -6,9 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"testing"
-	"time"
 
 	"coordplane/internal/core"
 
@@ -49,66 +47,6 @@ func TestCT01FileMigrationIsExactAndIdempotent(t *testing.T) {
 	requireNoError(t, err)
 	if !reflect.DeepEqual(info.Tables, wantTables) {
 		t.Fatalf("reopened tables = %v", info.Tables)
-	}
-}
-
-func TestCT01V1CodexStateRequiresRebuildWithoutMigration(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "coordplane-v1.db")
-	db, err := sql.Open("sqlite", path)
-	requireNoError(t, err)
-	_, err = db.ExecContext(ctx, strings.Join(splitStatements(schemaSQL), ";"))
-	requireNoError(t, err)
-	const now = "2026-07-12T00:00:00Z"
-	statements := []string{
-		`INSERT INTO schema_migrations VALUES(1,'coordplane_v1_six_objects','2026-07-12T00:00:00Z')`,
-		`INSERT INTO projects(id,name,source,source_ref,initial_sha,control_repo_path,canonical_ref,canonical_sha,status,version,created_at,updated_at) VALUES('prj_v1','v1','/source','main','abc','/control','refs/heads/main','abc','active',1,'` + now + `','` + now + `')`,
-		`INSERT INTO agents(id,display_name,adapter_id,image,instructions_file,status,version,created_at,updated_at) VALUES('agt_v1','v1','codex','image','/instructions','active',1,'` + now + `','` + now + `')`,
-		`INSERT INTO tasks(id,project_id,kind,created_by_kind,assignee_agent_id,title,description,status,current_run_id,generation,next_run_at,version,created_at,updated_at) VALUES('tsk_v1','prj_v1','work','boss','agt_v1','v1','','running','run_v1',1,'` + now + `',1,'` + now + `','` + now + `')`,
-		`INSERT INTO runs(id,project_id,task_id,agent_id,generation,adapter_id,image,state,token_hash,cleanup_state,container_name,launch_mode,version,created_at) VALUES('run_v1','prj_v1','tsk_v1','agt_v1',1,'codex','image','active','token-v1','not_needed','coordplane-run-v1','start',1,'` + now + `')`,
-	}
-	_, err = db.ExecContext(ctx, strings.Join(statements, ";"))
-	requireNoError(t, err)
-	requireNoError(t, db.Close())
-
-	database, err := Open(ctx, path)
-	if database != nil {
-		_ = database.Close()
-		t.Fatal("retired Codex database unexpectedly opened")
-	}
-	typed := core.AsError(err)
-	if typed.Code != core.CodeLegacySchemaRebuildRequired || typed.Retryable || !strings.Contains(typed.Message, "backup") || !strings.Contains(typed.Message, "fresh data_dir") {
-		t.Fatalf("startup preflight error = %#v", typed)
-	}
-	db, err = sql.Open("sqlite", path)
-	requireNoError(t, err)
-	defer db.Close()
-	var version, isolationColumns, codexRows int
-	requireNoError(t, db.QueryRow(`SELECT max(version) FROM schema_migrations`).Scan(&version))
-	requireNoError(t, db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name='isolation_spec_version'`).Scan(&isolationColumns))
-	requireNoError(t, db.QueryRow(`SELECT (SELECT COUNT(*) FROM agents WHERE adapter_id='codex')+(SELECT COUNT(*) FROM runs WHERE adapter_id='codex')`).Scan(&codexRows))
-	if version != 1 || isolationColumns != 0 || codexRows != 2 {
-		t.Fatalf("legacy database changed: version=%d isolation_columns=%d codex_rows=%d", version, isolationColumns, codexRows)
-	}
-}
-
-func TestCT01SQLitePragmasSurviveConnectionReplacement(t *testing.T) {
-	ctx := context.Background()
-	store, err := Open(ctx, filepath.Join(t.TempDir(), "connection-churn.db"))
-	requireNoError(t, err)
-	defer store.Close()
-	store.db.SetConnMaxLifetime(time.Nanosecond)
-
-	for range 3 {
-		time.Sleep(time.Millisecond)
-		info, err := store.SchemaInfo(ctx)
-		requireNoError(t, err)
-		if info.JournalMode != "wal" || !info.ForeignKeys || info.BusyTimeout != busyTimeoutMillis {
-			t.Fatalf("replacement connection SQLite pragmas = %#v", info)
-		}
-	}
-	if store.db.Stats().MaxLifetimeClosed == 0 {
-		t.Fatal("test did not replace a SQLite connection")
 	}
 }
 

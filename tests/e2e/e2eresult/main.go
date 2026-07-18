@@ -14,7 +14,7 @@ var expected = map[string]bool{"TestRealClaudeAdapterSmoke": true, "TestRealClau
 
 func main() {
 	decoder := json.NewDecoder(os.Stdin)
-	ran, passed := make(map[string]bool), make(map[string]int)
+	ran, passed := make(map[string]int), make(map[string]int)
 	for {
 		var event testEvent
 		err := decoder.Decode(&event)
@@ -35,14 +35,14 @@ func main() {
 			fail("live test %s ended with %s", event.Test, event.Action)
 		}
 		if event.Test == top && event.Action == "run" {
-			ran[top] = true
+			ran[top]++
 		}
 		if event.Test == top && event.Action == "pass" {
 			passed[top]++
 		}
 	}
 	for name := range expected {
-		if !ran[name] || passed[name] != 1 {
+		if ran[name] != 1 || passed[name] != 1 {
 			fail("live test %s did not run and pass exactly once", name)
 		}
 	}
