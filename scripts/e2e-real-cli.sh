@@ -20,7 +20,8 @@ esac
 case "$digest" in *[!0-9a-f]*) skip "explicit immutable sha256 image is required" ;; esac
 
 docker_config=$(mktemp -d "${TMPDIR:-/tmp}/coordplane-live-docker.XXXXXX")
-cleanup() { rm -rf "$docker_config"; }
+results=$(mktemp "${TMPDIR:-/tmp}/coordplane-live-results.XXXXXX")
+cleanup() { rm -rf "$docker_config" "$results"; }
 trap cleanup EXIT HUP INT TERM
 export DOCKER_CONFIG="$docker_config"
 
@@ -62,8 +63,14 @@ if ! E2E_REAL_CLI=1 \
 	E2E_DOCKER_NETWORK="$network" \
 	E2E_PROVIDER_ENV_ALLOWLIST="$provider_env" \
 	go test -tags=e2e ./tests/e2e \
-		-run '^(TestRealClaudeAdapterSmoke|TestRealClaudeTwoAgentConvergence)$' -count=1 -v -timeout 20m; then
+		-run '^(TestRealClaudeAdapterSmoke|TestRealClaudeTwoAgentConvergence)$' -count=1 -json -timeout 20m >"$results"; then
+	cat "$results"
 	echo "FAIL(real Claude live E2E)"
+	exit 1
+fi
+cat "$results"
+if ! go run ./tests/e2e/e2eresult <"$results"; then
+	echo "FAIL(real Claude live E2E evidence)"
 	exit 1
 fi
 

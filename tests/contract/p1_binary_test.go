@@ -3,6 +3,7 @@ package contract_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -239,6 +240,43 @@ func TestP3ProductionBinaryRejectsRetiredCodexWithoutDurableWrites(t *testing.T)
 	after := durableSignature(t, database, "")
 	if len(snapshot.Agents) != 0 || len(events) != 0 || after != before {
 		t.Fatalf("retired adapter wrote durable state: agents=%#v events=%#v signature_changed=%t", snapshot.Agents, events, after != before)
+	}
+}
+
+func TestP3ProductionBinaryRejectsRetiredCodexResidueBeforeStartupSideEffects(t *testing.T) {
+	tests := []struct {
+		name, agentAdapter, taskState, runState string
+	}{
+		{name: "agent", agentAdapter: "codex"},
+		{name: "queued task", agentAdapter: "codex", taskState: "queued"},
+		{name: "terminal run", agentAdapter: "claude", taskState: "failed", runState: "exited"},
+		{name: "starting run", agentAdapter: "claude", taskState: "running", runState: "starting"},
+		{name: "active run", agentAdapter: "claude", taskState: "running", runState: "active"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, dataDir, socket, configPath := contractConfigPaths(t, "")
+			databasePath := filepath.Join(dataDir, "coordplane.db")
+			seedRetiredCodexState(t, databasePath, test.agentAdapter, test.taskState, test.runState)
+			before, err := os.ReadFile(databasePath)
+			requireNoError(t, err)
+			command := exec.Command(testBinaries.coordplane, "serve", "--config", configPath)
+			raw, runErr := command.CombinedOutput()
+			if runErr == nil || !bytes.Contains(raw, []byte(string(core.CodeLegacySchemaRebuildRequired))) ||
+				!bytes.Contains(raw, []byte("backup")) || !bytes.Contains(raw, []byte("fresh data_dir")) {
+				t.Fatalf("legacy startup err=%v output=%s", runErr, raw)
+			}
+			after, err := os.ReadFile(databasePath)
+			requireNoError(t, err)
+			if !bytes.Equal(after, before) {
+				t.Fatal("legacy startup changed the durable SQLite database")
+			}
+			for _, path := range []string{socket, filepath.Join(dataDir, "locks"), filepath.Join(dataDir, "repos"), filepath.Join(dataDir, "handoff"), filepath.Join(dataDir, "run-control")} {
+				if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("legacy startup created side effect %s: %v", path, err)
+				}
+			}
+		})
 	}
 }
 
@@ -1290,6 +1328,42 @@ func durableSignature(t *testing.T, database *store.Store, projectID string) str
 	}{snapshot, events})
 	requireNoError(t, err)
 	return string(raw)
+}
+
+func seedRetiredCodexState(t *testing.T, path, agentAdapter, taskState, runState string) {
+	t.Helper()
+	requireNoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	database, err := store.Open(context.Background(), path)
+	requireNoError(t, err)
+	requireNoError(t, database.Close())
+	db, err := sql.Open("sqlite", path)
+	requireNoError(t, err)
+	defer db.Close()
+	const now = "2026-07-18T00:00:00Z"
+	_, err = db.Exec(`INSERT INTO projects(id,name,source,source_ref,initial_sha,control_repo_path,canonical_ref,canonical_sha,status,version,created_at,updated_at) VALUES('prj_legacy','legacy','/source','main','abc','/control','refs/heads/main','abc','active',1,?,?)`, now, now)
+	requireNoError(t, err)
+	_, err = db.Exec(`INSERT INTO agents(id,display_name,adapter_id,image,instructions_file,status,version,created_at,updated_at) VALUES('agt_legacy','legacy',?,'image','/instructions','active',1,?,?)`, agentAdapter, now, now)
+	requireNoError(t, err)
+	if taskState == "" {
+		return
+	}
+	currentRun := ""
+	if runState == "starting" || runState == "active" {
+		currentRun = "run_legacy"
+	}
+	_, err = db.Exec(`INSERT INTO tasks(id,project_id,kind,created_by_kind,assignee_agent_id,title,description,status,current_run_id,generation,next_run_at,version,created_at,updated_at) VALUES('tsk_legacy','prj_legacy','work','boss','agt_legacy','legacy','',?,?,1,?,1,?,?)`, taskState, currentRun, now, now, now)
+	requireNoError(t, err)
+	if runState == "" {
+		return
+	}
+	cleanup := "not_needed"
+	if runState == "active" {
+		cleanup = "pending"
+	} else if runState == "exited" {
+		cleanup = "removed"
+	}
+	_, err = db.Exec(`INSERT INTO runs(id,project_id,task_id,agent_id,generation,adapter_id,image,state,token_hash,cleanup_state,container_name,launch_mode,version,created_at) VALUES('run_legacy','prj_legacy','tsk_legacy','agt_legacy',1,'codex','image',?,'legacy-token',?,'coordplane-run-legacy','start',1,?)`, runState, cleanup, now)
+	requireNoError(t, err)
 }
 
 func writeConfig(t *testing.T, root, dataDir, socket, suffix string) string {

@@ -451,6 +451,39 @@ func TestSupervisorStopsRunAfterSessionPersistenceFailure(t *testing.T) {
 	}
 }
 
+func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
+	for _, test := range []struct{ name, frame string }{
+		{name: "malformed", frame: "{"},
+		{name: "init without session", frame: `{"type":"system","subtype":"init"}`},
+		{name: "success without is_error", frame: `{"type":"result","subtype":"success"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, claim := claimRuntimeTestRun(t)
+			message := requireRuntimeValue(service.SendBossMessage(context.Background(), core.BossMessageInput{
+				ProjectID: claim.Task.ProjectID, AgentID: claim.Task.AssigneeAgentID, TaskID: claim.Task.ID,
+				Body: "must remain pending", RequestID: "protocol-message-" + test.name,
+			}))
+			active, ref := activateRuntimeTestRun(t, service, claim)
+			executor := &monitorFailureExecutor{payload: test.frame, stopped: make(chan struct{})}
+			controller := newRuntimeTestController(t, service, executor)
+			monitor := controller.newMonitor(active, ref, adapter.Claude{}, nil)
+			controller.monitors[active.ID] = monitor
+			controller.supervise(monitor)
+			persisted := requireRuntimeValue(service.Run(context.Background(), active.ID))
+			task := requireRuntimeValue(service.Task(context.Background(), claim.Task.ID)).Task
+			if persisted.State != core.RunInterrupted || persisted.RuntimeErrorCode != runtimeLogFailureCode ||
+				persisted.NativeSessionID != "" || persisted.RequestedOutcome != "" || persisted.CleanupState != core.CleanupRemoved ||
+				task.Status == core.TaskCompleted || task.Status == core.TaskSubmitted || task.CurrentRunID != "" {
+				t.Fatalf("protocol frame did not fail closed: Run=%#v Task=%#v", persisted, task)
+			}
+			messages := requireRuntimeValue(service.ListMessages(context.Background(), core.MessageFilter{TaskID: claim.Task.ID}))
+			if len(messages.Items) != 1 || messages.Items[0].ID != message.ID || messages.Items[0].State == core.MessageAcknowledged {
+				t.Fatalf("protocol frame acknowledged a Message: %#v", messages.Items)
+			}
+		})
+	}
+}
+
 func TestShutdownReplaysTailLogsBeforeTerminalConvergence(t *testing.T) {
 	service, claim := claimRuntimeTestRun(t)
 	active, ref := activateRuntimeTestRun(t, service, claim)
@@ -568,6 +601,7 @@ type runtimeTestExecutor struct {
 
 type monitorFailureExecutor struct {
 	runtimeTestExecutor
+	payload string
 	stopped chan struct{}
 	once    sync.Once
 }
@@ -580,6 +614,19 @@ func (e *monitorFailureExecutor) Stop(
 	e.stopCalls.Add(1)
 	e.once.Do(func() { close(e.stopped) })
 	return containerruntime.StopResult{}, nil
+}
+
+func (e *monitorFailureExecutor) Logs(context.Context, containerruntime.RuntimeRef, bool) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader(e.payload)), nil
+}
+
+func (e *monitorFailureExecutor) Wait(ctx context.Context, ref containerruntime.RuntimeRef) (containerruntime.ExitFact, error) {
+	select {
+	case <-e.stopped:
+		return containerruntime.ExitFact{Ref: ref, ExitCode: 143}, nil
+	case <-ctx.Done():
+		return containerruntime.ExitFact{}, ctx.Err()
+	}
 }
 
 type shutdownReplayExecutor struct {

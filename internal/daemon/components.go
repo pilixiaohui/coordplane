@@ -34,6 +34,10 @@ func buildComponents(ctx context.Context, configPath string) (*components, error
 	if err != nil {
 		return nil, err
 	}
+	databasePath := filepath.Join(cfg.DataDir, "coordplane.db")
+	if err := store.PreflightLegacyAdapterState(ctx, databasePath); err != nil {
+		return nil, err
+	}
 	lock, err := AcquireDataDirLock(cfg.DataDir)
 	if err != nil {
 		return nil, err
@@ -42,10 +46,13 @@ func buildComponents(ctx context.Context, configPath string) (*components, error
 	fail := func(cause error) (*components, error) {
 		return nil, errors.Join(cause, result.Close())
 	}
+	if err := store.PreflightLegacyAdapterState(ctx, databasePath); err != nil {
+		return fail(err)
+	}
 	if err := prepareDataDirectories(cfg); err != nil {
 		return fail(err)
 	}
-	database, err := store.Open(ctx, filepath.Join(cfg.DataDir, "coordplane.db"))
+	database, err := store.Open(ctx, databasePath)
 	if err != nil {
 		return fail(err)
 	}

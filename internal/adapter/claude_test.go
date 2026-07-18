@@ -78,11 +78,6 @@ func TestClaudeTypedStreamJSONConformance(t *testing.T) {
 			}
 		})
 	}
-	for _, frame := range []string{"", `{`, `{"type":"system","subtype":"init"}`, `{"type":"result","subtype":"success"}`} {
-		if _, err := entry.ParseEvent([]byte(frame)); err == nil {
-			t.Fatalf("malformed frame accepted: %q", frame)
-		}
-	}
 }
 
 func TestClaudeResumeCompatibilityFencesTaskAgentAndWorkspace(t *testing.T) {

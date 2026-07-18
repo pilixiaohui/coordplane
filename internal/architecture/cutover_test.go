@@ -6,6 +6,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -181,8 +182,9 @@ func TestProductionSourcesDoNotReintroduceLegacyRoutesOrCLI(t *testing.T) {
 	failOffenders(t, "legacy production routes or CLI tokens remain", offenders)
 }
 
-func TestNeedDirectoryHasExactlyFiveAuthorities(t *testing.T) {
-	entries, err := os.ReadDir(filepath.Join(repositoryRoot(t), "need"))
+func TestNeedDirectoryAndProviderContract(t *testing.T) {
+	root := repositoryRoot(t)
+	entries, err := os.ReadDir(filepath.Join(root, "need"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,10 +194,60 @@ func TestNeedDirectoryHasExactlyFiveAuthorities(t *testing.T) {
 			names = append(names, entry.Name())
 		}
 	}
-	sort.Strings(names)
 	want := []string{"README.md", "acceptance.md", "core.md", "git.md", "runtime.md"}
 	if strings.Join(names, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("need authority set = %v, want %v", names, want)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "need", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if docs := string(raw); !strings.Contains(docs, "- ANTHROPIC_API_KEY") || !strings.Contains(docs, "`--bare`") || strings.Contains(docs, "ANTHROPIC_AUTH_TOKEN") || !strings.Contains(docs, "~/.claude") {
+		t.Fatal("README provider credential contract is inconsistent with the Claude runtime")
+	}
+}
+
+func TestRealGateEvidenceRequiresExactNonSkippedTestSet(t *testing.T) {
+	root := repositoryRoot(t)
+	binary := filepath.Join(t.TempDir(), "e2eresult")
+	build := exec.Command("go", "build", "-buildvcs=false", "-o", binary, "./tests/e2e/e2eresult")
+	build.Dir = root
+	if raw, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build real gate evidence checker: %v\n%s", err, raw)
+	}
+	const smoke = "TestRealClaudeAdapterSmoke"
+	const agents = "TestRealClaudeTwoAgentConvergence"
+	exact := `{"Action":"run","Test":"` + smoke + `"}
+{"Action":"run","Test":"` + smoke + `/resume"}
+{"Action":"pass","Test":"` + smoke + `/resume"}
+{"Action":"pass","Test":"` + smoke + `"}
+{"Action":"run","Test":"` + agents + `"}
+{"Action":"pass","Test":"` + agents + `"}`
+	tests := []struct {
+		name, input string
+		pass        bool
+	}{
+		{name: "exact pass", input: exact, pass: true},
+		{name: "zero matches", input: `{"Action":"pass"}`},
+		{name: "one missing", input: `{"Action":"run","Test":"` + smoke + `"}
+{"Action":"pass","Test":"` + smoke + `"}`},
+		{name: "top skip", input: exact + `
+{"Action":"skip","Test":"` + agents + `"}`},
+		{name: "child skip", input: exact + `
+{"Action":"skip","Test":"` + smoke + `/child"}`},
+		{name: "failure", input: `{"Action":"fail","Test":"` + smoke + `"}`},
+		{name: "unexpected top level", input: exact + `
+{"Action":"run","Test":"TestRenamedLiveGate"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			command := exec.Command(binary)
+			command.Stdin = strings.NewReader(test.input)
+			err := command.Run()
+			if (err == nil) != test.pass {
+				t.Fatalf("gate evidence err=%v want_pass=%t", err, test.pass)
+			}
+		})
 	}
 }
 

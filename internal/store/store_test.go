@@ -52,7 +52,7 @@ func TestCT01FileMigrationIsExactAndIdempotent(t *testing.T) {
 	}
 }
 
-func TestCT01V1RunMigrationPreservesLegacyIsolationSpec(t *testing.T) {
+func TestCT01V1CodexStateRequiresRebuildWithoutMigration(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "coordplane-v1.db")
 	db, err := sql.Open("sqlite", path)
@@ -63,21 +63,32 @@ func TestCT01V1RunMigrationPreservesLegacyIsolationSpec(t *testing.T) {
 	statements := []string{
 		`INSERT INTO schema_migrations VALUES(1,'coordplane_v1_six_objects','2026-07-12T00:00:00Z')`,
 		`INSERT INTO projects(id,name,source,source_ref,initial_sha,control_repo_path,canonical_ref,canonical_sha,status,version,created_at,updated_at) VALUES('prj_v1','v1','/source','main','abc','/control','refs/heads/main','abc','active',1,'` + now + `','` + now + `')`,
-		`INSERT INTO agents(id,display_name,adapter_id,image,instructions_file,status,version,created_at,updated_at) VALUES('agt_v1','v1','claude','image','/instructions','active',1,'` + now + `','` + now + `')`,
+		`INSERT INTO agents(id,display_name,adapter_id,image,instructions_file,status,version,created_at,updated_at) VALUES('agt_v1','v1','codex','image','/instructions','active',1,'` + now + `','` + now + `')`,
 		`INSERT INTO tasks(id,project_id,kind,created_by_kind,assignee_agent_id,title,description,status,current_run_id,generation,next_run_at,version,created_at,updated_at) VALUES('tsk_v1','prj_v1','work','boss','agt_v1','v1','','running','run_v1',1,'` + now + `',1,'` + now + `','` + now + `')`,
-		`INSERT INTO runs(id,project_id,task_id,agent_id,generation,adapter_id,image,state,token_hash,cleanup_state,container_name,launch_mode,version,created_at) VALUES('run_v1','prj_v1','tsk_v1','agt_v1',1,'claude','image','active','token-v1','not_needed','coordplane-run-v1','start',1,'` + now + `')`,
+		`INSERT INTO runs(id,project_id,task_id,agent_id,generation,adapter_id,image,state,token_hash,cleanup_state,container_name,launch_mode,version,created_at) VALUES('run_v1','prj_v1','tsk_v1','agt_v1',1,'codex','image','active','token-v1','not_needed','coordplane-run-v1','start',1,'` + now + `')`,
 	}
 	_, err = db.ExecContext(ctx, strings.Join(statements, ";"))
 	requireNoError(t, err)
 	requireNoError(t, db.Close())
 
 	database, err := Open(ctx, path)
+	if database != nil {
+		_ = database.Close()
+		t.Fatal("retired Codex database unexpectedly opened")
+	}
+	typed := core.AsError(err)
+	if typed.Code != core.CodeLegacySchemaRebuildRequired || typed.Retryable || !strings.Contains(typed.Message, "backup") || !strings.Contains(typed.Message, "fresh data_dir") {
+		t.Fatalf("startup preflight error = %#v", typed)
+	}
+	db, err = sql.Open("sqlite", path)
 	requireNoError(t, err)
-	defer database.Close()
-	run, err := database.Run(ctx, "run_v1")
-	requireNoError(t, err)
-	if run.IsolationSpecVersion != core.RunIsolationSpecV1 {
-		t.Fatalf("migrated isolation spec = %d, want legacy v1", run.IsolationSpecVersion)
+	defer db.Close()
+	var version, isolationColumns, codexRows int
+	requireNoError(t, db.QueryRow(`SELECT max(version) FROM schema_migrations`).Scan(&version))
+	requireNoError(t, db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name='isolation_spec_version'`).Scan(&isolationColumns))
+	requireNoError(t, db.QueryRow(`SELECT (SELECT COUNT(*) FROM agents WHERE adapter_id='codex')+(SELECT COUNT(*) FROM runs WHERE adapter_id='codex')`).Scan(&codexRows))
+	if version != 1 || isolationColumns != 0 || codexRows != 2 {
+		t.Fatalf("legacy database changed: version=%d isolation_columns=%d codex_rows=%d", version, isolationColumns, codexRows)
 	}
 }
 

@@ -213,7 +213,7 @@ runtime:
   log_root: /path/to/coordplane-data/logs
   default_image: coordplane-agent:latest
   provider_env_allowlist:
-    - ANTHROPIC_AUTH_TOKEN
+    - ANTHROPIC_API_KEY
 ```
 
 规则：
@@ -224,6 +224,7 @@ runtime:
 - Adapter/image等Runtime配置修改只影响新 Run；Run 必须保存本次解析后的 adapter、image 和 instructions hash。Retention是当前GC策略，每次preview/run都用当前值计算既有closed Task/terminal Run，不改写其`closed_at/ended_at`。
 - Agent 指令可以描述 Manager/Developer/Integrator 工作方式，但 Daemon 不解析其语义。
 - Provider credentials 只通过 runtime 明确 allowlist 注入，不写入配置快照、数据库、事件或日志。
+- Claude provider 固定使用 `--bare` 和 `ANTHROPIC_API_KEY`；不读取 OAuth/keychain/Boss HOME，不挂载或复制宿主 `~/.claude`。
 - `runtime.run_timeout` 可省略或设为 `0` 以禁用自动 deadline；正 duration 会在新 Run 启动时固化为 `deadline_at`，不追溯修改既有 Run。
 - `runtime.shutdown_grace` 可省略（默认 `5s`），显式值必须为正 duration；SIGTERM、stop/cancel/timeout 与重启对账统一使用该 grace。
 - Project 通过 Boss 命令注册，不要求写进配置文件。

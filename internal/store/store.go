@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -49,6 +50,9 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	if err != nil {
 		return nil, core.WrapError(core.CodeInvalidArgument, "resolve SQLite path", false, err)
 	}
+	if err := preflightLegacyAdapterState(ctx, absolute); err != nil {
+		return nil, err
+	}
 	u := &url.URL{Scheme: "file", Path: filepath.ToSlash(absolute)}
 	query := u.Query()
 	query.Set("_txlock", "immediate")
@@ -76,6 +80,53 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, err
 	}
 	return store, nil
+}
+
+// PreflightLegacyAdapterState rejects retired provider state without opening
+// the database for writes or running migrations.
+func PreflightLegacyAdapterState(ctx context.Context, path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" || path == ":memory:" || strings.Contains(path, "mode=memory") {
+		return core.NewError(core.CodeInvalidArgument, "store requires a file-backed SQLite path", false)
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return core.WrapError(core.CodeInvalidArgument, "resolve SQLite path", false, err)
+	}
+	return preflightLegacyAdapterState(ctx, absolute)
+}
+
+func preflightLegacyAdapterState(ctx context.Context, path string) error {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return core.WrapError(core.CodeInternal, "inspect SQLite before startup", false, err)
+	}
+	u := &url.URL{Scheme: "file", Path: filepath.ToSlash(path)}
+	query := u.Query()
+	query.Set("mode", "ro")
+	u.RawQuery = query.Encode()
+	db, err := sql.Open("sqlite", u.String())
+	if err != nil {
+		return core.WrapError(core.CodeInternal, "open SQLite startup preflight", false, err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	var tables int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('agents','runs')`).Scan(&tables); err != nil {
+		return core.WrapError(core.CodeInternal, "inspect SQLite startup schema", false, err)
+	}
+	if tables != 2 {
+		return nil
+	}
+	var legacy int
+	if err := db.QueryRowContext(ctx, `SELECT CASE WHEN EXISTS(SELECT 1 FROM agents WHERE adapter_id='codex') OR EXISTS(SELECT 1 FROM runs WHERE adapter_id='codex') THEN 1 ELSE 0 END`).Scan(&legacy); err != nil {
+		return core.WrapError(core.CodeInternal, "inspect retired adapter state", false, err)
+	}
+	if legacy != 0 {
+		return core.NewError(core.CodeLegacySchemaRebuildRequired, "retired Codex durable state requires backup and a fresh data_dir; stop live resources with the old environment", false)
+	}
+	return nil
 }
 
 func (s *Store) Close() error {

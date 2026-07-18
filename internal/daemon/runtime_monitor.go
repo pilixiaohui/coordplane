@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -56,6 +57,9 @@ func (c *runtimeController) streamLogs(ctx context.Context, run core.Run, ref co
 			ProjectID: run.ProjectID, TaskID: run.TaskID, RunID: run.ID, OperationID: run.LaunchOperationID,
 		})
 		event, parseErr := entry.ParseEvent(line)
+		if parseErr != nil && bytes.HasPrefix(bytes.TrimSpace(line), []byte("{")) {
+			return fmt.Errorf("adapter protocol frame rejected: %w", parseErr)
+		}
 		if parseErr == nil {
 			switch event.Kind {
 			case adapter.EventSessionStarted:
