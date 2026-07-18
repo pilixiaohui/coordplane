@@ -4,7 +4,7 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 image=${E2E_RUNTIME_IMAGE:-}
 network=${E2E_DOCKER_NETWORK:-}
-provider_env=ANTHROPIC_API_KEY
+provider_env=ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL,ANTHROPIC_MODEL,ANTHROPIC_DEFAULT_OPUS_MODEL,ANTHROPIC_DEFAULT_SONNET_MODEL,ANTHROPIC_DEFAULT_HAIKU_MODEL,CLAUDE_CODE_SUBAGENT_MODEL,CLAUDE_CODE_EFFORT_LEVEL
 expected_claude_version='2.1.126 (Claude Code)'
 
 skip() {
@@ -35,7 +35,7 @@ claude_version=$(docker run --rm --network none --read-only --entrypoint claude 
 [ "$claude_version" = "$expected_claude_version" ] || skip "runtime image must contain Claude Code 2.1.126"
 echo "REAL_CLAUDE_IMAGE=$image"
 echo "REAL_CLAUDE_VERSION=$claude_version"
-[ -n "${ANTHROPIC_API_KEY:-}" ] || skip "ANTHROPIC_API_KEY is unavailable"
+[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ] || skip "ANTHROPIC_AUTH_TOKEN is unavailable"
 
 if [ -z "$network" ]; then
 	network=bridge

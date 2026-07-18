@@ -201,7 +201,7 @@ func TestNeedDirectoryAndProviderContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if docs := string(raw); !strings.Contains(docs, "- ANTHROPIC_API_KEY") || !strings.Contains(docs, "`--bare`") || strings.Contains(docs, "ANTHROPIC_AUTH_TOKEN") || !strings.Contains(docs, "~/.claude") {
+	if docs := string(raw); strings.Contains(docs, "ANTHROPIC_API_KEY") || !strings.Contains(docs, "ANTHROPIC_AUTH_TOKEN") || !strings.Contains(docs, "ANTHROPIC_BASE_URL") || !strings.Contains(docs, "CLAUDE_CODE_EFFORT_LEVEL") || !strings.Contains(docs, "`--bare`") || !strings.Contains(docs, "~/.claude") {
 		t.Fatal("README provider credential contract is inconsistent with the Claude runtime")
 	}
 }

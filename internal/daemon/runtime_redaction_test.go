@@ -63,7 +63,7 @@ func TestRuntimeRedactionRemovesEveryLineOfMultilineSecret(t *testing.T) {
 func TestRuntimeLogBoundaryRedactsBoundsAndReplaysFromZero(t *testing.T) {
 	root := t.TempDir()
 	const (
-		providerName = "ANTHROPIC_API_KEY"
+		providerName = "ANTHROPIC_AUTH_TOKEN"
 		secretLineA  = "provider-secret-line-a"
 		secretLineB  = "provider-secret-line-b"
 		runToken     = "run-token-log-boundary"

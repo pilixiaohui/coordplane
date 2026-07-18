@@ -21,6 +21,7 @@ import (
 const (
 	liveE2ETimeout    = 15 * time.Minute
 	realClaudeVersion = "2.1.126 (Claude Code)"
+	realProviderEnv   = "ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL,ANTHROPIC_MODEL,ANTHROPIC_DEFAULT_OPUS_MODEL,ANTHROPIC_DEFAULT_SONNET_MODEL,ANTHROPIC_DEFAULT_HAIKU_MODEL,CLAUDE_CODE_SUBAGENT_MODEL,CLAUDE_CODE_EFFORT_LEVEL"
 )
 
 func TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests(t *testing.T) {
@@ -46,7 +47,7 @@ func TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests(t *testing.T)
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			command := exec.Command(filepath.Clean("../../scripts/e2e-real-cli.sh"))
-			command.Env = append(os.Environ(), "E2E_RUNTIME_IMAGE="+test.image, "ANTHROPIC_API_KEY=not-a-real-key")
+			command.Env = append(os.Environ(), "E2E_RUNTIME_IMAGE="+test.image, "E2E_PROVIDER_ENV_ALLOWLIST="+realProviderEnv, "E2E_EXPECTED_PROVIDER_ENV="+realProviderEnv, "ANTHROPIC_AUTH_TOKEN=not-a-real-token", "ANTHROPIC_API_KEY=")
 			output, runErr := command.CombinedOutput()
 			var exitErr *exec.ExitError
 			if !errors.As(runErr, &exitErr) || exitErr.ExitCode() != 77 || !strings.Contains(string(output), test.want) || strings.Contains(string(output), "PASS(") {
@@ -62,7 +63,7 @@ func TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests(t *testing.T)
 	stubDir, fixture := t.TempDir(), filepath.Join(t.TempDir(), "go-test.json")
 	writeFile(t, filepath.Join(stubDir, "docker"), []byte("#!/bin/sh\ncase \"$1\" in version) exit 0;; image) printf '%s\\n' \"$5\";; run) printf '%s\\n' '"+realClaudeVersion+"';; *) exit 2;; esac\n"), 0o700)
 	writeFile(t, filepath.Join(stubDir, "make"), []byte("#!/bin/sh\nexit 0\n"), 0o700)
-	writeFile(t, filepath.Join(stubDir, "go"), []byte("#!/bin/sh\ncase \"$1\" in test) cat \"$E2E_GATE_FIXTURE\";; run) exec \"$E2E_REAL_GO\" \"$@\";; *) exit 2;; esac\n"), 0o700)
+	writeFile(t, filepath.Join(stubDir, "go"), []byte("#!/bin/sh\ncase \"$1\" in test) [ \"$E2E_PROVIDER_ENV_ALLOWLIST\" = \"$E2E_EXPECTED_PROVIDER_ENV\" ] || exit 4; cat \"$E2E_GATE_FIXTURE\";; run) exec \"$E2E_REAL_GO\" \"$@\";; *) exit 2;; esac\n"), 0o700)
 	const smoke, agents = "TestRealClaudeAdapterSmoke", "TestRealClaudeTwoAgentConvergence"
 	exact := `{"Action":"run","Test":"` + smoke + `"}
 {"Action":"run","Test":"` + smoke + `/resume"}
@@ -93,8 +94,8 @@ func TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests(t *testing.T)
 			writeFile(t, fixture, []byte(test.input), 0o600)
 			command := exec.Command(filepath.Clean("../../scripts/e2e-real-cli.sh"))
 			command.Env = append(os.Environ(), "PATH="+stubDir+string(os.PathListSeparator)+os.Getenv("PATH"),
-				"E2E_RUNTIME_IMAGE=sha256:"+strings.Repeat("a", 64), "ANTHROPIC_API_KEY=not-a-real-key",
-				"E2E_GATE_FIXTURE="+fixture, "E2E_REAL_GO="+realGo)
+				"E2E_RUNTIME_IMAGE=sha256:"+strings.Repeat("a", 64), "E2E_PROVIDER_ENV_ALLOWLIST="+realProviderEnv, "E2E_EXPECTED_PROVIDER_ENV="+realProviderEnv, "ANTHROPIC_AUTH_TOKEN=not-a-real-token", "ANTHROPIC_API_KEY=",
+				"HTTP_PROXY=", "HTTPS_PROXY=", "ALL_PROXY=", "NO_PROXY=", "E2E_GATE_FIXTURE="+fixture, "E2E_REAL_GO="+realGo)
 			output, runErr := command.CombinedOutput()
 			if (runErr == nil) != test.pass || (!test.pass && (!strings.Contains(string(output), "real gate evidence:") || strings.Contains(string(output), "PASS("))) {
 				t.Fatalf("shell gate err=%v want_pass=%t output=%s", runErr, test.pass, output)
@@ -353,12 +354,12 @@ func liveRuntimeConfig(t *testing.T) (string, string, []string) {
 			providerEnv = append(providerEnv, name)
 		}
 	}
-	foundKey := false
+	foundToken := false
 	for _, name := range providerEnv {
-		foundKey = foundKey || name == "ANTHROPIC_API_KEY"
+		foundToken = foundToken || name == "ANTHROPIC_AUTH_TOKEN"
 	}
-	if !foundKey || strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")) == "" {
-		t.Fatal("ANTHROPIC_API_KEY must be present in the provider environment allowlist")
+	if !foundToken || strings.TrimSpace(os.Getenv("ANTHROPIC_AUTH_TOKEN")) == "" {
+		t.Fatal("ANTHROPIC_AUTH_TOKEN must be present in the provider environment allowlist")
 	}
 	return image, network, providerEnv
 }

@@ -118,22 +118,16 @@ func TestBootstrapAdvertisesTheImportedSourceConvenienceRef(t *testing.T) {
 }
 
 func TestContainerSpecKeepsTrustedRuntimeEnvironmentOverProviderAllowlist(t *testing.T) {
-	for _, name := range []string{
-		"HOME",
-		"ANTHROPIC_API_KEY",
-		"COORDPLANE_RUN_SOCKET",
-		"COORDPLANE_RUN_TOKEN_FILE",
-	} {
+	providerEnv := []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL", "CLAUDE_CODE_EFFORT_LEVEL"}
+	for _, name := range append(providerEnv, "HOME", "COORDPLANE_RUN_SOCKET", "COORDPLANE_RUN_TOKEN_FILE") {
 		t.Setenv(name, "/untrusted/provider-value")
 	}
 	coordlink, err := os.Executable()
 	requireNoError(t, err)
 	controller := &runtimeController{
 		config: config.Config{Runtime: config.RuntimeConfig{
-			DockerNetwork: "none",
-			ProviderEnvAllowlist: []string{
-				"HOME", "ANTHROPIC_API_KEY", "COORDPLANE_RUN_SOCKET", "COORDPLANE_RUN_TOKEN_FILE",
-			},
+			DockerNetwork:        "none",
+			ProviderEnvAllowlist: providerEnv,
 		}},
 		coordlink: coordlink,
 	}
@@ -147,16 +141,15 @@ func TestContainerSpecKeepsTrustedRuntimeEnvironmentOverProviderAllowlist(t *tes
 		Env:        map[string]string{"HOME": "/home/agent"},
 	}, "/runtime/run-control/run-env")
 	requireNoError(t, err)
-	want := map[string]string{
-		"HOME":                      "/home/agent",
-		"ANTHROPIC_API_KEY":         "/untrusted/provider-value",
-		"COORDPLANE_RUN_SOCKET":     "/run/coordplane/api.sock",
-		"COORDPLANE_RUN_TOKEN_FILE": "/run/coordplane/token",
-	}
 	if !reflect.DeepEqual(spec.SensitiveEnvKeys, controller.config.Runtime.ProviderEnvAllowlist) {
 		t.Fatalf("sensitive environment keys = %v", spec.SensitiveEnvKeys)
 	}
-	for name, value := range want {
+	for _, name := range providerEnv {
+		if spec.Command.Env[name] != "/untrusted/provider-value" {
+			t.Errorf("container %s = %q, want provider value", name, spec.Command.Env[name])
+		}
+	}
+	for name, value := range map[string]string{"HOME": "/home/agent", "COORDPLANE_RUN_SOCKET": "/run/coordplane/api.sock", "COORDPLANE_RUN_TOKEN_FILE": "/run/coordplane/token"} {
 		if spec.Command.Env[name] != value {
 			t.Errorf("container %s = %q, want trusted %q", name, spec.Command.Env[name], value)
 		}

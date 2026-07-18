@@ -25,7 +25,7 @@ func TestLoadAcceptsStrictMinimalConfigAndZeroRetention(t *testing.T) {
 	if cfg.Retention.CompletedWorkspace != 0 || cfg.Retention.TerminalTaskRef != 168*time.Hour || cfg.Retention.RunLog != 0 {
 		t.Fatalf("retention = %+v", cfg.Retention)
 	}
-	if len(cfg.Runtime.ProviderEnvAllowlist) != 1 || cfg.Runtime.ProviderEnvAllowlist[0] != "ANTHROPIC_API_KEY" {
+	if strings.Join(cfg.Runtime.ProviderEnvAllowlist, ",") != "ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL,ANTHROPIC_MODEL,ANTHROPIC_DEFAULT_OPUS_MODEL,ANTHROPIC_DEFAULT_SONNET_MODEL,ANTHROPIC_DEFAULT_HAIKU_MODEL,CLAUDE_CODE_SUBAGENT_MODEL,CLAUDE_CODE_EFFORT_LEVEL" {
 		t.Fatalf("provider allowlist = %#v", cfg.Runtime.ProviderEnvAllowlist)
 	}
 	if cfg.Runtime.RunTimeout != 0 {
@@ -60,8 +60,8 @@ func TestLoadRejectsInvalidConfigWithoutFallback(t *testing.T) {
 		{name: "relative data directory", raw: strings.Replace(valid, "data_dir: "+dataDir, "data_dir: relative/data", 1), want: "absolute path"},
 		{name: "operator socket outside", raw: strings.Replace(valid, filepath.Join(dataDir, "operator.sock"), filepath.Join(base, "operator.sock"), 1), want: "inside data_dir"},
 		{name: "workspace traversal outside", raw: strings.Replace(valid, filepath.Join(dataDir, "workspaces"), filepath.Join(dataDir, "..", "workspaces"), 1), want: "inside data_dir"},
-		{name: "invalid provider env", raw: strings.Replace(valid, "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY=value", 1), want: "valid environment variable name"},
-		{name: "duplicate provider env", raw: strings.Replace(valid, "    - ANTHROPIC_API_KEY\n", "    - ANTHROPIC_API_KEY\n    - ANTHROPIC_API_KEY\n", 1), want: "contains duplicate"},
+		{name: "invalid provider env", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN=value", 1), want: "valid environment variable name"},
+		{name: "duplicate provider env", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN,", "ANTHROPIC_AUTH_TOKEN, ANTHROPIC_AUTH_TOKEN,", 1), want: "contains duplicate"},
 		{name: "negative run timeout", raw: strings.Replace(valid, "  default_image:", "  run_timeout: -1s\n  default_image:", 1), want: "runtime.run_timeout must be a positive duration or 0"},
 		{name: "zero shutdown grace", raw: strings.Replace(valid, "  default_image:", "  shutdown_grace: 0\n  default_image:", 1), want: "runtime.shutdown_grace must be a positive duration"},
 		{name: "invalid capture timeout", raw: valid + "git:\n  capture_timeout: 0\n", want: "git.capture_timeout must be a positive duration"},
@@ -128,7 +128,7 @@ func TestLoadRejectsProviderAllowlistOverridesOfTrustedRuntimeEnvironment(t *tes
 	} {
 		t.Run(name, func(t *testing.T) {
 			dataDir := filepath.Join(t.TempDir(), "data")
-			raw := strings.Replace(validConfig(dataDir), "ANTHROPIC_API_KEY", name, 1)
+			raw := strings.Replace(validConfig(dataDir), "ANTHROPIC_AUTH_TOKEN", name, 1)
 			_, err := config.Load(writeConfig(t, raw))
 			if err == nil || !strings.Contains(err.Error(), "reserved environment variable") || !strings.Contains(err.Error(), name) {
 				t.Fatalf("Load() error = %v, want reserved %s rejection", err, name)
@@ -172,8 +172,7 @@ func validConfig(dataDir string) string {
 		"  agent_home_root: " + filepath.Join(dataDir, "agent-homes") + "\n" +
 		"  log_root: " + filepath.Join(dataDir, "logs") + "\n" +
 		"  default_image: coordplane-agent:latest\n" +
-		"  provider_env_allowlist:\n" +
-		"    - ANTHROPIC_API_KEY\n"
+		"  provider_env_allowlist: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, ANTHROPIC_MODEL, ANTHROPIC_DEFAULT_OPUS_MODEL, ANTHROPIC_DEFAULT_SONNET_MODEL, ANTHROPIC_DEFAULT_HAIKU_MODEL, CLAUDE_CODE_SUBAGENT_MODEL, CLAUDE_CODE_EFFORT_LEVEL]\n"
 }
 
 func writeConfig(t *testing.T, raw string) string {
