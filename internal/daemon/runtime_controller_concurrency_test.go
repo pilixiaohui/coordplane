@@ -470,13 +470,29 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 			executor := &monitorFailureExecutor{payload: test.frame, stopped: make(chan struct{})}
 			controller := newRuntimeTestController(t, service, executor)
 			if test.waitFirst {
-				monitor := &runMonitor{runID: active.ID, ref: ref, logs: make(chan error, 1), redact: controller.runtimeRedaction(active)}
-				monitor.logs <- controller.streamLogs(context.Background(), active, ref, adapter.Claude{}, monitor)
-				requireNoError(t, controller.finishObservedRun(active, monitor, waitResult{fact: containerruntime.ExitFact{Ref: ref, ExitCode: 1}}))
+				executor.releaseWait, executor.releaseLogs = make(chan struct{}), make(chan struct{})
+				monitor := controller.newMonitor(active, ref, adapter.Claude{}, nil)
+				monitor.wait, monitor.waitDelivered = make(chan waitResult), make(chan struct{})
+				done := make(chan struct{})
+				go func() { controller.supervise(monitor); close(done) }()
+				close(executor.releaseWait)
+				select {
+				case <-monitor.waitDelivered:
+				case <-time.After(time.Second):
+					t.Fatal("Wait-first supervisor did not receive Wait fact")
+				}
+				close(executor.releaseLogs)
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Fatal("Wait-first supervisor did not converge")
+				}
 			} else {
 				monitor := controller.newMonitor(active, ref, adapter.Claude{}, nil)
-				controller.monitors[active.ID] = monitor
 				controller.supervise(monitor)
+			}
+			if test.waitFirst && (executor.stopCalls.Load() == 0 || executor.removeCalls.Load() == 0) {
+				t.Fatalf("Wait-first cleanup calls stop=%d remove=%d", executor.stopCalls.Load(), executor.removeCalls.Load())
 			}
 			persisted := requireRuntimeValue(service.Run(context.Background(), active.ID))
 			task := requireRuntimeValue(service.Task(context.Background(), claim.Task.ID)).Task
@@ -610,9 +626,11 @@ type runtimeTestExecutor struct {
 
 type monitorFailureExecutor struct {
 	runtimeTestExecutor
-	payload string
-	stopped chan struct{}
-	once    sync.Once
+	payload                  string
+	stopped                  chan struct{}
+	once                     sync.Once
+	releaseWait, releaseLogs chan struct{}
+	removeCalls              atomic.Int32
 }
 
 func (e *monitorFailureExecutor) Stop(
@@ -626,16 +644,28 @@ func (e *monitorFailureExecutor) Stop(
 }
 
 func (e *monitorFailureExecutor) Logs(context.Context, containerruntime.RuntimeRef, bool) (io.ReadCloser, error) {
+	if e.releaseLogs != nil {
+		<-e.releaseLogs
+	}
 	return io.NopCloser(strings.NewReader(e.payload)), nil
 }
 
 func (e *monitorFailureExecutor) Wait(ctx context.Context, ref containerruntime.RuntimeRef) (containerruntime.ExitFact, error) {
+	if e.releaseWait != nil {
+		<-e.releaseWait
+		return containerruntime.ExitFact{Ref: ref, ExitCode: 143}, nil
+	}
 	select {
 	case <-e.stopped:
 		return containerruntime.ExitFact{Ref: ref, ExitCode: 143}, nil
 	case <-ctx.Done():
 		return containerruntime.ExitFact{}, ctx.Err()
 	}
+}
+
+func (e *monitorFailureExecutor) Remove(context.Context, containerruntime.RuntimeRef) (containerruntime.RemoveResult, error) {
+	e.removeCalls.Add(1)
+	return containerruntime.RemoveResult{}, nil
 }
 
 type shutdownReplayExecutor struct {

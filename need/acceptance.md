@@ -54,6 +54,13 @@ Verification command
 - 禁止用固定 sleep证明 scheduler/reconciler已运行；等待具体 Event、状态或 Docker/Git事实，并带明确 deadline。
 - 删除旧机制时，同一变更删除旧 fixture和正向兼容测试；只保留防止旧路径回归的负向 guard。
 
+SQLite startup no-side-effect signatures have one explicit sidecar rule: the main
+database and `-wal` bytes must remain identical. The `-shm` path, type, mode, and
+size are durable directory evidence, but its WAL-index and lock bytes are
+process-local SQLite state and are excluded from byte equality because a
+read-only preflight may acquire and release those slots. Tests must not treat
+that permitted index churn as a migration or startup side effect.
+
 ## 3. 测试层级
 
 | 层级 | 必测内容 | 必须使用的真实边界 |

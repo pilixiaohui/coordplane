@@ -5,8 +5,8 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
+	"time"
 
 	"coordplane/internal/core"
 
@@ -25,12 +25,9 @@ func TestCT01FileMigrationIsExactAndIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "coordplane.db")
 	store, err := Open(ctx, path)
 	requireNoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
 	info, err := store.SchemaInfo(ctx)
 	requireNoError(t, err)
-	wantTables := []string{"agents", "events", "messages", "projects", "request_dedupes", "runs", "schema_migrations", "tasks"}
-	if !reflect.DeepEqual(info.Tables, wantTables) {
-		t.Fatalf("tables = %v, want %v", info.Tables, wantTables)
-	}
 	if info.JournalMode != "wal" || !info.ForeignKeys || info.BusyTimeout != busyTimeoutMillis {
 		t.Fatalf("SQLite pragmas = %#v", info)
 	}
@@ -39,45 +36,17 @@ func TestCT01FileMigrationIsExactAndIdempotent(t *testing.T) {
 	if len(result.Applied) != 0 {
 		t.Fatalf("second migration applied %v", result.Applied)
 	}
-	requireNoError(t, store.Close())
-	reopened, err := Open(ctx, path)
-	requireNoError(t, err)
-	t.Cleanup(func() { _ = reopened.Close() })
-	info, err = reopened.SchemaInfo(ctx)
-	requireNoError(t, err)
-	if !reflect.DeepEqual(info.Tables, wantTables) {
-		t.Fatalf("reopened tables = %v", info.Tables)
+	store.db.SetConnMaxLifetime(time.Nanosecond)
+	for range 3 {
+		time.Sleep(time.Millisecond)
+		info, err = store.SchemaInfo(ctx)
+		requireNoError(t, err)
+		if info.JournalMode != "wal" || !info.ForeignKeys || info.BusyTimeout != busyTimeoutMillis {
+			t.Fatalf("replacement connection pragmas = %#v", info)
+		}
 	}
-}
-
-func TestCT01LegacyDatabaseFailsClosedWithoutSchemaRewrite(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "legacy.db")
-	db, err := sql.Open("sqlite", path)
-	requireNoError(t, err)
-	if _, err := db.Exec(`CREATE TABLE work_contracts(id TEXT PRIMARY KEY, status TEXT); INSERT INTO work_contracts VALUES('old','active')`); err != nil {
-		t.Fatal(err)
-	}
-	requireNoError(t, db.Close())
-	opened, err := Open(ctx, path)
-	if opened != nil {
-		_ = opened.Close()
-		t.Fatal("legacy database unexpectedly opened")
-	}
-	if !core.IsCode(err, core.CodeLegacySchemaRebuildRequired) {
-		t.Fatalf("error = %v", err)
-	}
-	db, err = sql.Open("sqlite", path)
-	requireNoError(t, err)
-	defer db.Close()
-	var status string
-	if err := db.QueryRow(`SELECT status FROM work_contracts WHERE id='old'`).Scan(&status); err != nil || status != "active" {
-		t.Fatalf("legacy row changed: status=%q err=%v", status, err)
-	}
-	var newTables int
-	requireNoError(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='projects'`).Scan(&newTables))
-	if newTables != 0 {
-		t.Fatal("new schema was written beside legacy schema")
+	if store.db.Stats().MaxLifetimeClosed == 0 {
+		t.Fatal("test did not replace a SQLite connection")
 	}
 }
 

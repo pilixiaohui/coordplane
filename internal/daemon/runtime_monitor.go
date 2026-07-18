@@ -31,6 +31,9 @@ func (c *runtimeController) newMonitor(run core.Run, ref containerruntime.Runtim
 	go func() {
 		fact, err := c.executor.Wait(waitCtx, ref)
 		monitor.wait <- waitResult{fact: fact, err: err}
+		if monitor.waitDelivered != nil {
+			close(monitor.waitDelivered)
+		}
 	}()
 	go func() { monitor.logs <- c.streamLogs(waitCtx, run, ref, entry, monitor) }()
 	return monitor

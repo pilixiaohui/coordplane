@@ -1382,6 +1382,7 @@ func seedRetiredCodexState(t *testing.T, path, agentAdapter, taskState, runState
 
 func dataDirSignature(t *testing.T, root string) string {
 	t.Helper()
+	// Signature contract: DB/WAL bytes are literal; SQLite's process-local SHM index is metadata-only.
 	var entries []string
 	requireNoError(t, filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
