@@ -154,16 +154,19 @@ func TestValidateAdoptionRejectsIsolationDrift(t *testing.T) {
 	if err := ValidateAdoption(spec, valid()); err != nil {
 		t.Fatalf("matching isolation rejected: %v", err)
 	}
-	rotatedSecret := valid()
-	setEnvironmentDigest(&rotatedSecret, "PROVIDER_TOKEN", "rotated-provider-secret")
-	if err := ValidateAdoption(spec, rotatedSecret); err != nil {
-		t.Fatalf("rotated sensitive environment value rejected: %v", err)
+	withoutSecret := validTestSpec(source)
+	delete(withoutSecret.Command.Env, "PROVIDER_TOKEN")
+	if err := ValidateAdoption(withoutSecret, valid()); !errors.Is(err, ErrOwnership) {
+		t.Fatalf("removed sensitive environment error = %v, want ownership rejection", err)
 	}
 	tests := map[string]func(*LiveState){
-		"image":               func(state *LiveState) { state.Image = "other:image" },
-		"entrypoint":          func(state *LiveState) { state.Entrypoint = []string{"/bin/sh"} },
-		"command arguments":   func(state *LiveState) { state.CommandArgs = []string{"other"} },
-		"fixed environment":   func(state *LiveState) { setEnvironmentDigest(state, "HOME", "/root") },
+		"image":             func(state *LiveState) { state.Image = "other:image" },
+		"entrypoint":        func(state *LiveState) { state.Entrypoint = []string{"/bin/sh"} },
+		"command arguments": func(state *LiveState) { state.CommandArgs = []string{"other"} },
+		"fixed environment": func(state *LiveState) { setEnvironmentDigest(state, "HOME", "/root") },
+		"rotated sensitive environment": func(state *LiveState) {
+			setEnvironmentDigest(state, "PROVIDER_TOKEN", "rotated-provider-secret")
+		},
 		"missing environment": func(state *LiveState) { removeEnvironmentFact(state, "PROVIDER_TOKEN") },
 		"duplicate environment": func(state *LiveState) {
 			state.Environment = append(state.Environment, state.Environment[0])

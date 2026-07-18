@@ -22,6 +22,8 @@ const (
 	liveE2ETimeout    = 15 * time.Minute
 	realClaudeVersion = "2.1.126 (Claude Code)"
 	realProviderEnv   = "ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL,ANTHROPIC_MODEL,ANTHROPIC_DEFAULT_OPUS_MODEL,ANTHROPIC_DEFAULT_SONNET_MODEL,ANTHROPIC_DEFAULT_HAIKU_MODEL,CLAUDE_CODE_SUBAGENT_MODEL,CLAUDE_CODE_EFFORT_LEVEL"
+	realTokenCanary   = "real-gate-auth-token-canary"
+	realAPIKeyCanary  = "real-gate-api-key-canary"
 )
 
 func TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests(t *testing.T) {
@@ -47,8 +49,8 @@ func TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests(t *testing.T)
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			command := exec.Command(filepath.Clean("../../scripts/e2e-real-cli.sh"))
-			command.Env = append(os.Environ(), "E2E_RUNTIME_IMAGE="+test.image, "E2E_PROVIDER_ENV_ALLOWLIST="+realProviderEnv, "E2E_EXPECTED_PROVIDER_ENV="+realProviderEnv, "ANTHROPIC_AUTH_TOKEN=not-a-real-token", "ANTHROPIC_API_KEY=")
-			output, runErr := command.CombinedOutput()
+			command.Env = append(os.Environ(), "E2E_RUNTIME_IMAGE="+test.image, "E2E_PROVIDER_ENV_ALLOWLIST="+realProviderEnv, "E2E_EXPECTED_PROVIDER_ENV="+realProviderEnv, "ANTHROPIC_AUTH_TOKEN="+realTokenCanary, "ANTHROPIC_API_KEY="+realAPIKeyCanary)
+			output, runErr := realGateOutput(t, command)
 			var exitErr *exec.ExitError
 			if !errors.As(runErr, &exitErr) || exitErr.ExitCode() != 77 || !strings.Contains(string(output), test.want) || strings.Contains(string(output), "PASS(") {
 				t.Fatalf("gate err=%v output=%s", runErr, output)
@@ -65,24 +67,16 @@ func TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests(t *testing.T)
 	writeFile(t, filepath.Join(stubDir, "make"), []byte("#!/bin/sh\nexit 0\n"), 0o700)
 	writeFile(t, filepath.Join(stubDir, "go"), []byte("#!/bin/sh\ncase \"$1\" in test) [ \"$E2E_PROVIDER_ENV_ALLOWLIST\" = \"$E2E_EXPECTED_PROVIDER_ENV\" ] || exit 4; cat \"$E2E_GATE_FIXTURE\";; run) exec \"$E2E_REAL_GO\" \"$@\";; *) exit 2;; esac\n"), 0o700)
 	const smoke, agents = "TestRealClaudeAdapterSmoke", "TestRealClaudeTwoAgentConvergence"
-	exact := `{"Action":"run","Test":"` + smoke + `"}
-{"Action":"run","Test":"` + smoke + `/resume"}
-{"Action":"pass","Test":"` + smoke + `/resume"}
-{"Action":"pass","Test":"` + smoke + `"}
-{"Action":"run","Test":"` + agents + `"}
-{"Action":"pass","Test":"` + agents + `"}`
+	exact := `{"Action":"run","Test":"` + smoke + `"}` + "\n" + `{"Action":"run","Test":"` + smoke + `/resume"}` + "\n" + `{"Action":"pass","Test":"` + smoke + `/resume"}` + "\n" + `{"Action":"pass","Test":"` + smoke + `"}` + "\n" + `{"Action":"run","Test":"` + agents + `"}` + "\n" + `{"Action":"pass","Test":"` + agents + `"}`
 	mutants := []struct {
 		name, input string
 		pass        bool
 	}{
 		{name: "exact set", input: exact, pass: true},
 		{name: "zero matches", input: `{"Action":"pass"}`},
-		{name: "missing test", input: `{"Action":"run","Test":"` + smoke + `"}
-{"Action":"pass","Test":"` + smoke + `"}`},
-		{name: "top skip", input: exact + `
-{"Action":"skip","Test":"` + agents + `"}`},
-		{name: "child skip", input: exact + `
-{"Action":"skip","Test":"` + smoke + `/child"}`},
+		{name: "missing test", input: `{"Action":"run","Test":"` + smoke + `"}` + "\n" + `{"Action":"pass","Test":"` + smoke + `"}`},
+		{name: "top skip", input: exact + "\n" + `{"Action":"skip","Test":"` + agents + `"}`},
+		{name: "child skip", input: exact + "\n" + `{"Action":"skip","Test":"` + smoke + `/child"}`},
 		{name: "failure", input: `{"Action":"fail","Test":"` + smoke + `"}`},
 		{name: "unexpected top level", input: exact + `
 {"Action":"run","Test":"TestRenamedLiveGate"}`},
@@ -94,14 +88,23 @@ func TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests(t *testing.T)
 			writeFile(t, fixture, []byte(test.input), 0o600)
 			command := exec.Command(filepath.Clean("../../scripts/e2e-real-cli.sh"))
 			command.Env = append(os.Environ(), "PATH="+stubDir+string(os.PathListSeparator)+os.Getenv("PATH"),
-				"E2E_RUNTIME_IMAGE=sha256:"+strings.Repeat("a", 64), "E2E_PROVIDER_ENV_ALLOWLIST="+realProviderEnv, "E2E_EXPECTED_PROVIDER_ENV="+realProviderEnv, "ANTHROPIC_AUTH_TOKEN=not-a-real-token", "ANTHROPIC_API_KEY=",
-				"HTTP_PROXY=", "HTTPS_PROXY=", "ALL_PROXY=", "NO_PROXY=", "E2E_GATE_FIXTURE="+fixture, "E2E_REAL_GO="+realGo)
-			output, runErr := command.CombinedOutput()
+				"E2E_RUNTIME_IMAGE=sha256:"+strings.Repeat("a", 64), "E2E_PROVIDER_ENV_ALLOWLIST="+realProviderEnv, "E2E_EXPECTED_PROVIDER_ENV="+realProviderEnv, "ANTHROPIC_AUTH_TOKEN="+realTokenCanary, "ANTHROPIC_API_KEY="+realAPIKeyCanary,
+				"HTTP_PROXY=proxy-canary", "HTTPS_PROXY=proxy-canary", "ALL_PROXY=proxy-canary", "NO_PROXY=proxy-canary", "E2E_GATE_FIXTURE="+fixture, "E2E_REAL_GO="+realGo)
+			output, runErr := realGateOutput(t, command)
 			if (runErr == nil) != test.pass || (!test.pass && (!strings.Contains(string(output), "real gate evidence:") || strings.Contains(string(output), "PASS("))) {
 				t.Fatalf("shell gate err=%v want_pass=%t output=%s", runErr, test.pass, output)
 			}
 		})
 	}
+}
+
+func realGateOutput(t *testing.T, command *exec.Cmd) ([]byte, error) {
+	t.Helper()
+	output, err := command.CombinedOutput()
+	if strings.Contains(string(output), realTokenCanary) || strings.Contains(string(output), realAPIKeyCanary) {
+		t.Fatal("real gate output leaked a credential canary")
+	}
+	return output, err
 }
 
 func TestRealClaudeAdapterSmoke(t *testing.T) {

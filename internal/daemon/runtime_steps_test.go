@@ -119,7 +119,7 @@ func TestBootstrapAdvertisesTheImportedSourceConvenienceRef(t *testing.T) {
 
 func TestContainerSpecKeepsTrustedRuntimeEnvironmentOverProviderAllowlist(t *testing.T) {
 	providerEnv := []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL", "CLAUDE_CODE_EFFORT_LEVEL"}
-	for _, name := range append(providerEnv, "HOME", "COORDPLANE_RUN_SOCKET", "COORDPLANE_RUN_TOKEN_FILE") {
+	for _, name := range append(providerEnv, "ANTHROPIC_API_KEY", "HOME", "COORDPLANE_RUN_SOCKET", "COORDPLANE_RUN_TOKEN_FILE") {
 		t.Setenv(name, "/untrusted/provider-value")
 	}
 	coordlink, err := os.Executable()
@@ -148,6 +148,9 @@ func TestContainerSpecKeepsTrustedRuntimeEnvironmentOverProviderAllowlist(t *tes
 		if spec.Command.Env[name] != "/untrusted/provider-value" {
 			t.Errorf("container %s = %q, want provider value", name, spec.Command.Env[name])
 		}
+	}
+	if _, exists := spec.Command.Env["ANTHROPIC_API_KEY"]; exists {
+		t.Fatal("ContainerSpec admitted retired ANTHROPIC_API_KEY")
 	}
 	for name, value := range map[string]string{"HOME": "/home/agent", "COORDPLANE_RUN_SOCKET": "/run/coordplane/api.sock", "COORDPLANE_RUN_TOKEN_FILE": "/run/coordplane/token"} {
 		if spec.Command.Env[name] != value {

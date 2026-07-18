@@ -93,7 +93,14 @@ func validateAdoptionEnvironment(expected ContainerSpec, actual []EnvironmentFac
 		if !exists {
 			return isolationMismatch("environment")
 		}
-		if _, secret := sensitive[name]; !secret && actualDigest != environmentValueDigest(value) {
+		if actualDigest != environmentValueDigest(value) {
+			return isolationMismatch("environment")
+		}
+	}
+	for name := range sensitive {
+		_, expectedPresent := expected.Command.Env[name]
+		_, actualPresent := actualByName[name]
+		if expectedPresent != actualPresent {
 			return isolationMismatch("environment")
 		}
 	}

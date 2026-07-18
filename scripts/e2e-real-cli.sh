@@ -47,12 +47,6 @@ if [ -z "$network" ]; then
 	done
 fi
 
-for name in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY; do
-	if value=$(printenv "$name" 2>/dev/null) && [ -n "$value" ]; then
-		provider_env="$provider_env,$name"
-	fi
-done
-
 cd "$root"
 make build
 if ! E2E_REAL_CLI=1 \
