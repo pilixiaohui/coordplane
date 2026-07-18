@@ -18,6 +18,18 @@ func requireNoError(t *testing.T, err error) {
 	}
 }
 
+func requireRedactedOwnershipError(t *testing.T, err error) {
+	t.Helper()
+	if !errors.Is(err, ErrOwnership) {
+		t.Fatal("drift did not return the generic ownership error")
+	}
+	for _, forbidden := range []string{"PROVIDER_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "provider-secret", "rotated-provider-secret", environmentValueDigest("provider-secret"), environmentValueDigest("rotated-provider-secret")} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Fatal("ownership error exposed sensitive environment detail")
+		}
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -156,9 +168,7 @@ func TestValidateAdoptionRejectsIsolationDrift(t *testing.T) {
 	}
 	withoutSecret := validTestSpec(source)
 	delete(withoutSecret.Command.Env, "PROVIDER_TOKEN")
-	if err := ValidateAdoption(withoutSecret, valid()); !errors.Is(err, ErrOwnership) {
-		t.Fatalf("removed sensitive environment error = %v, want ownership rejection", err)
-	}
+	requireRedactedOwnershipError(t, ValidateAdoption(withoutSecret, valid()))
 	tests := map[string]func(*LiveState){
 		"image":             func(state *LiveState) { state.Image = "other:image" },
 		"entrypoint":        func(state *LiveState) { state.Entrypoint = []string{"/bin/sh"} },
@@ -208,9 +218,7 @@ func TestValidateAdoptionRejectsIsolationDrift(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			state := valid()
 			mutate(&state)
-			if err := ValidateAdoption(spec, state); !errors.Is(err, ErrOwnership) {
-				t.Fatalf("drift error = %v, want ownership rejection", err)
-			}
+			requireRedactedOwnershipError(t, ValidateAdoption(spec, state))
 		})
 	}
 }

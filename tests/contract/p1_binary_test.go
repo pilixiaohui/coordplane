@@ -1420,22 +1420,8 @@ func dataDirSignature(t *testing.T, root string) string {
 func writeConfig(t *testing.T, root, dataDir, socket, suffix string) string {
 	t.Helper()
 	path := filepath.Join(root, "coordplane.yaml")
-	raw := fmt.Sprintf(`data_dir: %s
-operator_socket: %s
-max_parallel_runs: 4
-retention:
-  completed_workspace: 24h
-  terminal_task_ref: 168h
-  run_log: 168h
-runtime:
-  docker_network: coordplane
-  workspace_root: %s
-  agent_home_root: %s
-  log_root: %s
-  default_image: agent:latest
-  provider_env_allowlist: []
-%s`, dataDir, socket, filepath.Join(dataDir, "workspaces"), filepath.Join(dataDir, "agent-homes"), filepath.Join(dataDir, "logs"), suffix)
-	requireNoError(t, os.WriteFile(path, []byte(raw), 0o600))
+	raw := testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: 4, CompletedWorkspace: "24h", TerminalTaskRef: "168h", RunLog: "168h", DockerNetwork: "coordplane", DefaultImage: "agent:latest", Tail: suffix})
+	requireNoError(t, os.WriteFile(path, raw, 0o600))
 	return path
 }
 

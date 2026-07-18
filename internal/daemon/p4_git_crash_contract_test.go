@@ -5,7 +5,6 @@ package daemon
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +16,7 @@ import (
 	"coordplane/internal/gitcapture"
 	"coordplane/internal/gitrepo"
 	"coordplane/internal/store"
+	"coordplane/tests/testsupport"
 )
 
 func TestGT03SQLiteTaskRunAndRealGitCaptureRecoverAcrossProcessSIGKILL(t *testing.T) {
@@ -176,21 +176,7 @@ func writeP4ComponentsConfig(t *testing.T, root string) string {
 	t.Helper()
 	requireNoError(t, os.Chmod(root, 0o700))
 	path := filepath.Join(root, "coordplane.yaml")
-	raw := fmt.Sprintf(`data_dir: %s
-operator_socket: %s
-max_parallel_runs: 4
-retention:
-  completed_workspace: 24h
-  terminal_task_ref: 168h
-  run_log: 168h
-runtime:
-  docker_network: coordplane
-  workspace_root: %s
-  agent_home_root: %s
-  log_root: %s
-  default_image: agent:test
-  provider_env_allowlist: []
-`, root, filepath.Join(root, "operator.sock"), filepath.Join(root, "workspaces"), filepath.Join(root, "homes"), filepath.Join(root, "logs"))
+	raw := testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: root, OperatorSocket: filepath.Join(root, "operator.sock"), WorkspaceRoot: filepath.Join(root, "workspaces"), AgentHomeRoot: filepath.Join(root, "homes"), LogRoot: filepath.Join(root, "logs"), MaxParallelRuns: 4, CompletedWorkspace: "24h", TerminalTaskRef: "168h", RunLog: "168h", DockerNetwork: "coordplane", DefaultImage: "agent:test"})
 	requireNoError(t, os.WriteFile(path, []byte(raw), 0o600))
 	return path
 }

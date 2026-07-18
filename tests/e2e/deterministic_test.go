@@ -632,29 +632,7 @@ func createSourceRepository(t *testing.T, ctx context.Context, root string) (str
 func writeConfig(t *testing.T, root, dataDir, socket, image string) string {
 	t.Helper()
 	path := filepath.Join(root, "coordplane.yaml")
-	content := fmt.Sprintf(`data_dir: %s
-operator_socket: %s
-max_parallel_runs: 2
-retention:
-  completed_workspace: 0
-  terminal_task_ref: 24h
-  run_log: 24h
-runtime:
-  docker_network: none
-  workspace_root: %s
-  agent_home_root: %s
-  log_root: %s
-  default_image: %s
-  provider_env_allowlist: []
-  run_timeout: 2m
-  shutdown_grace: 3s
-git:
-  capture_helper_image: %s
-  capture_timeout: 30s
-  maximum_bundle_bytes: 67108864
-  maximum_objects: 250000
-  maximum_handoff_bytes: 268435456
-`, dataDir, socket, filepath.Join(dataDir, "workspaces"), filepath.Join(dataDir, "agent-homes"), filepath.Join(dataDir, "logs"), image, image)
+	content := testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: 2, CompletedWorkspace: "0", TerminalTaskRef: "24h", RunLog: "24h", DockerNetwork: "none", DefaultImage: image, Tail: "  run_timeout: 2m\n  shutdown_grace: 3s\ngit:\n  capture_helper_image: " + image + "\n  capture_timeout: 30s\n  maximum_bundle_bytes: 67108864\n  maximum_objects: 250000\n  maximum_handoff_bytes: 268435456\n"})
 	writeFile(t, path, []byte(content), 0o600)
 	return path
 }

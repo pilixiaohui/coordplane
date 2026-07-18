@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -18,7 +19,11 @@ const (
 	DefaultCaptureBundleSize = int64(64 << 20)
 	DefaultCaptureObjects    = 250_000
 	DefaultHandoffSize       = int64(256 << 20)
+	claudeProviderEnvNames   = "ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL,ANTHROPIC_MODEL,ANTHROPIC_DEFAULT_OPUS_MODEL,ANTHROPIC_DEFAULT_SONNET_MODEL,ANTHROPIC_DEFAULT_HAIKU_MODEL,CLAUDE_CODE_SUBAGENT_MODEL,CLAUDE_CODE_EFFORT_LEVEL"
 )
+
+// ClaudeProviderEnvCatalog is the only provider environment admitted by v1 configuration.
+func ClaudeProviderEnvCatalog() []string { return strings.Split(claudeProviderEnvNames, ",") }
 
 // Config is the complete v1 daemon configuration surface.
 type Config struct {
@@ -268,6 +273,7 @@ func (c *Config) Validate() error {
 		return errors.New("validate config: git.maximum_handoff_bytes must be at least maximum_bundle_bytes")
 	}
 
+	catalog := ClaudeProviderEnvCatalog()
 	seenEnv := make(map[string]struct{}, len(c.Runtime.ProviderEnvAllowlist))
 	for i, name := range c.Runtime.ProviderEnvAllowlist {
 		name = strings.TrimSpace(name)
@@ -276,6 +282,9 @@ func (c *Config) Validate() error {
 		}
 		if reservedRuntimeEnvironment(name) {
 			return fmt.Errorf("validate config: runtime.provider_env_allowlist[%d] cannot override reserved environment variable %q", i, name)
+		}
+		if !slices.Contains(catalog, name) {
+			return fmt.Errorf("validate config: runtime.provider_env_allowlist[%d] is outside the Claude provider environment catalog: %q", i, name)
 		}
 		if _, exists := seenEnv[name]; exists {
 			return fmt.Errorf("validate config: runtime.provider_env_allowlist contains duplicate %q", name)

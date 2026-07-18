@@ -118,7 +118,7 @@ func TestBootstrapAdvertisesTheImportedSourceConvenienceRef(t *testing.T) {
 }
 
 func TestContainerSpecKeepsTrustedRuntimeEnvironmentOverProviderAllowlist(t *testing.T) {
-	providerEnv := []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL", "CLAUDE_CODE_EFFORT_LEVEL"}
+	providerEnv := config.ClaudeProviderEnvCatalog()
 	for _, name := range append(providerEnv, "ANTHROPIC_API_KEY", "HOME", "COORDPLANE_RUN_SOCKET", "COORDPLANE_RUN_TOKEN_FILE") {
 		t.Setenv(name, "/untrusted/provider-value")
 	}

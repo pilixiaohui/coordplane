@@ -1133,7 +1133,7 @@ func pfJSON[T any](batch *pfBatch, args ...string) T {
 func writePerfConfig(t *testing.T, root, dataDir, socket, image string, parallel int) string {
 	t.Helper()
 	path := filepath.Join(root, "coordplane.yaml")
-	content := fmt.Sprintf("data_dir: %s\noperator_socket: %s\nmax_parallel_runs: %d\nretention:\n  completed_workspace: 0\n  terminal_task_ref: 24h\n  run_log: 0\nruntime:\n  docker_network: none\n  workspace_root: %s\n  agent_home_root: %s\n  log_root: %s\n  default_image: %s\n  provider_env_allowlist: []\n  run_timeout: 3m\n  shutdown_grace: 3s\ngit:\n  capture_helper_image: %s\n  capture_timeout: 30s\n  maximum_bundle_bytes: 67108864\n  maximum_objects: 250000\n  maximum_handoff_bytes: 268435456\n", dataDir, socket, parallel, filepath.Join(dataDir, "workspaces"), filepath.Join(dataDir, "agent-homes"), filepath.Join(dataDir, "logs"), image, image)
+	content := testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: parallel, CompletedWorkspace: "0", TerminalTaskRef: "24h", RunLog: "0", DockerNetwork: "none", DefaultImage: image, Tail: "  run_timeout: 3m\n  shutdown_grace: 3s\ngit:\n  capture_helper_image: " + image + "\n  capture_timeout: 30s\n  maximum_bundle_bytes: 67108864\n  maximum_objects: 250000\n  maximum_handoff_bytes: 268435456\n"})
 	writeFile(t, path, []byte(content), 0o600)
 	return path
 }

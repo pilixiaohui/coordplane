@@ -792,53 +792,6 @@ func waitP3DaemonProcess(t *testing.T, process *p3DaemonProcess) {
 	_ = process.log.Close()
 }
 
-func waitForP3DaemonNotReady(t *testing.T, process *p3DaemonProcess, client *transport.Client) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	var last core.Status
-	var lastErr error
-	for time.Now().Before(deadline) {
-		lastErr = client.JSON(context.Background(), http.MethodGet, "/v1/status", nil, &last)
-		if lastErr == nil && !last.DaemonReady {
-			return
-		}
-		select {
-		case err := <-process.done:
-			process.command = nil
-			_ = process.log.Close()
-			t.Fatalf("daemon exited before shutdown grace was observable: %v\n%s", err, readP3DaemonLog(process.logPath))
-		default:
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("daemon did not expose shutdown readiness fence: status=%#v err=%v\n%s", last, lastErr, readP3DaemonLog(process.logPath))
-}
-
-func assertTaskUnclaimedDuringShutdown(
-	t *testing.T,
-	process *p3DaemonProcess,
-	client *transport.Client,
-	taskID string,
-) {
-	t.Helper()
-	deadline := time.Now().Add(500 * time.Millisecond)
-	observations := 0
-	for time.Now().Before(deadline) {
-		var detail core.TaskDetail
-		if err := client.JSON(context.Background(), http.MethodGet, "/v1/tasks/"+taskID, nil, &detail); err != nil {
-			t.Fatalf("read shutdown-fenced Task: %v\n%s", err, readP3DaemonLog(process.logPath))
-		}
-		if detail.Task.Status != core.TaskQueued || detail.Task.CurrentRunID != "" || detail.CurrentRun != nil {
-			t.Fatalf("shutdown scheduler claimed new Task during grace: %#v", detail)
-		}
-		observations++
-		time.Sleep(20 * time.Millisecond)
-	}
-	if observations < 2 {
-		t.Fatalf("shutdown claim fence observations = %d", observations)
-	}
-}
-
 func readP3DaemonLog(path string) string {
 	raw, err := os.ReadFile(path)
 	if err != nil {

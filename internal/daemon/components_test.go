@@ -3,13 +3,13 @@ package daemon
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"coordplane/tests/testsupport"
 	_ "modernc.org/sqlite"
 )
 
@@ -106,21 +106,7 @@ func writeTestConfig(t *testing.T, root string) string {
 	t.Helper()
 	dataDir := filepath.Join(root, "data")
 	configPath := filepath.Join(root, "coordplane.yaml")
-	raw := fmt.Sprintf(`data_dir: %s
-operator_socket: %s
-max_parallel_runs: 4
-retention:
-  completed_workspace: 24h
-  terminal_task_ref: 168h
-  run_log: 168h
-runtime:
-  docker_network: coordplane
-  workspace_root: %s
-  agent_home_root: %s
-  log_root: %s
-  default_image: coordplane-agent:latest
-  provider_env_allowlist: []
-`, dataDir, filepath.Join(dataDir, "operator.sock"), filepath.Join(dataDir, "workspaces"), filepath.Join(dataDir, "agent-homes"), filepath.Join(dataDir, "logs"))
+	raw := testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: filepath.Join(dataDir, "operator.sock"), MaxParallelRuns: 4, CompletedWorkspace: "24h", TerminalTaskRef: "168h", RunLog: "168h", DockerNetwork: "coordplane", DefaultImage: "coordplane-agent:latest"})
 	requireNoError(t, os.WriteFile(configPath, []byte(raw), 0o600))
 	return configPath
 }

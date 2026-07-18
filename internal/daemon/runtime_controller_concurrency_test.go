@@ -279,6 +279,74 @@ func TestReconcileRefreshesCanonicalRunAfterOwnershipHandoff(t *testing.T) {
 	}
 }
 
+func TestReconcileRejectsSensitiveEnvironmentMismatchBeforeMonitor(t *testing.T) {
+	const providerName, currentValue, staleValue = "ANTHROPIC_AUTH_TOKEN", "current-auth-canary", "stale-auth-canary"
+	tests := []struct {
+		name, actualValue string
+		expectedPresent   bool
+	}{{name: "rotated", expectedPresent: true, actualValue: staleValue}, {name: "removed", actualValue: staleValue}, {name: "missing", expectedPresent: true}}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if test.expectedPresent {
+				t.Setenv(providerName, currentValue)
+			} else {
+				previous, present := os.LookupEnv(providerName)
+				requireNoError(t, os.Unsetenv(providerName))
+				t.Cleanup(func() {
+					if present {
+						_ = os.Setenv(providerName, previous)
+					}
+				})
+			}
+			service, claim := claimRuntimeTestRun(t)
+			active, _ := activateRuntimeTestRun(t, service, claim)
+			requireRuntimeValue(service.SendBossMessage(context.Background(), core.BossMessageInput{ProjectID: active.ProjectID, AgentID: active.AgentID, TaskID: active.TaskID, Body: "remain pending across rejected adoption", RequestID: "adoption-message-" + test.name}))
+			executor := &runtimeTestExecutor{}
+			controller := newRuntimeTestController(t, service, executor)
+			controller.config.Runtime = config.RuntimeConfig{DockerNetwork: "none", ProviderEnvAllowlist: []string{providerName}}
+			controller.coordlink = requireRuntimeValue(os.Executable())
+			controlPath := filepath.Join(controller.controlRoot, active.ID)
+			requireNoError(t, os.Mkdir(controlPath, runControlDirectoryMode))
+			requireNoError(t, writeRunControlMarker(controlPath, active))
+			requireNoError(t, writeRuntimeFile(filepath.Join(controlPath, "bootstrap"), []byte("adoption bootstrap"), runControlFileMode))
+			command := requireRuntimeValue((adapter.Claude{}).BuildStartCommand(adapter.LaunchSpec{BootstrapPath: adapter.ContainerBootstrapPath, ContainerHome: "/home/agent", ContainerWork: "/workspace/project"}))
+			spec := requireRuntimeValue(controller.containerSpec(active, claim.Task.Kind, command, controlPath))
+			state := containerruntime.LiveState{Ref: spec.Ref, Image: spec.Image, Entrypoint: []string{spec.Command.Executable}, CommandArgs: spec.Command.Args, Status: containerruntime.StatusRunning, Running: true}
+			for name, value := range spec.Command.Env {
+				if name == providerName {
+					value = test.actualValue
+					if value == "" {
+						continue
+					}
+				}
+				state.Environment = append(state.Environment, containerruntime.EnvironmentFact{Name: name, ValueDigest: fmt.Sprintf("%x", sha256.Sum256([]byte(value)))})
+			}
+			if !test.expectedPresent {
+				state.Environment = append(state.Environment, containerruntime.EnvironmentFact{Name: providerName, ValueDigest: fmt.Sprintf("%x", sha256.Sum256([]byte(test.actualValue)))})
+			}
+			executor.state = &state
+			before := requireRuntimeValue(json.Marshal(requireRuntimeValue(service.Snapshot(context.Background(), active.ProjectID))))
+			requireNoError(t, controller.Reconcile(context.Background()))
+			after := requireRuntimeValue(json.Marshal(requireRuntimeValue(service.Snapshot(context.Background(), active.ProjectID))))
+			if string(before) != string(after) {
+				t.Fatal("rejected adoption advanced durable Task, Run, session, outcome, Message, or Event state")
+			}
+			time.Sleep(10 * time.Millisecond)
+			if executor.logCalls.Load() != 0 || executor.waitCalls.Load() != 0 || controller.monitor(active.ID) != nil {
+				t.Fatalf("rejected adoption side effects: Logs=%d Wait=%d monitor=%v", executor.logCalls.Load(), executor.waitCalls.Load(), controller.monitor(active.ID) != nil)
+			}
+			if _, err := os.Stat(active.LogPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("rejected adoption created a runtime log: %v", err)
+			}
+			healthy, reason := controller.Healthy()
+			wantReason := fmt.Sprintf("reconcile Run %s: %s: container isolation environment mismatch", active.ID, containerruntime.ErrOwnership)
+			if healthy || reason != wantReason {
+				t.Fatal("rejected adoption did not degrade with only the generic ownership error")
+			}
+		})
+	}
+}
+
 func TestShutdownPersistsIntentBeforeCancellingMonitorAndConverges(t *testing.T) {
 	service, claim := claimRuntimeTestRun(t)
 	active, _ := activateRuntimeTestRun(t, service, claim)
@@ -625,6 +693,9 @@ type runtimeTestExecutor struct {
 	containerruntime.Executor
 	inspectCalls atomic.Int32
 	stopCalls    atomic.Int32
+	waitCalls    atomic.Int32
+	logCalls     atomic.Int32
+	state        *containerruntime.LiveState
 }
 
 type monitorFailureExecutor struct {
@@ -863,9 +934,7 @@ func (*staleInspectExecutor) Logs(context.Context, containerruntime.RuntimeRef, 
 }
 
 func newBlockingLaunchExecutor() *blockingLaunchExecutor {
-	return &blockingLaunchExecutor{
-		createEntered: make(chan struct{}), allowCreate: make(chan struct{}), stopped: make(chan struct{}),
-	}
+	return &blockingLaunchExecutor{createEntered: make(chan struct{}), allowCreate: make(chan struct{}), stopped: make(chan struct{})}
 }
 
 func (e *blockingLaunchExecutor) Create(ctx context.Context, spec containerruntime.ContainerSpec) (containerruntime.RuntimeRef, error) {
@@ -943,6 +1012,9 @@ func (e *runtimeTestExecutor) Ping(context.Context) error { return nil }
 
 func (e *runtimeTestExecutor) Inspect(context.Context, containerruntime.RuntimeRef) (containerruntime.LiveState, error) {
 	e.inspectCalls.Add(1)
+	if e.state != nil {
+		return *e.state, nil
+	}
 	return containerruntime.LiveState{}, containerruntime.ErrNotFound
 }
 
@@ -951,7 +1023,8 @@ func (e *runtimeTestExecutor) Stop(context.Context, containerruntime.RuntimeRef,
 	return containerruntime.StopResult{}, nil
 }
 
-func (*runtimeTestExecutor) Wait(_ context.Context, ref containerruntime.RuntimeRef) (containerruntime.ExitFact, error) {
+func (e *runtimeTestExecutor) Wait(_ context.Context, ref containerruntime.RuntimeRef) (containerruntime.ExitFact, error) {
+	e.waitCalls.Add(1)
 	return containerruntime.ExitFact{Ref: ref, ExitCode: 143}, nil
 }
 
@@ -964,16 +1037,14 @@ func (e *runtimeTestExecutor) Managed(context.Context) ([]containerruntime.LiveS
 }
 
 func (e *runtimeTestExecutor) Logs(context.Context, containerruntime.RuntimeRef, bool) (io.ReadCloser, error) {
+	e.logCalls.Add(1)
 	return nil, containerruntime.ErrUnsupported
 }
 
 type runtimeTestGit struct{ sha string }
 
 func (g *runtimeTestGit) Preflight(context.Context, string, string) (core.ProjectGitFact, error) {
-	return core.ProjectGitFact{
-		Source: "/source", SourceRef: "refs/heads/main", InitialSHA: g.sha,
-		CanonicalRef: "refs/heads/main", CanonicalSHA: g.sha,
-	}, nil
+	return core.ProjectGitFact{Source: "/source", SourceRef: "refs/heads/main", InitialSHA: g.sha, CanonicalRef: "refs/heads/main", CanonicalSHA: g.sha}, nil
 }
 
 func (g *runtimeTestGit) ControlPath(projectID string) string {
@@ -1004,7 +1075,11 @@ func newRuntimeTestService(t *testing.T) *core.Service {
 func claimRuntimeTestRun(t *testing.T) (*core.Service, core.Claim) {
 	t.Helper()
 	service := newRuntimeTestService(t)
-	task := addRuntimeTestTask(t, service)
+	agent, project := addRuntimeTestProject(service, "/instructions/runtime.md")
+	task := requireRuntimeValue(service.CreateTask(context.Background(), core.CreateTaskInput{
+		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
+		Title: "Runtime task", RequestID: "add-runtime-task",
+	}))
 	claim, ok, err := service.ClaimNext(context.Background(), "")
 	if err != nil || !ok || claim.Task.ID != task.ID {
 		t.Fatalf("claim runtime test Run: claim=%#v ok=%t err=%v", claim, ok, err)
@@ -1017,17 +1092,6 @@ func newRuntimeTestController(t *testing.T, service *core.Service, executor cont
 		service: service, executor: executor, adapters: adapter.Production(), controlRoot: t.TempDir(),
 		monitors: make(map[string]*runMonitor), controls: make(map[string]*runControl), runOperations: make(map[string]*runOperation),
 	}
-}
-
-func addRuntimeTestTask(t *testing.T, service *core.Service) core.Task {
-	t.Helper()
-	ctx := context.Background()
-	agent, project := addRuntimeTestProject(service, "/instructions/runtime.md")
-	task := requireRuntimeValue(service.CreateTask(ctx, core.CreateTaskInput{
-		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
-		Title: "Runtime task", RequestID: "add-runtime-task",
-	}))
-	return task
 }
 
 func addRuntimeTestProject(service *core.Service, instructions string) (core.Agent, core.Project) {

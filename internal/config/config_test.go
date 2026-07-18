@@ -62,6 +62,12 @@ func TestLoadRejectsInvalidConfigWithoutFallback(t *testing.T) {
 		{name: "workspace traversal outside", raw: strings.Replace(valid, filepath.Join(dataDir, "workspaces"), filepath.Join(dataDir, "..", "workspaces"), 1), want: "inside data_dir"},
 		{name: "invalid provider env", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN=value", 1), want: "valid environment variable name"},
 		{name: "duplicate provider env", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN,", "ANTHROPIC_AUTH_TOKEN, ANTHROPIC_AUTH_TOKEN,", 1), want: "contains duplicate"},
+		{name: "retired API key", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", 1), want: "Claude provider environment catalog"},
+		{name: "proxy credential", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "HTTPS_PROXY", 1), want: "Claude provider environment catalog"},
+		{name: "arbitrary provider env", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "PROVIDER_EXTRA", 1), want: "Claude provider environment catalog"},
+		{name: "reserved HOME", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "HOME", 1), want: "reserved environment variable"},
+		{name: "reserved Run socket", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "COORDPLANE_RUN_SOCKET", 1), want: "reserved environment variable"},
+		{name: "reserved token file", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "COORDPLANE_RUN_TOKEN_FILE", 1), want: "reserved environment variable"},
 		{name: "negative run timeout", raw: strings.Replace(valid, "  default_image:", "  run_timeout: -1s\n  default_image:", 1), want: "runtime.run_timeout must be a positive duration or 0"},
 		{name: "zero shutdown grace", raw: strings.Replace(valid, "  default_image:", "  shutdown_grace: 0\n  default_image:", 1), want: "runtime.shutdown_grace must be a positive duration"},
 		{name: "invalid capture timeout", raw: valid + "git:\n  capture_timeout: 0\n", want: "git.capture_timeout must be a positive duration"},
@@ -117,23 +123,6 @@ func TestLoadAcceptsBoundedGitCaptureHelperConfig(t *testing.T) {
 	if cfg.Git.CaptureHelperImage != "coordplane-git-helper:test" || cfg.Git.CaptureTimeout != 45*time.Second ||
 		cfg.Git.MaximumBundleBytes != 1<<20 || cfg.Git.MaximumObjects != 5000 || cfg.Git.MaximumHandoffBytes != 4<<20 {
 		t.Fatalf("Git capture config = %+v", cfg.Git)
-	}
-}
-
-func TestLoadRejectsProviderAllowlistOverridesOfTrustedRuntimeEnvironment(t *testing.T) {
-	for _, name := range []string{
-		"HOME",
-		"COORDPLANE_RUN_SOCKET",
-		"COORDPLANE_RUN_TOKEN_FILE",
-	} {
-		t.Run(name, func(t *testing.T) {
-			dataDir := filepath.Join(t.TempDir(), "data")
-			raw := strings.Replace(validConfig(dataDir), "ANTHROPIC_AUTH_TOKEN", name, 1)
-			_, err := config.Load(writeConfig(t, raw))
-			if err == nil || !strings.Contains(err.Error(), "reserved environment variable") || !strings.Contains(err.Error(), name) {
-				t.Fatalf("Load() error = %v, want reserved %s rejection", err, name)
-			}
-		})
 	}
 }
 
