@@ -72,9 +72,7 @@ func TestSnapshotUsesOneFileBackedSQLiteReadTransaction(t *testing.T) {
 
 func TestTaskRunAndMessageHistoryUseStableOpaqueCursorPages(t *testing.T) {
 	ctx := context.Background()
-	database, err := Open(ctx, filepath.Join(t.TempDir(), "pages.db"))
-	requireNoError(t, err)
-	defer database.Close()
+	database := openTestStore(t, ctx, "pages.db")
 	for _, suffix := range []string{"c", "a", "b"} {
 		requireNoError(t, insertReadFixture(ctx, database, suffix, core.TaskCompleted, core.RunExited, core.MessageAcknowledged, false))
 	}
@@ -122,9 +120,7 @@ func TestTaskRunAndMessageHistoryUseStableOpaqueCursorPages(t *testing.T) {
 
 func TestTaskHasStartedRunSearchesBeyondTheFirstHundredHistoryRows(t *testing.T) {
 	ctx := context.Background()
-	database, err := Open(ctx, filepath.Join(t.TempDir(), "run-history.db"))
-	requireNoError(t, err)
-	defer database.Close()
+	database := openTestStore(t, ctx, "run-history.db")
 
 	const (
 		projectID = "prj_run_history"
@@ -205,9 +201,7 @@ func TestTaskHasStartedRunSearchesBeyondTheFirstHundredHistoryRows(t *testing.T)
 
 func TestEventHistoryUsesOpaqueIDCursorWithoutGapsOrDuplicates(t *testing.T) {
 	ctx := context.Background()
-	database, err := Open(ctx, filepath.Join(t.TempDir(), "event-pages.db"))
-	requireNoError(t, err)
-	defer database.Close()
+	database := openTestStore(t, ctx, "event-pages.db")
 	payload, err := json.Marshal(map[string]string{"text": strings.Repeat("\x01", 4000)})
 	requireNoError(t, err)
 	const eventCount = 47
@@ -284,14 +278,10 @@ func TestEventHistoryUsesOpaqueIDCursorWithoutGapsOrDuplicates(t *testing.T) {
 
 func TestStatusProjectionIsBoundedAndOmitsHistoricalPayloads(t *testing.T) {
 	ctx := context.Background()
-	database, err := Open(ctx, filepath.Join(t.TempDir(), "status.db"))
-	requireNoError(t, err)
-	defer database.Close()
+	database := openTestStore(t, ctx, "status.db")
 	requireNoError(t, insertReadFixture(ctx, database, "zzzz", core.TaskQueued, core.RunStarting, core.MessagePending, true))
-	if _, err := database.db.ExecContext(ctx, `UPDATE tasks SET title=? WHERE id='tsk_zzzz'`, strings.Repeat("x", 300)); err != nil {
-		t.Fatal(err)
-	}
-	err = database.Transact(ctx, func(tx core.Transaction) error {
+	execTestSQL(t, ctx, database.db, `UPDATE tasks SET title=? WHERE id='tsk_zzzz'`, strings.Repeat("x", 300))
+	err := database.Transact(ctx, func(tx core.Transaction) error {
 		for index := 0; index < core.StatusSnapshotLimit; index++ {
 			id := fmt.Sprintf("tsk_%03d", index)
 			if err := tx.InsertTask(core.Task{
@@ -334,9 +324,7 @@ func TestStatusProjectionIsBoundedAndOmitsHistoricalPayloads(t *testing.T) {
 
 func TestTaskAndRunSummariesUseConsistentUTF8ByteBudgets(t *testing.T) {
 	ctx := context.Background()
-	database, err := Open(ctx, filepath.Join(t.TempDir(), "utf8-summaries.db"))
-	requireNoError(t, err)
-	defer database.Close()
+	database := openTestStore(t, ctx, "utf8-summaries.db")
 	requireNoError(t, insertReadFixture(ctx, database, "utf8", core.TaskRunning, core.RunActive, core.MessagePending, false))
 
 	title := strings.Repeat("题", 100)
@@ -346,12 +334,8 @@ func TestTaskAndRunSummariesUseConsistentUTF8ByteBudgets(t *testing.T) {
 	terminal := strings.Repeat("终", 200)
 	lastError := strings.Repeat("错", 200)
 	runtimeErrorCode := strings.Repeat("码", 100)
-	if _, err := database.db.ExecContext(ctx, `UPDATE tasks SET title=?,wait_reason=?,result_summary=?,failure_reason=? WHERE id='tsk_utf8'`, title, waitReason, resultSummary, failure); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := database.db.ExecContext(ctx, `UPDATE runs SET terminal_reason=?,last_error=?,runtime_error_code=? WHERE id='run_utf8'`, terminal, lastError, runtimeErrorCode); err != nil {
-		t.Fatal(err)
-	}
+	execTestSQL(t, ctx, database.db, `UPDATE tasks SET title=?,wait_reason=?,result_summary=?,failure_reason=? WHERE id='tsk_utf8'`, title, waitReason, resultSummary, failure)
+	execTestSQL(t, ctx, database.db, `UPDATE runs SET terminal_reason=?,last_error=?,runtime_error_code=? WHERE id='run_utf8'`, terminal, lastError, runtimeErrorCode)
 
 	status, err := database.StatusProjection(ctx, "prj_utf8")
 	requireNoError(t, err)
@@ -405,11 +389,9 @@ func assertUTF8Budget(t *testing.T, field, value string, limit, wantBytes int) {
 
 func TestStatusProjectionMarksAgentsOmittedAfterRequiredSlotsFillTheBound(t *testing.T) {
 	ctx := context.Background()
-	database, err := Open(ctx, filepath.Join(t.TempDir(), "status-agents.db"))
-	requireNoError(t, err)
-	defer database.Close()
+	database := openTestStore(t, ctx, "status-agents.db")
 	requireNoError(t, insertReadFixture(ctx, database, "agent_bound", core.TaskCompleted, core.RunExited, core.MessageAcknowledged, false))
-	err = database.Transact(ctx, func(tx core.Transaction) error {
+	err := database.Transact(ctx, func(tx core.Transaction) error {
 		for index := 0; index < core.StatusSnapshotLimit; index++ {
 			id := fmt.Sprintf("agt_required_%02d", index)
 			if err := tx.InsertAgent(core.Agent{

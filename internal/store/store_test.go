@@ -20,13 +20,38 @@ func requireNoError(t *testing.T, err error) {
 	}
 }
 
+func openTestStore(t *testing.T, ctx context.Context, name string) *Store {
+	t.Helper()
+	database, err := Open(ctx, filepath.Join(t.TempDir(), name))
+	requireNoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	return database
+}
+
+func requireOpenError(t *testing.T, path, description string) error {
+	t.Helper()
+	opened, err := Open(context.Background(), path)
+	if opened != nil {
+		_ = opened.Close()
+		t.Fatalf("%s unexpectedly opened", description)
+	}
+	if err == nil {
+		t.Fatalf("%s returned no error", description)
+	}
+	return err
+}
+
+func execTestSQL(t *testing.T, ctx context.Context, db *sql.DB, statement string, args ...any) {
+	t.Helper()
+	_, err := db.ExecContext(ctx, statement, args...)
+	requireNoError(t, err)
+}
+
 func TestCT01FileMigrationIsExactAndIdempotent(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "coordplane.db")
-	store, err := Open(ctx, path)
-	requireNoError(t, err)
-	t.Cleanup(func() { _ = store.Close() })
+	store := openTestStore(t, ctx, "coordplane.db")
 	info, err := store.SchemaInfo(ctx)
+	requireNoError(t, err)
 	if info.JournalMode != "wal" || !info.ForeignKeys || info.BusyTimeout != busyTimeoutMillis {
 		t.Fatalf("SQLite pragmas = %#v", info)
 	}
@@ -39,6 +64,7 @@ func TestCT01FileMigrationIsExactAndIdempotent(t *testing.T) {
 	for range 3 {
 		time.Sleep(time.Millisecond)
 		info, err = store.SchemaInfo(ctx)
+		requireNoError(t, err)
 		if info.JournalMode != "wal" || !info.ForeignKeys || info.BusyTimeout != busyTimeoutMillis {
 			t.Fatalf("replacement connection pragmas = %#v", info)
 		}
@@ -48,35 +74,51 @@ func TestCT01FileMigrationIsExactAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestCT01LegacyDatabaseFailsClosedWithoutSchemaRewrite(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.db")
+	db, err := sql.Open("sqlite", path)
+	requireNoError(t, err)
+	execTestSQL(t, ctx, db, `CREATE TABLE work_contracts(id TEXT PRIMARY KEY, status TEXT); INSERT INTO work_contracts VALUES('old','active')`)
+	requireNoError(t, db.Close())
+	err = requireOpenError(t, path, "legacy database")
+	if !core.IsCode(err, core.CodeLegacySchemaRebuildRequired) {
+		t.Fatalf("Open() error = %v, want %s", err, core.CodeLegacySchemaRebuildRequired)
+	}
+	after, err := os.ReadDir(dir)
+	requireNoError(t, err)
+	if len(after) != 1 || after[0].Name() != filepath.Base(path) {
+		t.Fatalf("legacy database gained side files: %v", after)
+	}
+	db, err = sql.Open("sqlite", path)
+	requireNoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	var status string
+	requireNoError(t, db.QueryRow(`SELECT status FROM work_contracts WHERE id='old'`).Scan(&status))
+	if status != "active" {
+		t.Fatalf("legacy row status = %q, want active", status)
+	}
+	var projects int
+	requireNoError(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='projects'`).Scan(&projects))
+	if projects != 0 {
+		t.Fatal("new projects table was written beside legacy schema")
+	}
+}
+
 func TestCT01PartialOrCorruptDatabaseNeverBecomesReady(t *testing.T) {
 	t.Run("partial allowed table", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "partial.db")
 		db, err := sql.Open("sqlite", path)
 		requireNoError(t, err)
-		if _, err := db.Exec(`CREATE TABLE agents(id TEXT PRIMARY KEY)`); err != nil {
-			t.Fatal(err)
-		}
+		execTestSQL(t, context.Background(), db, `CREATE TABLE agents(id TEXT PRIMARY KEY)`)
 		_ = db.Close()
-		store, err := Open(context.Background(), path)
-		if store != nil {
-			_ = store.Close()
-			t.Fatal("partial database unexpectedly opened")
-		}
-		if err == nil {
-			t.Fatal("partial database returned no error")
-		}
+		requireOpenError(t, path, "partial database")
 	})
 	t.Run("corrupt bytes", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "corrupt.db")
 		requireNoError(t, os.WriteFile(path, []byte("not a sqlite database"), 0o600))
-		store, err := Open(context.Background(), path)
-		if store != nil {
-			_ = store.Close()
-			t.Fatal("corrupt database unexpectedly opened")
-		}
-		if err == nil {
-			t.Fatal("corrupt database returned no error")
-		}
+		requireOpenError(t, path, "corrupt database")
 	})
 }
 
@@ -88,37 +130,27 @@ func TestCT01ExistingSchemaDriftFailsClosed(t *testing.T) {
 		{
 			name: "critical index dropped",
 			mutate: func(t *testing.T, db *sql.DB) {
-				if _, err := db.Exec(`DROP INDEX runs_one_live_per_agent`); err != nil {
-					t.Fatal(err)
-				}
+				execTestSQL(t, context.Background(), db, `DROP INDEX runs_one_live_per_agent`)
 			},
 		},
 		{
 			name: "allowed table structurally changed",
 			mutate: func(t *testing.T, db *sql.DB) {
-				if _, err := db.Exec(`ALTER TABLE events RENAME COLUMN payload_json TO payload_text`); err != nil {
-					t.Fatal(err)
-				}
+				execTestSQL(t, context.Background(), db, `ALTER TABLE events RENAME COLUMN payload_json TO payload_text`)
 			},
 		},
 		{
 			name: "hidden migration history",
 			mutate: func(t *testing.T, db *sql.DB) {
-				if _, err := db.Exec(`INSERT INTO schema_migrations(version,name,applied_at) VALUES(0,'legacy','2026-07-12T00:00:00Z')`); err != nil {
-					t.Fatal(err)
-				}
+				execTestSQL(t, context.Background(), db, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(0,'legacy','2026-07-12T00:00:00Z')`)
 			},
 		},
 		{
 			name: "foreign key violation",
 			mutate: func(t *testing.T, db *sql.DB) {
 				const now = "2026-07-12T00:00:00Z"
-				if _, err := db.Exec(`INSERT INTO agents(id,display_name,adapter_id,image,instructions_file,status,version,created_at,updated_at) VALUES('agt_orphan','Orphan','one-shot','image','/instructions','active',1,?,?)`, now, now); err != nil {
-					t.Fatal(err)
-				}
-				if _, err := db.Exec(`INSERT INTO tasks(id,project_id,kind,created_by_kind,assignee_agent_id,title,description,status,next_run_at,version,created_at,updated_at) VALUES('tsk_orphan','prj_missing','work','boss','agt_orphan','Orphan','Orphan','queued',?,1,?,?)`, now, now, now); err != nil {
-					t.Fatal(err)
-				}
+				execTestSQL(t, context.Background(), db, `INSERT INTO agents(id,display_name,adapter_id,image,instructions_file,status,version,created_at,updated_at) VALUES('agt_orphan','Orphan','one-shot','image','/instructions','active',1,?,?)`, now, now)
+				execTestSQL(t, context.Background(), db, `INSERT INTO tasks(id,project_id,kind,created_by_kind,assignee_agent_id,title,description,status,next_run_at,version,created_at,updated_at) VALUES('tsk_orphan','prj_missing','work','boss','agt_orphan','Orphan','Orphan','queued',?,1,?,?)`, now, now, now)
 			},
 		},
 	}
@@ -135,11 +167,7 @@ func TestCT01ExistingSchemaDriftFailsClosed(t *testing.T) {
 			test.mutate(t, db)
 			requireNoError(t, db.Close())
 
-			reopened, err := Open(context.Background(), path)
-			if reopened != nil {
-				_ = reopened.Close()
-				t.Fatal("structurally drifted database unexpectedly opened")
-			}
+			err = requireOpenError(t, path, "structurally drifted database")
 			if !core.IsCode(err, core.CodeLegacySchemaRebuildRequired) {
 				t.Fatalf("Open() error = %v, want %s", err, core.CodeLegacySchemaRebuildRequired)
 			}
@@ -149,15 +177,13 @@ func TestCT01ExistingSchemaDriftFailsClosed(t *testing.T) {
 
 func TestMutationAndEventRollbackTogether(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(ctx, filepath.Join(t.TempDir(), "atomic.db"))
-	requireNoError(t, err)
-	defer store.Close()
+	store := openTestStore(t, ctx, "atomic.db")
 	agent := core.Agent{
 		ID: "agt_atomic", DisplayName: "Atomic", AdapterID: "one-shot", Image: "image",
 		InstructionsFile: "/instructions", Status: core.AgentActive, Version: 1,
 		CreatedAt: "2026-07-12T00:00:00Z", UpdatedAt: "2026-07-12T00:00:00Z",
 	}
-	err = store.Transact(ctx, func(tx core.Transaction) error {
+	err := store.Transact(ctx, func(tx core.Transaction) error {
 		if err := tx.InsertAgent(agent); err != nil {
 			return err
 		}
@@ -184,10 +210,8 @@ func TestMutationAndEventRollbackTogether(t *testing.T) {
 
 func TestEventsLimitReturnsTheRecentTailInStableOrder(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(ctx, filepath.Join(t.TempDir(), "events.db"))
-	requireNoError(t, err)
-	defer store.Close()
-	err = store.Transact(ctx, func(tx core.Transaction) error {
+	store := openTestStore(t, ctx, "events.db")
+	err := store.Transact(ctx, func(tx core.Transaction) error {
 		for _, kind := range []string{"first", "second", "third"} {
 			if _, err := tx.AppendEvent(core.Event{
 				EntityType: "daemon", EntityID: "daemon", Kind: kind,

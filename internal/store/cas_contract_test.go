@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -91,9 +90,7 @@ func TestCT02EntityCASRejectsStaleVersionAndStateWithoutSideEffects(t *testing.T
 		}{{"state", test.wrongState}, {"version", test.wrongVer}} {
 			t.Run(test.name+"/stale_"+stale.name, func(t *testing.T) {
 				ctx := context.Background()
-				database, err := Open(ctx, filepath.Join(t.TempDir(), "cas.db"))
-				requireNoError(t, err)
-				defer database.Close()
+				database := openTestStore(t, ctx, "cas.db")
 				fixture := insertCASFixture(t, database)
 				before, err := database.Snapshot(ctx, fixture.project.ID)
 				requireNoError(t, err)
