@@ -13,12 +13,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func requireNoError(t *testing.T, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatal(err)
-	}
-}
+var requireNoError = testsupport.RequireNoError
 
 func TestGT00CompositionQuarantinesRepositoryWithoutProjectRow(t *testing.T) {
 	root := t.TempDir()
@@ -106,9 +101,7 @@ func writeTestConfig(t *testing.T, root string) string {
 	t.Helper()
 	dataDir := filepath.Join(root, "data")
 	configPath := filepath.Join(root, "coordplane.yaml")
-	raw := testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: filepath.Join(dataDir, "operator.sock"), MaxParallelRuns: 4, CompletedWorkspace: "24h", TerminalTaskRef: "168h", RunLog: "168h", DockerNetwork: "coordplane", DefaultImage: "coordplane-agent:latest"})
-	requireNoError(t, os.WriteFile(configPath, []byte(raw), 0o600))
-	return configPath
+	return testsupport.WriteFile(t, configPath, testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: filepath.Join(dataDir, "operator.sock"), MaxParallelRuns: 4, CompletedWorkspace: "24h", TerminalTaskRef: "168h", RunLog: "168h", DockerNetwork: "coordplane", DefaultImage: "coordplane-agent:latest"}), 0o600)
 }
 
 func createSourceRepository(t *testing.T, root string) string {

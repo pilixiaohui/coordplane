@@ -22,12 +22,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func requireNoError(t *testing.T, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatal(err)
-	}
-}
+var requireNoError = testsupport.RequireNoError
+var writeFile = testsupport.WriteFile
 
 const e2eTimeout = 3 * time.Minute
 
@@ -54,7 +50,7 @@ func TestDeterministicTwoAgentConvergence(t *testing.T) {
 	socket := filepath.Join(dataDir, "operator.sock")
 	instructions := filepath.Join(root, "instructions.md")
 	writeFile(t, instructions, []byte("Execute only the deterministic P5 bootstrap contract.\n"), 0o600)
-	configPath := writeConfig(t, root, dataDir, socket, image)
+	configPath := testsupport.WriteFile(t, filepath.Join(root, "coordplane.yaml"), testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: 2, CompletedWorkspace: "0", TerminalTaskRef: "24h", RunLog: "24h", DockerNetwork: "none", DefaultImage: image, Tail: "  run_timeout: 2m\n  shutdown_grace: 3s\ngit:\n  capture_helper_image: " + image + "\n  capture_timeout: 30s\n  maximum_bundle_bytes: 67108864\n  maximum_objects: 250000\n  maximum_handoff_bytes: 268435456\n"}), 0o600)
 
 	daemon := startDaemon(t, coordplane, configPath, socket)
 	t.Cleanup(func() { _ = daemon.Stop() })
@@ -96,7 +92,7 @@ func TestDeterministicTwoAgentConvergence(t *testing.T) {
 			"agent", "resume", agent.ID, "--socket", socket, "--request-id", "p5-resume-"+agent.ID, "--output", "json")
 	}
 
-	runA, runB := waitForConcurrentRuns(t, ctx, coordplane, socket, taskA.ID, taskB.ID)
+	runA, runB := waitForConcurrentRunsWithProgress(t, ctx, coordplane, socket, taskA.ID, taskB.ID, "P5-READY", 45*time.Second)
 	inspectA := inspectContainer(t, ctx, runA.ContainerID)
 	inspectB := inspectContainer(t, ctx, runB.ContainerID)
 	assertIsolatedRuns(t, dataDir, runA, runB, inspectA, inspectB)
@@ -235,16 +231,12 @@ type daemonProcess struct {
 }
 
 func startDaemon(t *testing.T, binary, configPath, socket string) *daemonProcess {
-	return startDaemonWithEnv(t, binary, configPath, socket, nil)
-}
-
-func startDaemonWithEnv(t *testing.T, binary, configPath, socket string, environment []string) *daemonProcess {
 	t.Helper()
 	logPath := filepath.Join(filepath.Dir(configPath), fmt.Sprintf("daemon-%d.log", time.Now().UnixNano()))
 	logFile, err := os.Create(logPath)
 	requireNoError(t, err)
 	command := exec.Command(binary, "serve", "--config", configPath)
-	command.Env = append(os.Environ(), environment...)
+	command.Env = os.Environ()
 	command.Stdout, command.Stderr = logFile, logFile
 	if err := command.Start(); err != nil {
 		_ = logFile.Close()
@@ -320,11 +312,6 @@ func waitForReady(t *testing.T, ctx context.Context, binary, socket, reason stri
 		}
 		return status, status.DaemonReady, status.Reason
 	})
-}
-
-func waitForConcurrentRuns(t *testing.T, ctx context.Context, binary, socket, taskA, taskB string) (core.Run, core.Run) {
-	t.Helper()
-	return waitForConcurrentRunsWithProgress(t, ctx, binary, socket, taskA, taskB, "P5-READY", 45*time.Second)
 }
 
 func waitForConcurrentRunsWithProgress(
@@ -629,14 +616,6 @@ func createSourceRepository(t *testing.T, ctx context.Context, root string) (str
 	return source, git(t, ctx, source, "rev-parse", "HEAD")
 }
 
-func writeConfig(t *testing.T, root, dataDir, socket, image string) string {
-	t.Helper()
-	path := filepath.Join(root, "coordplane.yaml")
-	content := testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: 2, CompletedWorkspace: "0", TerminalTaskRef: "24h", RunLog: "24h", DockerNetwork: "none", DefaultImage: image, Tail: "  run_timeout: 2m\n  shutdown_grace: 3s\ngit:\n  capture_helper_image: " + image + "\n  capture_timeout: 30s\n  maximum_bundle_bytes: 67108864\n  maximum_objects: 250000\n  maximum_handoff_bytes: 268435456\n"})
-	writeFile(t, path, []byte(content), 0o600)
-	return path
-}
-
 func runJSON[T any](t *testing.T, ctx context.Context, binary string, args ...string) T {
 	t.Helper()
 	value, err := commandJSON[T](ctx, binary, args...)
@@ -686,11 +665,6 @@ func requireExecutable(t *testing.T, name string) string {
 		t.Fatalf("%s=%s is not executable: %v", name, path, err)
 	}
 	return path
-}
-
-func writeFile(t *testing.T, path string, content []byte, mode os.FileMode) {
-	t.Helper()
-	requireNoError(t, os.WriteFile(path, content, mode))
 }
 
 func assertFile(t *testing.T, path, want string) {

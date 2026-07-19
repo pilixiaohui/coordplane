@@ -9,16 +9,12 @@ import (
 	"time"
 
 	"coordplane/internal/core"
+	"coordplane/tests/testsupport"
 
 	_ "modernc.org/sqlite"
 )
 
-func requireNoError(t *testing.T, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatal(err)
-	}
-}
+var requireNoError = testsupport.RequireNoError
 
 func openTestStore(t *testing.T, ctx context.Context, name string) *Store {
 	t.Helper()

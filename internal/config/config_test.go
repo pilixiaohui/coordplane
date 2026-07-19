@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"coordplane/internal/config"
+	"coordplane/tests/testsupport"
 )
 
 func TestLoadAcceptsStrictMinimalConfigAndZeroRetention(t *testing.T) {
@@ -61,7 +62,7 @@ func TestLoadRejectsInvalidConfigWithoutFallback(t *testing.T) {
 		{name: "operator socket outside", raw: strings.Replace(valid, filepath.Join(dataDir, "operator.sock"), filepath.Join(base, "operator.sock"), 1), want: "inside data_dir"},
 		{name: "workspace traversal outside", raw: strings.Replace(valid, filepath.Join(dataDir, "workspaces"), filepath.Join(dataDir, "..", "workspaces"), 1), want: "inside data_dir"},
 		{name: "invalid provider env", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN=value", 1), want: "valid environment variable name"},
-		{name: "duplicate provider env", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN,", "ANTHROPIC_AUTH_TOKEN, ANTHROPIC_AUTH_TOKEN,", 1), want: "contains duplicate"},
+		{name: "duplicate provider env", raw: strings.Replace(valid, "    - ANTHROPIC_AUTH_TOKEN\n", "    - ANTHROPIC_AUTH_TOKEN\n    - ANTHROPIC_AUTH_TOKEN\n", 1), want: "contains duplicate"},
 		{name: "retired API key", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", 1), want: "Claude provider environment catalog"},
 		{name: "proxy credential", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "HTTPS_PROXY", 1), want: "Claude provider environment catalog"},
 		{name: "arbitrary provider env", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "PROVIDER_EXTRA", 1), want: "Claude provider environment catalog"},
@@ -148,27 +149,10 @@ func TestLoadRejectsRuntimeRootEscapingThroughSymlink(t *testing.T) {
 }
 
 func validConfig(dataDir string) string {
-	return "data_dir: " + dataDir + "\n" +
-		"operator_socket: " + filepath.Join(dataDir, "operator.sock") + "\n" +
-		"max_parallel_runs: 4\n" +
-		"retention:\n" +
-		"  completed_workspace: 0\n" +
-		"  terminal_task_ref: 168h\n" +
-		"  run_log: 0\n" +
-		"runtime:\n" +
-		"  docker_network: coordplane\n" +
-		"  workspace_root: " + filepath.Join(dataDir, "workspaces") + "\n" +
-		"  agent_home_root: " + filepath.Join(dataDir, "agent-homes") + "\n" +
-		"  log_root: " + filepath.Join(dataDir, "logs") + "\n" +
-		"  default_image: coordplane-agent:latest\n" +
-		"  provider_env_allowlist: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, ANTHROPIC_MODEL, ANTHROPIC_DEFAULT_OPUS_MODEL, ANTHROPIC_DEFAULT_SONNET_MODEL, ANTHROPIC_DEFAULT_HAIKU_MODEL, CLAUDE_CODE_SUBAGENT_MODEL, CLAUDE_CODE_EFFORT_LEVEL]\n"
+	return string(testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: filepath.Join(dataDir, "operator.sock"), MaxParallelRuns: 4, CompletedWorkspace: "0", TerminalTaskRef: "168h", RunLog: "0", DockerNetwork: "coordplane", DefaultImage: "coordplane-agent:latest", ProviderEnv: config.ClaudeProviderEnvCatalog()}))
 }
 
 func writeConfig(t *testing.T, raw string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "coordplane.yaml")
-	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	return path
+	return testsupport.WriteFile(t, filepath.Join(t.TempDir(), "coordplane.yaml"), []byte(raw), 0o600)
 }

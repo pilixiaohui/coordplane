@@ -15,14 +15,10 @@ import (
 
 	"coordplane/internal/core"
 	"coordplane/internal/store"
+	"coordplane/tests/testsupport"
 )
 
-func requireNoError(t *testing.T, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatal(err)
-	}
-}
+var requireNoError = testsupport.RequireNoError
 
 func TestCT03StaleRunCannotWriteThroughAgentEntry(t *testing.T) {
 	h := newHarness(t)

@@ -9,14 +9,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"coordplane/tests/testsupport"
 )
 
-func requireNoError(t *testing.T, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatal(err)
-	}
-}
+var requireNoError = testsupport.RequireNoError
 
 func requireRedactedOwnershipError(t *testing.T, err error) {
 	t.Helper()

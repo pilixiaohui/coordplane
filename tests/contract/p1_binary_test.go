@@ -1420,9 +1420,7 @@ func dataDirSignature(t *testing.T, root string) string {
 func writeConfig(t *testing.T, root, dataDir, socket, suffix string) string {
 	t.Helper()
 	path := filepath.Join(root, "coordplane.yaml")
-	raw := testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: 4, CompletedWorkspace: "24h", TerminalTaskRef: "168h", RunLog: "168h", DockerNetwork: "coordplane", DefaultImage: "agent:latest", Tail: suffix})
-	requireNoError(t, os.WriteFile(path, raw, 0o600))
-	return path
+	return testsupport.WriteFile(t, path, testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: 4, CompletedWorkspace: "24h", TerminalTaskRef: "168h", RunLog: "168h", DockerNetwork: "coordplane", DefaultImage: "agent:latest", Tail: suffix}), 0o600)
 }
 
 func createRepository(t *testing.T, root string) string {

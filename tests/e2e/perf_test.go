@@ -522,7 +522,7 @@ func newPFBatchWithEnv(
 	socket := filepath.Join(dataDir, "operator.sock")
 	instructions := filepath.Join(root, "instructions.md")
 	writeFile(t, instructions, []byte("Execute the deterministic PF-01 bootstrap contract.\n"), 0o600)
-	config := writePerfConfig(t, root, dataDir, socket, image, parallel)
+	config := testsupport.WriteFile(t, filepath.Join(root, "coordplane.yaml"), testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: parallel, CompletedWorkspace: "0", TerminalTaskRef: "24h", RunLog: "0", DockerNetwork: "none", DefaultImage: image, Tail: "  run_timeout: 3m\n  shutdown_grace: 3s\ngit:\n  capture_helper_image: " + image + "\n  capture_timeout: 30s\n  maximum_bundle_bytes: 67108864\n  maximum_objects: 250000\n  maximum_handoff_bytes: 268435456\n"}), 0o600)
 	observer := filepath.Join(root, "observer.jsonl")
 	environment := append([]string{
 		"COORDPLANE_PERF_OBSERVER_OUTPUT=" + observer,
@@ -1128,14 +1128,6 @@ func (b *pfBatch) sendGO(tasks []core.Task, body, waveID string) time.Time {
 
 func pfJSON[T any](batch *pfBatch, args ...string) T {
 	return runJSON[T](batch.t, batch.ctx, batch.binary, args...)
-}
-
-func writePerfConfig(t *testing.T, root, dataDir, socket, image string, parallel int) string {
-	t.Helper()
-	path := filepath.Join(root, "coordplane.yaml")
-	content := testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: parallel, CompletedWorkspace: "0", TerminalTaskRef: "24h", RunLog: "0", DockerNetwork: "none", DefaultImage: image, Tail: "  run_timeout: 3m\n  shutdown_grace: 3s\ngit:\n  capture_helper_image: " + image + "\n  capture_timeout: 30s\n  maximum_bundle_bytes: 67108864\n  maximum_objects: 250000\n  maximum_handoff_bytes: 268435456\n"})
-	writeFile(t, path, []byte(content), 0o600)
-	return path
 }
 
 func startPerfDaemon(t *testing.T, binary, image, root, config, socket, sampleID string, environment []string) *pfDaemonProcess {

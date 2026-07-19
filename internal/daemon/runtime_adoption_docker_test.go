@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"cmp"
 	"context"
 	"os"
 	"os/exec"
@@ -72,8 +73,9 @@ func TestReconcileRefusesToStartInsecureSameLabelContainer(t *testing.T) {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	network := cmp.Or(fixture.components.config.Runtime.DockerNetwork, "none")
 	args := []string{
-		"create", "--name", prepared.ContainerName, "--network", preparedNetwork(fixture),
+		"create", "--name", prepared.ContainerName, "--network", network,
 		"--workdir", "/workspace/project", "--user", "0:0", "--privileged",
 	}
 	for _, key := range keys {
@@ -108,11 +110,4 @@ func TestReconcileRefusesToStartInsecureSameLabelContainer(t *testing.T) {
 	if persisted.ContainerID == "" || persisted.LaunchPhase != core.LaunchCreated || persisted.State != core.RunStarting {
 		t.Fatalf("durable Run did not stop at the rejected adoption boundary: %#v", persisted)
 	}
-}
-
-func preparedNetwork(fixture *p3DockerFixture) string {
-	if fixture.components.config.Runtime.DockerNetwork == "" {
-		return "none"
-	}
-	return fixture.components.config.Runtime.DockerNetwork
 }

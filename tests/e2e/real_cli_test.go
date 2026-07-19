@@ -4,12 +4,14 @@ package e2e_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -19,11 +21,12 @@ import (
 )
 
 const (
-	liveE2ETimeout    = 15 * time.Minute
-	realClaudeVersion = "2.1.126 (Claude Code)"
-	realProviderEnv   = "ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL,ANTHROPIC_MODEL,ANTHROPIC_DEFAULT_OPUS_MODEL,ANTHROPIC_DEFAULT_SONNET_MODEL,ANTHROPIC_DEFAULT_HAIKU_MODEL,CLAUDE_CODE_SUBAGENT_MODEL,CLAUDE_CODE_EFFORT_LEVEL"
-	realTokenCanary   = "real-gate-auth-token-canary"
-	realAPIKeyCanary  = "real-gate-api-key-canary"
+	liveE2ETimeout          = 15 * time.Minute
+	liveDiagnosticTailBytes = 8 << 10
+	realClaudeVersion       = "2.1.126 (Claude Code)"
+	realProviderEnv         = "ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL,ANTHROPIC_MODEL,ANTHROPIC_DEFAULT_OPUS_MODEL,ANTHROPIC_DEFAULT_SONNET_MODEL,ANTHROPIC_DEFAULT_HAIKU_MODEL,CLAUDE_CODE_SUBAGENT_MODEL,CLAUDE_CODE_EFFORT_LEVEL"
+	realTokenCanary         = "real-gate-auth-token-canary"
+	realAPIKeyCanary        = "real-gate-api-key-canary"
 )
 
 func TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests(t *testing.T) {
@@ -98,6 +101,54 @@ func TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests(t *testing.T)
 	}
 }
 
+func TestRealCLIGatePreservesFailureDiagnosticsBeforeCleanupWithoutProvider(t *testing.T) {
+	names := strings.Split(realProviderEnv, ",")
+	leaked := new(strings.Builder)
+	for _, name := range names {
+		value := "diagnostic-secret-" + name
+		t.Setenv(name, value)
+		fmt.Fprintf(leaked, "%s %x ", value, sha256.Sum256([]byte(value)))
+	}
+	fixtureRoot, dataDir := t.TempDir(), filepath.Join(t.TempDir(), "data")
+	taskJSON, runsJSON, runJSON := filepath.Join(fixtureRoot, "task.json"), filepath.Join(fixtureRoot, "runs.json"), filepath.Join(fixtureRoot, "run.json")
+	writeFile(t, taskJSON, []byte(fmt.Sprintf(`{"task":{"id":"task-diag","status":"failed","failure_reason":"AUTH_FAILURE %s"}}`, leaked)), 0o600)
+	writeFile(t, runsJSON, []byte(`{"items":[{"id":"run-diag","task_id":"task-diag","state":"failed","cleanup_state":"removed","terminal_reason":"protocol failure"}]}`), 0o600)
+	writeFile(t, runJSON, []byte(fmt.Sprintf(`{"id":"run-diag","task_id":"task-diag","state":"failed","exit_code":23,"cleanup_state":"removed","terminal_reason":"PROTOCOL_FAILURE %s","runtime_error_code":"PROVIDER_ERROR"}`, leaked)), 0o600)
+	binary := filepath.Join(fixtureRoot, "coordplane")
+	writeFile(t, binary, []byte(fmt.Sprintf("#!/bin/sh\ncase \"$1:$2\" in task:show) cat %q;; run:list) cat %q;; run:show) cat %q;; *) exit 2;; esac\n", taskJSON, runsJSON, runJSON)), 0o700)
+	logPath := filepath.Join(dataDir, "logs", "run-diag", "run.log")
+	requireNoError(t, os.MkdirAll(filepath.Dir(logPath), 0o700))
+	writeFile(t, logPath, []byte("discarded-marker\n"+strings.Repeat("x", liveDiagnosticTailBytes+1)+"diagnostic-marker "+leaked.String()), 0o600)
+
+	var evidence string
+	requireNoError(t, preserveLiveFailureDiagnostics(
+		func() string {
+			return liveFailureDiagnostics(context.Background(), binary, "unused.sock", dataDir, names, "task-diag")
+		},
+		func(value string) {
+			evidence = value
+			if _, err := os.Stat(logPath); err != nil {
+				t.Fatal("failure evidence was emitted after cleanup")
+			}
+		},
+		func() error { return os.RemoveAll(dataDir) },
+	))
+	for _, want := range []string{`failure_reason="AUTH_FAILURE`, "terminal_run=run-diag state=failed exit_code=23", "run_log_tail=", "diagnostic-marker"} {
+		if !strings.Contains(evidence, want) {
+			t.Fatal("failure evidence omitted a required diagnostic field")
+		}
+	}
+	for _, name := range names {
+		value := os.Getenv(name)
+		if strings.Contains(evidence, value) || strings.Contains(evidence, fmt.Sprintf("%x", sha256.Sum256([]byte(value)))) {
+			t.Fatal("failure evidence leaked provider credential material")
+		}
+	}
+	if _, err := os.Stat(logPath); !errors.Is(err, os.ErrNotExist) || !strings.Contains(evidence, "diagnostic-marker") || strings.Contains(evidence, "discarded-marker") {
+		t.Fatal("failure evidence was not retained before data-dir cleanup")
+	}
+}
+
 func realGateOutput(t *testing.T, command *exec.Cmd) ([]byte, error) {
 	t.Helper()
 	output, err := command.CombinedOutput()
@@ -105,6 +156,90 @@ func realGateOutput(t *testing.T, command *exec.Cmd) ([]byte, error) {
 		t.Fatal("real gate output leaked a credential canary")
 	}
 	return output, err
+}
+
+func registerLiveFailureDiagnostics(t *testing.T, binary, socket, dataDir string, providerEnv []string, stop func() error) func(...string) {
+	t.Helper()
+	var taskIDs []string
+	t.Cleanup(func() {
+		var err error
+		if t.Failed() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			err = preserveLiveFailureDiagnostics(
+				func() string { return liveFailureDiagnostics(ctx, binary, socket, dataDir, providerEnv, taskIDs...) },
+				func(value string) { t.Logf("LIVE_FAILURE_DIAGNOSTICS\n%s", value) }, stop,
+			)
+		} else {
+			err = stop()
+		}
+		if err != nil {
+			t.Errorf("stop live daemon: %v", err)
+		}
+	})
+	return func(ids ...string) { taskIDs = append(taskIDs, ids...) }
+}
+
+func preserveLiveFailureDiagnostics(collect func() string, emit func(string), cleanup func() error) error {
+	emit(collect())
+	return cleanup()
+}
+
+func liveFailureDiagnostics(ctx context.Context, binary, socket, dataDir string, providerEnv []string, taskIDs ...string) string {
+	var evidence strings.Builder
+	for _, taskID := range taskIDs {
+		detail, taskErr := commandJSON[core.TaskDetail](ctx, binary, "task", "show", taskID, "--socket", socket, "--output", "json")
+		fmt.Fprintf(&evidence, "task=%s status=%s current_run=%t failure_reason=%q query_error=%t\n", taskID, detail.Task.Status, detail.CurrentRun != nil, detail.Task.FailureReason, taskErr != nil)
+		page, listErr := commandJSON[core.RunPage](ctx, binary, "run", "list", "--task", taskID, "--limit", "20", "--socket", socket, "--output", "json")
+		var terminal core.RunSummary
+		for index := len(page.Items) - 1; listErr == nil && index >= 0; index-- {
+			if core.IsRunTerminal(page.Items[index].State) {
+				terminal = page.Items[index]
+				break
+			}
+		}
+		run, showErr := commandJSON[core.Run](ctx, binary, "run", "show", terminal.ID, "--socket", socket, "--output", "json")
+		exitCode := "null"
+		if run.ExitCode != nil {
+			exitCode = fmt.Sprint(*run.ExitCode)
+		}
+		tail, tailErr := readLiveRunLogTail(filepath.Join(dataDir, "logs", terminal.ID, "run.log"))
+		fmt.Fprintf(&evidence, "terminal_run=%s state=%s exit_code=%s cleanup=%s runtime_error=%q reason=%q last_error=%q list_error=%t show_error=%t\nrun_log_tail=%q error=%t\n", terminal.ID, terminal.State, exitCode, terminal.CleanupState, run.RuntimeErrorCode, run.TerminalReason, run.LastError, listErr != nil, showErr != nil, tail, tailErr != nil)
+	}
+	return strings.ReplaceAll(redactLiveDiagnostics(evidence.String(), providerEnv), dataDir, "[REDACTED_DATA_DIR]")
+}
+
+func readLiveRunLogTail(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	if len(raw) > liveDiagnosticTailBytes {
+		raw = raw[len(raw)-liveDiagnosticTailBytes:]
+	}
+	return string(raw), nil
+}
+
+func redactLiveDiagnostics(value string, providerEnv []string) string {
+	var forbidden []string
+	for _, name := range providerEnv {
+		secret := os.Getenv(name)
+		if secret == "" {
+			continue
+		}
+		for _, candidate := range append([]string{secret, strings.TrimSpace(secret)}, strings.Fields(secret)...) {
+			if candidate == "" {
+				continue
+			}
+			digest := fmt.Sprintf("%x", sha256.Sum256([]byte(candidate)))
+			forbidden = append(forbidden, candidate, digest, strings.ToUpper(digest))
+		}
+	}
+	sort.Slice(forbidden, func(left, right int) bool { return len(forbidden[left]) > len(forbidden[right]) })
+	for _, item := range forbidden {
+		value = strings.ReplaceAll(value, item, "[REDACTED_SECRET]")
+	}
+	return value
 }
 
 func TestRealClaudeAdapterSmoke(t *testing.T) {
@@ -123,10 +258,10 @@ func TestRealClaudeAdapterSmoke(t *testing.T) {
 	registerLiveHomeCleanup(t, image, dataDir)
 	instructions := filepath.Join(root, "smoke-instructions.md")
 	writeFile(t, instructions, []byte(realSmokeInstructions), 0o600)
-	configPath := writeLiveConfig(t, root, dataDir, socket, image, network, providerEnv, 1)
+	configPath := testsupport.WriteFile(t, filepath.Join(root, "coordplane-live.yaml"), testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: 1, CompletedWorkspace: "24h", TerminalTaskRef: "24h", RunLog: "24h", DockerNetwork: network, DefaultImage: image, ProviderEnv: providerEnv, Tail: "  run_timeout: 12m\n  shutdown_grace: 5s\ngit:\n  capture_helper_image: " + image + "\n  capture_timeout: 30s\n  maximum_bundle_bytes: 67108864\n  maximum_objects: 250000\n  maximum_handoff_bytes: 268435456\n"}), 0o600)
 
 	daemon := startDaemon(t, coordplane, configPath, socket)
-	t.Cleanup(func() { _ = daemon.Stop() })
+	trackFailure := registerLiveFailureDiagnostics(t, coordplane, socket, dataDir, providerEnv, func() error { return daemon.Stop() })
 	waitForReady(t, ctx, coordplane, socket, "live smoke daemon startup")
 	agent := runJSON[core.Agent](t, ctx, coordplane,
 		"agent", "add", "--socket", socket, "--id", "agt_live_smoke", "--display-name", "Live smoke Agent",
@@ -140,6 +275,7 @@ func TestRealClaudeAdapterSmoke(t *testing.T) {
 	first := runJSON[core.ChatResult](t, ctx, coordplane,
 		"chat", "--socket", socket, "--project", project.ID, "--agent", agent.ID,
 		"--body", "LIVE-SMOKE-ONE", "--request-id", "live-smoke-one", "--output", "json")
+	trackFailure(first.Task.ID)
 	runOne, homeOne := waitForLiveRun(t, ctx, coordplane, socket, first.Task.ID, "", "LIVE-SMOKE-READY", 5*time.Minute)
 	sendBossMessage(t, ctx, coordplane, socket, project.ID, agent.ID, first.Task.ID, "LIVE-SMOKE-FINISH-ONE", "live-smoke-finish-one")
 	waitForTaskWithin(t, ctx, coordplane, socket, first.Task.ID, "first live wait", 5*time.Minute, func(task core.Task) bool {
@@ -203,10 +339,10 @@ func TestRealClaudeTwoAgentConvergence(t *testing.T) {
 	registerLiveHomeCleanup(t, image, dataDir)
 	instructions := filepath.Join(root, "live-instructions.md")
 	writeFile(t, instructions, []byte(realWorkInstructions), 0o600)
-	configPath := writeLiveConfig(t, root, dataDir, socket, image, network, providerEnv, 2)
+	configPath := testsupport.WriteFile(t, filepath.Join(root, "coordplane-live.yaml"), testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: 2, CompletedWorkspace: "24h", TerminalTaskRef: "24h", RunLog: "24h", DockerNetwork: network, DefaultImage: image, ProviderEnv: providerEnv, Tail: "  run_timeout: 12m\n  shutdown_grace: 5s\ngit:\n  capture_helper_image: " + image + "\n  capture_timeout: 30s\n  maximum_bundle_bytes: 67108864\n  maximum_objects: 250000\n  maximum_handoff_bytes: 268435456\n"}), 0o600)
 
 	daemon := startDaemon(t, coordplane, configPath, socket)
-	t.Cleanup(func() { _ = daemon.Stop() })
+	trackFailure := registerLiveFailureDiagnostics(t, coordplane, socket, dataDir, providerEnv, func() error { return daemon.Stop() })
 	waitForReady(t, ctx, coordplane, socket, "live E2E daemon startup")
 	agentA := runJSON[core.Agent](t, ctx, coordplane,
 		"agent", "add", "--socket", socket, "--id", "agt_live_a", "--display-name", "Live Agent A",
@@ -235,6 +371,7 @@ func TestRealClaudeTwoAgentConvergence(t *testing.T) {
 		"task", "create", "--socket", socket, "--project", project.ID, "--agent", agentB.ID,
 		"--title", "Live work B", "--description", "live_role=B;peer_agent_id="+agentA.ID,
 		"--request-id", "live-task-b", "--output", "json")
+	trackFailure(taskA.ID, taskB.ID)
 	if taskA.BaseSHA != initialSHA || taskB.BaseSHA != initialSHA {
 		t.Fatalf("live work Tasks do not share C0: A=%s B=%s C0=%s", taskA.BaseSHA, taskB.BaseSHA, initialSHA)
 	}
@@ -309,7 +446,6 @@ func TestRealClaudeTwoAgentConvergence(t *testing.T) {
 		t.Fatalf("stop live daemon before recovery: %v\n%s", err, readLog(daemon.logPath))
 	}
 	daemon = startDaemon(t, coordplane, configPath, socket)
-	t.Cleanup(func() { _ = daemon.Stop() })
 	waitForReady(t, ctx, coordplane, socket, "live daemon restart")
 	if got := projectDetail(t, ctx, coordplane, socket, project.ID); got.Status != core.ProjectActive || got.ActualCanonicalSHA != finalSHA {
 		t.Fatalf("live restart lost canonical truth: %#v", got)
@@ -365,14 +501,6 @@ func liveRuntimeConfig(t *testing.T) (string, string, []string) {
 		t.Fatal("ANTHROPIC_AUTH_TOKEN must be present in the provider environment allowlist")
 	}
 	return image, network, providerEnv
-}
-
-func writeLiveConfig(t *testing.T, root, dataDir, socket, image, network string, providerEnv []string, parallel int) string {
-	t.Helper()
-	path := filepath.Join(root, "coordplane-live.yaml")
-	content := testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: parallel, CompletedWorkspace: "24h", TerminalTaskRef: "24h", RunLog: "24h", DockerNetwork: network, DefaultImage: image, ProviderEnv: providerEnv, Tail: "  run_timeout: 12m\n  shutdown_grace: 5s\ngit:\n  capture_helper_image: " + image + "\n  capture_timeout: 30s\n  maximum_bundle_bytes: 67108864\n  maximum_objects: 250000\n  maximum_handoff_bytes: 268435456\n"})
-	writeFile(t, path, []byte(content), 0o600)
-	return path
 }
 
 func registerLiveHomeCleanup(t *testing.T, image, dataDir string) {

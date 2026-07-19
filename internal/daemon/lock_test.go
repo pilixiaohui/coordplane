@@ -7,14 +7,10 @@ import (
 	"testing"
 
 	"coordplane/internal/daemon"
+	"coordplane/tests/testsupport"
 )
 
-func requireNoError(t *testing.T, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatal(err)
-	}
-}
+var requireNoError = testsupport.RequireNoError
 
 func TestDataDirLockRejectsConcurrentOwnerAndReleasesOnClose(t *testing.T) {
 	dataDir := filepath.Join(t.TempDir(), "data")

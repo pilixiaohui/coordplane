@@ -9,14 +9,10 @@ import (
 	"coordplane/internal/core"
 	"coordplane/internal/store"
 	"coordplane/internal/transport"
+	"coordplane/tests/testsupport"
 )
 
-func requireNoError(t *testing.T, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatal(err)
-	}
-}
+var requireNoError = testsupport.RequireNoError
 
 func newContractServiceFixture(t *testing.T, options core.ServiceOptions) (context.Context, string, *store.Store, *contractGit, *core.Service) {
 	t.Helper()

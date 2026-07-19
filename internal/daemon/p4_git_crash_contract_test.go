@@ -42,7 +42,9 @@ func TestGT03SQLiteTaskRunAndRealGitCaptureRecoverAcrossProcessSIGKILL(t *testin
 			requireNoError(t, h.database.Close())
 			killGT03CoreGitWorker(t, h.root, task.ID, test.phase, filepath.Join(h.root, "gt03-worker-ready"))
 
-			postKill, closePostKill := openGT03Store(t, h.root)
+			postKill, err := store.Open(context.Background(), filepath.Join(h.root, "coordplane.db"))
+			requireNoError(t, err)
+			closePostKill := func() { _ = postKill.Close() }
 			persisted, err := postKill.Task(context.Background(), task.ID)
 			requireNoError(t, err)
 			if test.phase == "submitted_before_cleanup" {
@@ -58,7 +60,8 @@ func TestGT03SQLiteTaskRunAndRealGitCaptureRecoverAcrossProcessSIGKILL(t *testin
 				}
 				beforeRestart := p4StoreDurableSignature(t, postKill, h.project.ID)
 				closePostKill()
-				configPath := writeP4ComponentsConfig(t, h.root)
+				requireNoError(t, os.Chmod(h.root, 0o700))
+				configPath := testsupport.WriteFile(t, filepath.Join(h.root, "coordplane.yaml"), testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: h.root, OperatorSocket: filepath.Join(h.root, "operator.sock"), WorkspaceRoot: filepath.Join(h.root, "workspaces"), AgentHomeRoot: filepath.Join(h.root, "homes"), LogRoot: filepath.Join(h.root, "logs"), MaxParallelRuns: 4, CompletedWorkspace: "24h", TerminalTaskRef: "168h", RunLog: "168h", DockerNetwork: "coordplane", DefaultImage: "agent:test"}), 0o600)
 				first, err := buildComponents(context.Background(), configPath)
 				requireNoError(t, err)
 				h.database = first.store
@@ -83,7 +86,10 @@ func TestGT03SQLiteTaskRunAndRealGitCaptureRecoverAcrossProcessSIGKILL(t *testin
 			}
 			closePostKill()
 
-			request := captureHelperRequest(task, claim)
+			request := gitrepo.CaptureHelperRequest{
+				ProjectID: task.ProjectID, TaskID: task.ID, RunID: claim.Run.ID,
+				Workspace: claim.Run.WorkspacePath, ExpectedHead: task.PendingExpectedSHA, BaseSHA: task.BaseSHA,
+			}
 			valid := []gitrepo.CaptureHelperRequest{request}
 			requireNoError(t, (&dockerCaptureHelper{root: filepath.Join(h.root, "handoff")}).Recover(valid))
 			h.database, h.service = reopenRealP4Service(t, h)
@@ -170,15 +176,6 @@ func assertP4QuarantineEmpty(t *testing.T, root string) {
 	if len(entries) != 0 {
 		t.Fatalf("capture quarantine entries = %#v", entries)
 	}
-}
-
-func writeP4ComponentsConfig(t *testing.T, root string) string {
-	t.Helper()
-	requireNoError(t, os.Chmod(root, 0o700))
-	path := filepath.Join(root, "coordplane.yaml")
-	raw := testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: root, OperatorSocket: filepath.Join(root, "operator.sock"), WorkspaceRoot: filepath.Join(root, "workspaces"), AgentHomeRoot: filepath.Join(root, "homes"), LogRoot: filepath.Join(root, "logs"), MaxParallelRuns: 4, CompletedWorkspace: "24h", TerminalTaskRef: "168h", RunLog: "168h", DockerNetwork: "coordplane", DefaultImage: "agent:test"})
-	requireNoError(t, os.WriteFile(path, []byte(raw), 0o600))
-	return path
 }
 
 func TestGT03ExistingTaskRefReplayIsIdempotentAndRejectsDifferentHead(t *testing.T) {
@@ -336,20 +333,6 @@ func (g killAfterAdvanceProjectGit) Advance(ctx context.Context, intent core.Git
 		return core.GitAdvanceFact{}, err
 	}
 	select {}
-}
-
-func captureHelperRequest(task core.Task, claim core.Claim) gitrepo.CaptureHelperRequest {
-	return gitrepo.CaptureHelperRequest{
-		ProjectID: task.ProjectID, TaskID: task.ID, RunID: claim.Run.ID,
-		Workspace: claim.Run.WorkspacePath, ExpectedHead: task.PendingExpectedSHA, BaseSHA: task.BaseSHA,
-	}
-}
-
-func openGT03Store(t *testing.T, root string) (*store.Store, func()) {
-	t.Helper()
-	database, err := store.Open(context.Background(), filepath.Join(root, "coordplane.db"))
-	requireNoError(t, err)
-	return database, func() { _ = database.Close() }
 }
 
 func reopenRealP4Service(t *testing.T, h *realP4Harness) (*store.Store, *core.Service) {

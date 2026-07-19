@@ -12,14 +12,10 @@ import (
 	"testing"
 
 	"coordplane/internal/gitcapture"
+	"coordplane/tests/testsupport"
 )
 
-func requireNoError(t *testing.T, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatal(err)
-	}
-}
+var requireNoError = testsupport.RequireNoError
 
 func TestGT01MaterializeCreatesExactPrivateClone(t *testing.T) {
 	ctx := context.Background()

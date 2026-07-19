@@ -3,8 +3,10 @@ package testsupport
 import (
 	"cmp"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"testing"
 )
 
 type RuntimeConfigFixture struct {
@@ -37,4 +39,19 @@ runtime:
   provider_env_allowlist:%s
 %s`, f.DataDir, f.OperatorSocket, f.MaxParallelRuns, f.CompletedWorkspace, f.TerminalTaskRef, f.RunLog,
 		f.DockerNetwork, f.WorkspaceRoot, f.AgentHomeRoot, f.LogRoot, f.DefaultImage, allowlist, f.Tail))
+}
+
+func WriteFile(t testing.TB, path string, content []byte, mode os.FileMode) string {
+	t.Helper()
+	if err := os.WriteFile(path, content, mode); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func RequireNoError(t testing.TB, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
 }
