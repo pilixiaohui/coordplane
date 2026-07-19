@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"sort"
 	"time"
 
 	"coordplane/internal/adapter"
@@ -109,13 +111,16 @@ func (c *runtimeController) streamLogs(ctx context.Context, run core.Run, ref co
 			}
 		}
 
-		writeLine([]byte(monitor.redact.Text(string(line))), false)
+		writeLine(sanitizedRuntimeLogLine(monitor.redact, line), false)
 	}
 	return errors.Join(outputErr, scanner.Err())
 }
 
 func rejectedFrameLogLine(redact runtimeRedaction, frame []byte, parseErr error) []byte {
-	redactedFrame := redact.Text(string(frame))
+	redactedFrame, err := sanitizeJSONFrame(redact, frame)
+	if err != nil {
+		redactedFrame = rejectedFrameMetadata(frame)
+	}
 	truncated := len(redactedFrame) > runtimeRejectedFrameLimit
 	if truncated {
 		redactedFrame = redactedFrame[:runtimeRejectedFrameLimit]
@@ -128,8 +133,60 @@ func rejectedFrameLogLine(redact runtimeRedaction, frame []byte, parseErr error)
 		Error     string `json:"error"`
 		Frame     string `json:"frame"`
 		Truncated bool   `json:"truncated"`
-	}{Error: redactedError, Frame: redactedFrame, Truncated: truncated})
+	}{Error: redactedError, Frame: string(redactedFrame), Truncated: truncated})
 	return append([]byte("[coordplane: adapter frame rejected] "), evidence...)
+}
+
+func sanitizedRuntimeLogLine(redact runtimeRedaction, frame []byte) []byte {
+	sanitized, err := sanitizeJSONFrame(redact, frame)
+	if err == nil {
+		return sanitized
+	}
+	trimmed := bytes.TrimSpace(frame)
+	if len(trimmed) > 0 && bytes.ContainsAny(trimmed[:1], `[{"`) {
+		return rejectedFrameMetadata(frame)
+	}
+	return []byte(redact.Text(string(frame)))
+}
+
+func sanitizeJSONFrame(redact runtimeRedaction, frame []byte) ([]byte, error) {
+	decoder := json.NewDecoder(bytes.NewReader(frame))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, errors.New("JSON frame contains trailing data")
+	}
+	return json.Marshal(sanitizeJSONValue(redact, value))
+}
+
+func sanitizeJSONValue(redact runtimeRedaction, value any) any {
+	switch typed := value.(type) {
+	case string:
+		return redact.Text(typed)
+	case []any:
+		for index := range typed {
+			typed[index] = sanitizeJSONValue(redact, typed[index])
+		}
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		clean := make(map[string]any, len(typed))
+		for _, key := range keys {
+			clean[redact.Text(key)] = sanitizeJSONValue(redact, typed[key])
+		}
+		return clean
+	}
+	return value
+}
+
+func rejectedFrameMetadata(frame []byte) []byte {
+	return []byte(fmt.Sprintf(`{"bytes":%d,"sanitized":false}`, len(frame)))
 }
 
 func (m *runMonitor) setRuntimeError(code, message string) {

@@ -88,9 +88,7 @@ func TestLoadAcceptsRuntimeRunTimeout(t *testing.T) {
 	dataDir := filepath.Join(t.TempDir(), "data")
 	raw := strings.Replace(validConfig(dataDir), "  default_image:", "  run_timeout: 45s\n  default_image:", 1)
 	cfg, err := config.Load(writeConfig(t, raw))
-	if err != nil {
-		t.Fatal(err)
-	}
+	testsupport.RequireNoError(t, err)
 	if cfg.Runtime.RunTimeout != 45*time.Second {
 		t.Fatalf("run timeout = %s, want 45s", cfg.Runtime.RunTimeout)
 	}
@@ -118,9 +116,7 @@ func TestLoadAcceptsBoundedGitCaptureHelperConfig(t *testing.T) {
   maximum_handoff_bytes: 4194304
 `
 	cfg, err := config.Load(writeConfig(t, raw))
-	if err != nil {
-		t.Fatal(err)
-	}
+	testsupport.RequireNoError(t, err)
 	if cfg.Git.CaptureHelperImage != "coordplane-git-helper:test" || cfg.Git.CaptureTimeout != 45*time.Second ||
 		cfg.Git.MaximumBundleBytes != 1<<20 || cfg.Git.MaximumObjects != 5000 || cfg.Git.MaximumHandoffBytes != 4<<20 {
 		t.Fatalf("Git capture config = %+v", cfg.Git)

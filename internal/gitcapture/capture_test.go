@@ -16,9 +16,7 @@ func TestCaptureIgnoresRepositoryConfigAndPublishesReadyAtomically(t *testing.T)
 	workspace, head := newCaptureRepository(t)
 	marker := filepath.Join(t.TempDir(), "fsmonitor-ran")
 	command := filepath.Join(t.TempDir(), "fsmonitor")
-	if err := os.WriteFile(command, []byte("#!/bin/sh\n: > "+marker+"\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	testsupport.RequireNoError(t, os.WriteFile(command, []byte("#!/bin/sh\n: > "+marker+"\n"), 0o700))
 	testsupport.Git(t, workspace, "config", "core.fsmonitor", command)
 
 	handoff := t.TempDir()
@@ -26,9 +24,7 @@ func TestCaptureIgnoresRepositoryConfigAndPublishesReadyAtomically(t *testing.T)
 		Workspace: workspace, Handoff: handoff, ExpectedHead: head,
 		BaseSHA: head, MaximumBundleBytes: 8 << 20, MaximumObjects: 100,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	testsupport.RequireNoError(t, err)
 	if fact.HeadSHA != head || fact.ObjectCount == 0 {
 		t.Fatalf("capture fact = %#v", fact)
 	}
@@ -76,9 +72,7 @@ func TestInspectIgnoresRepositoryConfigAndReportsDirtyAndUnfinishedState(t *test
 	workspace, head := newCaptureRepository(t)
 	marker := filepath.Join(t.TempDir(), "fsmonitor-ran")
 	command := filepath.Join(t.TempDir(), "fsmonitor")
-	if err := os.WriteFile(command, []byte("#!/bin/sh\n: > "+marker+"\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	testsupport.RequireNoError(t, os.WriteFile(command, []byte("#!/bin/sh\n: > "+marker+"\n"), 0o700))
 	testsupport.Git(t, workspace, "config", "core.fsmonitor", command)
 
 	inspect := func() Fact {
@@ -86,9 +80,7 @@ func TestInspectIgnoresRepositoryConfigAndReportsDirtyAndUnfinishedState(t *test
 		fact, err := Inspect(context.Background(), InspectRequest{
 			Workspace: workspace, Handoff: t.TempDir(), MaximumObjects: 100,
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		testsupport.RequireNoError(t, err)
 		return fact
 	}
 	clean := inspect()
@@ -99,16 +91,12 @@ func TestInspectIgnoresRepositoryConfigAndReportsDirtyAndUnfinishedState(t *test
 		t.Fatalf("repository fsmonitor executed during inspect: %v", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(workspace, "dirty.txt"), []byte("dirty\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testsupport.RequireNoError(t, os.WriteFile(filepath.Join(workspace, "dirty.txt"), []byte("dirty\n"), 0o600))
 	dirty := inspect()
 	if dirty.Clean || dirty.StatusDigest == clean.StatusDigest {
 		t.Fatalf("dirty inspect fact = %#v, clean = %#v", dirty, clean)
 	}
-	if err := os.WriteFile(filepath.Join(workspace, ".git", "MERGE_HEAD"), []byte(head+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testsupport.RequireNoError(t, os.WriteFile(filepath.Join(workspace, ".git", "MERGE_HEAD"), []byte(head+"\n"), 0o600))
 	unfinished := inspect()
 	if !unfinished.Unfinished {
 		t.Fatalf("unfinished inspect fact = %#v", unfinished)
@@ -121,9 +109,7 @@ func newCaptureRepository(t *testing.T) (string, string) {
 	testsupport.Git(t, root, "init", "-q")
 	testsupport.Git(t, root, "config", "user.name", "Capture Test")
 	testsupport.Git(t, root, "config", "user.email", "capture@example.invalid")
-	if err := os.WriteFile(filepath.Join(root, "result.txt"), []byte("result\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testsupport.RequireNoError(t, os.WriteFile(filepath.Join(root, "result.txt"), []byte("result\n"), 0o600))
 	testsupport.Git(t, root, "add", "result.txt")
 	testsupport.Git(t, root, "commit", "-q", "-m", "result")
 	return root, testsupport.Git(t, root, "rev-parse", "HEAD^{commit}")

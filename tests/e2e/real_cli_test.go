@@ -63,9 +63,7 @@ func TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests(t *testing.T)
 	}
 
 	realGo, err := exec.LookPath("go")
-	if err != nil {
-		t.Fatal(err)
-	}
+	testsupport.RequireNoError(t, err)
 	stubDir, fixture := t.TempDir(), filepath.Join(t.TempDir(), "go-test.json")
 	testsupport.WriteFile(t, filepath.Join(stubDir, "docker"), []byte("#!/bin/sh\ncase \"$1\" in version) exit 0;; image) printf '%s\\n' \"$5\";; run) printf '%s\\n' '"+realClaudeVersion+"';; *) exit 2;; esac\n"), 0o700)
 	testsupport.WriteFile(t, filepath.Join(stubDir, "make"), []byte("#!/bin/sh\nexit 0\n"), 0o700)

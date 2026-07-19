@@ -49,9 +49,7 @@ runtime:
 
 func WriteFile(t testing.TB, path string, content []byte, mode os.FileMode) string {
 	t.Helper()
-	if err := os.WriteFile(path, content, mode); err != nil {
-		t.Fatal(err)
-	}
+	RequireNoError(t, os.WriteFile(path, content, mode))
 	return path
 }
 

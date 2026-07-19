@@ -188,9 +188,7 @@ func TestP3DockerTagSelectsRuntimeIntegrationTest(t *testing.T) {
 		}
 		return nil
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if !found {
 		t.Fatal("docker tag selects no TestDocker function that exercises DockerExecutor")
 	}

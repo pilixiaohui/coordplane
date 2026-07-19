@@ -92,44 +92,39 @@ func TestObserverCommitSchemaAndRestartContract(t *testing.T) {
 func appendObserverRecord(t *testing.T, path string, record map[string]any) {
 	t.Helper()
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requirePerfNoError(t, err)
 	defer file.Close()
-	if err := json.NewEncoder(file).Encode(record); err != nil {
-		t.Fatal(err)
-	}
+	requirePerfNoError(t, json.NewEncoder(file).Encode(record))
 }
 
 func startObserver(t *testing.T) {
 	t.Helper()
-	if err := Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	requirePerfNoError(t, Start(context.Background()))
 }
 
 func stopObserver(t *testing.T) {
 	t.Helper()
-	if err := Stop(); err != nil {
-		t.Fatal(err)
-	}
+	requirePerfNoError(t, Stop())
 }
 
 func observerRecords(t *testing.T, path string) []map[string]any {
 	t.Helper()
 	file, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requirePerfNoError(t, err)
 	defer file.Close()
 	var records []map[string]any
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		var record map[string]any
-		if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
-			t.Fatal(err)
-		}
+		requirePerfNoError(t, json.Unmarshal(scanner.Bytes(), &record))
 		records = append(records, record)
 	}
 	return records
+}
+
+func requirePerfNoError(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
 }

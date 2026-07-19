@@ -517,13 +517,14 @@ func TestSupervisorStopsRunAfterSessionPersistenceFailure(t *testing.T) {
 
 func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 	for _, test := range []struct {
-		name, frame, session string
-		waitFirst, evidence  bool
+		name, frame, session, evidence string
+		waitFirst                      bool
 	}{
-		{name: "malformed wait first", frame: "{", waitFirst: true},
+		{name: "malformed wait first", waitFirst: true, evidence: "metadata"},
 		{name: "init without session", frame: `{"type":"system","subtype":"init"}`},
 		{name: "success without is_error", frame: `{"type":"result","subtype":"success"}`},
-		{name: "rejected after init is durable", session: "diagnostic-session", evidence: true},
+		{name: "escaped rejected JSON is sanitized", session: "diagnostic-session", evidence: "sanitized"},
+		{name: "full log reserves rejected evidence", session: "reserve-session", evidence: "reserve"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			service, claim := claimRuntimeTestRun(t)
@@ -535,25 +536,42 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 			frame := test.frame
 			secret, lowerDigest, upperDigest := "", "", ""
 			executor := &monitorFailureExecutor{stopped: make(chan struct{})}
+			executor.state = &containerruntime.LiveState{Ref: ref, Running: true, Status: containerruntime.StatusRunning}
 			controller := newRuntimeTestController(t, service, executor)
 			canonical := requireRuntimeValue(service.Snapshot(context.Background(), claim.Task.ProjectID)).Projects[0].CanonicalSHA
 			var beforeFailure core.Run
 			var beforeTask core.TaskDetail
 			var beforeCleanup core.Snapshot
-			if test.evidence {
+			if test.evidence != "" {
 				const providerName = "ANTHROPIC_AUTH_TOKEN"
-				secret = `provider-"secret"\canary`
-				lowerDigest = "48cb4a2f9fed48b2b49da3bb10305b8e2e2b4f7aa540fc88a775f94c97338ef6"
+				secret = "provider-\"secret\"\\canary\n<&>"
+				lowerDigest = fmt.Sprintf("%x", sha256.Sum256([]byte(secret)))
 				upperDigest = strings.ToUpper(lowerDigest)
 				t.Setenv(providerName, secret)
 				controller.config.Runtime.ProviderEnvAllowlist = []string{providerName}
-				init := fmt.Sprintf(`{"type":"system","subtype":"init","session_id":%q}`, test.session)
-				frame = init + "\n" + `{"z":"` + secret + `","a":"` + lowerDigest + `","b":"` + upperDigest + `","padding":"` + strings.Repeat("x", 2048)
-				executor.beforeStop = func() []byte {
-					beforeFailure = requireRuntimeValue(service.Run(context.Background(), active.ID))
-					beforeTask = requireRuntimeValue(service.Task(context.Background(), claim.Task.ID))
-					beforeCleanup = requireRuntimeValue(service.Snapshot(context.Background(), claim.Task.ProjectID))
-					return requireRuntimeValue(os.ReadFile(active.LogPath))
+				padding := "short"
+				if test.evidence == "reserve" {
+					padding = strings.Repeat("x", 2048)
+				}
+				rejected := requireRuntimeValue(json.Marshal(map[string]any{
+					"type": "system", "subtype": "init", "z_padding": padding,
+					"a_sensitive": map[string]any{"secret": secret, "digests": []string{lowerDigest, upperDigest}},
+				}))
+				if test.evidence == "metadata" {
+					frame = string(rejected[:len(rejected)-1])
+				} else {
+					init := fmt.Sprintf(`{"type":"system","subtype":"init","session_id":%q}`, test.session)
+					frame = init + "\n" + string(rejected)
+					if test.evidence == "reserve" {
+						ordinary := strings.Repeat("o", 512<<10) + "\n"
+						frame = strings.Repeat(ordinary, runtimeLogLimit/len(ordinary)+1) + frame
+					}
+					executor.beforeStop = func() []byte {
+						beforeFailure = requireRuntimeValue(service.Run(context.Background(), active.ID))
+						beforeTask = requireRuntimeValue(service.Task(context.Background(), claim.Task.ID))
+						beforeCleanup = requireRuntimeValue(service.Snapshot(context.Background(), claim.Task.ProjectID))
+						return requireRuntimeValue(os.ReadFile(active.LogPath))
+					}
 				}
 			}
 			executor.payload = frame
@@ -574,28 +592,53 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 				monitor := controller.newMonitor(active, ref, adapter.Claude{}, nil)
 				controller.supervise(monitor)
 			}
-			if test.evidence {
+			if test.evidence != "" {
 				raw := executor.capturedLog
-				lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+				if raw == nil {
+					raw = requireRuntimeValue(os.ReadFile(active.LogPath))
+				}
+				text := strings.TrimSuffix(string(raw), "\n")
+				line := text[strings.LastIndex(text, "\n")+1:]
 				const prefix = `[coordplane: adapter frame rejected] `
-				if len(lines) != 2 || !strings.HasPrefix(lines[1], prefix+`{"error":`) ||
-					!strings.Contains(lines[1], `,"frame":`) || !strings.HasSuffix(lines[1], `,"truncated":true}`) {
+				if !strings.HasPrefix(line, prefix+`{"error":`) || !strings.Contains(line, `,"frame":`) || !strings.Contains(line, `,"truncated":`) {
 					t.Fatalf("rejected-frame diagnostic shape/order = %q", raw)
 				}
 				var evidence map[string]any
-				requireNoError(t, json.Unmarshal([]byte(strings.TrimPrefix(lines[1], prefix)), &evidence))
-				frame, _ := evidence["frame"].(string)
-				if evidence["error"] != "adapter: invalid Claude JSON event" || len(frame) != 1024 || evidence["truncated"] != true {
+				requireNoError(t, json.Unmarshal([]byte(strings.TrimPrefix(line, prefix)), &evidence))
+				savedFrame, _ := evidence["frame"].(string)
+				wantError := "adapter: Claude system init omitted session_id"
+				if test.evidence == "metadata" {
+					wantError = "adapter: invalid Claude JSON event"
+				}
+				if evidence["error"] != wantError {
 					t.Fatalf("rejected-frame diagnostic = %#v", evidence)
 				}
-				for _, forbidden := range []string{secret, lowerDigest, upperDigest} {
-					if strings.Contains(string(raw), forbidden) {
+				encodedSecret := requireRuntimeValue(json.Marshal(secret))
+				escapedSecret := string(encodedSecret[1 : len(encodedSecret)-1])
+				doubleEncoded := requireRuntimeValue(json.Marshal(escapedSecret))
+				for _, forbidden := range []string{secret, escapedSecret, string(doubleEncoded[1 : len(doubleEncoded)-1]), lowerDigest, upperDigest} {
+					if strings.Contains(string(raw), forbidden) || strings.Contains(savedFrame, forbidden) {
 						t.Fatalf("rejected-frame diagnostic leaked sensitive value %q", forbidden)
 					}
 				}
-				if core.IsRunTerminal(beforeFailure.State) || beforeFailure.CleanupState == core.CleanupRemoved || beforeFailure.NativeSessionID != test.session ||
+				switch test.evidence {
+				case "metadata":
+					if savedFrame != fmt.Sprintf(`{"bytes":%d,"sanitized":false}`, len(frame)) || evidence["truncated"] != false {
+						t.Fatalf("unsafe malformed-frame fallback = %#v", evidence)
+					}
+				case "sanitized":
+					want := `"a_sensitive":{"digests":["[REDACTED_SECRET]","[REDACTED_SECRET]"],"secret":"[REDACTED_SECRET]"}`
+					if !strings.Contains(savedFrame, want) || evidence["truncated"] != false {
+						t.Fatalf("structured rejected-frame redaction = %#v", evidence)
+					}
+				case "reserve":
+					if len(raw) > runtimeLogLimit || strings.Count(string(raw), runtimeLogTruncatedMarker) != 1 || len(savedFrame) != 1024 || evidence["truncated"] != true {
+						t.Fatalf("reserved rejected-frame boundary: bytes=%d evidence=%#v", len(raw), evidence)
+					}
+				}
+				if test.evidence != "metadata" && (core.IsRunTerminal(beforeFailure.State) || beforeFailure.CleanupState == core.CleanupRemoved || beforeFailure.NativeSessionID != test.session ||
 					beforeFailure.RequestedOutcome != "" || beforeTask.LatestProgress != nil || beforeTask.Task.Status != core.TaskRunning ||
-					beforeTask.Task.HeadSHA != "" || beforeTask.Task.IntegrationTaskID != "" || beforeTask.Task.FinalCanonicalSHA != "" || beforeCleanup.Projects[0].CanonicalSHA != canonical {
+					beforeTask.Task.HeadSHA != "" || beforeTask.Task.IntegrationTaskID != "" || beforeTask.Task.FinalCanonicalSHA != "" || beforeCleanup.Projects[0].CanonicalSHA != canonical) {
 					t.Fatalf("protocol diagnostic advanced state before failure/cleanup: Run=%#v Task=%#v Project=%#v", beforeFailure, beforeTask, beforeCleanup.Projects[0])
 				}
 			}

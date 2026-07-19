@@ -23,12 +23,12 @@ type productionSource struct {
 	file *ast.File
 }
 
+var requireNoError = testsupport.RequireNoError
+
 func TestV1SchemaBusinessTableAllowlist(t *testing.T) {
 	root := repositoryRoot()
 	raw, err := os.ReadFile(filepath.Join(root, "internal", "store", "schema.go"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	pattern := regexp.MustCompile(`(?i)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-z_][a-z0-9_]*)`)
 	allowed := stringSet(
 		"projects", "agents", "tasks", "runs", "messages", "events",
@@ -185,9 +185,7 @@ func TestProductionSourcesDoNotReintroduceLegacyRoutesOrCLI(t *testing.T) {
 func TestNeedDirectoryAndProviderContract(t *testing.T) {
 	root := repositoryRoot()
 	entries, err := os.ReadDir(filepath.Join(root, "need"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	var names []string
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -199,9 +197,7 @@ func TestNeedDirectoryAndProviderContract(t *testing.T) {
 		t.Fatalf("need authority set = %v, want %v", names, want)
 	}
 	raw, err := os.ReadFile(filepath.Join(root, "need", "README.md"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if docs := string(raw); strings.Contains(docs, "ANTHROPIC_API_KEY") || !strings.Contains(docs, "ANTHROPIC_AUTH_TOKEN") || !strings.Contains(docs, "ANTHROPIC_BASE_URL") || !strings.Contains(docs, "CLAUDE_CODE_EFFORT_LEVEL") || !strings.Contains(docs, "`--bare`") || !strings.Contains(docs, "~/.claude") {
 		t.Fatal("README provider credential contract is inconsistent with the Claude runtime")
 	}
@@ -250,9 +246,7 @@ func productionSources(t *testing.T, roots ...string) []productionSource {
 			result = append(result, productionSource{filepath.ToSlash(rel), raw, parsed})
 			return nil
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err)
 	}
 	return result
 }
