@@ -20,9 +20,8 @@ func main() {
 	}
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
-		path := scanner.Text()
-		for _, line := range statementLines(path, nil) {
-			fmt.Printf("%s:%d\n", path, line)
+		for _, line := range statementLines(scanner.Text(), nil) {
+			fmt.Printf("%s:%d\n", scanner.Text(), line)
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -32,7 +31,8 @@ func main() {
 
 func liveIntegrationWiring(file *ast.File) bool {
 	function := file.Scope.Lookup("TestRealClaudeTwoAgentConvergence").Decl.(*ast.FuncDecl)
-	integrations, trackers, helperCalls, trackerWrites, integrationPos := 0, 0, 0, 0, token.NoPos
+	integrations, helperCalls, trackerUses, integrationPos := 0, 0, 0, token.NoPos
+	var trackerObject *ast.Object
 	for _, statement := range function.Body.List {
 		assignment, ok := statement.(*ast.AssignStmt)
 		if !ok || len(assignment.Lhs) != 1 || len(assignment.Rhs) != 1 {
@@ -41,10 +41,10 @@ func liveIntegrationWiring(file *ast.File) bool {
 		call, callOK := assignment.Rhs[0].(*ast.CallExpr)
 		switch identifierName(assignment.Lhs[0]) {
 		case "trackFailure":
-			trackers++
-			if !callOK || assignment.Tok != token.DEFINE || identifierName(call.Fun) != "registerLiveFailureDiagnostics" {
+			if trackerObject != nil || !callOK || assignment.Tok != token.DEFINE || identifierName(call.Fun) != "registerLiveFailureDiagnostics" {
 				return false
 			}
+			trackerObject = assignment.Lhs[0].(*ast.Ident).Obj
 		case "integration":
 			integrations++
 			integrationPos = assignment.Pos()
@@ -56,22 +56,22 @@ func liveIntegrationWiring(file *ast.File) bool {
 			}
 		}
 	}
+	// Before the wait, only direct tracker calls may consume the canonical binding.
 	ast.Inspect(function.Body, func(node ast.Node) bool {
-		if call, ok := node.(*ast.CallExpr); ok && identifierName(call.Fun) == "waitForLiveIntegration" {
-			helperCalls++
-		}
-		assignment, ok := node.(*ast.AssignStmt)
-		if !ok || integrationPos == token.NoPos || assignment.Pos() >= integrationPos {
-			return true
-		}
-		for _, left := range assignment.Lhs {
-			if identifierName(left) == "trackFailure" {
-				trackerWrites++
+		if call, ok := node.(*ast.CallExpr); ok {
+			if identifierName(call.Fun) == "waitForLiveIntegration" {
+				helperCalls++
 			}
+			if callee, ok := call.Fun.(*ast.Ident); ok && call.Pos() < integrationPos && callee.Obj == trackerObject {
+				trackerUses--
+			}
+		}
+		if identifier, ok := node.(*ast.Ident); ok && identifier.Pos() < integrationPos && identifier.Obj == trackerObject {
+			trackerUses++
 		}
 		return true
 	})
-	return helperCalls == 1 && integrations == 1 && trackers == 1 && trackerWrites == 1
+	return helperCalls == 1 && integrations == 1 && trackerObject != nil && trackerUses == 1
 }
 
 func identifierName(expression ast.Expr) string {
@@ -130,6 +130,7 @@ func checkSelfTest() {
 		{name: "integration alias", body: trackerBinding + "integrationID := taskB.IntegrationTaskID\nintegration := waitForTaskWithin(a, b, c, d, integrationID, e, f, g)"},
 		{name: "same-name no-op binding", body: "trackFailure := func(...string) {}\nintegration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)"},
 		{name: "tracker reassignment", body: trackerBinding + "trackFailure = func(...string) {}\nintegration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)"},
+		{name: "indirect tracker reassignment", body: trackerBinding + "*(&trackFailure) = func(...string) {}\nintegration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)"},
 	} {
 		source := "package p\nfunc TestRealClaudeTwoAgentConvergence() {\n" + test.body + "\n}"
 		if got := liveIntegrationWiring(parseFile(token.NewFileSet(), test.name, source)); got != test.want {
