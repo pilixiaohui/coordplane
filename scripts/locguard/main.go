@@ -31,47 +31,47 @@ func main() {
 
 func liveIntegrationWiring(file *ast.File) bool {
 	function := file.Scope.Lookup("TestRealClaudeTwoAgentConvergence").Decl.(*ast.FuncDecl)
-	integrations, helperCalls, trackerUses, integrationPos := 0, 0, 0, token.NoPos
+	helperCalls, trackerUses, trackerCalls, integrationPos := 0, 0, 0, token.NoPos
 	var trackerObject *ast.Object
 	for _, statement := range function.Body.List {
-		assignment, ok := statement.(*ast.AssignStmt)
-		if !ok || len(assignment.Lhs) != 1 || len(assignment.Rhs) != 1 {
-			continue
-		}
-		call, callOK := assignment.Rhs[0].(*ast.CallExpr)
-		switch identifierName(assignment.Lhs[0]) {
-		case "trackFailure":
-			if trackerObject != nil || !callOK || assignment.Tok != token.DEFINE || identifierName(call.Fun) != "registerLiveFailureDiagnostics" {
-				return false
+		switch statement := statement.(type) {
+		case *ast.ExprStmt:
+			call, _ := statement.X.(*ast.CallExpr)
+			if call != nil && trackerObject != nil && integrationPos == token.NoPos &&
+				identifierName(call.Fun) == "trackFailure" && call.Fun.(*ast.Ident).Obj == trackerObject {
+				trackerCalls++
 			}
-			trackerObject = assignment.Lhs[0].(*ast.Ident).Obj
-		case "integration":
-			integrations++
-			integrationPos = assignment.Pos()
-			if !callOK || assignment.Tok != token.DEFINE || identifierName(call.Fun) != "waitForLiveIntegration" || len(call.Args) != 9 {
-				return false
+		case *ast.AssignStmt:
+			if len(statement.Lhs) != 1 || len(statement.Rhs) != 1 {
+				continue
 			}
-			if identifierName(call.Args[4]) != "trackFailure" || identifierName(call.Args[5]) != "taskB" {
-				return false
+			call, callOK := statement.Rhs[0].(*ast.CallExpr)
+			switch identifierName(statement.Lhs[0]) {
+			case "trackFailure":
+				if trackerObject != nil || !callOK || statement.Tok != token.DEFINE || identifierName(call.Fun) != "registerLiveFailureDiagnostics" {
+					return false
+				}
+				trackerObject = statement.Lhs[0].(*ast.Ident).Obj
+			case "integration":
+				if integrationPos != token.NoPos || !callOK || statement.Tok != token.DEFINE || identifierName(call.Fun) != "waitForLiveIntegration" || len(call.Args) != 9 ||
+					identifierName(call.Args[4]) != "trackFailure" || identifierName(call.Args[5]) != "taskB" {
+					return false
+				}
+				integrationPos = statement.Pos()
 			}
 		}
 	}
-	// Before the wait, only direct tracker calls may consume the canonical binding.
+	// Before the wait, only direct tracker calls in Body.List may consume the binding.
 	ast.Inspect(function.Body, func(node ast.Node) bool {
-		if call, ok := node.(*ast.CallExpr); ok {
-			if identifierName(call.Fun) == "waitForLiveIntegration" {
-				helperCalls++
-			}
-			if callee, ok := call.Fun.(*ast.Ident); ok && call.Pos() < integrationPos && callee.Obj == trackerObject {
-				trackerUses--
-			}
+		if call, ok := node.(*ast.CallExpr); ok && identifierName(call.Fun) == "waitForLiveIntegration" {
+			helperCalls++
 		}
 		if identifier, ok := node.(*ast.Ident); ok && identifier.Pos() < integrationPos && identifier.Obj == trackerObject {
 			trackerUses++
 		}
 		return true
 	})
-	return helperCalls == 1 && integrations == 1 && trackerObject != nil && trackerUses == 1
+	return helperCalls == 1 && integrationPos != token.NoPos && trackerObject != nil && trackerUses == trackerCalls+1
 }
 
 func identifierName(expression ast.Expr) string {
@@ -116,25 +116,25 @@ func checkSelfTest() {
 		}
 	}
 	const trackerBinding = "trackFailure := registerLiveFailureDiagnostics(a)\n"
-	for _, test := range []struct {
-		name, body string
-		want       bool
-	}{
-		{name: "production", body: trackerBinding + `integration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)`, want: true},
-		{name: "inline direct", body: trackerBinding + `integration := waitForTaskWithin(a, b, c, d, taskB.IntegrationTaskID, e, f, g)`},
-		{name: "no-op tracker", body: trackerBinding + `integration := waitForLiveIntegration(a, b, c, d, func(...string) {}, taskB, e, f, g)`},
-		{name: "alternate tracker", body: trackerBinding + `integration := waitForLiveIntegration(a, b, c, d, otherTracker, taskB, e, f, g)`},
-		{name: "wrong source", body: trackerBinding + `integration := waitForLiveIntegration(a, b, c, d, trackFailure, taskA, e, f, g)`},
-		{name: "dead helper", body: trackerBinding + "if false { integration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g) }\nintegration := waitForTaskWithin(a, b, c, d, taskB.IntegrationTaskID, e, f, g)"},
-		{name: "closure helper", body: trackerBinding + "helper := func() { integration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g) }\n_ = helper\nintegrationID := taskB.IntegrationTaskID\nintegration := waitForTaskWithin(a, b, c, d, integrationID, e, f, g)"},
-		{name: "integration alias", body: trackerBinding + "integrationID := taskB.IntegrationTaskID\nintegration := waitForTaskWithin(a, b, c, d, integrationID, e, f, g)"},
-		{name: "same-name no-op binding", body: "trackFailure := func(...string) {}\nintegration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)"},
-		{name: "tracker reassignment", body: trackerBinding + "trackFailure = func(...string) {}\nintegration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)"},
-		{name: "indirect tracker reassignment", body: trackerBinding + "*(&trackFailure) = func(...string) {}\nintegration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)"},
+	for name, body := range map[string]string{
+		"production":                    trackerBinding + `integration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)`,
+		"inline direct":                 trackerBinding + `integration := waitForTaskWithin(a, b, c, d, taskB.IntegrationTaskID, e, f, g)`,
+		"no-op tracker":                 trackerBinding + `integration := waitForLiveIntegration(a, b, c, d, func(...string) {}, taskB, e, f, g)`,
+		"alternate tracker":             trackerBinding + `integration := waitForLiveIntegration(a, b, c, d, otherTracker, taskB, e, f, g)`,
+		"wrong source":                  trackerBinding + `integration := waitForLiveIntegration(a, b, c, d, trackFailure, taskA, e, f, g)`,
+		"dead helper":                   trackerBinding + "if false { integration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g) }\nintegration := waitForTaskWithin(a, b, c, d, taskB.IntegrationTaskID, e, f, g)",
+		"closure helper":                trackerBinding + "helper := func() { integration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g) }\n_ = helper\nintegrationID := taskB.IntegrationTaskID\nintegration := waitForTaskWithin(a, b, c, d, integrationID, e, f, g)",
+		"integration alias":             trackerBinding + "integrationID := taskB.IntegrationTaskID\nintegration := waitForTaskWithin(a, b, c, d, integrationID, e, f, g)",
+		"same-name no-op binding":       "trackFailure := func(...string) {}\nintegration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)",
+		"tracker reassignment":          trackerBinding + "trackFailure = func(...string) {}\nintegration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)",
+		"indirect tracker reassignment": trackerBinding + "*(&trackFailure) = func(...string) {}\nintegration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)",
+		"closure direct tracker call":   trackerBinding + "_ = func() { trackFailure(a) }\nintegration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)",
+		"defer tracker call":            trackerBinding + "defer trackFailure(a)\nintegration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)",
+		"go tracker call":               trackerBinding + "go trackFailure(a)\nintegration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)",
 	} {
-		source := "package p\nfunc TestRealClaudeTwoAgentConvergence() {\n" + test.body + "\n}"
-		if got := liveIntegrationWiring(parseFile(token.NewFileSet(), test.name, source)); got != test.want {
-			panic("live integration self-test failed: " + test.name)
+		source := "package p\nfunc TestRealClaudeTwoAgentConvergence() {\n" + body + "\n}"
+		if got := liveIntegrationWiring(parseFile(token.NewFileSet(), name, source)); got != (name == "production") {
+			panic("live integration self-test failed: " + name)
 		}
 	}
 }
