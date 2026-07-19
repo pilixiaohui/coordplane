@@ -140,19 +140,22 @@ func TestRealCLIGatePreservesFailureDiagnosticsBeforeCleanupWithoutProvider(t *t
 		testsupport.WriteFile(t, logPath, []byte("discarded-marker\n"+strings.Repeat("x", liveDiagnosticTailBytes)+"diagnostic-marker "+leaked), 0o600)
 	}
 	boundaryPath := filepath.Join(fixtureRoot, "boundary.log")
-	for _, size := range []int{liveDiagnosticTailBytes - 1, liveDiagnosticTailBytes, liveDiagnosticTailBytes + 1} {
+	if liveDiagnosticTailBytes != 8192 {
+		t.Fatalf("live diagnostic tail limit = %d, want 8192", liveDiagnosticTailBytes)
+	}
+	for _, size := range []int{8191, 8192, 8193} {
 		content := []byte("A" + strings.Repeat("x", size-2) + "Z")
 		testsupport.WriteFile(t, boundaryPath, content, 0o600)
 		got, err := readLiveRunLogTail(boundaryPath)
 		requireNoError(t, err)
-		want := content[max(0, len(content)-liveDiagnosticTailBytes):]
-		if got != string(want) || len(got) != min(size, liveDiagnosticTailBytes) {
+		want := content[max(0, len(content)-8192):]
+		if got != string(want) || len(got) != min(size, 8192) {
 			t.Fatalf("tail size=%d got=%d want=%d", size, len(got), len(want))
 		}
 	}
 
 	tracked := []string{"task-history", "task-unproven"}
-	_ = waitForTrackedTaskWithin(t, context.Background(), binary, "unused.sock", func(ids ...string) { tracked = append(tracked, ids...) }, "task-integration", "dynamic integration diagnostic", time.Second, func(task core.Task) bool { return task.Status == core.TaskFailed })
+	_ = waitForLiveIntegration(t, context.Background(), binary, "unused.sock", func(ids ...string) { tracked = append(tracked, ids...) }, core.Task{IntegrationTaskID: "task-integration"}, "dynamic integration diagnostic", time.Second, func(task core.Task) bool { return task.Status == core.TaskFailed })
 	var evidence string
 	requireNoError(t, preserveLiveFailureDiagnostics(
 		func() string {
@@ -311,10 +314,11 @@ func redactLiveDiagnostics(value, dataDir string, providerEnv []string) string {
 	return value
 }
 
-func waitForTrackedTaskWithin(t *testing.T, ctx context.Context, binary, socket string, track func(...string), id, reason string, timeout time.Duration, predicate func(core.Task) bool) core.Task {
+func waitForLiveIntegration(t *testing.T, ctx context.Context, binary, socket string, track func(...string), source core.Task, reason string, timeout time.Duration, predicate func(core.Task) bool) core.Task {
 	t.Helper()
-	track(id)
-	return waitForTaskWithin(t, ctx, binary, socket, id, reason, timeout, predicate)
+	integrationID := source.IntegrationTaskID
+	track(integrationID)
+	return waitForTaskWithin(t, ctx, binary, socket, integrationID, reason, timeout, predicate)
 }
 
 func TestRealClaudeAdapterSmoke(t *testing.T) {
@@ -484,7 +488,7 @@ func TestRealClaudeTwoAgentConvergence(t *testing.T) {
 	taskB = waitForTaskWithin(t, ctx, coordplane, socket, taskB.ID, "live B stale link", 2*time.Minute, func(task core.Task) bool {
 		return task.Status == core.TaskSubmitted && task.IntegrationTaskID != ""
 	})
-	integration := waitForTrackedTaskWithin(t, ctx, coordplane, socket, trackFailure, taskB.IntegrationTaskID, "live integration", 7*time.Minute, func(task core.Task) bool {
+	integration := waitForLiveIntegration(t, ctx, coordplane, socket, trackFailure, taskB, "live integration", 7*time.Minute, func(task core.Task) bool {
 		return task.Status == core.TaskCompleted && task.HeadSHA != "" && task.FinalCanonicalSHA == task.HeadSHA
 	})
 	taskB = waitForTaskWithin(t, ctx, coordplane, socket, taskB.ID, "live B completion", 2*time.Minute, func(task core.Task) bool {

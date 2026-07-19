@@ -267,9 +267,7 @@ func sourceImports(source productionSource, path string) bool {
 	return false
 }
 
-func repositoryRoot() string {
-	return testsupport.RepositoryRoot()
-}
+var repositoryRoot = testsupport.RepositoryRoot
 
 func containsGoFile(root string) (bool, error) {
 	found := false

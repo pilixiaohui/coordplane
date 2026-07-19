@@ -661,9 +661,7 @@ func TestCT04RealDockerExitZeroAndDoneTextCannotCompleteTask(t *testing.T) {
 	}
 }
 
-func daemonRepositoryRoot() string {
-	return testsupport.RepositoryRoot()
-}
+var daemonRepositoryRoot = testsupport.RepositoryRoot
 
 func gitWorkspaceSpecForTest(task core.Task) gitrepo.WorkspaceSpec {
 	return gitrepo.WorkspaceSpec{ProjectID: task.ProjectID, TaskID: task.ID, BaseSHA: task.BaseSHA}
