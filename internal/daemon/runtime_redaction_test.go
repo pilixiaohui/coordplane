@@ -19,7 +19,7 @@ func TestRuntimeRedaction(t *testing.T) {
 	workspace := filepath.Join(root, "workspaces", "task")
 	secret := "provider-secret-canary"
 	multiline := "provider-secret-header\r\n\r\n provider-secret-body \nprovider-secret-footer"
-	tests := []struct {
+	for _, test := range []struct {
 		name, input, want string
 		paths, secrets    []string
 	}{
@@ -29,8 +29,7 @@ func TestRuntimeRedaction(t *testing.T) {
 		{name: "provider-secret-header", input: "runtime output: provider-secret-header", want: "runtime output: " + redactedSecret, secrets: []string{multiline}},
 		{name: "provider-secret-body", input: "runtime output: provider-secret-body", want: "runtime output: " + redactedSecret, secrets: []string{multiline}},
 		{name: "provider-secret-footer", input: "runtime output: provider-secret-footer", want: "runtime output: " + redactedSecret, secrets: []string{multiline}},
-	}
-	for _, test := range tests {
+	} {
 		t.Run(test.name, func(t *testing.T) {
 			if result := newRuntimeRedaction(test.paths, test.secrets).Text(test.input); result != test.want {
 				t.Fatalf("runtime redaction = %q, want %q", result, test.want)

@@ -533,7 +533,7 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 				Body: "must remain pending", RequestID: "protocol-message-" + test.name,
 			}))
 			active, ref := activateRuntimeTestRun(t, service, claim)
-			frame := test.frame
+			frame, accepted := test.frame, []byte(nil)
 			secret, lowerDigest, upperDigest := "", "", ""
 			executor := &monitorFailureExecutor{stopped: make(chan struct{})}
 			executor.state = &containerruntime.LiveState{Ref: ref, Running: true, Status: containerruntime.StatusRunning}
@@ -553,6 +553,7 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 				if test.evidence == "reserve" {
 					padding = strings.Repeat("x", 2048)
 				}
+				accepted = requireRuntimeValue(json.Marshal(map[string]any{"type": "assistant", secret: map[string]any{"secret": secret, "digests": []string{lowerDigest, upperDigest}}}))
 				rejected := requireRuntimeValue(json.Marshal(map[string]any{
 					"type": "system", "subtype": "init", "z_padding": padding,
 					"a_sensitive": map[string]any{"secret": secret, "digests": []string{lowerDigest, upperDigest}},
@@ -561,7 +562,7 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 					frame = string(rejected[:len(rejected)-1])
 				} else {
 					init := fmt.Sprintf(`{"type":"system","subtype":"init","session_id":%q}`, test.session)
-					frame = init + "\n" + string(rejected)
+					frame = strings.Join([]string{init, string(accepted), "[" + string(accepted), string(rejected)}, "\n")
 					if test.evidence == "reserve" {
 						ordinary := strings.Repeat("o", 512<<10) + "\n"
 						frame = strings.Repeat(ordinary, runtimeLogLimit/len(ordinary)+1) + frame
@@ -628,7 +629,7 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 					}
 				case "sanitized":
 					want := `"a_sensitive":{"digests":["[REDACTED_SECRET]","[REDACTED_SECRET]"],"secret":"[REDACTED_SECRET]"}`
-					if !strings.Contains(savedFrame, want) || evidence["truncated"] != false {
+					if !strings.Contains(text, "\n"+`{"[REDACTED_SECRET]":{"digests":["[REDACTED_SECRET]","[REDACTED_SECRET]"],"secret":"[REDACTED_SECRET]"},"type":"assistant"}`+"\n"+fmt.Sprintf(`{"bytes":%d,"sanitized":false}`, len(accepted)+1)+"\n") || !strings.Contains(savedFrame, want) || evidence["truncated"] != false {
 						t.Fatalf("structured rejected-frame redaction = %#v", evidence)
 					}
 				case "reserve":
