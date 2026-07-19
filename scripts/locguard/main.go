@@ -13,7 +13,7 @@ import (
 func main() {
 	checkSelfTest()
 	if len(os.Args) == 3 && os.Args[1] == "--live-integration" {
-		if !liveIntegrationWiring(parseFile(token.NewFileSet(), os.Args[2], nil)) {
+		if !liveIntegrationWiring(must(parser.ParseFile(token.NewFileSet(), os.Args[2], nil, 0))) {
 			panic("live integration wiring guard failed")
 		}
 		return
@@ -39,6 +39,9 @@ func liveIntegrationWiring(file *ast.File) bool {
 			call, _ := statement.X.(*ast.CallExpr)
 			if call != nil && trackerObject != nil && integrationPos == token.NoPos &&
 				identifierName(call.Fun) == "trackFailure" && call.Fun.(*ast.Ident).Obj == trackerObject {
+				if len(call.Args) != 2 || identifierName(call.Args[0]) != "taskA.ID" || identifierName(call.Args[1]) != "taskB.ID" {
+					return false
+				}
 				trackerCalls++
 			}
 		case *ast.AssignStmt:
@@ -71,12 +74,15 @@ func liveIntegrationWiring(file *ast.File) bool {
 		}
 		return true
 	})
-	return helperCalls == 1 && integrationPos != token.NoPos && trackerObject != nil && trackerUses == trackerCalls+1
+	return helperCalls == 1 && integrationPos != token.NoPos && trackerObject != nil && trackerCalls == 1 && trackerUses == 2
 }
 
 func identifierName(expression ast.Expr) string {
-	if identifier, ok := expression.(*ast.Ident); ok {
-		return identifier.Name
+	switch expression := expression.(type) {
+	case *ast.Ident:
+		return expression.Name
+	case *ast.SelectorExpr:
+		return identifierName(expression.X) + "." + expression.Sel.Name
 	}
 	return ""
 }
@@ -90,7 +96,7 @@ func statementLines(name string, source any) (lines []int) {
 			}
 		}
 	}
-	ast.Inspect(parseFile(set, name, source), func(node ast.Node) bool {
+	ast.Inspect(must(parser.ParseFile(set, name, source, 0)), func(node ast.Node) bool {
 		switch value := node.(type) {
 		case *ast.BlockStmt:
 			check(value.List)
@@ -115,7 +121,8 @@ func checkSelfTest() {
 			panic("locguard self-test failed")
 		}
 	}
-	const trackerBinding = "trackFailure := registerLiveFailureDiagnostics(a)\n"
+	const trackerDeclaration = "trackFailure := registerLiveFailureDiagnostics(a)\n"
+	const trackerBinding = trackerDeclaration + "trackFailure(taskA.ID, taskB.ID)\n"
 	for name, body := range map[string]string{
 		"production":                    trackerBinding + `integration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)`,
 		"inline direct":                 trackerBinding + `integration := waitForTaskWithin(a, b, c, d, taskB.IntegrationTaskID, e, f, g)`,
@@ -131,18 +138,21 @@ func checkSelfTest() {
 		"closure direct tracker call":   trackerBinding + "_ = func() { trackFailure(a) }\nintegration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)",
 		"defer tracker call":            trackerBinding + "defer trackFailure(a)\nintegration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)",
 		"go tracker call":               trackerBinding + "go trackFailure(a)\nintegration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)",
+		"zero tracker call":             trackerDeclaration + `integration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)`,
+		"missing taskB":                 trackerDeclaration + "trackFailure(taskA.ID)\nintegration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)",
+		"wrong tracker order":           trackerDeclaration + "trackFailure(taskB.ID, taskA.ID)\nintegration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)",
+		"extra tracker call":            trackerBinding + "trackFailure(taskA.ID, taskB.ID)\nintegration := waitForLiveIntegration(a, b, c, d, trackFailure, taskB, e, f, g)",
 	} {
 		source := "package p\nfunc TestRealClaudeTwoAgentConvergence() {\n" + body + "\n}"
-		if got := liveIntegrationWiring(parseFile(token.NewFileSet(), name, source)); got != (name == "production") {
+		if got := liveIntegrationWiring(must(parser.ParseFile(token.NewFileSet(), name, source, 0))); got != (name == "production") {
 			panic("live integration self-test failed: " + name)
 		}
 	}
 }
 
-func parseFile(set *token.FileSet, name string, source any) *ast.File {
-	file, err := parser.ParseFile(set, name, source, 0)
+func must[T any](value T, err error) T {
 	if err != nil {
 		panic(err)
 	}
-	return file
+	return value
 }

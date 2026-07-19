@@ -5,15 +5,14 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 image="coordplane-e2e-deterministic:$$"
 temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/coordplane-e2e.XXXXXX")
 build_dir="$temporary_root/build"
-docker_config="$temporary_root/docker"
+export DOCKER_CONFIG="$temporary_root/docker"
 
 cleanup() {
 	docker image rm -f "$image" >/dev/null 2>&1 || true
 	rm -rf "$temporary_root"
 }
 trap cleanup EXIT HUP INT TERM
-mkdir -p "$docker_config"
-export DOCKER_CONFIG="$docker_config"
+mkdir -p "$DOCKER_CONFIG"
 
 abort() {
 	echo "$1"

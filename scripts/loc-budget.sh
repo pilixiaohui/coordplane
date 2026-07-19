@@ -17,10 +17,9 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$output" ] || { echo "loc-budget: --output is required" >&2; exit 2; }
 
-case "$output" in
-  /*) ;;
-  *) output=$PWD/$output ;;
-esac
+if [ "${output#/}" = "$output" ]; then
+  output=$PWD/$output
+fi
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 git -C "$root" rev-parse --is-inside-work-tree >/dev/null
@@ -85,22 +84,16 @@ count_lines() {
 
 check_functions() {
   awk -v path="$1" -v warnings="$tmp/function-warnings" -v blockers="$tmp/function-blockers" '
-    function code(s) {
-      sub(/^[[:space:]]+/, "", s)
-      return s!="" && s!~/^\/\//
-    }
-    function delta(s, opens, closes) {
-      gsub(/"([^"\\]|\\.)*"/, "", s)
-      opens=gsub(/{/, "{", s)
-      closes=gsub(/}/, "}", s)
-      return opens-closes
-    }
     /^[[:space:]]*func[[:space:]]/ {
       active=1; seen=0; depth=0; lines=0; start=FNR
     }
     active {
-      if (code($0)) lines++
-      d=delta($0)
+      line=$0
+      sub(/^[[:space:]]+/, "", line)
+      if (line!="" && line!~/^\/\//) lines++
+      braces=$0
+      gsub(/"([^"\\]|\\.)*"/, "", braces)
+      d=gsub(/{/, "{", braces)-gsub(/}/, "}", braces)
       if (d>0) seen=1
       depth+=d
       if (seen && depth<=0) {
@@ -219,9 +212,7 @@ awk -F'|' \
 mkdir -p "$(dirname "$output")"
 cp "$tmp/report.json" "$output.tmp.$$"
 mv "$output.tmp.$$" "$output"
-if [ "$failure" = true ]; then
-  echo "loc-budget: FAIL production=$production tests=$tests infra=$infra total=$total (report: $output)" >&2
-  [ "$check" = false ] || exit 1
-else
-  echo "loc-budget: PASS production=$production tests=$tests infra=$infra total=$total (report: $output)" >&2
-fi
+result=PASS
+[ "$failure" = false ] || result=FAIL
+echo "loc-budget: $result production=$production tests=$tests infra=$infra total=$total (report: $output)" >&2
+[ "$failure" = false ] || [ "$check" = false ] || exit 1
