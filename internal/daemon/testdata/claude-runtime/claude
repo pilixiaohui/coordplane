@@ -54,4 +54,4 @@ elif grep -q "hold until stopped" "$bootstrap"; then
 fi
 
 echo '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
-echo 'done completed'
+echo '{"type":"assistant","message":"done completed"}'

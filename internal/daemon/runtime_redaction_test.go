@@ -56,8 +56,8 @@ func TestRuntimeLogBoundaryRedactsBoundsAndReplaysFromZero(t *testing.T) {
 	requireNoError(t, os.MkdirAll(controlPath, 0o700))
 	requireNoError(t, os.WriteFile(filepath.Join(controlPath, "token"), []byte(runToken+"\n"), 0o400))
 	requireNoError(t, os.MkdirAll(filepath.Dir(run.LogPath), 0o700))
-	firstLine := "canary " + secretLineA + " " + secretLineB + " " + runToken + " " + root + "\n"
-	filler := strings.Repeat("log-data-", 128) + "\n"
+	firstLine := `{"type":"assistant","message":"canary ` + secretLineA + " " + secretLineB + " " + runToken + " " + root + `"}` + "\n"
+	filler := `{"type":"assistant","message":"` + strings.Repeat("log-data-", 128) + `"}` + "\n"
 	var payload strings.Builder
 	payload.WriteString(firstLine)
 	for payload.Len() <= runtimeLogLimit+(1<<20) {

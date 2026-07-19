@@ -5,6 +5,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"coordplane/tests/testsupport"
 )
 
 func TestProductionRegistryContainsOnlyClaude(t *testing.T) {
@@ -29,18 +31,14 @@ func TestClaudeBuildsExactStartAndResumeCommands(t *testing.T) {
 	entry := Claude{}
 	launch := LaunchSpec{BootstrapPath: ContainerBootstrapPath, ContainerHome: "/home/agent", ContainerWork: "/workspace/project"}
 	start, err := entry.BuildStartCommand(launch)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testsupport.RequireNoError(t, err)
 	common := []string{"-p", "--bare", "--verbose", "--output-format", "stream-json", "--dangerously-skip-permissions"}
 	wantStart := append(append([]string(nil), common...), "--", bootstrapReferencePrompt())
 	if start.Executable != "claude" || !reflect.DeepEqual(start.Args, wantStart) || !reflect.DeepEqual(start.Env, map[string]string{"HOME": "/home/agent"}) {
 		t.Fatalf("start command = %#v", start)
 	}
 	resume, err := entry.BuildResumeCommand(ResumeSpec{LaunchSpec: launch, NativeSessionID: "0190a1b2-session"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	testsupport.RequireNoError(t, err)
 	wantResume := append(append([]string(nil), common...), "--resume", "0190a1b2-session", "--", bootstrapReferencePrompt())
 	if resume.Executable != "claude" || !reflect.DeepEqual(resume.Args, wantResume) || !reflect.DeepEqual(resume.Env, start.Env) {
 		t.Fatalf("resume command = %#v", resume)
@@ -57,7 +55,7 @@ func TestClaudeBuildsExactStartAndResumeCommands(t *testing.T) {
 
 func TestClaudeTypedStreamJSONConformance(t *testing.T) {
 	entry := Claude{}
-	tests := []struct {
+	for _, test := range []struct {
 		name, frame, session, message string
 		kind                          EventKind
 	}{
@@ -66,13 +64,10 @@ func TestClaudeTypedStreamJSONConformance(t *testing.T) {
 		{name: "error result", frame: `{"type":"result","subtype":"error_during_execution","is_error":true,"result":"provider unavailable"}`, kind: EventProviderError, message: "provider unavailable"},
 		{name: "error envelope", frame: `{"type":"error","error":{"message":"invalid request"}}`, kind: EventProviderError, message: "invalid request"},
 		{name: "assistant text is not resume evidence", frame: `{"type":"assistant","message":"session not found"}`, kind: EventProtocol},
-	}
-	for _, test := range tests {
+	} {
 		t.Run(test.name, func(t *testing.T) {
 			event, err := entry.ParseEvent([]byte(test.frame))
-			if err != nil {
-				t.Fatal(err)
-			}
+			testsupport.RequireNoError(t, err)
 			if event.Kind != test.kind || event.NativeSessionID != test.session || event.Message != test.message || len(event.Raw) == 0 {
 				t.Fatalf("event = %#v", event)
 			}

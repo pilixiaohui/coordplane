@@ -533,7 +533,7 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 				Body: "must remain pending", RequestID: "protocol-message-" + test.name,
 			}))
 			active, ref := activateRuntimeTestRun(t, service, claim)
-			frame, accepted := test.frame, []byte(nil)
+			frame, ordinary, accepted := test.frame, "", []byte(nil)
 			secret, lowerDigest, upperDigest := "", "", ""
 			executor := &monitorFailureExecutor{stopped: make(chan struct{})}
 			executor.state = &containerruntime.LiveState{Ref: ref, Running: true, Status: containerruntime.StatusRunning}
@@ -549,6 +549,7 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 				upperDigest = strings.ToUpper(lowerDigest)
 				t.Setenv(providerName, secret)
 				controller.config.Runtime.ProviderEnvAllowlist = []string{providerName}
+				ordinary = "stderr: " + string(requireRuntimeValue(json.Marshal(secret))) + " " + lowerDigest + " " + upperDigest
 				padding := "short"
 				if test.evidence == "reserve" {
 					padding = strings.Repeat("x", 2048)
@@ -562,10 +563,10 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 					frame = string(rejected[:len(rejected)-1])
 				} else {
 					init := fmt.Sprintf(`{"type":"system","subtype":"init","session_id":%q}`, test.session)
-					frame = strings.Join([]string{init, string(accepted), "[" + string(accepted), string(rejected)}, "\n")
+					frame = strings.Join([]string{init, string(accepted), "[" + string(accepted), ordinary, string(rejected)}, "\n")
 					if test.evidence == "reserve" {
-						ordinary := strings.Repeat("o", 512<<10) + "\n"
-						frame = strings.Repeat(ordinary, runtimeLogLimit/len(ordinary)+1) + frame
+						filler := `{"type":"assistant","padding":"` + strings.Repeat("o", 512<<10) + "\"}\n"
+						frame = strings.Repeat(filler, runtimeLogLimit/len(filler)+1) + frame
 					}
 					executor.beforeStop = func() []byte {
 						beforeFailure = requireRuntimeValue(service.Run(context.Background(), active.ID))
@@ -629,8 +630,13 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 					}
 				case "sanitized":
 					want := `"a_sensitive":{"digests":["[REDACTED_SECRET]","[REDACTED_SECRET]"],"secret":"[REDACTED_SECRET]"}`
-					if !strings.Contains(text, "\n"+`{"[REDACTED_SECRET]":{"digests":["[REDACTED_SECRET]","[REDACTED_SECRET]"],"secret":"[REDACTED_SECRET]"},"type":"assistant"}`+"\n"+fmt.Sprintf(`{"bytes":%d,"sanitized":false}`, len(accepted)+1)+"\n") || !strings.Contains(savedFrame, want) || evidence["truncated"] != false {
-						t.Fatalf("structured rejected-frame redaction = %#v", evidence)
+					streamLines := strings.Split(text, "\n")
+					var decoded []any
+					requireNoError(t, json.Unmarshal([]byte("["+strings.Join(streamLines[1:4], ",")+"]"), &decoded))
+					decodedStream := requireRuntimeValue(json.Marshal(decoded))
+					wantStream := fmt.Sprintf(`[{"[REDACTED_SECRET]":{"digests":["[REDACTED_SECRET]","[REDACTED_SECRET]"],"secret":"[REDACTED_SECRET]"},"type":"assistant"},{"bytes":%d,"sanitized":false},{"bytes":%d,"sanitized":false}]`, len(accepted)+1, len(ordinary))
+					if string(decodedStream) != wantStream || !strings.Contains(savedFrame, want) || evidence["truncated"] != false {
+						t.Fatalf("structured runtime diagnostics = %s; rejected=%#v", decodedStream, evidence)
 					}
 				case "reserve":
 					if len(raw) > runtimeLogLimit || strings.Count(string(raw), runtimeLogTruncatedMarker) != 1 || len(savedFrame) != 1024 || evidence["truncated"] != true {

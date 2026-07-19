@@ -142,11 +142,7 @@ func sanitizedRuntimeLogLine(redact runtimeRedaction, frame []byte) []byte {
 	if err == nil {
 		return sanitized
 	}
-	trimmed := bytes.TrimSpace(frame)
-	if len(trimmed) > 0 && bytes.ContainsAny(trimmed[:1], `[{"`) {
-		return rejectedFrameMetadata(frame)
-	}
-	return []byte(redact.Text(string(frame)))
+	return rejectedFrameMetadata(frame)
 }
 
 func sanitizeJSONFrame(redact runtimeRedaction, frame []byte) ([]byte, error) {
