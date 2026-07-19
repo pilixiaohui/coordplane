@@ -12,11 +12,12 @@ import (
 
 	"coordplane/internal/core"
 	"coordplane/internal/store"
+	"coordplane/tests/testsupport"
 )
 
 func TestStatusHumanBinaryReportsTruncatedTasksAndAgents(t *testing.T) {
 	root, _, socket, configPath := contractConfigPaths(t, "")
-	source := createRepository(t, root)
+	source := testsupport.CreateGitRepository(t, root, "CoordPlane Contract", "contract@coordplane.local")
 	daemon := startDaemon(t, configPath, socket)
 	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
 
@@ -75,7 +76,7 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 	requireNoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	_, dataDir, socket, configPath := contractConfigPaths(t, "", root)
-	source := createRepository(t, root)
+	source := testsupport.CreateGitRepository(t, root, "CoordPlane Contract", "contract@coordplane.local")
 	daemon := startDaemon(t, configPath, socket)
 	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
 

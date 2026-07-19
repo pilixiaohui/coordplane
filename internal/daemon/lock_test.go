@@ -10,8 +10,6 @@ import (
 	"coordplane/tests/testsupport"
 )
 
-var requireNoError = testsupport.RequireNoError
-
 func TestDataDirLockRejectsConcurrentOwnerAndReleasesOnClose(t *testing.T) {
 	dataDir := filepath.Join(t.TempDir(), "data")
 	first, err := daemon.AcquireDataDirLock(dataDir)
@@ -65,7 +63,7 @@ func TestDataDirLockRejectsSymlinksWithoutTouchingTheirTargets(t *testing.T) {
 	t.Run("intermediate data directory", func(t *testing.T) {
 		root := t.TempDir()
 		outside := t.TempDir()
-		requireNoError(t, os.Symlink(outside, filepath.Join(root, "redirect")))
+		testsupport.RequireNoError(t, os.Symlink(outside, filepath.Join(root, "redirect")))
 		dataDir := filepath.Join(root, "redirect", "nested", "data")
 		if lock, err := daemon.AcquireDataDirLock(dataDir); err == nil {
 			_ = lock.Close()
@@ -80,9 +78,9 @@ func TestDataDirLockRejectsSymlinksWithoutTouchingTheirTargets(t *testing.T) {
 		root := t.TempDir()
 		dataDir := filepath.Join(root, "data")
 		outside := filepath.Join(root, "outside")
-		requireNoError(t, os.MkdirAll(dataDir, 0o700))
-		requireNoError(t, os.MkdirAll(outside, 0o700))
-		requireNoError(t, os.Symlink(outside, filepath.Join(dataDir, "locks")))
+		testsupport.RequireNoError(t, os.MkdirAll(dataDir, 0o700))
+		testsupport.RequireNoError(t, os.MkdirAll(outside, 0o700))
+		testsupport.RequireNoError(t, os.Symlink(outside, filepath.Join(dataDir, "locks")))
 
 		if lock, err := daemon.AcquireDataDirLock(dataDir); err == nil {
 			_ = lock.Close()
@@ -97,18 +95,18 @@ func TestDataDirLockRejectsSymlinksWithoutTouchingTheirTargets(t *testing.T) {
 		root := t.TempDir()
 		dataDir := filepath.Join(root, "data")
 		lockDir := filepath.Join(dataDir, "locks")
-		requireNoError(t, os.MkdirAll(lockDir, 0o700))
+		testsupport.RequireNoError(t, os.MkdirAll(lockDir, 0o700))
 		target := filepath.Join(root, "outside.lock")
 		const sentinel = "do not touch\n"
-		requireNoError(t, os.WriteFile(target, []byte(sentinel), 0o600))
-		requireNoError(t, os.Symlink(target, filepath.Join(lockDir, "daemon.lock")))
+		testsupport.RequireNoError(t, os.WriteFile(target, []byte(sentinel), 0o600))
+		testsupport.RequireNoError(t, os.Symlink(target, filepath.Join(lockDir, "daemon.lock")))
 
 		if lock, err := daemon.AcquireDataDirLock(dataDir); err == nil {
 			_ = lock.Close()
 			t.Fatal("AcquireDataDirLock() accepted a symlinked lock file")
 		}
 		raw, err := os.ReadFile(target)
-		requireNoError(t, err)
+		testsupport.RequireNoError(t, err)
 		if string(raw) != sentinel {
 			t.Fatalf("symlink target changed to %q", raw)
 		}

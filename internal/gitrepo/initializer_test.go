@@ -4,12 +4,17 @@ import (
 	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"coordplane/tests/testsupport"
 )
+
+var gitOutput = testsupport.Git
+var gitDirOutput = testsupport.GitDir
+var gitCommand = testsupport.GitCommand
 
 func TestPreflightRequiresFullBranchRefAndDoesNotModifySource(t *testing.T) {
 	ctx := context.Background()
@@ -280,30 +285,4 @@ func assertSourceSnapshot(t *testing.T, repoPath string, want sourceState) {
 	if got := snapshotSource(t, repoPath); !reflect.DeepEqual(got, want) {
 		t.Fatalf("source repository changed\n got: %+v\nwant: %+v", got, want)
 	}
-}
-
-func gitOutput(t *testing.T, repoPath string, args ...string) string {
-	t.Helper()
-	return gitCommand(t, append([]string{"-C", repoPath}, args...)...)
-}
-
-func gitDirOutput(t *testing.T, gitDir string, args ...string) string {
-	t.Helper()
-	return gitCommand(t, append([]string{"--git-dir=" + gitDir}, args...)...)
-}
-
-func gitCommand(t *testing.T, args ...string) string {
-	t.Helper()
-	cmd := exec.Command("git", args...)
-	cmd.Env = append(os.Environ(),
-		"GIT_CONFIG_NOSYSTEM=1",
-		"GIT_CONFIG_GLOBAL="+os.DevNull,
-		"GIT_TERMINAL_PROMPT=0",
-		"LC_ALL=C",
-	)
-	raw, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(raw)))
-	}
-	return strings.TrimSpace(string(raw))
 }

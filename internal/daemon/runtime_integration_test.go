@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -22,6 +21,7 @@ import (
 	"coordplane/internal/gitrepo"
 	containerruntime "coordplane/internal/runtime"
 	"coordplane/internal/transport"
+	"coordplane/tests/testsupport"
 )
 
 func TestRT01RealDockerKeepsTwoAgentsWorkspacesHomesAndMountsPrivate(t *testing.T) {
@@ -559,7 +559,7 @@ func TestCT04RealDockerExitZeroAndDoneTextCannotCompleteTask(t *testing.T) {
 		t.Skipf("SKIP(Docker unavailable): %v", err)
 	}
 
-	repositoryRoot := daemonRepositoryRoot(t)
+	repositoryRoot := daemonRepositoryRoot()
 	root, err := os.MkdirTemp("/tmp", "cp3-")
 	requireNoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
@@ -661,13 +661,8 @@ func TestCT04RealDockerExitZeroAndDoneTextCannotCompleteTask(t *testing.T) {
 	}
 }
 
-func daemonRepositoryRoot(t *testing.T) string {
-	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("resolve daemon test path")
-	}
-	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+func daemonRepositoryRoot() string {
+	return testsupport.RepositoryRoot()
 }
 
 func gitWorkspaceSpecForTest(task core.Task) gitrepo.WorkspaceSpec {
@@ -844,7 +839,7 @@ func newP3DockerFixtureWithRunTimeout(t *testing.T, runTimeout time.Duration) *p
 	}
 	root, err := os.MkdirTemp("/tmp", "cp3-")
 	requireNoError(t, err)
-	repositoryRoot := daemonRepositoryRoot(t)
+	repositoryRoot := daemonRepositoryRoot()
 	coordlinkPath := filepath.Join(root, "coordlink")
 	build := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-o", coordlinkPath, "./cmd/coordlink")
 	build.Dir = repositoryRoot

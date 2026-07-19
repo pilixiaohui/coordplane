@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +13,8 @@ import (
 )
 
 var requireNoError = testsupport.RequireNoError
+var gitIn = testsupport.Git
+var gitOutput = testsupport.GitCommand
 
 func TestGT00CompositionQuarantinesRepositoryWithoutProjectRow(t *testing.T) {
 	root := t.TempDir()
@@ -105,29 +106,5 @@ func writeTestConfig(t *testing.T, root string) string {
 }
 
 func createSourceRepository(t *testing.T, root string) string {
-	t.Helper()
-	repository := filepath.Join(root, "source")
-	requireNoError(t, os.MkdirAll(repository, 0o700))
-	gitIn(t, repository, "init", "-b", "main")
-	gitIn(t, repository, "config", "user.email", "tests@coordplane.local")
-	gitIn(t, repository, "config", "user.name", "CoordPlane Tests")
-	requireNoError(t, os.WriteFile(filepath.Join(repository, "README.md"), []byte("initial\n"), 0o600))
-	gitIn(t, repository, "add", "README.md")
-	gitIn(t, repository, "commit", "-m", "initial")
-	return repository
-}
-
-func gitIn(t *testing.T, directory string, args ...string) string {
-	t.Helper()
-	command := exec.Command("git", append([]string{"-C", directory}, args...)...)
-	raw, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("git %v: %v\n%s", args, err, raw)
-	}
-	return string(raw)
-}
-
-func gitOutput(t *testing.T, args ...string) string {
-	t.Helper()
-	return strings.TrimSpace(gitIn(t, ".", args...))
+	return testsupport.CreateGitRepository(t, root, "CoordPlane Tests", "tests@coordplane.local")
 }

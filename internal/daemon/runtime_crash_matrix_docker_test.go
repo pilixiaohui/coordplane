@@ -159,7 +159,7 @@ func buildRT05ProcessArtifacts(t *testing.T, ctx context.Context) rt05ProcessArt
 	t.Helper()
 	root, err := os.MkdirTemp("/tmp", "cp-rt05-matrix-")
 	requireNoError(t, err)
-	repositoryRoot := daemonRepositoryRoot(t)
+	repositoryRoot := daemonRepositoryRoot()
 	artifacts := rt05ProcessArtifacts{
 		root: root, daemon: filepath.Join(root, "coordplane-contract"),
 		coordlink:  filepath.Join(root, "coordlink"),

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -66,9 +67,9 @@ func TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests(t *testing.T)
 		t.Fatal(err)
 	}
 	stubDir, fixture := t.TempDir(), filepath.Join(t.TempDir(), "go-test.json")
-	writeFile(t, filepath.Join(stubDir, "docker"), []byte("#!/bin/sh\ncase \"$1\" in version) exit 0;; image) printf '%s\\n' \"$5\";; run) printf '%s\\n' '"+realClaudeVersion+"';; *) exit 2;; esac\n"), 0o700)
-	writeFile(t, filepath.Join(stubDir, "make"), []byte("#!/bin/sh\nexit 0\n"), 0o700)
-	writeFile(t, filepath.Join(stubDir, "go"), []byte("#!/bin/sh\ncase \"$1\" in test) [ \"$E2E_PROVIDER_ENV_ALLOWLIST\" = \"$E2E_EXPECTED_PROVIDER_ENV\" ] || exit 4; cat \"$E2E_GATE_FIXTURE\";; run) exec \"$E2E_REAL_GO\" \"$@\";; *) exit 2;; esac\n"), 0o700)
+	testsupport.WriteFile(t, filepath.Join(stubDir, "docker"), []byte("#!/bin/sh\ncase \"$1\" in version) exit 0;; image) printf '%s\\n' \"$5\";; run) printf '%s\\n' '"+realClaudeVersion+"';; *) exit 2;; esac\n"), 0o700)
+	testsupport.WriteFile(t, filepath.Join(stubDir, "make"), []byte("#!/bin/sh\nexit 0\n"), 0o700)
+	testsupport.WriteFile(t, filepath.Join(stubDir, "go"), []byte("#!/bin/sh\ncase \"$1\" in test) [ \"$E2E_PROVIDER_ENV_ALLOWLIST\" = \"$E2E_EXPECTED_PROVIDER_ENV\" ] || exit 4; cat \"$E2E_GATE_FIXTURE\";; run) exec \"$E2E_REAL_GO\" \"$@\";; *) exit 2;; esac\n"), 0o700)
 	const smoke, agents = "TestRealClaudeAdapterSmoke", "TestRealClaudeTwoAgentConvergence"
 	exact := `{"Action":"run","Test":"` + smoke + `"}` + "\n" + `{"Action":"run","Test":"` + smoke + `/resume"}` + "\n" + `{"Action":"pass","Test":"` + smoke + `/resume"}` + "\n" + `{"Action":"pass","Test":"` + smoke + `"}` + "\n" + `{"Action":"run","Test":"` + agents + `"}` + "\n" + `{"Action":"pass","Test":"` + agents + `"}`
 	mutants := []struct {
@@ -88,7 +89,7 @@ func TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests(t *testing.T)
 	}
 	for _, test := range mutants {
 		t.Run("checker/"+test.name, func(t *testing.T) {
-			writeFile(t, fixture, []byte(test.input), 0o600)
+			testsupport.WriteFile(t, fixture, []byte(test.input), 0o600)
 			command := exec.Command(filepath.Clean("../../scripts/e2e-real-cli.sh"))
 			command.Env = append(os.Environ(), "PATH="+stubDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 				"E2E_RUNTIME_IMAGE=sha256:"+strings.Repeat("a", 64), "E2E_PROVIDER_ENV_ALLOWLIST="+realProviderEnv, "E2E_EXPECTED_PROVIDER_ENV="+realProviderEnv, "ANTHROPIC_AUTH_TOKEN="+realTokenCanary, "ANTHROPIC_API_KEY="+realAPIKeyCanary,
@@ -103,48 +104,79 @@ func TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests(t *testing.T)
 
 func TestRealCLIGatePreservesFailureDiagnosticsBeforeCleanupWithoutProvider(t *testing.T) {
 	names := strings.Split(realProviderEnv, ",")
-	leaked := new(strings.Builder)
-	for _, name := range names {
-		value := "diagnostic-secret-" + name
+	var canaries []string
+	for index, name := range names {
+		value := fmt.Sprintf(" quoted\"slash\\%d \nfragment-%d\t tail-%d ", index, index, index)
 		t.Setenv(name, value)
-		fmt.Fprintf(leaked, "%s %x ", value, sha256.Sum256([]byte(value)))
+		for _, candidate := range append([]string{value, strings.TrimSpace(value)}, strings.Fields(value)...) {
+			digest := sha256.Sum256([]byte(candidate))
+			escaped := fmt.Sprintf("%q", candidate)
+			canaries = append(canaries, candidate, escaped[1:len(escaped)-1], hex.EncodeToString(digest[:]), strings.ToUpper(hex.EncodeToString(digest[:])))
+		}
 	}
+	leaked := strings.Join(canaries, " | ")
 	fixtureRoot, dataDir := t.TempDir(), filepath.Join(t.TempDir(), "data")
-	taskJSON, runsJSON, runJSON := filepath.Join(fixtureRoot, "task.json"), filepath.Join(fixtureRoot, "runs.json"), filepath.Join(fixtureRoot, "run.json")
-	writeFile(t, taskJSON, []byte(fmt.Sprintf(`{"task":{"id":"task-diag","status":"failed","failure_reason":"AUTH_FAILURE %s"}}`, leaked)), 0o600)
-	writeFile(t, runsJSON, []byte(`{"items":[{"id":"run-diag","task_id":"task-diag","state":"failed","cleanup_state":"removed","terminal_reason":"protocol failure"}]}`), 0o600)
-	writeFile(t, runJSON, []byte(fmt.Sprintf(`{"id":"run-diag","task_id":"task-diag","state":"failed","exit_code":23,"cleanup_state":"removed","terminal_reason":"PROTOCOL_FAILURE %s","runtime_error_code":"PROVIDER_ERROR"}`, leaked)), 0o600)
+	taskCurrent := core.TaskDetail{Task: core.Task{ID: "task-integration", Status: core.TaskFailed, FailureReason: "AUTH_FAILURE " + leaked}, CurrentRun: &core.Run{ID: "run-current", TaskID: "task-integration", State: core.RunActive, CleanupState: "pending", RuntimeErrorCode: "CURRENT " + leaked}}
+	taskHistory := core.TaskDetail{Task: core.Task{ID: "task-history", Status: core.TaskFailed, FailureReason: "HISTORY_FAILURE " + leaked}}
+	taskUnproven := core.TaskDetail{Task: core.Task{ID: "task-unproven", Status: core.TaskFailed, FailureReason: "UNPROVEN_FAILURE " + leaked}}
+	pageOne := core.RunPage{Items: []core.RunSummary{{ID: "run-old", TaskID: "task-history", State: core.RunFailed}}, NextCursor: "page-two"}
+	pageTwo := core.RunPage{Items: []core.RunSummary{{ID: "run-newest", TaskID: "task-history", State: core.RunFailed}}}
+	repeatedPage := core.RunPage{Items: []core.RunSummary{{ID: "run-unproven", TaskID: "task-unproven", State: core.RunFailed}}, NextCursor: "repeat"}
+	exitCode := 23
+	newest := core.Run{ID: "run-newest", TaskID: "task-history", State: core.RunFailed, ExitCode: &exitCode, CleanupState: "removed", TerminalReason: "PROTOCOL_FAILURE " + leaked, RuntimeErrorCode: "PROVIDER_ERROR", LastError: "quoted " + leaked}
+	paths := make([]string, 7)
+	for index, value := range []any{taskCurrent, taskHistory, taskUnproven, pageOne, pageTwo, repeatedPage, newest} {
+		paths[index] = filepath.Join(fixtureRoot, fmt.Sprintf("fixture-%d.json", index))
+		raw, err := json.Marshal(value)
+		requireNoError(t, err)
+		testsupport.WriteFile(t, paths[index], raw, 0o600)
+	}
 	binary := filepath.Join(fixtureRoot, "coordplane")
-	writeFile(t, binary, []byte(fmt.Sprintf("#!/bin/sh\ncase \"$1:$2\" in task:show) cat %q;; run:list) cat %q;; run:show) cat %q;; *) exit 2;; esac\n", taskJSON, runsJSON, runJSON)), 0o700)
-	logPath := filepath.Join(dataDir, "logs", "run-diag", "run.log")
-	requireNoError(t, os.MkdirAll(filepath.Dir(logPath), 0o700))
-	writeFile(t, logPath, []byte("discarded-marker\n"+strings.Repeat("x", liveDiagnosticTailBytes+1)+"diagnostic-marker "+leaked.String()), 0o600)
+	script := fmt.Sprintf("#!/bin/sh\ncase \"$1:$2:$3\" in\n task:show:task-integration) cat %q;;\n task:show:task-history) cat %q;;\n task:show:task-unproven) cat %q;;\n run:list:*) case \"$4:$5:$6:$7:$8\" in\n  task-history:--limit:500:--socket:*) cat %q;;\n  task-history:--limit:500:--cursor:page-two) cat %q;;\n  task-unproven:--limit:500:--socket:*) cat %q;;\n  task-unproven:--limit:500:--cursor:repeat) cat %q;;\n  *) exit 3;; esac;;\n run:show:run-newest) cat %q;;\n *) exit 2;;\nesac\n", paths[0], paths[1], paths[2], paths[3], paths[4], paths[5], paths[5], paths[6])
+	testsupport.WriteFile(t, binary, []byte(script), 0o700)
+	for _, runID := range []string{"run-current", "run-newest"} {
+		logPath := filepath.Join(dataDir, "logs", runID, "run.log")
+		requireNoError(t, os.MkdirAll(filepath.Dir(logPath), 0o700))
+		testsupport.WriteFile(t, logPath, []byte("discarded-marker\n"+strings.Repeat("x", liveDiagnosticTailBytes)+"diagnostic-marker "+leaked), 0o600)
+	}
+	boundaryPath := filepath.Join(fixtureRoot, "boundary.log")
+	for _, size := range []int{liveDiagnosticTailBytes - 1, liveDiagnosticTailBytes, liveDiagnosticTailBytes + 1} {
+		content := []byte("A" + strings.Repeat("x", size-2) + "Z")
+		testsupport.WriteFile(t, boundaryPath, content, 0o600)
+		got, err := readLiveRunLogTail(boundaryPath)
+		requireNoError(t, err)
+		want := content[max(0, len(content)-liveDiagnosticTailBytes):]
+		if got != string(want) || len(got) != min(size, liveDiagnosticTailBytes) {
+			t.Fatalf("tail size=%d got=%d want=%d", size, len(got), len(want))
+		}
+	}
 
+	tracked := []string{"task-history", "task-unproven"}
+	_ = waitForTrackedTaskWithin(t, context.Background(), binary, "unused.sock", func(ids ...string) { tracked = append(tracked, ids...) }, "task-integration", "dynamic integration diagnostic", time.Second, func(task core.Task) bool { return task.Status == core.TaskFailed })
 	var evidence string
 	requireNoError(t, preserveLiveFailureDiagnostics(
 		func() string {
-			return liveFailureDiagnostics(context.Background(), binary, "unused.sock", dataDir, names, "task-diag")
+			return liveFailureDiagnostics(context.Background(), binary, "unused.sock", dataDir, names, tracked...)
 		},
 		func(value string) {
 			evidence = value
-			if _, err := os.Stat(logPath); err != nil {
+			if _, err := os.Stat(filepath.Join(dataDir, "logs", "run-current", "run.log")); err != nil {
 				t.Fatal("failure evidence was emitted after cleanup")
 			}
 		},
 		func() error { return os.RemoveAll(dataDir) },
 	))
-	for _, want := range []string{`failure_reason="AUTH_FAILURE`, "terminal_run=run-diag state=failed exit_code=23", "run_log_tail=", "diagnostic-marker"} {
+	for _, want := range []string{"task=task-integration", "run=run-current source=current state=active", "task=task-history", "run=run-newest source=history state=failed exit_code=23", "task=task-unproven", "run_selection_error=", "run_log_tail=", "diagnostic-marker", "[REDACTED_SECRET]"} {
 		if !strings.Contains(evidence, want) {
-			t.Fatal("failure evidence omitted a required diagnostic field")
+			t.Fatalf("failure evidence omitted %q", want)
 		}
 	}
-	for _, name := range names {
-		value := os.Getenv(name)
-		if strings.Contains(evidence, value) || strings.Contains(evidence, fmt.Sprintf("%x", sha256.Sum256([]byte(value)))) {
-			t.Fatal("failure evidence leaked provider credential material")
+	for _, canary := range canaries {
+		if strings.Contains(evidence, canary) {
+			t.Fatalf("failure evidence leaked provider credential material of length %d", len(canary))
 		}
 	}
-	if _, err := os.Stat(logPath); !errors.Is(err, os.ErrNotExist) || !strings.Contains(evidence, "diagnostic-marker") || strings.Contains(evidence, "discarded-marker") {
+	if _, err := os.Stat(dataDir); !errors.Is(err, os.ErrNotExist) || strings.Contains(evidence, "run-old") || strings.Contains(evidence, "run-unproven") || strings.Contains(evidence, "discarded-marker") {
 		t.Fatal("failure evidence was not retained before data-dir cleanup")
 	}
 }
@@ -187,40 +219,73 @@ func preserveLiveFailureDiagnostics(collect func() string, emit func(string), cl
 
 func liveFailureDiagnostics(ctx context.Context, binary, socket, dataDir string, providerEnv []string, taskIDs ...string) string {
 	var evidence strings.Builder
+	redact := func(value string) string { return redactLiveDiagnostics(value, dataDir, providerEnv) }
 	for _, taskID := range taskIDs {
 		detail, taskErr := commandJSON[core.TaskDetail](ctx, binary, "task", "show", taskID, "--socket", socket, "--output", "json")
-		fmt.Fprintf(&evidence, "task=%s status=%s current_run=%t failure_reason=%q query_error=%t\n", taskID, detail.Task.Status, detail.CurrentRun != nil, detail.Task.FailureReason, taskErr != nil)
-		page, listErr := commandJSON[core.RunPage](ctx, binary, "run", "list", "--task", taskID, "--limit", "20", "--socket", socket, "--output", "json")
-		var terminal core.RunSummary
-		for index := len(page.Items) - 1; listErr == nil && index >= 0; index-- {
-			if core.IsRunTerminal(page.Items[index].State) {
-				terminal = page.Items[index]
-				break
-			}
+		fmt.Fprintf(&evidence, "task=%s status=%s current_run=%t failure_reason=%q query_error=%t\n", redact(taskID), redact(string(detail.Task.Status)), detail.CurrentRun != nil, redact(detail.Task.FailureReason), taskErr != nil)
+		if taskErr != nil {
+			continue
 		}
-		run, showErr := commandJSON[core.Run](ctx, binary, "run", "show", terminal.ID, "--socket", socket, "--output", "json")
+		run, source, selectionErr := liveDiagnosticRun(ctx, binary, socket, taskID, detail.CurrentRun)
+		if selectionErr != nil {
+			fmt.Fprintf(&evidence, "run_selection_error=%q\n", redact(selectionErr.Error()))
+			continue
+		}
 		exitCode := "null"
 		if run.ExitCode != nil {
 			exitCode = fmt.Sprint(*run.ExitCode)
 		}
-		tail, tailErr := readLiveRunLogTail(filepath.Join(dataDir, "logs", terminal.ID, "run.log"))
-		fmt.Fprintf(&evidence, "terminal_run=%s state=%s exit_code=%s cleanup=%s runtime_error=%q reason=%q last_error=%q list_error=%t show_error=%t\nrun_log_tail=%q error=%t\n", terminal.ID, terminal.State, exitCode, terminal.CleanupState, run.RuntimeErrorCode, run.TerminalReason, run.LastError, listErr != nil, showErr != nil, tail, tailErr != nil)
+		tail, tailErr := readLiveRunLogTail(filepath.Join(dataDir, "logs", run.ID, "run.log"))
+		fmt.Fprintf(&evidence, "run=%s source=%s state=%s exit_code=%s cleanup=%s runtime_error=%q reason=%q last_error=%q\nrun_log_tail=%q error=%t\n", redact(run.ID), redact(source), redact(string(run.State)), exitCode, redact(run.CleanupState), redact(run.RuntimeErrorCode), redact(run.TerminalReason), redact(run.LastError), redact(tail), tailErr != nil)
 	}
-	return strings.ReplaceAll(redactLiveDiagnostics(evidence.String(), providerEnv), dataDir, "[REDACTED_DATA_DIR]")
+	return redact(evidence.String())
+}
+
+func liveDiagnosticRun(ctx context.Context, binary, socket, taskID string, current *core.Run) (core.Run, string, error) {
+	if current != nil {
+		return *current, "current", nil
+	}
+	cursor := ""
+	var latest core.RunSummary
+	for pageNumber := 0; pageNumber < 20; pageNumber++ {
+		args := []string{"run", "list", "--task", taskID, "--limit", "500"}
+		if cursor != "" {
+			args = append(args, "--cursor", cursor)
+		}
+		args = append(args, "--socket", socket, "--output", "json")
+		page, err := commandJSON[core.RunPage](ctx, binary, args...)
+		if err != nil {
+			return core.Run{}, "history", fmt.Errorf("list Run history: %w", err)
+		}
+		for _, candidate := range page.Items {
+			if core.IsRunTerminal(candidate.State) {
+				latest = candidate
+			}
+		}
+		if page.NextCursor == "" {
+			if latest.ID == "" {
+				return core.Run{}, "history", errors.New("Run history has no terminal Run")
+			}
+			run, err := commandJSON[core.Run](ctx, binary, "run", "show", latest.ID, "--socket", socket, "--output", "json")
+			return run, "history", err
+		}
+		if page.NextCursor == cursor {
+			return core.Run{}, "history", errors.New("Run history cursor did not advance")
+		}
+		cursor = page.NextCursor
+	}
+	return core.Run{}, "history", errors.New("Run history exceeds 20 pages")
 }
 
 func readLiveRunLogTail(path string) (string, error) {
 	raw, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
 	if len(raw) > liveDiagnosticTailBytes {
 		raw = raw[len(raw)-liveDiagnosticTailBytes:]
 	}
-	return string(raw), nil
+	return string(raw), err
 }
 
-func redactLiveDiagnostics(value string, providerEnv []string) string {
+func redactLiveDiagnostics(value, dataDir string, providerEnv []string) string {
 	var forbidden []string
 	for _, name := range providerEnv {
 		secret := os.Getenv(name)
@@ -231,7 +296,8 @@ func redactLiveDiagnostics(value string, providerEnv []string) string {
 			if candidate == "" {
 				continue
 			}
-			digest := fmt.Sprintf("%x", sha256.Sum256([]byte(candidate)))
+			sum := sha256.Sum256([]byte(candidate))
+			digest := hex.EncodeToString(sum[:])
 			forbidden = append(forbidden, candidate, digest, strings.ToUpper(digest))
 		}
 	}
@@ -239,7 +305,16 @@ func redactLiveDiagnostics(value string, providerEnv []string) string {
 	for _, item := range forbidden {
 		value = strings.ReplaceAll(value, item, "[REDACTED_SECRET]")
 	}
+	if dataDir != "" {
+		value = strings.ReplaceAll(value, dataDir, "[REDACTED_DATA_DIR]")
+	}
 	return value
+}
+
+func waitForTrackedTaskWithin(t *testing.T, ctx context.Context, binary, socket string, track func(...string), id, reason string, timeout time.Duration, predicate func(core.Task) bool) core.Task {
+	t.Helper()
+	track(id)
+	return waitForTaskWithin(t, ctx, binary, socket, id, reason, timeout, predicate)
 }
 
 func TestRealClaudeAdapterSmoke(t *testing.T) {
@@ -257,7 +332,7 @@ func TestRealClaudeAdapterSmoke(t *testing.T) {
 	socket := filepath.Join(dataDir, "operator.sock")
 	registerLiveHomeCleanup(t, image, dataDir)
 	instructions := filepath.Join(root, "smoke-instructions.md")
-	writeFile(t, instructions, []byte(realSmokeInstructions), 0o600)
+	testsupport.WriteFile(t, instructions, []byte(realSmokeInstructions), 0o600)
 	configPath := testsupport.WriteFile(t, filepath.Join(root, "coordplane-live.yaml"), testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: 1, CompletedWorkspace: "24h", TerminalTaskRef: "24h", RunLog: "24h", DockerNetwork: network, DefaultImage: image, ProviderEnv: providerEnv, Tail: "  run_timeout: 12m\n  shutdown_grace: 5s\ngit:\n  capture_helper_image: " + image + "\n  capture_timeout: 30s\n  maximum_bundle_bytes: 67108864\n  maximum_objects: 250000\n  maximum_handoff_bytes: 268435456\n"}), 0o600)
 
 	daemon := startDaemon(t, coordplane, configPath, socket)
@@ -338,7 +413,7 @@ func TestRealClaudeTwoAgentConvergence(t *testing.T) {
 	socket := filepath.Join(dataDir, "operator.sock")
 	registerLiveHomeCleanup(t, image, dataDir)
 	instructions := filepath.Join(root, "live-instructions.md")
-	writeFile(t, instructions, []byte(realWorkInstructions), 0o600)
+	testsupport.WriteFile(t, instructions, []byte(realWorkInstructions), 0o600)
 	configPath := testsupport.WriteFile(t, filepath.Join(root, "coordplane-live.yaml"), testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: 2, CompletedWorkspace: "24h", TerminalTaskRef: "24h", RunLog: "24h", DockerNetwork: network, DefaultImage: image, ProviderEnv: providerEnv, Tail: "  run_timeout: 12m\n  shutdown_grace: 5s\ngit:\n  capture_helper_image: " + image + "\n  capture_timeout: 30s\n  maximum_bundle_bytes: 67108864\n  maximum_objects: 250000\n  maximum_handoff_bytes: 268435456\n"}), 0o600)
 
 	daemon := startDaemon(t, coordplane, configPath, socket)
@@ -409,7 +484,7 @@ func TestRealClaudeTwoAgentConvergence(t *testing.T) {
 	taskB = waitForTaskWithin(t, ctx, coordplane, socket, taskB.ID, "live B stale link", 2*time.Minute, func(task core.Task) bool {
 		return task.Status == core.TaskSubmitted && task.IntegrationTaskID != ""
 	})
-	integration := waitForTaskWithin(t, ctx, coordplane, socket, taskB.IntegrationTaskID, "live integration", 7*time.Minute, func(task core.Task) bool {
+	integration := waitForTrackedTaskWithin(t, ctx, coordplane, socket, trackFailure, taskB.IntegrationTaskID, "live integration", 7*time.Minute, func(task core.Task) bool {
 		return task.Status == core.TaskCompleted && task.HeadSHA != "" && task.FinalCanonicalSHA == task.HeadSHA
 	})
 	taskB = waitForTaskWithin(t, ctx, coordplane, socket, taskB.ID, "live B completion", 2*time.Minute, func(task core.Task) bool {

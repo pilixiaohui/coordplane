@@ -155,7 +155,7 @@ func TestP3ProductionAdapterRegistryIsOneStaticOneShotList(t *testing.T) {
 }
 
 func TestP3DockerTagSelectsRuntimeIntegrationTest(t *testing.T) {
-	root := repositoryRoot(t)
+	root := repositoryRoot()
 	docker := build.Default
 	docker.BuildTags = append(append([]string(nil), docker.BuildTags...), "docker")
 	found := false

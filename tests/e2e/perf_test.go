@@ -521,7 +521,7 @@ func newPFBatchWithEnv(
 	dataDir := filepath.Join(root, "data")
 	socket := filepath.Join(dataDir, "operator.sock")
 	instructions := filepath.Join(root, "instructions.md")
-	writeFile(t, instructions, []byte("Execute the deterministic PF-01 bootstrap contract.\n"), 0o600)
+	testsupport.WriteFile(t, instructions, []byte("Execute the deterministic PF-01 bootstrap contract.\n"), 0o600)
 	config := testsupport.WriteFile(t, filepath.Join(root, "coordplane.yaml"), testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: parallel, CompletedWorkspace: "0", TerminalTaskRef: "24h", RunLog: "0", DockerNetwork: "none", DefaultImage: image, Tail: "  run_timeout: 3m\n  shutdown_grace: 3s\ngit:\n  capture_helper_image: " + image + "\n  capture_timeout: 30s\n  maximum_bundle_bytes: 67108864\n  maximum_objects: 250000\n  maximum_handoff_bytes: 268435456\n"}), 0o600)
 	observer := filepath.Join(root, "observer.jsonl")
 	environment := append([]string{
@@ -1200,20 +1200,20 @@ func createPerfRepository(t *testing.T, ctx context.Context, root string) (strin
 	run(t, ctx, "git", "init", "-q", "-b", "main", repo)
 	runIn(t, ctx, repo, "git", "config", "user.name", "PF01 Fixture")
 	runIn(t, ctx, repo, "git", "config", "user.email", "pf01@coordplane.local")
-	writeFile(t, filepath.Join(repo, "fixture-test.sh"), []byte("#!/bin/sh\nset -eu\nexec /usr/local/bin/pf01-fixturecheck\n"), 0o755)
+	testsupport.WriteFile(t, filepath.Join(repo, "fixture-test.sh"), []byte("#!/bin/sh\nset -eu\nexec /usr/local/bin/pf01-fixturecheck\n"), 0o755)
 	for _, role := range []string{"a", "b", "c", "d"} {
-		writeFile(t, filepath.Join(repo, "bench", role+".txt"), []byte("base\n"), 0o600)
+		testsupport.WriteFile(t, filepath.Join(repo, "bench", role+".txt"), []byte("base\n"), 0o600)
 	}
 	for index := 0; index < 2048; index++ {
 		path := filepath.Join(repo, "data", fmt.Sprintf("file-%04d.bin", index))
-		writeFile(t, path, perfFixtureBytes(index, 0), 0o600)
+		testsupport.WriteFile(t, path, perfFixtureBytes(index, 0), 0o600)
 	}
 	commitPerfFixture(t, ctx, repo, 0)
 	for commit := 1; commit < 32; commit++ {
 		for item := 0; item < 64; item++ {
 			index := (commit-1)*64 + item
 			path := filepath.Join(repo, "data", fmt.Sprintf("file-%04d.bin", index))
-			writeFile(t, path, perfFixtureBytes(index, commit), 0o600)
+			testsupport.WriteFile(t, path, perfFixtureBytes(index, commit), 0o600)
 		}
 		commitPerfFixture(t, ctx, repo, commit)
 	}

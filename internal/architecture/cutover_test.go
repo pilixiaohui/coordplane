@@ -8,12 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"unicode"
+
+	"coordplane/tests/testsupport"
 )
 
 type productionSource struct {
@@ -23,7 +24,7 @@ type productionSource struct {
 }
 
 func TestV1SchemaBusinessTableAllowlist(t *testing.T) {
-	root := repositoryRoot(t)
+	root := repositoryRoot()
 	raw, err := os.ReadFile(filepath.Join(root, "internal", "store", "schema.go"))
 	if err != nil {
 		t.Fatal(err)
@@ -126,7 +127,7 @@ func TestV1ProductionOwnershipBoundaries(t *testing.T) {
 }
 
 func TestLegacyProductPackagesAndEntrypointsAreDeleted(t *testing.T) {
-	root := repositoryRoot(t)
+	root := repositoryRoot()
 	packages := []string{
 		"adapters", "backend", "capability", "codemanagement", "commandrun",
 		"coordination", "cpprobe", "delivery", "objects", "operator", "policy",
@@ -182,7 +183,7 @@ func TestProductionSourcesDoNotReintroduceLegacyRoutesOrCLI(t *testing.T) {
 }
 
 func TestNeedDirectoryAndProviderContract(t *testing.T) {
-	root := repositoryRoot(t)
+	root := repositoryRoot()
 	entries, err := os.ReadDir(filepath.Join(root, "need"))
 	if err != nil {
 		t.Fatal(err)
@@ -211,7 +212,7 @@ func productionSources(t *testing.T, roots ...string) []productionSource {
 	if len(roots) == 0 {
 		roots = []string{"cmd", "internal"}
 	}
-	root := repositoryRoot(t)
+	root := repositoryRoot()
 	docker := build.Default
 	docker.BuildTags = append(append([]string(nil), docker.BuildTags...), "docker")
 	var result []productionSource
@@ -266,13 +267,8 @@ func sourceImports(source productionSource, path string) bool {
 	return false
 }
 
-func repositoryRoot(t *testing.T) string {
-	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("resolve test source path")
-	}
-	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+func repositoryRoot() string {
+	return testsupport.RepositoryRoot()
 }
 
 func containsGoFile(root string) (bool, error) {

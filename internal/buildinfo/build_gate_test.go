@@ -8,19 +8,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
 	"coordplane/internal/buildinfo"
+	"coordplane/tests/testsupport"
 )
 
 func TestMakeBuildProducesTraceableBinariesAndValidManifest(t *testing.T) {
-	_, currentFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("resolve build gate source path")
-	}
-	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", ".."))
+	repoRoot := testsupport.RepositoryRoot()
 	outputDir := t.TempDir()
 	const (
 		wantVersion = "1.2.3-build-gate"

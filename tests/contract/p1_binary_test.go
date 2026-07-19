@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -43,7 +42,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	root := repositoryRoot()
+	root := testsupport.RepositoryRoot()
 	testBinaries.directory = directory
 	testBinaries.coordplane = filepath.Join(directory, "coordplane")
 	testBinaries.coordplaneContract = filepath.Join(directory, "coordplane-contract")
@@ -104,8 +103,8 @@ func TestGT00DaemonBinaryRecoversEveryInitializationPhase(t *testing.T) {
 			requireNoError(t, err)
 			t.Cleanup(func() { _ = os.RemoveAll(root) })
 			_, dataDir, socket, configPath := contractConfigPaths(t, "", root)
-			source := createRepository(t, root)
-			initial := strings.TrimSpace(git(t, source, "rev-parse", "refs/heads/main"))
+			source := testsupport.CreateGitRepository(t, root, "CoordPlane Contract", "contract@coordplane.local")
+			initial := strings.TrimSpace(testsupport.Git(t, source, "rev-parse", "refs/heads/main"))
 			readyPath := filepath.Join(root, "git-phase-ready")
 			daemon := startDaemonBinaryWithEnv(t, testBinaries.coordplaneContract, configPath, socket, []string{
 				"COORDPLANE_CONTRACT_GIT_PHASE=" + phase,
@@ -127,13 +126,13 @@ func TestGT00DaemonBinaryRecoversEveryInitializationPhase(t *testing.T) {
 			}
 
 			requireNoError(t, os.WriteFile(filepath.Join(source, "advanced.txt"), []byte(phase+"\n"), 0o600))
-			git(t, source, "add", "advanced.txt")
-			git(t, source, "commit", "-m", "advance source after "+phase)
-			advanced := strings.TrimSpace(git(t, source, "rev-parse", "refs/heads/main"))
+			testsupport.Git(t, source, "add", "advanced.txt")
+			testsupport.Git(t, source, "commit", "-m", "advance source after "+phase)
+			advanced := strings.TrimSpace(testsupport.Git(t, source, "rev-parse", "refs/heads/main"))
 			if advanced == initial {
 				t.Fatal("source ref did not advance after initialization intent")
 			}
-			sourceStatus := git(t, source, "status", "--porcelain=v1", "--untracked-files=all")
+			sourceStatus := testsupport.Git(t, source, "status", "--porcelain=v1", "--untracked-files=all")
 			sourceConfig, err := os.ReadFile(filepath.Join(source, ".git", "config"))
 			requireNoError(t, err)
 
@@ -156,14 +155,14 @@ func TestGT00DaemonBinaryRecoversEveryInitializationPhase(t *testing.T) {
 				t.Fatalf("recovered project = %#v, want immutable initial %s", project, initial)
 			}
 			controlRepo := filepath.Join(dataDir, "repos", project.ID+".git")
-			if got := strings.TrimSpace(git(t, controlRepo, "rev-parse", "refs/heads/main^{commit}")); got != initial {
+			if got := strings.TrimSpace(testsupport.Git(t, controlRepo, "rev-parse", "refs/heads/main^{commit}")); got != initial {
 				t.Fatalf("recovered canonical = %s, want %s", got, initial)
 			}
-			git(t, controlRepo, "fsck", "--full", "--strict")
-			if got := strings.TrimSpace(git(t, source, "rev-parse", "refs/heads/main")); got != advanced {
+			testsupport.Git(t, controlRepo, "fsck", "--full", "--strict")
+			if got := strings.TrimSpace(testsupport.Git(t, source, "rev-parse", "refs/heads/main")); got != advanced {
 				t.Fatalf("recovery rewrote source ref: got %s want %s", got, advanced)
 			}
-			if got := git(t, source, "status", "--porcelain=v1", "--untracked-files=all"); got != sourceStatus {
+			if got := testsupport.Git(t, source, "status", "--porcelain=v1", "--untracked-files=all"); got != sourceStatus {
 				t.Fatalf("recovery changed source worktree: before=%q after=%q", sourceStatus, got)
 			}
 			afterConfig, err := os.ReadFile(filepath.Join(source, ".git", "config"))
@@ -188,7 +187,7 @@ func TestGT00DaemonBinaryRecoversEveryInitializationPhase(t *testing.T) {
 
 func TestGT00ProductionBinaryHasNoContractFaultControl(t *testing.T) {
 	root, _, socket, configPath := contractConfigPaths(t, "")
-	source := createRepository(t, root)
+	source := testsupport.CreateGitRepository(t, root, "CoordPlane Contract", "contract@coordplane.local")
 	readyPath := filepath.Join(root, "must-not-exist")
 	daemon := startDaemonBinaryWithEnv(t, testBinaries.coordplane, configPath, socket, []string{
 		"COORDPLANE_CONTRACT_GIT_PHASE=partial_prepared",
@@ -282,9 +281,9 @@ func TestP3ProductionBinaryRejectsRetiredCodexResidueBeforeStartupSideEffects(t 
 
 func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 	root, dataDir, socket, configPath := contractConfigPaths(t, "")
-	source := createRepository(t, root)
-	sourceRefBefore := git(t, source, "rev-parse", "refs/heads/main")
-	sourceStatusBefore := git(t, source, "status", "--porcelain=v1", "--untracked-files=all")
+	source := testsupport.CreateGitRepository(t, root, "CoordPlane Contract", "contract@coordplane.local")
+	sourceRefBefore := testsupport.Git(t, source, "rev-parse", "refs/heads/main")
+	sourceStatusBefore := testsupport.Git(t, source, "status", "--porcelain=v1", "--untracked-files=all")
 	sourceConfigBefore, err := os.ReadFile(filepath.Join(source, ".git", "config"))
 	requireNoError(t, err)
 	daemon := startDaemon(t, configPath, socket)
@@ -396,10 +395,10 @@ func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 	if !bytes.Equal(afterRestart, beforeRestart) {
 		t.Fatalf("restart changed row versions or Event IDs/order\nbefore=%s\nafter=%s", beforeRestart, afterRestart)
 	}
-	if got := git(t, source, "rev-parse", "refs/heads/main"); got != sourceRefBefore {
+	if got := testsupport.Git(t, source, "rev-parse", "refs/heads/main"); got != sourceRefBefore {
 		t.Fatalf("source ref changed: before=%s after=%s", sourceRefBefore, got)
 	}
-	if got := git(t, source, "status", "--porcelain=v1", "--untracked-files=all"); got != sourceStatusBefore {
+	if got := testsupport.Git(t, source, "status", "--porcelain=v1", "--untracked-files=all"); got != sourceStatusBefore {
 		t.Fatalf("source status changed: before=%q after=%q", sourceStatusBefore, got)
 	}
 	sourceConfigAfter, err := os.ReadFile(filepath.Join(source, ".git", "config"))
@@ -411,11 +410,11 @@ func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 	stopDaemon(t, daemon, socket)
 	controlRepo := filepath.Join(dataDir, "repos", project.ID+".git")
 	requireNoError(t, os.WriteFile(filepath.Join(source, "canonical-advanced.txt"), []byte("advanced\n"), 0o600))
-	git(t, source, "add", "canonical-advanced.txt")
-	git(t, source, "commit", "-m", "advance canonical before loss")
-	advancedSHA := strings.TrimSpace(git(t, source, "rev-parse", "refs/heads/main"))
-	git(t, controlRepo, "fetch", "--no-tags", source, advancedSHA)
-	git(t, controlRepo, "update-ref", "refs/heads/main", advancedSHA, strings.TrimSpace(sourceRefBefore))
+	testsupport.Git(t, source, "add", "canonical-advanced.txt")
+	testsupport.Git(t, source, "commit", "-m", "advance canonical before loss")
+	advancedSHA := strings.TrimSpace(testsupport.Git(t, source, "rev-parse", "refs/heads/main"))
+	testsupport.Git(t, controlRepo, "fetch", "--no-tags", source, advancedSHA)
+	testsupport.Git(t, controlRepo, "update-ref", "refs/heads/main", advancedSHA, strings.TrimSpace(sourceRefBefore))
 	missingRepo := filepath.Join(root, "missing-control.git")
 	requireNoError(t, os.Rename(controlRepo, missingRepo))
 	daemon = startDaemon(t, configPath, socket)
@@ -455,7 +454,7 @@ func TestP1OperatorBinaryUnixCutoverAndRestart(t *testing.T) {
 	if repaired.Status != core.ProjectActive || repaired.InitialSHA != strings.TrimSpace(sourceRefBefore) || repaired.CanonicalSHA != advancedSHA {
 		t.Fatalf("repaired project = %#v", repaired)
 	}
-	if got := strings.TrimSpace(git(t, controlRepo, "rev-parse", "refs/heads/main^{commit}")); got != advancedSHA {
+	if got := strings.TrimSpace(testsupport.Git(t, controlRepo, "rev-parse", "refs/heads/main^{commit}")); got != advancedSHA {
 		t.Fatalf("repaired canonical = %s, want restored actual %s", got, advancedSHA)
 	}
 }
@@ -467,7 +466,7 @@ func TestGT07FormalOperatorBinaryChecksOutExactControllerTaskRef(t *testing.T) {
 	configRaw = bytes.ReplaceAll(configRaw, []byte("completed_workspace: 24h"), []byte("completed_workspace: 0"))
 	configRaw = bytes.ReplaceAll(configRaw, []byte("terminal_task_ref: 168h"), []byte("terminal_task_ref: 0"))
 	requireNoError(t, os.WriteFile(configPath, configRaw, 0o600))
-	source := createRepository(t, root)
+	source := testsupport.CreateGitRepository(t, root, "CoordPlane Contract", "contract@coordplane.local")
 	daemon := startDaemon(t, configPath, socket)
 	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"agent", "add", "--socket", socket, "--display-name", "Checkout reviewer",
@@ -529,7 +528,7 @@ func TestGT07FormalOperatorBinaryChecksOutExactControllerTaskRef(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireNoError(t, database.Close())
-	gitDir(t, project.ControlRepoPath, "update-ref", taskRef, head)
+	testsupport.GitDir(t, project.ControlRepoPath, "update-ref", taskRef, head)
 
 	daemon = startDaemon(t, configPath, socket)
 	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
@@ -541,10 +540,10 @@ func TestGT07FormalOperatorBinaryChecksOutExactControllerTaskRef(t *testing.T) {
 	if checkout.HeadSHA != head || checkout.Destination != destination {
 		t.Fatalf("formal checkout = %#v", checkout)
 	}
-	if got := strings.TrimSpace(git(t, destination, "rev-parse", "HEAD^{commit}")); got != head {
+	if got := strings.TrimSpace(testsupport.Git(t, destination, "rev-parse", "HEAD^{commit}")); got != head {
 		t.Fatalf("checked-out HEAD = %s, want %s", got, head)
 	}
-	if remotes := strings.TrimSpace(git(t, destination, "remote")); remotes != "" {
+	if remotes := strings.TrimSpace(testsupport.Git(t, destination, "remote")); remotes != "" {
 		t.Fatalf("checked-out review has remotes: %q", remotes)
 	}
 	stopDaemon(t, daemon, socket)
@@ -668,7 +667,7 @@ func TestGT07FormalOperatorBinaryChecksOutExactControllerTaskRef(t *testing.T) {
 
 func TestGT07FormalOperatorBinaryCreatesRetryLineageFromClosedSameProjectTask(t *testing.T) {
 	root, dataDir, socket, configPath := contractConfigPaths(t, "")
-	source := createRepository(t, root)
+	source := testsupport.CreateGitRepository(t, root, "CoordPlane Contract", "contract@coordplane.local")
 	daemon := startDaemon(t, configPath, socket)
 	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"agent", "add", "--socket", socket, "--display-name", "Retry worker",
@@ -712,13 +711,13 @@ func TestGT07FormalOperatorBinaryCreatesRetryLineageFromClosedSameProjectTask(t 
 
 	stopDaemon(t, daemon, socket)
 	requireNoError(t, os.WriteFile(filepath.Join(source, "retry-canonical.txt"), []byte("advanced\n"), 0o600))
-	git(t, source, "add", "retry-canonical.txt")
-	git(t, source, "commit", "-m", "advance canonical for retry")
-	advanced := strings.TrimSpace(git(t, source, "rev-parse", "refs/heads/main^{commit}"))
+	testsupport.Git(t, source, "add", "retry-canonical.txt")
+	testsupport.Git(t, source, "commit", "-m", "advance canonical for retry")
+	advanced := strings.TrimSpace(testsupport.Git(t, source, "rev-parse", "refs/heads/main^{commit}"))
 	controlRepo := filepath.Join(dataDir, "repos", project.ID+".git")
-	oldCanonical := strings.TrimSpace(git(t, controlRepo, "rev-parse", project.CanonicalRef+"^{commit}"))
-	git(t, controlRepo, "fetch", "--no-tags", source, advanced)
-	git(t, controlRepo, "update-ref", project.CanonicalRef, advanced, oldCanonical)
+	oldCanonical := strings.TrimSpace(testsupport.Git(t, controlRepo, "rev-parse", project.CanonicalRef+"^{commit}"))
+	testsupport.Git(t, controlRepo, "fetch", "--no-tags", source, advanced)
+	testsupport.Git(t, controlRepo, "update-ref", project.CanonicalRef, advanced, oldCanonical)
 	daemon = startDaemon(t, configPath, socket)
 	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
 
@@ -750,7 +749,7 @@ func TestGT07FormalOperatorBinaryCreatesRetryLineageFromClosedSameProjectTask(t 
 		{name: "cross", target: cross.ID, requestID: "retry-invalid-cross", code: core.CodeScopeDenied},
 	} {
 		before := durableSignature(t, auditStore, project.ID)
-		canonicalBefore := strings.TrimSpace(git(t, controlRepo, "rev-parse", project.CanonicalRef+"^{commit}"))
+		canonicalBefore := strings.TrimSpace(testsupport.Git(t, controlRepo, "rev-parse", project.CanonicalRef+"^{commit}"))
 		command := exec.Command(testBinaries.coordplane,
 			"task", "create", "--socket", socket, "--project", project.ID, "--agent", agent.ID,
 			"--title", "invalid retry", "--retry-of", invalid.target,
@@ -762,7 +761,7 @@ func TestGT07FormalOperatorBinaryCreatesRetryLineageFromClosedSameProjectTask(t 
 		if after := durableSignature(t, auditStore, project.ID); after != before {
 			t.Fatalf("%s rejected retry changed Task/Run/Message/Event state", invalid.name)
 		}
-		canonicalAfter := strings.TrimSpace(git(t, controlRepo, "rev-parse", project.CanonicalRef+"^{commit}"))
+		canonicalAfter := strings.TrimSpace(testsupport.Git(t, controlRepo, "rev-parse", project.CanonicalRef+"^{commit}"))
 		if canonicalAfter != canonicalBefore {
 			t.Fatalf("%s rejected retry changed canonical from %s to %s", invalid.name, canonicalBefore, canonicalAfter)
 		}
@@ -795,7 +794,7 @@ func TestP1BinaryReadSurfacesStayBoundedPastTwoMiBLedger(t *testing.T) {
 	requireNoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	_, dataDir, socket, configPath := contractConfigPaths(t, "", root)
-	source := createRepository(t, root)
+	source := testsupport.CreateGitRepository(t, root, "CoordPlane Contract", "contract@coordplane.local")
 	daemon := startDaemon(t, configPath, socket)
 	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
 
@@ -1333,7 +1332,7 @@ func durableSignature(t *testing.T, database *store.Store, projectID string) str
 func seedRetiredCodexState(t *testing.T, path, agentAdapter, taskState, runState string) *sql.DB {
 	t.Helper()
 	requireNoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
-	fixture, err := os.ReadFile(filepath.Join(repositoryRoot(), "tests", "contract", "fixtures", "coordplane-v1.db"))
+	fixture, err := os.ReadFile(filepath.Join(testsupport.RepositoryRoot(), "tests", "contract", "fixtures", "coordplane-v1.db"))
 	requireNoError(t, err)
 	requireNoError(t, os.WriteFile(path, fixture, 0o600))
 	db, err := sql.Open("sqlite", path)
@@ -1423,49 +1422,11 @@ func writeConfig(t *testing.T, root, dataDir, socket, suffix string) string {
 	return testsupport.WriteFile(t, path, testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: 4, CompletedWorkspace: "24h", TerminalTaskRef: "168h", RunLog: "168h", DockerNetwork: "coordplane", DefaultImage: "agent:latest", Tail: suffix}), 0o600)
 }
 
-func createRepository(t *testing.T, root string) string {
-	t.Helper()
-	path := filepath.Join(root, "source")
-	requireNoError(t, os.MkdirAll(path, 0o700))
-	git(t, path, "init", "-b", "main")
-	git(t, path, "config", "user.email", "contract@coordplane.local")
-	git(t, path, "config", "user.name", "CoordPlane Contract")
-	requireNoError(t, os.WriteFile(filepath.Join(path, "README.md"), []byte("initial\n"), 0o600))
-	git(t, path, "add", "README.md")
-	git(t, path, "commit", "-m", "initial")
-	return path
-}
-
-func git(t *testing.T, directory string, args ...string) string {
-	t.Helper()
-	command := exec.Command("git", append([]string{"-C", directory}, args...)...)
-	raw, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("git %v: %v\n%s", args, err, raw)
-	}
-	return string(raw)
-}
-
-func gitDir(t *testing.T, directory string, args ...string) string {
-	t.Helper()
-	command := exec.Command("git", append([]string{"--git-dir=" + directory}, args...)...)
-	raw, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("git --git-dir %v: %v\n%s", args, err, raw)
-	}
-	return string(raw)
-}
-
 func decodeJSON(t *testing.T, raw []byte, target any) {
 	t.Helper()
 	if err := json.Unmarshal(raw, target); err != nil {
 		t.Fatalf("decode JSON: %v\n%s", err, raw)
 	}
-}
-
-func repositoryRoot() string {
-	_, file, _, _ := runtime.Caller(0)
-	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
 }
 
 func processExited(process *os.Process) bool {

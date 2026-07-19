@@ -16,6 +16,7 @@ import (
 	"coordplane/internal/config"
 	"coordplane/internal/gitrepo"
 	containerruntime "coordplane/internal/runtime"
+	"coordplane/tests/testsupport"
 )
 
 func TestGT03DockerCaptureHelperIsolatesConfigAndPublishesBoundedReadyHandoff(t *testing.T) {
@@ -29,7 +30,7 @@ func TestGT03DockerCaptureHelperIsolatesConfigAndPublishesBoundedReadyHandoff(t 
 	root := t.TempDir()
 	helperBinary := filepath.Join(root, "coordplane-git-helper")
 	build := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-o", helperBinary, "./cmd/coordplane-git-helper")
-	build.Dir = daemonRepositoryRoot(t)
+	build.Dir = daemonRepositoryRoot()
 	build.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if raw, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build helper: %v\n%s", err, raw)
@@ -90,7 +91,7 @@ func TestGT07DockerGCPreviewAndDiscardNeverExecuteWorkspaceGitConfigOnHost(t *te
 	root := t.TempDir()
 	helperBinary := filepath.Join(root, "coordplane-git-helper")
 	build := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-o", helperBinary, "./cmd/coordplane-git-helper")
-	build.Dir = daemonRepositoryRoot(t)
+	build.Dir = daemonRepositoryRoot()
 	build.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if raw, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build helper: %v\n%s", err, raw)
@@ -103,7 +104,7 @@ func TestGT07DockerGCPreviewAndDiscardNeverExecuteWorkspaceGitConfigOnHost(t *te
 	requireNoError(t, err)
 
 	source, _ := dockerCaptureRepository(t, root)
-	sourceRef := dockerGit(t, source, "symbolic-ref", "HEAD")
+	sourceRef := testsupport.Git(t, source, "symbolic-ref", "HEAD")
 	initializer, err := gitrepo.New(filepath.Join(root, "repos"))
 	requireNoError(t, err)
 	preflight, err := initializer.Preflight(ctx, source, sourceRef)
@@ -126,7 +127,7 @@ func TestGT07DockerGCPreviewAndDiscardNeverExecuteWorkspaceGitConfigOnHost(t *te
 	marker := filepath.Join(root, "host-fsmonitor-ran")
 	command := filepath.Join(workspace.Path, ".git", "host-fsmonitor")
 	requireNoError(t, os.WriteFile(command, []byte(fmt.Sprintf("#!/bin/sh\n: > %q\n", marker)), 0o770))
-	dockerGit(t, workspace.Path, "config", "core.fsmonitor", command)
+	testsupport.Git(t, workspace.Path, "config", "core.fsmonitor", command)
 
 	preview, err := manager.State(ctx, spec, workspace.HeadSHA, 1)
 	requireNoError(t, err)
@@ -180,7 +181,7 @@ func dockerGitHelperImage(t *testing.T, ctx context.Context, root string) string
 	dockerConfig := filepath.Join(root, "docker-config")
 	requireNoError(t, os.Mkdir(dockerConfig, 0o700))
 	dockerBuild := exec.CommandContext(ctx, "docker", "build", "-q", "-t", image,
-		filepath.Join(daemonRepositoryRoot(t), "internal", "daemon", "testdata", "git-capture-helper"))
+		filepath.Join(daemonRepositoryRoot(), "internal", "daemon", "testdata", "git-capture-helper"))
 	dockerBuild.Env = append(os.Environ(), "DOCKER_CONFIG="+dockerConfig)
 	if raw, err := dockerBuild.CombinedOutput(); err != nil {
 		t.Fatalf("build helper image: %v\n%s", err, raw)
@@ -199,15 +200,15 @@ func dockerCaptureRepository(t *testing.T, root string) (string, string) {
 	t.Helper()
 	workspace := filepath.Join(root, "workspace")
 	requireNoError(t, os.Mkdir(workspace, 0o770))
-	dockerGit(t, workspace, "init", "-q")
-	dockerGit(t, workspace, "config", "user.name", "Docker Capture")
-	dockerGit(t, workspace, "config", "user.email", "capture@example.invalid")
+	testsupport.Git(t, workspace, "init", "-q")
+	testsupport.Git(t, workspace, "config", "user.name", "Docker Capture")
+	testsupport.Git(t, workspace, "config", "user.email", "capture@example.invalid")
 	requireNoError(t, os.WriteFile(filepath.Join(workspace, "result.txt"), []byte("captured\n"), 0o660))
-	dockerGit(t, workspace, "add", "result.txt")
-	dockerGit(t, workspace, "commit", "-q", "-m", "capture")
+	testsupport.Git(t, workspace, "add", "result.txt")
+	testsupport.Git(t, workspace, "commit", "-q", "-m", "capture")
 	command := filepath.Join(workspace, ".git", "malicious-fsmonitor")
 	requireNoError(t, os.WriteFile(command, []byte("#!/bin/sh\n: > /handoff/host-command-ran\n"), 0o770))
-	dockerGit(t, workspace, "config", "core.fsmonitor", "/workspace/.git/malicious-fsmonitor")
+	testsupport.Git(t, workspace, "config", "core.fsmonitor", "/workspace/.git/malicious-fsmonitor")
 	if err := filepath.WalkDir(workspace, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -227,15 +228,5 @@ func dockerCaptureRepository(t *testing.T, root string) (string, string) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	return workspace, dockerGit(t, workspace, "rev-parse", "HEAD^{commit}")
-}
-
-func dockerGit(t *testing.T, directory string, args ...string) string {
-	t.Helper()
-	command := exec.Command("git", append([]string{"-C", directory}, args...)...)
-	raw, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, raw)
-	}
-	return strings.TrimSpace(string(raw))
+	return workspace, testsupport.Git(t, workspace, "rev-parse", "HEAD^{commit}")
 }

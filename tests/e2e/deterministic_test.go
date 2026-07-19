@@ -23,7 +23,6 @@ import (
 )
 
 var requireNoError = testsupport.RequireNoError
-var writeFile = testsupport.WriteFile
 
 const e2eTimeout = 3 * time.Minute
 
@@ -49,7 +48,7 @@ func TestDeterministicTwoAgentConvergence(t *testing.T) {
 	dataDir := filepath.Join(root, "data")
 	socket := filepath.Join(dataDir, "operator.sock")
 	instructions := filepath.Join(root, "instructions.md")
-	writeFile(t, instructions, []byte("Execute only the deterministic P5 bootstrap contract.\n"), 0o600)
+	testsupport.WriteFile(t, instructions, []byte("Execute only the deterministic P5 bootstrap contract.\n"), 0o600)
 	configPath := testsupport.WriteFile(t, filepath.Join(root, "coordplane.yaml"), testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: 2, CompletedWorkspace: "0", TerminalTaskRef: "24h", RunLog: "24h", DockerNetwork: "none", DefaultImage: image, Tail: "  run_timeout: 2m\n  shutdown_grace: 3s\ngit:\n  capture_helper_image: " + image + "\n  capture_timeout: 30s\n  maximum_bundle_bytes: 67108864\n  maximum_objects: 250000\n  maximum_handoff_bytes: 268435456\n"}), 0o600)
 
 	daemon := startDaemon(t, coordplane, configPath, socket)
@@ -609,8 +608,8 @@ func createSourceRepository(t *testing.T, ctx context.Context, root string) (str
 	run(t, ctx, "git", "init", "--quiet", "--initial-branch", "main", source)
 	git(t, ctx, source, "config", "user.name", "CoordPlane P5 Fixture")
 	git(t, ctx, source, "config", "user.email", "p5-fixture@coordplane.local")
-	writeFile(t, filepath.Join(source, "base.txt"), []byte("C0\n"), 0o644)
-	writeFile(t, filepath.Join(source, "fixture-test.sh"), []byte("#!/bin/sh\nset -eu\ntest \"$(cat base.txt)\" = C0\nfor role in A B; do\n  file=agent-$role.txt\n  if [ -e \"$file\" ]; then test \"$(cat \"$file\")\" = agent-$role; fi\ndone\n"), 0o755)
+	testsupport.WriteFile(t, filepath.Join(source, "base.txt"), []byte("C0\n"), 0o644)
+	testsupport.WriteFile(t, filepath.Join(source, "fixture-test.sh"), []byte("#!/bin/sh\nset -eu\ntest \"$(cat base.txt)\" = C0\nfor role in A B; do\n  file=agent-$role.txt\n  if [ -e \"$file\" ]; then test \"$(cat \"$file\")\" = agent-$role; fi\ndone\n"), 0o755)
 	git(t, ctx, source, "add", "base.txt", "fixture-test.sh")
 	git(t, ctx, source, "commit", "--quiet", "-m", "P5 C0")
 	return source, git(t, ctx, source, "rev-parse", "HEAD")

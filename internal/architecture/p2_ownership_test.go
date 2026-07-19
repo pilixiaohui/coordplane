@@ -10,7 +10,7 @@ import (
 )
 
 func TestP2LegacyCoordinationOwnersCannotReturn(t *testing.T) {
-	root := repositoryRoot(t)
+	root := repositoryRoot()
 	for _, name := range []string{"coordination", "delivery", "queue"} {
 		if found, err := containsGoFile(filepath.Join(root, "internal", name)); err != nil {
 			t.Fatal(err)

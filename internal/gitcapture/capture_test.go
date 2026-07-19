@@ -4,11 +4,12 @@ import (
 	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"coordplane/tests/testsupport"
 )
 
 func TestCaptureIgnoresRepositoryConfigAndPublishesReadyAtomically(t *testing.T) {
@@ -18,7 +19,7 @@ func TestCaptureIgnoresRepositoryConfigAndPublishesReadyAtomically(t *testing.T)
 	if err := os.WriteFile(command, []byte("#!/bin/sh\n: > "+marker+"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	git(t, workspace, "config", "core.fsmonitor", command)
+	testsupport.Git(t, workspace, "config", "core.fsmonitor", command)
 
 	handoff := t.TempDir()
 	fact, err := Capture(context.Background(), Request{
@@ -78,7 +79,7 @@ func TestInspectIgnoresRepositoryConfigAndReportsDirtyAndUnfinishedState(t *test
 	if err := os.WriteFile(command, []byte("#!/bin/sh\n: > "+marker+"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	git(t, workspace, "config", "core.fsmonitor", command)
+	testsupport.Git(t, workspace, "config", "core.fsmonitor", command)
 
 	inspect := func() Fact {
 		t.Helper()
@@ -117,24 +118,13 @@ func TestInspectIgnoresRepositoryConfigAndReportsDirtyAndUnfinishedState(t *test
 func newCaptureRepository(t *testing.T) (string, string) {
 	t.Helper()
 	root := t.TempDir()
-	git(t, root, "init", "-q")
-	git(t, root, "config", "user.name", "Capture Test")
-	git(t, root, "config", "user.email", "capture@example.invalid")
+	testsupport.Git(t, root, "init", "-q")
+	testsupport.Git(t, root, "config", "user.name", "Capture Test")
+	testsupport.Git(t, root, "config", "user.email", "capture@example.invalid")
 	if err := os.WriteFile(filepath.Join(root, "result.txt"), []byte("result\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	git(t, root, "add", "result.txt")
-	git(t, root, "commit", "-q", "-m", "result")
-	return root, git(t, root, "rev-parse", "HEAD^{commit}")
-}
-
-func git(t *testing.T, directory string, args ...string) string {
-	t.Helper()
-	command := exec.Command("git", append([]string{"-C", directory}, args...)...)
-	command.Env = append(os.Environ(), "LC_ALL=C")
-	raw, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, raw)
-	}
-	return strings.TrimSpace(string(raw))
+	testsupport.Git(t, root, "add", "result.txt")
+	testsupport.Git(t, root, "commit", "-q", "-m", "result")
+	return root, testsupport.Git(t, root, "rev-parse", "HEAD^{commit}")
 }
