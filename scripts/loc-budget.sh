@@ -34,25 +34,9 @@ generated_manifest=scripts/generated-manifest.json
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/coordplane-loc.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
-records=$tmp/records
-unknown=$tmp/unknown
-file_warnings=$tmp/file-warnings
-file_blockers=$tmp/file-blockers
-function_warnings=$tmp/function-warnings
-function_blockers=$tmp/function-blockers
-gofmt_bad=$tmp/gofmt
-multistatement_blockers=$tmp/multistatement-blockers
-go_files=$tmp/go-files
-untracked_maintained=$tmp/untracked-maintained
-: >"$records"
-: >"$unknown"
-: >"$file_warnings"
-: >"$file_blockers"
-: >"$function_warnings"
-: >"$function_blockers"
-: >"$multistatement_blockers"
-: >"$go_files"
-: >"$untracked_maintained"
+for report in records unknown file-warnings file-blockers function-warnings function-blockers gofmt multistatement-blockers go-files untracked-maintained; do
+  : >"$tmp/$report"
+done
 
 classify() {
   classify_path=$1
@@ -68,12 +52,18 @@ classify() {
   return 1
 }
 
-count_go() {
-  awk '
+count_lines() {
+  awk -v go="$2" '
     function trim(s) { sub(/^[[:space:]]+/, "", s); return s }
     {
       s=trim($0)
       if (s=="") next
+      if (!go) {
+        if (s ~ /^#/ && s !~ /^#!/) next
+        if (s ~ /^\/\//) next
+        total++
+        next
+      }
       while (1) {
         if (block) {
           if (match(s, /\*\//)) { s=trim(substr(s,RSTART+RLENGTH)); block=0; if (s=="") next }
@@ -93,22 +83,8 @@ count_go() {
   ' "$1"
 }
 
-count_text() {
-  awk '
-    {
-      s=$0
-      sub(/^[[:space:]]+/, "", s)
-      if (s=="") next
-      if (s ~ /^#/ && s !~ /^#!/) next
-      if (s ~ /^\/\//) next
-      total++
-    }
-    END { print total+0 }
-  ' "$1"
-}
-
 check_functions() {
-  awk -v path="$1" -v warnings="$function_warnings" -v blockers="$function_blockers" '
+  awk -v path="$1" -v warnings="$tmp/function-warnings" -v blockers="$tmp/function-blockers" '
     function code(s) {
       sub(/^[[:space:]]+/, "", s)
       return s!="" && s!~/^\/\//
@@ -137,46 +113,45 @@ check_functions() {
   ' "$1"
 }
 
-fixture_bytes=0
 git ls-files --cached --others --exclude-standard | LC_ALL=C sort -u | while IFS= read -r path; do
   [ -f "$path" ] || continue
   if ! classification=$(classify "$path"); then
-    printf '%s\n' "$path" >>"$unknown"
+    printf '%s\n' "$path" >>"$tmp/unknown"
     continue
   fi
   bucket=${classification%%|*}
   module=${classification#*|}
   [ "$bucket" != excluded ] || continue
-	if ! git ls-files --error-unmatch "$path" >/dev/null 2>&1; then
-		printf '%s\n' "$path" >>"$untracked_maintained"
-	fi
+  if ! git ls-files --error-unmatch "$path" >/dev/null 2>&1; then
+    printf '%s\n' "$path" >>"$tmp/untracked-maintained"
+  fi
   case "$path" in
-    *.go) lines=$(count_go "$path"); printf '%s\n' "$path" >>"$go_files" ;;
-    *) lines=$(count_text "$path") ;;
+    *.go) lines=$(count_lines "$path" 1); printf '%s\n' "$path" >>"$tmp/go-files" ;;
+    *) lines=$(count_lines "$path" 0) ;;
   esac
   case "$bucket" in
     generated_*)
-      grep -Fq "\"path\": \"$path\"" "$generated_manifest" || printf '%s\n' "$path" >>"$unknown"
+      grep -Fq "\"path\": \"$path\"" "$generated_manifest" || printf '%s\n' "$path" >>"$tmp/unknown"
       ;;
     *)
       if grep -q 'Code generated .* DO NOT EDIT\.' "$path"; then
-        printf '%s\n' "$path" >>"$unknown"
+        printf '%s\n' "$path" >>"$tmp/unknown"
       fi
       ;;
   esac
-  printf '%s|%s|%s|%s\n' "$bucket" "$module" "$lines" "$path" >>"$records"
+  printf '%s|%s|%s|%s\n' "$bucket" "$module" "$lines" "$path" >>"$tmp/records"
   if [ "$bucket" = handwritten_production ] || [ "$bucket" = generated_semantic_production ]; then
-    if [ "$lines" -gt 800 ]; then printf '%s:%s\n' "$path" "$lines" >>"$file_blockers"
-    elif [ "$lines" -gt 500 ]; then printf '%s:%s\n' "$path" "$lines" >>"$file_warnings"
+    if [ "$lines" -gt 800 ]; then printf '%s:%s\n' "$path" "$lines" >>"$tmp/file-blockers"
+    elif [ "$lines" -gt 500 ]; then printf '%s:%s\n' "$path" "$lines" >>"$tmp/file-warnings"
     fi
     case "$path" in *.go) check_functions "$path" ;; esac
   fi
 done
-go run ./scripts/locguard <"$go_files" >"$multistatement_blockers"
+go run ./scripts/locguard <"$tmp/go-files" >"$tmp/multistatement-blockers"
 
 # The pipeline loop runs in a subshell; fixture bytes are calculated separately.
 fixture_bytes=$(git ls-files --cached --others --exclude-standard | awk '/(^|\/)testdata\//{print}' | xargs -r wc -c | awk 'END{print $1+0}')
-gofmt -l $(git ls-files --cached --others --exclude-standard '*.go') >"$gofmt_bad"
+gofmt -l $(git ls-files --cached --others --exclude-standard '*.go') >"$tmp/gofmt"
 
 base=${LOC_BASE_REF:-HEAD^}
 git rev-parse --verify "$base^{commit}" >/dev/null 2>&1 || base=$(git rev-list --max-parents=0 HEAD)
@@ -184,22 +159,20 @@ base=$(git rev-parse "$base^{commit}")
 revision=$(git rev-parse HEAD)
 raw_added=$(git diff --numstat "$base" -- | awk '$1~/^[0-9]+$/{n+=$1} END{print n+0}')
 raw_deleted=$(git diff --numstat "$base" -- | awk '$2~/^[0-9]+$/{n+=$2} END{print n+0}')
-untracked_added=$(git ls-files --others --exclude-standard | xargs -r wc -l | awk 'END{print $1+0}')
-raw_added=$((raw_added + untracked_added))
+raw_added=$((raw_added + $(git ls-files --others --exclude-standard | xargs -r wc -l | awk 'END{print $1+0}')))
 
-handwritten_production=$(awk -F'|' '$1=="handwritten_production"{n+=$3} END{print n+0}' "$records")
-handwritten_tests=$(awk -F'|' '$1=="handwritten_tests"{n+=$3} END{print n+0}' "$records")
-handwritten_infra=$(awk -F'|' '$1=="handwritten_infra"{n+=$3} END{print n+0}' "$records")
-generated_semantic_production=$(awk -F'|' '$1=="generated_semantic_production"{n+=$3} END{print n+0}' "$records")
-generated_semantic_tests=$(awk -F'|' '$1=="generated_semantic_tests"{n+=$3} END{print n+0}' "$records")
-generated_semantic_infra=$(awk -F'|' '$1=="generated_semantic_infra"{n+=$3} END{print n+0}' "$records")
-generated_mechanical_excluded=$(awk -F'|' '$1=="generated_mechanical_excluded"{n+=$3} END{print n+0}' "$records")
+handwritten_production=$(awk -F'|' '$1=="handwritten_production"{n+=$3} END{print n+0}' "$tmp/records")
+handwritten_tests=$(awk -F'|' '$1=="handwritten_tests"{n+=$3} END{print n+0}' "$tmp/records")
+handwritten_infra=$(awk -F'|' '$1=="handwritten_infra"{n+=$3} END{print n+0}' "$tmp/records")
+generated_semantic_production=$(awk -F'|' '$1=="generated_semantic_production"{n+=$3} END{print n+0}' "$tmp/records")
+generated_semantic_tests=$(awk -F'|' '$1=="generated_semantic_tests"{n+=$3} END{print n+0}' "$tmp/records")
+generated_semantic_infra=$(awk -F'|' '$1=="generated_semantic_infra"{n+=$3} END{print n+0}' "$tmp/records")
+generated_mechanical_excluded=$(awk -F'|' '$1=="generated_mechanical_excluded"{n+=$3} END{print n+0}' "$tmp/records")
 production=$((handwritten_production + generated_semantic_production))
 tests=$((handwritten_tests + generated_semantic_tests))
 infra=$((handwritten_infra + generated_semantic_infra))
 total=$((production + tests + infra))
 generated_total=$((generated_semantic_production + generated_semantic_tests + generated_semantic_infra + generated_mechanical_excluded))
-first_party_source_total=$((total + generated_mechanical_excluded))
 
 failure=false
 [ "$production" -le 20500 ] || failure=true
@@ -207,24 +180,21 @@ failure=false
 [ "$infra" -le 600 ] || failure=true
 [ "$total" -le 43600 ] || failure=true
 [ "$generated_total" -le 3000 ] || failure=true
-[ ! -s "$unknown" ] || failure=true
-[ ! -s "$file_blockers" ] || failure=true
-[ ! -s "$function_blockers" ] || failure=true
-[ ! -s "$gofmt_bad" ] || failure=true
-[ ! -s "$multistatement_blockers" ] || failure=true
+for report in unknown file-blockers function-blockers gofmt multistatement-blockers; do
+  [ ! -s "$tmp/$report" ] || failure=true
+done
 clean=true
 git diff --quiet -- && git diff --cached --quiet -- || clean=false
-[ ! -s "$untracked_maintained" ] || clean=false
+[ ! -s "$tmp/untracked-maintained" ] || clean=false
 [ "$clean" = true ] || failure=true
 
-json_tmp=$tmp/report.json
 awk -F'|' \
   -v revision="$revision" -v base="$base" -v added="$raw_added" -v deleted="$raw_deleted" \
   -v hp="$handwritten_production" -v ht="$handwritten_tests" -v hi="$handwritten_infra" \
   -v gsp="$generated_semantic_production" -v gst="$generated_semantic_tests" -v gsi="$generated_semantic_infra" -v gme="$generated_mechanical_excluded" \
   -v production="$production" -v tests="$tests" -v infra="$infra" -v total="$total" \
-  -v generated="$generated_total" -v source_total="$first_party_source_total" -v fixture_bytes="$fixture_bytes" \
-  -v unknown="$unknown" -v fw="$file_warnings" -v fb="$file_blockers" -v fnw="$function_warnings" -v fnb="$function_blockers" -v gofmt_bad="$gofmt_bad" -v multi="$multistatement_blockers" -v clean="$clean" -v failed="$failure" '
+  -v generated="$generated_total" -v source_total="$((total + generated_mechanical_excluded))" -v fixture_bytes="$fixture_bytes" \
+  -v unknown="$tmp/unknown" -v fw="$tmp/file-warnings" -v fb="$tmp/file-blockers" -v fnw="$tmp/function-warnings" -v fnb="$tmp/function-blockers" -v gofmt_bad="$tmp/gofmt" -v multi="$tmp/multistatement-blockers" -v clean="$clean" -v failed="$failure" '
   function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
   function array(path, line, first) {
     printf "["; first=1
@@ -244,10 +214,10 @@ awk -F'|' \
     printf "  \"clean_revision\": %s,\n", clean=="true" ? "true" : "false"
     printf "  \"pass\": %s\n}\n", failed=="true" ? "false" : "true"
   }
-' "$records" >"$json_tmp"
+' "$tmp/records" >"$tmp/report.json"
 
 mkdir -p "$(dirname "$output")"
-cp "$json_tmp" "$output.tmp.$$"
+cp "$tmp/report.json" "$output.tmp.$$"
 mv "$output.tmp.$$" "$output"
 if [ "$failure" = true ]; then
   echo "loc-budget: FAIL production=$production tests=$tests infra=$infra total=$total (report: $output)" >&2
