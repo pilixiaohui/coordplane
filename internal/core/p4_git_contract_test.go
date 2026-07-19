@@ -50,7 +50,7 @@ func TestGT07DiscardRespectsRetentionBeforeAndAtBoundary(t *testing.T) {
 		t.Fatalf("early workspace preview = %#v", workspaceTarget)
 	}
 	setNextClock(closedAt.Add(retention).Add(-time.Microsecond))
-	earlySignature := h.durableSignature(t, project.ID)
+	earlySignature := durableSignature(t, h.database, project.ID)
 	if result, err := service.GCDiscardWorkspace(context.Background(), core.GCDiscardWorkspaceInput{
 		TaskID: task.ID, ExpectedFingerprint: workspaceTarget.Fingerprint, RequestID: "retention-workspace-early",
 	}); err == nil || result.Discarded {
@@ -83,7 +83,7 @@ func TestGT07DiscardRespectsRetentionBeforeAndAtBoundary(t *testing.T) {
 		t.Fatalf("early task-ref preview = %#v", refTarget)
 	}
 	setNextClock(closedAt.Add(retention).Add(-time.Microsecond))
-	earlySignature = h.durableSignature(t, project.ID)
+	earlySignature = durableSignature(t, h.database, project.ID)
 	if result, err := service.GCDiscardTaskRef(context.Background(), core.GCDiscardTaskRefInput{
 		TaskID: task.ID, RunID: task.HeadRunID, ExpectedSHA: task.HeadSHA, RequestID: "retention-ref-early",
 	}); err == nil || result.Discarded {

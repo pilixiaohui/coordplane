@@ -58,7 +58,7 @@ func TestGT03SQLiteTaskRunAndRealGitCaptureRecoverAcrossProcessSIGKILL(t *testin
 				if _, err := os.Stat(filepath.Join(handoff, gitcapture.ReadyName)); err != nil {
 					t.Fatalf("post-kill capture.ready missing: %v", err)
 				}
-				beforeRestart := p4StoreDurableSignature(t, postKill, h.project.ID)
+				beforeRestart := durableSignature(t, postKill, h.project.ID)
 				closePostKill()
 				requireNoError(t, os.Chmod(h.root, 0o700))
 				configPath := testsupport.WriteFile(t, filepath.Join(h.root, "coordplane.yaml"), testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: h.root, OperatorSocket: filepath.Join(h.root, "operator.sock"), WorkspaceRoot: filepath.Join(h.root, "workspaces"), AgentHomeRoot: filepath.Join(h.root, "homes"), LogRoot: filepath.Join(h.root, "logs"), MaxParallelRuns: 4, CompletedWorkspace: "24h", TerminalTaskRef: "168h", RunLog: "168h", DockerNetwork: "coordplane", DefaultImage: "agent:test"}), 0o600)
@@ -67,13 +67,13 @@ func TestGT03SQLiteTaskRunAndRealGitCaptureRecoverAcrossProcessSIGKILL(t *testin
 				h.database = first.store
 				assertGT03RecoveredCapture(t, h, task, claim, head)
 				assertP4QuarantineEmpty(t, h.root)
-				if after := p4StoreDurableSignature(t, first.store, h.project.ID); after != beforeRestart {
+				if after := durableSignature(t, first.store, h.project.ID); after != beforeRestart {
 					t.Fatal("first production restart changed finalized capture state")
 				}
 				requireNoError(t, first.Close())
 				second, err := buildComponents(context.Background(), configPath)
 				requireNoError(t, err)
-				if after := p4StoreDurableSignature(t, second.store, h.project.ID); after != beforeRestart {
+				if after := durableSignature(t, second.store, h.project.ID); after != beforeRestart {
 					t.Fatal("second production restart changed finalized capture state")
 				}
 				h.database = second.store
@@ -193,7 +193,7 @@ func TestGT03ExistingTaskRefReplayIsIdempotentAndRejectsDifferentHead(t *testing
 		BaseSHA: task.BaseSHA, ExpectedHead: head,
 	}
 	adapter := projectGitAdapter{initializer: h.initializer, workspaces: h.workspaces}
-	before := p4DurableSignature(t, h)
+	before := durableSignature(t, h.database, h.project.ID)
 	for _, test := range []struct {
 		name, expectedHead string
 		wantError          bool
@@ -211,7 +211,7 @@ func TestGT03ExistingTaskRefReplayIsIdempotentAndRejectsDifferentHead(t *testing
 			} else if err != nil || fact.HeadSHA != head || fact.TaskRef != task.TaskRef {
 				t.Fatalf("same-head replay = %#v err=%v", fact, err)
 			}
-			if got := p4DurableSignature(t, h); got != before {
+			if got := durableSignature(t, h.database, h.project.ID); got != before {
 				t.Fatal("existing-ref replay changed SQLite or Event state")
 			}
 			assertP4Refs(t, h, h.project.InitialSHA, task.ID, head)

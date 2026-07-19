@@ -62,7 +62,7 @@ func TestP2BossReadMarksDeliveredWithoutPretendingAcknowledgement(t *testing.T) 
 		delivered.DeliveredAt == "" || delivered.DeliveryCount != 0 || delivered.AcknowledgedAt != "" {
 		t.Fatalf("Boss read projection = %#v", delivered)
 	}
-	beforeReplay := h.durableSignature(t, project.ID)
+	beforeReplay := durableSignature(t, h.database, project.ID)
 	if _, err := h.service.ReadBossMessage(context.Background(), message.ID, "boss-read"); err != nil {
 		t.Fatal(err)
 	}

@@ -31,7 +31,7 @@ func TestRunScopeAuthorizationAllowsStartingAndRejectsCrossScopeWithoutWrites(t 
 	scopeA := runScope(claimA.Run)
 	scopeB := runScope(claimB.Run)
 
-	before := h.durableSignature(t, project.ID)
+	before := durableSignature(t, h.database, project.ID)
 	if err := h.service.AuthorizeRunScope(context.Background(), claimA.Token, scopeA); err != nil {
 		t.Fatalf("authorize matching starting Run: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestStartingOutcomeDoesNotConsumeRequestIDBeforeActiveRetry(t *testing.T) {
 		Token: claim.Token, Outcome: core.OutcomeWait, Reason: "retry after active",
 		AckMessageIDs: []string{message.ID}, RequestID: "starting-outcome-request",
 	}
-	before := h.durableSignature(t, project.ID)
+	before := durableSignature(t, h.database, project.ID)
 	if _, err := h.service.RequestOutcome(context.Background(), input); !core.IsCode(err, core.CodeRunStarting) {
 		t.Fatalf("starting outcome error = %v, want %s", err, core.CodeRunStarting)
 	} else if typed := core.AsError(err); !typed.Retryable || typed.State != string(core.RunStarting) || typed.Version != claim.Run.Version {

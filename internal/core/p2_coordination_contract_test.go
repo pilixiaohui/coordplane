@@ -41,7 +41,7 @@ func TestP2OutcomeIntentReplaysAfterRevocationAndTerminalAppliesOnce(t *testing.
 	if err != nil || len(message.Items) != 1 || message.Items[0].State != core.MessageAcknowledged {
 		t.Fatalf("bundled ack = %#v err=%v", message, err)
 	}
-	beforeReplay := h.durableSignature(t, project.ID)
+	beforeReplay := durableSignature(t, h.database, project.ID)
 	if _, err := h.service.RequestOutcome(context.Background(), input); err != nil {
 		t.Fatalf("dedupe replay after token revocation: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestP2OutcomeIntentReplaysAfterRevocationAndTerminalAppliesOnce(t *testing.
 	if terminal.Task.Status != core.TaskWaiting || terminal.Task.CurrentRunID != "" || terminal.Task.WaitReason != "waiting for review" {
 		t.Fatalf("wait terminal projection = %#v", terminal.Task)
 	}
-	beforeTerminalReplay := h.durableSignature(t, project.ID)
+	beforeTerminalReplay := durableSignature(t, h.database, project.ID)
 	if _, err := recordRunTerminal(h, context.Background(), terminalInput); err != nil {
 		t.Fatalf("terminal replay: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestP2ChildCreateReplaysAfterOutcomeAndFinishingBlocksCancel(t *testing.T) 
 	if replay, err := h.service.CreateChildTask(context.Background(), childInput); err != nil || replay.ID != child.ID {
 		t.Fatalf("child replay after revoke=%#v err=%v", replay, err)
 	}
-	before := h.durableSignature(t, project.ID)
+	before := durableSignature(t, h.database, project.ID)
 	if _, err := h.service.CancelTask(context.Background(), core.TaskActionInput{
 		TaskID: parent.ID, Reason: "competing cancel", RequestID: "parent-cancel",
 	}); !core.IsCode(err, core.CodeActionInProgress) {

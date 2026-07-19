@@ -11,6 +11,13 @@ import (
 )
 
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == "--live-integration" {
+		file, err := parser.ParseFile(token.NewFileSet(), os.Args[2], nil, 0)
+		if err != nil || !liveIntegrationWiring(file) {
+			panic("live integration wiring guard failed")
+		}
+		return
+	}
 	checkSelfTest()
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
@@ -27,6 +34,35 @@ func main() {
 	if err := scanner.Err(); err != nil {
 		panic(err)
 	}
+}
+
+func liveIntegrationWiring(file *ast.File) bool {
+	function := file.Scope.Lookup("TestRealClaudeTwoAgentConvergence").Decl.(*ast.FuncDecl)
+	tracked, direct := 0, 0
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		callee, ok := call.Fun.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if callee.Name == "waitForLiveIntegration" {
+			tracked++
+		}
+		if callee.Name != "waitForTaskWithin" {
+			return true
+		}
+		for _, argument := range call.Args {
+			selector, ok := argument.(*ast.SelectorExpr)
+			if ok && selector.Sel.Name == "IntegrationTaskID" {
+				direct++
+			}
+		}
+		return true
+	})
+	return tracked == 1 && direct == 0
 }
 
 func statementLines(set *token.FileSet, node ast.Node) []int {

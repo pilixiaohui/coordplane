@@ -34,7 +34,8 @@ if ! docker build -q -t "$image" tests/e2e/testdata/runtime >/dev/null; then
 	exit 1
 fi
 
-if ! E2E_COORDPLANE_BIN="$build_dir/bin/coordplane" \
+if ! go run ./scripts/locguard --live-integration tests/e2e/real_cli_test.go >/dev/null ||
+	! E2E_COORDPLANE_BIN="$build_dir/bin/coordplane" \
 	E2E_COORDLINK_BIN="$build_dir/bin/coordlink" \
 	E2E_RUNTIME_IMAGE="$image" \
 	go test -tags=e2e ./tests/e2e -run '^(TestDeterministicTwoAgentConvergence|TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests|TestRealCLIGatePreservesFailureDiagnosticsBeforeCleanupWithoutProvider)$' -count=1 -v; then

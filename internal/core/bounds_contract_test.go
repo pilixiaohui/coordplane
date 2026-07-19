@@ -13,7 +13,7 @@ func TestMessageAndProgressLimitPlusOneHaveNoDurableSideEffects(t *testing.T) {
 	agent := h.addAgent(t, "bounded-agent")
 	project := h.addProject(t, "bounded-project", "")
 
-	before := h.durableSignature(t, project.ID)
+	before := durableSignature(t, h.database, project.ID)
 	if _, err := h.service.Chat(context.Background(), core.ChatInput{
 		ProjectID: project.ID, AgentID: agent.ID, Body: "valid",
 		Wake: true, RequestID: strings.Repeat("r", 257),
@@ -54,7 +54,7 @@ func TestMessageAndProgressLimitPlusOneHaveNoDurableSideEffects(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	before = h.durableSignature(t, project.ID)
+	before = durableSignature(t, h.database, project.ID)
 	progressRequestID := "bounded-progress"
 	if _, err := h.service.Progress(context.Background(), core.ProgressInput{
 		Token: claim.Token, Summary: strings.Repeat("p", core.MaximumProgressSummaryBytes+1), RequestID: progressRequestID,
@@ -68,7 +68,7 @@ func TestMessageAndProgressLimitPlusOneHaveNoDurableSideEffects(t *testing.T) {
 		t.Fatalf("exact-limit progress failed with the rejected request ID: %v", err)
 	}
 
-	before = h.durableSignature(t, project.ID)
+	before = durableSignature(t, h.database, project.ID)
 	agentMessageRequestID := "bounded-agent-message"
 	if _, err := h.service.SendAgentMessage(context.Background(), core.SendMessageInput{
 		Token: claim.Token, RecipientKind: "boss", Body: strings.Repeat("a", core.MaximumMessageBodyBytes+1), RequestID: agentMessageRequestID,

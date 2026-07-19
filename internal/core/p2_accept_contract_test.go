@@ -37,7 +37,7 @@ func TestCT08AcceptIntentFreezesDecisionWithoutAdvancingGit(t *testing.T) {
 	if _, err := h.service.ArchiveAgent(context.Background(), integrator.ID, "archive-accepted-integrator"); !core.IsCode(err, core.CodeInvalidState) {
 		t.Fatalf("accepted integration Agent archive error = %v", err)
 	}
-	beforeReplay := h.durableSignature(t, project.ID)
+	beforeReplay := durableSignature(t, h.database, project.ID)
 	replayed, err := h.service.RequestAccept(context.Background(), core.AcceptInput{
 		TaskID: task.ID, RequestID: "accept-intent",
 	})
@@ -70,7 +70,7 @@ func TestCT08ReadableAssignmentDoesNotAuthorizeAgentAcceptOrRework(t *testing.T)
 		t.Fatal(err)
 	}
 	target = makeSubmittedTask(t, h, target, "dddddddddddddddddddddddddddddddddddddddd")
-	before := h.durableSignature(t, project.ID)
+	before := durableSignature(t, h.database, project.ID)
 	if _, err := h.service.RequestAccept(context.Background(), core.AcceptInput{
 		Token: claim.Token, TaskID: target.ID, RequestID: "scope-accept",
 	}); !core.IsCode(err, core.CodeScopeDenied) {

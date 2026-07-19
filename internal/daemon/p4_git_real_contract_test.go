@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -18,7 +17,10 @@ import (
 	"coordplane/internal/gitrepo"
 	"coordplane/internal/store"
 	"coordplane/internal/transport"
+	"coordplane/tests/testsupport"
 )
+
+var durableSignature = testsupport.DurableSignature
 
 func TestGT04CT08FormalCommandsDeterministicallyFenceAcceptAndRevocation(t *testing.T) {
 	binary := buildP4Binary(t, "coordplane")
@@ -43,12 +45,12 @@ func TestGT04CT08FormalCommandsDeterministicallyFenceAcceptAndRevocation(t *test
 					if result := runP4OperatorCLI(binary, competeArgs...); result.code != 0 {
 						t.Fatalf("winning %s command: %s", competitor, result.stderr)
 					}
-					winnerSignature := p4DurableSignature(t, h)
+					winnerSignature := durableSignature(t, h.database, h.project.ID)
 					close(gate.resolveRelease)
 					if result := <-acceptResult; result.code == 0 || !strings.Contains(result.stderr, string(core.CodeInvalidState)) {
 						t.Fatalf("stale accept result = %#v", result)
 					}
-					if got := p4DurableSignature(t, h); got != winnerSignature {
+					if got := durableSignature(t, h.database, h.project.ID); got != winnerSignature {
 						t.Fatal("stale accept changed DB or Event state after revocation won")
 					}
 					if gate.advanceCallCount() != 0 {
@@ -69,11 +71,11 @@ func TestGT04CT08FormalCommandsDeterministicallyFenceAcceptAndRevocation(t *test
 				reconcile := make(chan error, 1)
 				go func() { reconcile <- h.service.ReconcileGit(context.Background()) }()
 				waitP4Barrier(t, gate.advanceEntered)
-				beforeLoser := p4DurableSignature(t, h)
+				beforeLoser := durableSignature(t, h.database, h.project.ID)
 				if result := runP4OperatorCLI(binary, competeArgs...); result.code == 0 || !strings.Contains(result.stderr, string(core.CodeActionInProgress)) {
 					t.Fatalf("losing %s result = %#v", competitor, result)
 				}
-				if got := p4DurableSignature(t, h); got != beforeLoser {
+				if got := durableSignature(t, h.database, h.project.ID); got != beforeLoser {
 					t.Fatalf("losing %s changed DB or Event state", competitor)
 				}
 				assertP4Refs(t, h, h.project.InitialSHA, task.ID, head)
@@ -245,9 +247,9 @@ func TestGT07WorkspaceDeleteCrashReopenReleasesDurableSourceOnce(t *testing.T) {
 	if err != nil || released.SourceRefReleasedAt == "" {
 		t.Fatalf("reopened source release = %#v err=%v", released, err)
 	}
-	stable := p4DurableSignature(t, h)
+	stable := durableSignature(t, h.database, h.project.ID)
 	requireNoError(t, h.service.ReconcileWorkspaceGC(ctx, consumer.ClosedAt))
-	if replay := p4DurableSignature(t, h); replay != stable {
+	if replay := durableSignature(t, h.database, h.project.ID); replay != stable {
 		t.Fatal("absent workspace replay changed durable state")
 	}
 	events, err := h.database.Events(ctx, core.EventFilter{ProjectID: h.project.ID, EntityID: consumer.ID})
@@ -747,24 +749,6 @@ func newRealP4Service(t *testing.T, database *store.Store, controller core.Proje
 	requireNoError(t, err)
 	service.SetReady(true, "")
 	return service
-}
-
-func p4DurableSignature(t *testing.T, h *realP4Harness) string {
-	return p4StoreDurableSignature(t, h.database, h.project.ID)
-}
-
-func p4StoreDurableSignature(t *testing.T, database *store.Store, projectID string) string {
-	t.Helper()
-	snapshot, err := database.Snapshot(context.Background(), projectID)
-	requireNoError(t, err)
-	events, err := database.Events(context.Background(), core.EventFilter{ProjectID: projectID})
-	requireNoError(t, err)
-	raw, err := json.Marshal(struct {
-		Snapshot core.Snapshot
-		Events   []core.Event
-	}{snapshot, events})
-	requireNoError(t, err)
-	return string(raw)
 }
 
 func assertP4Refs(t *testing.T, h *realP4Harness, canonical, taskID, taskHead string) {

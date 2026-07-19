@@ -76,7 +76,7 @@ func TestP2BossChatFailureRollsBackBundledAcknowledgement(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	before := h.durableSignature(t, project.ID)
+	before := durableSignature(t, h.database, project.ID)
 	if _, err := h.service.Chat(context.Background(), core.ChatInput{
 		ProjectID: project.ID, AgentID: agent.ID, Body: "failed reply", ReplyTo: message.ID,
 		Wake: true, AckMessageIDs: []string{message.ID}, RequestID: "boss-ack-rollback-reply",

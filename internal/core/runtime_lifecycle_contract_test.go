@@ -72,7 +72,7 @@ func TestP3RuntimeFactsAdvanceMonotonicallyAndFenceEveryExternalFact(t *testing.
 		t.Fatalf("created Run = %#v", created)
 	}
 
-	beforeWrongNonce := h.durableSignature(t, project.ID)
+	beforeWrongNonce := durableSignature(t, h.database, project.ID)
 	wrongNonce := fact
 	wrongNonce.LaunchNonce = "stale-nonce"
 	wrongNonce.RequestID = "wrong-nonce-start"
@@ -88,7 +88,7 @@ func TestP3RuntimeFactsAdvanceMonotonicallyAndFenceEveryExternalFact(t *testing.
 	missingContainer := fact
 	missingContainer.ContainerID = ""
 	missingContainer.RequestID = "missing-container-start"
-	beforeMissingContainer := h.durableSignature(t, project.ID)
+	beforeMissingContainer := durableSignature(t, h.database, project.ID)
 	if _, err := h.service.RecordRunStartIssued(context.Background(), missingContainer); !core.IsCode(err, core.CodeStaleRun) {
 		t.Fatalf("missing container error = %v, want %s", err, core.CodeStaleRun)
 	}
@@ -126,7 +126,7 @@ func TestP3SessionFactIsImmediateImmutableAndReplaySafe(t *testing.T) {
 	if session.NativeSessionID != "session-native-1" {
 		t.Fatalf("session Run = %#v", session)
 	}
-	beforeReplay := h.durableSignature(t, project.ID)
+	beforeReplay := durableSignature(t, h.database, project.ID)
 	if _, err := h.service.RecordRunSession(context.Background(), core.RunSessionInput{
 		RunRuntimeFactInput: fact, NativeSessionID: "session-native-1",
 	}); err != nil {
@@ -188,7 +188,7 @@ func TestP3CleanupRequiresTerminalAndStableOperationFence(t *testing.T) {
 	if removed.CleanupState != core.CleanupRemoved || removed.LastError != "Docker temporarily unavailable" {
 		t.Fatalf("removed cleanup = %#v", removed)
 	}
-	beforeWrongOperation := h.durableSignature(t, project.ID)
+	beforeWrongOperation := durableSignature(t, h.database, project.ID)
 	terminalFact.RequestID = "cleanup-wrong-operation"
 	if _, err := h.service.RecordRunCleanup(context.Background(), core.RunCleanupInput{
 		RunRuntimeFactInput: terminalFact, CleanupOperationID: "different-cleanup",
@@ -250,7 +250,7 @@ func TestP3CleanupOwnershipBlocksNextAgentRunUntilEveryRuntimeResourceIsRemoved(
 
 func assertAgentCannotClaimUntilCleanupRemoved(t *testing.T, h *harness, projectID string) {
 	t.Helper()
-	before := h.durableSignature(t, projectID)
+	before := durableSignature(t, h.database, projectID)
 	if claim, ok, err := h.service.ClaimNext(context.Background(), projectID); err != nil || ok {
 		t.Fatalf("claim while prior Run cleanup owns Agent: claim=%#v ok=%v err=%v", claim, ok, err)
 	}
@@ -312,7 +312,7 @@ func TestP3RuntimeTerminalIngressRejectsEveryStaleOwnershipFact(t *testing.T) {
 			input := base
 			input.RequestID += "-" + name
 			mutate(&input)
-			before := h.durableSignature(t, project.ID)
+			before := durableSignature(t, h.database, project.ID)
 			if _, err := h.service.RecordRuntimeRunTerminal(context.Background(), input); !core.IsCode(err, core.CodeStaleRun) {
 				t.Fatalf("stale %s error = %v, want %s", name, err, core.CodeStaleRun)
 			}
@@ -333,7 +333,7 @@ func TestP3RuntimeTerminalIngressAllowsOnlyNarrowPreLaunchFailure(t *testing.T) 
 	input := runtimeTerminalInput(claim.Run, core.RunExited, "prelaunch-exited")
 	input.TerminalReason = "no process was started"
 
-	before := h.durableSignature(t, project.ID)
+	before := durableSignature(t, h.database, project.ID)
 	if _, err := h.service.RecordRuntimeRunTerminal(context.Background(), input); !core.IsCode(err, core.CodeStaleRun) {
 		t.Fatalf("pre-launch exited error = %v, want %s", err, core.CodeStaleRun)
 	}
@@ -347,7 +347,7 @@ func TestP3RuntimeTerminalIngressAllowsOnlyNarrowPreLaunchFailure(t *testing.T) 
 		terminal.Task.Status != core.TaskFailed {
 		t.Fatalf("pre-launch failure result = %#v", terminal)
 	}
-	beforeReplay := h.durableSignature(t, project.ID)
+	beforeReplay := durableSignature(t, h.database, project.ID)
 	input.RequestID = "prelaunch-failed-replay"
 	if _, err := h.service.RecordRuntimeRunTerminal(context.Background(), input); err != nil {
 		t.Fatalf("replay pre-launch failure: %v", err)

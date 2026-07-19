@@ -1315,19 +1315,7 @@ func runCoordlink(t *testing.T, socket, token string, args ...string) ([]byte, e
 	return command.CombinedOutput()
 }
 
-func durableSignature(t *testing.T, database *store.Store, projectID string) string {
-	t.Helper()
-	snapshot, err := database.Snapshot(context.Background(), projectID)
-	requireNoError(t, err)
-	events, err := database.Events(context.Background(), core.EventFilter{ProjectID: projectID})
-	requireNoError(t, err)
-	raw, err := json.Marshal(struct {
-		Snapshot core.Snapshot `json:"snapshot"`
-		Events   []core.Event  `json:"events"`
-	}{snapshot, events})
-	requireNoError(t, err)
-	return string(raw)
-}
+var durableSignature = testsupport.DurableSignature
 
 func seedRetiredCodexState(t *testing.T, path, agentAdapter, taskState, runState string) *sql.DB {
 	t.Helper()

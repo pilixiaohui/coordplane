@@ -2,6 +2,8 @@ package testsupport
 
 import (
 	"cmp"
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,6 +11,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"coordplane/internal/core"
 )
 
 type RuntimeConfigFixture struct {
@@ -56,6 +60,20 @@ func RequireNoError(t testing.TB, err error) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func DurableSignature(t testing.TB, database interface {
+	Snapshot(context.Context, string) (core.Snapshot, error)
+	Events(context.Context, core.EventFilter) ([]core.Event, error)
+}, projectID string) string {
+	t.Helper()
+	snapshot, err := database.Snapshot(context.Background(), projectID)
+	RequireNoError(t, err)
+	events, err := database.Events(context.Background(), core.EventFilter{ProjectID: projectID})
+	RequireNoError(t, err)
+	raw, err := json.Marshal([2]any{snapshot, events})
+	RequireNoError(t, err)
+	return string(raw)
 }
 
 func GitCommand(t testing.TB, args ...string) string {

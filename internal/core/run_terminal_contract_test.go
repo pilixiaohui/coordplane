@@ -85,7 +85,7 @@ func TestRuntimeTerminalBoundsReasonAndReplaysWithoutDurableSideEffects(t *testi
 		!strings.HasSuffix(run.TerminalReason, "...[truncated]") || run.LastError != "" || run.ExitCode != nil {
 		t.Fatalf("bounded interrupt run = %#v", run)
 	}
-	beforeReplay := h.durableSignature(t, project.ID)
+	beforeReplay := durableSignature(t, h.database, project.ID)
 	if _, err := recordInterruptedRun(h, claim.Run, largeReason, "bounded-interrupt-replay"); err != nil {
 		t.Fatalf("idempotent interrupt replay: %v", err)
 	}

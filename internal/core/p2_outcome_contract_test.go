@@ -34,7 +34,7 @@ func TestP2OutcomeAckBundleRollsBackAsAUnit(t *testing.T) {
 	if _, err := activateRun(t, h, context.Background(), claim.Run.ID, "rollback-active"); err != nil {
 		t.Fatal(err)
 	}
-	before := h.durableSignature(t, project.ID)
+	before := durableSignature(t, h.database, project.ID)
 	if _, err := h.service.RequestOutcome(context.Background(), core.OutcomeInput{
 		Token: claim.Token, Outcome: core.OutcomeWait, Reason: "waiting",
 		AckMessageIDs: []string{foreign.Message.ID, valid.Message.ID}, RequestID: "rollback-outcome",
