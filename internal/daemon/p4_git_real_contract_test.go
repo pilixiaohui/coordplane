@@ -41,7 +41,7 @@ func TestGT04CT08FormalCommandsDeterministicallyFenceAcceptAndRevocation(t *test
 				if order == "revocation_first" {
 					acceptResult := make(chan p4CLIResult, 1)
 					go func() { acceptResult <- runP4OperatorCLI(binary, acceptArgs...) }()
-					waitP4Barrier(t, gate.resolveEntered)
+					waitRuntimeSignal(t, gate.resolveEntered, 10*time.Second, "Git executor barrier timeout")
 					if result := runP4OperatorCLI(binary, competeArgs...); result.code != 0 {
 						t.Fatalf("winning %s command: %s", competitor, result.stderr)
 					}
@@ -70,7 +70,7 @@ func TestGT04CT08FormalCommandsDeterministicallyFenceAcceptAndRevocation(t *test
 				}
 				reconcile := make(chan error, 1)
 				go func() { reconcile <- h.service.ReconcileGit(context.Background()) }()
-				waitP4Barrier(t, gate.advanceEntered)
+				waitRuntimeSignal(t, gate.advanceEntered, 10*time.Second, "Git executor barrier timeout")
 				beforeLoser := durableSignature(t, h.database, h.project.ID)
 				if result := runP4OperatorCLI(binary, competeArgs...); result.code == 0 || !strings.Contains(result.stderr, string(core.CodeActionInProgress)) {
 					t.Fatalf("losing %s result = %#v", competitor, result)
@@ -715,15 +715,6 @@ func startP4OperatorServer(t *testing.T, root string, service *core.Service) (st
 			_ = server.Close()
 			<-done
 		})
-	}
-}
-
-func waitP4Barrier(t *testing.T, entered <-chan struct{}) {
-	t.Helper()
-	select {
-	case <-entered:
-	case <-time.After(10 * time.Second):
-		t.Fatal("Git executor barrier timeout")
 	}
 }
 

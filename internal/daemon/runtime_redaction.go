@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -66,17 +68,14 @@ func newRuntimeRedaction(paths, secrets []string) runtimeRedaction {
 		unique[filepath.Clean(path)] = redactedHostPath
 	}
 	for _, secret := range secrets {
-		secret = strings.TrimSpace(secret)
-		if secret == "" {
-			continue
-		}
-		unique[secret] = redactedSecret
-		for _, segment := range strings.FieldsFunc(secret, func(character rune) bool {
-			return character == '\r' || character == '\n'
-		}) {
-			if segment = strings.TrimSpace(segment); segment != "" {
-				unique[segment] = redactedSecret
+		for _, candidate := range append([]string{secret, strings.TrimSpace(secret)}, strings.Fields(secret)...) {
+			if candidate == "" {
+				continue
 			}
+			unique[candidate] = redactedSecret
+			digest := fmt.Sprintf("%x", sha256.Sum256([]byte(candidate)))
+			unique[digest] = redactedSecret
+			unique[strings.ToUpper(digest)] = redactedSecret
 		}
 	}
 	values := make([]runtimeRedactionValue, 0, len(unique))

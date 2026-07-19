@@ -14,49 +14,28 @@ import (
 	containerruntime "coordplane/internal/runtime"
 )
 
-func TestRuntimeRedactionRemovesSecretsAndAbsoluteHostPaths(t *testing.T) {
+func TestRuntimeRedaction(t *testing.T) {
 	root := t.TempDir()
 	workspace := filepath.Join(root, "workspaces", "task")
 	secret := "provider-secret-canary"
-	redaction := newRuntimeRedaction(
-		[]string{root, workspace},
-		[]string{secret},
-	)
-
-	result := redaction.Text("open " + workspace + ": token=" + secret)
-	if strings.Contains(result, root) || strings.Contains(result, workspace) || strings.Contains(result, secret) {
-		t.Fatalf("runtime text retained sensitive input: %q", result)
+	multiline := "provider-secret-header\r\n\r\n provider-secret-body \nprovider-secret-footer"
+	tests := []struct {
+		name, input, want string
+		paths, secrets    []string
+	}{
+		{name: "secret and host paths", input: "open " + workspace + ": token=" + secret, want: "open " + redactedHostPath + ": token=" + redactedSecret, paths: []string{root, workspace}, secrets: []string{secret}},
+		{name: "secret classification wins", input: filepath.Join(root, "credential"), want: redactedSecret, paths: []string{root}, secrets: []string{filepath.Join(root, "credential")}},
+		{name: "complete multiline secret", input: multiline, want: redactedSecret, secrets: []string{multiline}},
+		{name: "provider-secret-header", input: "runtime output: provider-secret-header", want: "runtime output: " + redactedSecret, secrets: []string{multiline}},
+		{name: "provider-secret-body", input: "runtime output: provider-secret-body", want: "runtime output: " + redactedSecret, secrets: []string{multiline}},
+		{name: "provider-secret-footer", input: "runtime output: provider-secret-footer", want: "runtime output: " + redactedSecret, secrets: []string{multiline}},
 	}
-	if !strings.Contains(result, redactedHostPath) || !strings.Contains(result, redactedSecret) {
-		t.Fatalf("runtime text omitted redaction markers: %q", result)
-	}
-}
-
-func TestRuntimeRedactionPrefersSecretClassificationOverContainingPath(t *testing.T) {
-	root := t.TempDir()
-	secret := filepath.Join(root, "credential")
-	result := newRuntimeRedaction([]string{root}, []string{secret}).Text(secret)
-	if result != redactedSecret {
-		t.Fatalf("redacted overlapping value = %q, want %q", result, redactedSecret)
-	}
-}
-
-func TestRuntimeRedactionRemovesEveryLineOfMultilineSecret(t *testing.T) {
-	segments := []string{
-		"provider-secret-header",
-		"provider-secret-body",
-		"provider-secret-footer",
-	}
-	secret := segments[0] + "\r\n\r\n " + segments[1] + " \n" + segments[2]
-	redaction := newRuntimeRedaction(nil, []string{secret})
-
-	if result := redaction.Text(secret); result != redactedSecret {
-		t.Fatalf("redacted full secret = %q, want %q", result, redactedSecret)
-	}
-	for _, segment := range segments {
-		if result := redaction.Text("runtime output: " + segment); result != "runtime output: "+redactedSecret {
-			t.Errorf("redacted line containing %q = %q", segment, result)
-		}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if result := newRuntimeRedaction(test.paths, test.secrets).Text(test.input); result != test.want {
+				t.Fatalf("runtime redaction = %q, want %q", result, test.want)
+			}
+		})
 	}
 }
 

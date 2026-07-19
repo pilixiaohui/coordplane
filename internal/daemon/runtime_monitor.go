@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -52,8 +53,35 @@ func (c *runtimeController) streamLogs(ctx context.Context, run core.Run, ref co
 	scanner := bufio.NewScanner(stream)
 	scanner.Buffer(make([]byte, 64<<10), 1<<20)
 	written := int64(0)
-	contentLimit := int64(runtimeLogLimit - len(runtimeLogTruncatedMarker))
+	contentLimit := int64(runtimeLogLimit - len(runtimeLogTruncatedMarker) - runtimeRejectedLogReserve)
 	truncated := false
+	writeLine := func(line []byte, diagnostic bool) {
+		if outputErr != nil || (!diagnostic && truncated) {
+			return
+		}
+		if diagnostic {
+			if len(line)+1 > runtimeRejectedLogReserve {
+				outputErr = errors.New("rejected adapter frame diagnostic exceeded its reserved log bound")
+				return
+			}
+			_, outputErr = file.Write(append(append([]byte(nil), line...), '\n'))
+			return
+		}
+		remaining := contentLimit - written
+		completeLine := remaining > 0 && int64(len(line)+1) <= remaining
+		if remaining > 0 {
+			if !completeLine {
+				line = line[:maxInt(0, int(remaining)-1)]
+			}
+			count, writeErr := file.Write(append(append([]byte(nil), line...), '\n'))
+			written += int64(count)
+			outputErr = writeErr
+		}
+		if outputErr == nil && !completeLine {
+			_, outputErr = file.WriteString(runtimeLogTruncatedMarker)
+			truncated = outputErr == nil
+		}
+	}
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		perfobs.ClientLine(line, perfobs.Fields{
@@ -61,7 +89,8 @@ func (c *runtimeController) streamLogs(ctx context.Context, run core.Run, ref co
 		})
 		event, parseErr := entry.ParseEvent(line)
 		if parseErr != nil && bytes.HasPrefix(bytes.TrimSpace(line), []byte("{")) {
-			return fmt.Errorf("adapter protocol frame rejected: %w", parseErr)
+			writeLine(rejectedFrameLogLine(monitor.redact, line, parseErr), true)
+			return errors.Join(fmt.Errorf("adapter protocol frame rejected: %w", parseErr), outputErr)
 		}
 		if parseErr == nil {
 			switch event.Kind {
@@ -80,31 +109,27 @@ func (c *runtimeController) streamLogs(ctx context.Context, run core.Run, ref co
 			}
 		}
 
-		redactedLine := []byte(monitor.redact.Text(string(line)))
-		if outputErr == nil && !truncated {
-			remaining := contentLimit - written
-			completeLine := remaining > 0 && int64(len(redactedLine)+1) <= remaining
-			if remaining > 0 {
-				output := redactedLine
-				if !completeLine {
-					output = output[:maxInt(0, int(remaining)-1)]
-				}
-				count, writeErr := file.Write(append(append([]byte(nil), output...), '\n'))
-				written += int64(count)
-				if writeErr != nil {
-					outputErr = writeErr
-				}
-			}
-			if outputErr == nil && !completeLine {
-				if _, err := file.WriteString(runtimeLogTruncatedMarker); err != nil {
-					outputErr = err
-				} else {
-					truncated = true
-				}
-			}
-		}
+		writeLine([]byte(monitor.redact.Text(string(line))), false)
 	}
 	return errors.Join(outputErr, scanner.Err())
+}
+
+func rejectedFrameLogLine(redact runtimeRedaction, frame []byte, parseErr error) []byte {
+	redactedFrame := redact.Text(string(frame))
+	truncated := len(redactedFrame) > runtimeRejectedFrameLimit
+	if truncated {
+		redactedFrame = redactedFrame[:runtimeRejectedFrameLimit]
+	}
+	redactedError := redact.Text(parseErr.Error())
+	if len(redactedError) > runtimeRejectedErrorLimit {
+		redactedError = redactedError[:runtimeRejectedErrorLimit]
+	}
+	evidence, _ := json.Marshal(struct {
+		Error     string `json:"error"`
+		Frame     string `json:"frame"`
+		Truncated bool   `json:"truncated"`
+	}{Error: redactedError, Frame: redactedFrame, Truncated: truncated})
+	return append([]byte("[coordplane: adapter frame rejected] "), evidence...)
 }
 
 func (m *runMonitor) setRuntimeError(code, message string) {

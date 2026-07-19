@@ -208,11 +208,7 @@ func TestReconcileSkipsRunOwnedBetweenClaimAndMonitorRegistration(t *testing.T) 
 	}
 	launchDone := make(chan error, 1)
 	go func() { launchDone <- controller.launchOwned(context.Background(), claim, operation) }()
-	select {
-	case <-executor.createEntered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("launch did not reach the blocked Create boundary")
-	}
+	waitRuntimeSignal(t, executor.createEntered, 5*time.Second, "launch did not reach the blocked Create boundary")
 
 	requireNoError(t, controller.Reconcile(context.Background()))
 	if executor.inspectCalls.Load() != 0 {
@@ -521,12 +517,13 @@ func TestSupervisorStopsRunAfterSessionPersistenceFailure(t *testing.T) {
 
 func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 	for _, test := range []struct {
-		name, frame string
-		waitFirst   bool
+		name, frame, session string
+		waitFirst, evidence  bool
 	}{
 		{name: "malformed wait first", frame: "{", waitFirst: true},
 		{name: "init without session", frame: `{"type":"system","subtype":"init"}`},
 		{name: "success without is_error", frame: `{"type":"result","subtype":"success"}`},
+		{name: "rejected after init is durable", session: "diagnostic-session", evidence: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			service, claim := claimRuntimeTestRun(t)
@@ -535,8 +532,31 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 				Body: "must remain pending", RequestID: "protocol-message-" + test.name,
 			}))
 			active, ref := activateRuntimeTestRun(t, service, claim)
-			executor := &monitorFailureExecutor{payload: test.frame, stopped: make(chan struct{})}
+			frame := test.frame
+			secret, lowerDigest, upperDigest := "", "", ""
+			executor := &monitorFailureExecutor{stopped: make(chan struct{})}
 			controller := newRuntimeTestController(t, service, executor)
+			canonical := requireRuntimeValue(service.Snapshot(context.Background(), claim.Task.ProjectID)).Projects[0].CanonicalSHA
+			var beforeFailure core.Run
+			var beforeTask core.TaskDetail
+			var beforeCleanup core.Snapshot
+			if test.evidence {
+				const providerName = "ANTHROPIC_AUTH_TOKEN"
+				secret = `provider-"secret"\canary`
+				lowerDigest = "48cb4a2f9fed48b2b49da3bb10305b8e2e2b4f7aa540fc88a775f94c97338ef6"
+				upperDigest = strings.ToUpper(lowerDigest)
+				t.Setenv(providerName, secret)
+				controller.config.Runtime.ProviderEnvAllowlist = []string{providerName}
+				init := fmt.Sprintf(`{"type":"system","subtype":"init","session_id":%q}`, test.session)
+				frame = init + "\n" + `{"z":"` + secret + `","a":"` + lowerDigest + `","b":"` + upperDigest + `","padding":"` + strings.Repeat("x", 2048)
+				executor.beforeStop = func() []byte {
+					beforeFailure = requireRuntimeValue(service.Run(context.Background(), active.ID))
+					beforeTask = requireRuntimeValue(service.Task(context.Background(), claim.Task.ID))
+					beforeCleanup = requireRuntimeValue(service.Snapshot(context.Background(), claim.Task.ProjectID))
+					return requireRuntimeValue(os.ReadFile(active.LogPath))
+				}
+			}
+			executor.payload = frame
 			if test.waitFirst {
 				executor.releaseWait, executor.releaseLogs = make(chan struct{}), make(chan struct{})
 				monitor := controller.newMonitor(active, ref, adapter.Claude{}, nil)
@@ -547,29 +567,46 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 					controller.supervise(monitor)
 				}()
 				close(executor.releaseWait)
-				select {
-				case <-monitor.waitDelivered:
-				case <-time.After(time.Second):
-					t.Fatal("Wait-first supervisor did not receive Wait fact")
-				}
+				waitRuntimeSignal(t, monitor.waitDelivered, time.Second, "Wait-first supervisor did not receive Wait fact")
 				close(executor.releaseLogs)
-				select {
-				case <-done:
-				case <-time.After(time.Second):
-					t.Fatal("Wait-first supervisor did not converge")
-				}
+				waitRuntimeSignal(t, done, time.Second, "Wait-first supervisor did not converge")
 			} else {
 				monitor := controller.newMonitor(active, ref, adapter.Claude{}, nil)
 				controller.supervise(monitor)
 			}
-			if test.waitFirst && (executor.stopCalls.Load() == 0 || executor.removeCalls.Load() == 0) {
-				t.Fatalf("Wait-first cleanup calls stop=%d remove=%d", executor.stopCalls.Load(), executor.removeCalls.Load())
+			if test.evidence {
+				raw := executor.capturedLog
+				lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+				const prefix = `[coordplane: adapter frame rejected] `
+				if len(lines) != 2 || !strings.HasPrefix(lines[1], prefix+`{"error":`) ||
+					!strings.Contains(lines[1], `,"frame":`) || !strings.HasSuffix(lines[1], `,"truncated":true}`) {
+					t.Fatalf("rejected-frame diagnostic shape/order = %q", raw)
+				}
+				var evidence map[string]any
+				requireNoError(t, json.Unmarshal([]byte(strings.TrimPrefix(lines[1], prefix)), &evidence))
+				frame, _ := evidence["frame"].(string)
+				if evidence["error"] != "adapter: invalid Claude JSON event" || len(frame) != 1024 || evidence["truncated"] != true {
+					t.Fatalf("rejected-frame diagnostic = %#v", evidence)
+				}
+				for _, forbidden := range []string{secret, lowerDigest, upperDigest} {
+					if strings.Contains(string(raw), forbidden) {
+						t.Fatalf("rejected-frame diagnostic leaked sensitive value %q", forbidden)
+					}
+				}
+				if core.IsRunTerminal(beforeFailure.State) || beforeFailure.CleanupState == core.CleanupRemoved || beforeFailure.NativeSessionID != test.session ||
+					beforeFailure.RequestedOutcome != "" || beforeTask.LatestProgress != nil || beforeTask.Task.Status != core.TaskRunning ||
+					beforeTask.Task.HeadSHA != "" || beforeTask.Task.IntegrationTaskID != "" || beforeTask.Task.FinalCanonicalSHA != "" || beforeCleanup.Projects[0].CanonicalSHA != canonical {
+					t.Fatalf("protocol diagnostic advanced state before failure/cleanup: Run=%#v Task=%#v Project=%#v", beforeFailure, beforeTask, beforeCleanup.Projects[0])
+				}
+			}
+			if executor.stopCalls.Load() == 0 || executor.removeCalls.Load() == 0 {
+				t.Fatalf("protocol failure cleanup calls stop=%d remove=%d", executor.stopCalls.Load(), executor.removeCalls.Load())
 			}
 			persisted := requireRuntimeValue(service.Run(context.Background(), active.ID))
 			task := requireRuntimeValue(service.Task(context.Background(), claim.Task.ID)).Task
 			if persisted.State != core.RunInterrupted || persisted.RuntimeErrorCode != runtimeLogFailureCode ||
-				persisted.NativeSessionID != "" || persisted.RequestedOutcome != "" || persisted.CleanupState != core.CleanupRemoved ||
-				task.Status == core.TaskCompleted || task.Status == core.TaskSubmitted || task.CurrentRunID != "" {
+				persisted.NativeSessionID != test.session || persisted.RequestedOutcome != "" || persisted.CleanupState != core.CleanupRemoved || persisted.LastError == "" ||
+				task.Status != core.TaskFailed || task.CurrentRunID != "" {
 				t.Fatalf("protocol frame did not fail closed: Run=%#v Task=%#v", persisted, task)
 			}
 			messages := requireRuntimeValue(service.ListMessages(context.Background(), core.MessageFilter{TaskID: claim.Task.ID}))
@@ -604,11 +641,7 @@ func TestShutdownReplaysTailLogsBeforeTerminalConvergence(t *testing.T) {
 		defer controller.wg.Done()
 		controller.supervise(monitor)
 	}()
-	select {
-	case <-executor.firstLogStarted:
-	case <-time.After(time.Second):
-		t.Fatal("initial Docker log follow did not start")
-	}
+	waitRuntimeSignal(t, executor.firstLogStarted, time.Second, "initial Docker log follow did not start")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -704,6 +737,8 @@ type monitorFailureExecutor struct {
 	stopped                  chan struct{}
 	once                     sync.Once
 	releaseWait, releaseLogs chan struct{}
+	beforeStop               func() []byte
+	capturedLog              []byte
 	removeCalls              atomic.Int32
 }
 
@@ -713,7 +748,12 @@ func (e *monitorFailureExecutor) Stop(
 	time.Duration,
 ) (containerruntime.StopResult, error) {
 	e.stopCalls.Add(1)
-	e.once.Do(func() { close(e.stopped) })
+	e.once.Do(func() {
+		if e.beforeStop != nil {
+			e.capturedLog = e.beforeStop()
+		}
+		close(e.stopped)
+	})
 	return containerruntime.StopResult{}, nil
 }
 
@@ -1142,4 +1182,13 @@ func waitForRuntimeTestRun(t *testing.T, service *core.Service, runID string, re
 	run, err := service.Run(context.Background(), runID)
 	t.Fatalf("Run did not reach expected state: run=%#v err=%v", run, err)
 	return core.Run{}
+}
+
+func waitRuntimeSignal(t *testing.T, signal <-chan struct{}, timeout time.Duration, message string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(timeout):
+		t.Fatal(message)
+	}
 }
