@@ -554,7 +554,7 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 				if test.evidence == "reserve" {
 					padding = strings.Repeat("x", 2048)
 				}
-				accepted = requireRuntimeValue(json.Marshal(map[string]any{"type": "assistant", secret: map[string]any{"secret": secret, "digests": []string{lowerDigest, upperDigest}}}))
+				accepted = requireRuntimeValue(json.Marshal(map[string]any{"type": "assistant", "message": map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "thinking", "thinking": "private reasoning", "signature": "private signature"}, map[string]any{"type": "text", "text": "visible text"}, map[string]any{"type": "tool_use", "id": "tool-1", "name": "Read", "input": map[string]any{secret: map[string]any{"secret": secret, "digests": []string{lowerDigest, upperDigest}}}}}}}))
 				rejected := requireRuntimeValue(json.Marshal(map[string]any{
 					"type": "system", "subtype": "init", "z_padding": padding,
 					"a_sensitive": map[string]any{"secret": secret, "digests": []string{lowerDigest, upperDigest}},
@@ -634,7 +634,7 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 					var decoded []any
 					requireNoError(t, json.Unmarshal([]byte("["+strings.Join(streamLines[1:4], ",")+"]"), &decoded))
 					decodedStream := requireRuntimeValue(json.Marshal(decoded))
-					wantStream := fmt.Sprintf(`[{"[REDACTED_SECRET]":{"digests":["[REDACTED_SECRET]","[REDACTED_SECRET]"],"secret":"[REDACTED_SECRET]"},"type":"assistant"},{"bytes":%d,"sanitized":false},{"bytes":%d,"sanitized":false}]`, len(accepted)+1, len(ordinary))
+					wantStream := fmt.Sprintf(`[{"message":{"content":[{"text":"visible text","type":"text"},{"id":"tool-1","input":{"[REDACTED_SECRET]":{"digests":["[REDACTED_SECRET]","[REDACTED_SECRET]"],"secret":"[REDACTED_SECRET]"}},"name":"Read","type":"tool_use"}],"role":"assistant","type":"message"},"type":"assistant"},{"bytes":%d,"sanitized":false},{"bytes":%d,"sanitized":false}]`, len(accepted)+1, len(ordinary))
 					if string(decodedStream) != wantStream || !strings.Contains(savedFrame, want) || evidence["truncated"] != false {
 						t.Fatalf("structured runtime diagnostics = %s; rejected=%#v", decodedStream, evidence)
 					}

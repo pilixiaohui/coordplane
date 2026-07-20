@@ -95,6 +95,10 @@ func (c *runtimeController) streamLogs(ctx context.Context, run core.Run, ref co
 			return errors.Join(fmt.Errorf("adapter protocol frame rejected: %w", parseErr), outputErr)
 		}
 		if parseErr == nil {
+			if len(event.Raw) == 0 {
+				continue
+			}
+			line = event.Raw
 			switch event.Kind {
 			case adapter.EventSessionStarted:
 				if _, err := c.service.RecordRunSession(context.Background(), core.RunSessionInput{

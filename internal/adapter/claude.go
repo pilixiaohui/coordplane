@@ -99,6 +99,8 @@ func (Claude) ParseEvent(frame []byte) (Event, error) {
 	case "error":
 		event.Kind = EventProviderError
 		event.Message = claudeProtocolMessage(payload)
+	case "assistant":
+		return parseClaudeAssistantEvent(event, payload.Message)
 	}
 	return event, nil
 }
@@ -109,8 +111,68 @@ type claudeEnvelope struct {
 	SessionID string          `json:"session_id"`
 	IsError   *bool           `json:"is_error"`
 	Result    string          `json:"result"`
-	Message   string          `json:"message"`
+	Message   json.RawMessage `json:"message"`
 	Error     json.RawMessage `json:"error"`
+}
+
+type claudeAssistantMessage struct {
+	Type, Role string
+	Content    []json.RawMessage
+}
+
+type claudeContentBlock struct {
+	Type, Text, Thinking, Signature, ID, Name string
+	Input                                     json.RawMessage
+}
+
+func parseClaudeAssistantEvent(event Event, rawMessage json.RawMessage) (Event, error) {
+	var legacy string
+	if len(rawMessage) == 0 || json.Unmarshal(rawMessage, &legacy) == nil {
+		return event, nil
+	}
+	var message claudeAssistantMessage
+	if err := json.Unmarshal(rawMessage, &message); err != nil || message.Type != "message" || message.Role != "assistant" || message.Content == nil {
+		return Event{}, errors.New("adapter: unsupported Claude assistant message")
+	}
+	content := make([]any, 0, len(message.Content))
+	for _, rawBlock := range message.Content {
+		block, keep, err := parseClaudeContentBlock(rawBlock)
+		if err != nil {
+			return Event{}, err
+		}
+		if keep {
+			content = append(content, block)
+		}
+	}
+	event.Raw = nil
+	if len(content) > 0 {
+		event.Raw, _ = json.Marshal(map[string]any{
+			"type": "assistant", "message": map[string]any{"type": "message", "role": "assistant", "content": content},
+		})
+	}
+	return event, nil
+}
+
+func parseClaudeContentBlock(raw []byte) (any, bool, error) {
+	var block claudeContentBlock
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&block); err != nil {
+		return nil, false, errors.New("adapter: invalid Claude assistant content block")
+	}
+	switch block.Type {
+	case "thinking":
+		return nil, false, nil
+	case "text":
+		return map[string]any{"type": "text", "text": block.Text}, true, nil
+	case "tool_use":
+		if block.ID == "" || block.Name == "" || len(block.Input) == 0 || !json.Valid(block.Input) {
+			return nil, false, errors.New("adapter: invalid Claude tool_use block")
+		}
+		return map[string]any{"type": "tool_use", "id": block.ID, "name": block.Name, "input": block.Input}, true, nil
+	default:
+		return nil, false, errors.New("adapter: unsupported Claude assistant content block")
+	}
 }
 
 func validateLaunch(spec LaunchSpec) error {
@@ -135,10 +197,12 @@ func bootstrapReferencePrompt() string {
 }
 
 func claudeProtocolMessage(payload claudeEnvelope) string {
-	for _, message := range []string{payload.Message, payload.Result} {
-		if strings.TrimSpace(message) != "" {
-			return message
-		}
+	var message string
+	if json.Unmarshal(payload.Message, &message) == nil && strings.TrimSpace(message) != "" {
+		return message
+	}
+	if strings.TrimSpace(payload.Result) != "" {
+		return payload.Result
 	}
 	var detail struct {
 		Message string `json:"message"`
@@ -146,9 +210,9 @@ func claudeProtocolMessage(payload claudeEnvelope) string {
 	if json.Unmarshal(payload.Error, &detail) == nil && strings.TrimSpace(detail.Message) != "" {
 		return detail.Message
 	}
-	var message string
-	if json.Unmarshal(payload.Error, &message) == nil && strings.TrimSpace(message) != "" {
-		return message
+	var errorMessage string
+	if json.Unmarshal(payload.Error, &errorMessage) == nil && strings.TrimSpace(errorMessage) != "" {
+		return errorMessage
 	}
 	return "Claude provider error"
 }
