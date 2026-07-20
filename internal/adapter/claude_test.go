@@ -10,20 +10,12 @@ import (
 )
 
 func TestProductionRegistryContainsOnlyClaude(t *testing.T) {
-	if got, want := Production().Names(), []string{"claude"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("production adapters = %v, want %v", got, want)
-	}
+	requireClaude(t, reflect.DeepEqual(Production().Names(), []string{"claude"}), "production adapters = ", Production().Names())
 	entry, ok := Production().Lookup("claude")
-	if !ok {
-		t.Fatal("Claude adapter is not registered")
-	}
-	metadata := entry.Metadata()
-	if metadata.ExecutionModel != ExecutionOneShot || !metadata.SupportsResume || metadata.SupportsInject {
-		t.Fatalf("Claude metadata = %#v", metadata)
-	}
-	if _, err := entry.BuildInjectInput(MessageInput{}); !errors.Is(err, ErrInjectUnsupported) {
-		t.Fatalf("Claude inject error = %v", err)
-	}
+	requireClaude(t, ok, "Claude adapter is not registered")
+	requireClaude(t, entry.Metadata().ExecutionModel == ExecutionOneShot && entry.Metadata().SupportsResume && !entry.Metadata().SupportsInject, "Claude metadata = ", entry.Metadata())
+	_, err := entry.BuildInjectInput(MessageInput{})
+	requireClaude(t, errors.Is(err, ErrInjectUnsupported), "Claude inject error = ", err)
 }
 
 func TestClaudeBuildsExactStartAndResumeCommands(t *testing.T) {
@@ -31,22 +23,13 @@ func TestClaudeBuildsExactStartAndResumeCommands(t *testing.T) {
 	start, err := (Claude{}).BuildStartCommand(launch)
 	testsupport.RequireNoError(t, err)
 	common := []string{"-p", "--bare", "--verbose", "--output-format", "stream-json", "--dangerously-skip-permissions"}
-	wantStart := append(append([]string(nil), common...), "--", bootstrapReferencePrompt())
-	if start.Executable != "claude" || !reflect.DeepEqual(start.Args, wantStart) || !reflect.DeepEqual(start.Env, map[string]string{"HOME": "/home/agent"}) {
-		t.Fatalf("start command = %#v", start)
-	}
+	requireClaude(t, start.Executable == "claude" && reflect.DeepEqual(start.Args, append(append([]string(nil), common...), "--", bootstrapReferencePrompt())) && reflect.DeepEqual(start.Env, map[string]string{"HOME": "/home/agent"}), "start command = ", start)
 	resume, err := (Claude{}).BuildResumeCommand(ResumeSpec{LaunchSpec: launch, NativeSessionID: "0190a1b2-session"})
 	testsupport.RequireNoError(t, err)
-	wantResume := append(append([]string(nil), common...), "--resume", "0190a1b2-session", "--", bootstrapReferencePrompt())
-	if resume.Executable != "claude" || !reflect.DeepEqual(resume.Args, wantResume) || !reflect.DeepEqual(resume.Env, start.Env) {
-		t.Fatalf("resume command = %#v", resume)
-	}
+	requireClaude(t, resume.Executable == "claude" && reflect.DeepEqual(resume.Args, append(append([]string(nil), common...), "--resume", "0190a1b2-session", "--", bootstrapReferencePrompt())) && reflect.DeepEqual(resume.Env, start.Env), "resume command = ", resume)
 	for _, command := range []CommandSpec{start, resume} {
-		joined := strings.Join(command.Args, " ")
 		for _, forbidden := range []string{"--continue", "--fork-session", "--session-id", "--no-session-persistence", "sh -c"} {
-			if strings.Contains(joined, forbidden) {
-				t.Fatalf("provider command contains %q: %#v", forbidden, command)
-			}
+			requireClaude(t, !strings.Contains(strings.Join(command.Args, " "), forbidden), "provider command contains ", forbidden, ": ", command)
 		}
 	}
 }
@@ -55,32 +38,45 @@ func TestClaudeTypedStreamJSONConformance(t *testing.T) {
 	for _, test := range []struct {
 		name, frame, session, message, forbidden string
 		kind                                     EventKind
+		reject                                   bool
 	}{
 		{name: "init", frame: `{"type":"system","subtype":"init","session_id":"0190f8b7-acde"}`, kind: EventSessionStarted, session: "0190f8b7-acde"},
 		{name: "success", frame: `{"type":"result","subtype":"success","is_error":false,"result":"done"}`, kind: EventProtocol},
 		{name: "error result", frame: `{"type":"result","subtype":"error_during_execution","is_error":true,"result":"provider unavailable"}`, kind: EventProviderError, message: "provider unavailable"},
 		{name: "error envelope", frame: `{"type":"error","error":{"message":"invalid request"}}`, kind: EventProviderError, message: "invalid request"},
 		{name: "assistant text is not resume evidence", frame: `{"type":"assistant","message":"session not found"}`, kind: EventProtocol},
-		{name: "assistant object", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"thinking","thinking":"private reasoning","signature":"private signature"},{"type":"text","text":"visible text"},{"type":"tool_use","id":"tool-1","name":"Read","input":{"path":"README.md"}}]}}`, kind: EventProtocol, forbidden: "thinking"},
+		{name: "assistant object", frame: `{"type":"assistant","message":{"type":"message","id":"msg-1","model":"claude","role":"assistant","content":[{"type":"thinking","thinking":"private reasoning","signature":"private signature"},{"type":"text","text":"visible text"},{"type":"tool_use","id":"tool-1","name":"Read","input":{"path":"README.md"}}],"usage":{"input_tokens":1}}}`, kind: EventProtocol, forbidden: "thinking"},
+		{name: "missing message", frame: `{"type":"assistant"}`, reject: true},
+		{name: "null message", frame: `{"type":"assistant","message":null}`, reject: true},
+		{name: "empty object message", frame: `{"type":"assistant","message":{}}`, reject: true},
+		{name: "empty array message", frame: `{"type":"assistant","message":[]}`, reject: true},
+		{name: "unknown block", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"unknown"}]}}`, reject: true},
+		{name: "blank text", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":" "}]}}`, reject: true},
+		{name: "text with tool field", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":"visible","id":"cross-variant"}]}}`, reject: true},
+		{name: "thinking without signature", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"thinking","thinking":"private"}]}}`, reject: true},
+		{name: "thinking with text field", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"thinking","thinking":"private","signature":"sig","text":"cross-variant"}]}}`, reject: true},
+		{name: "tool blank id", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"tool_use","id":" ","name":"Read","input":{}}]}}`, reject: true},
+		{name: "tool missing name", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"tool-1","input":{}}]}}`, reject: true},
+		{name: "tool null input", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Read","input":null}]}}`, reject: true},
+		{name: "tool string input", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Read","input":"path"}]}}`, reject: true},
+		{name: "tool number input", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Read","input":1}]}}`, reject: true},
+		{name: "tool array input", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Read","input":[]}]}}`, reject: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			event, err := (Claude{}).ParseEvent([]byte(test.frame))
-			testsupport.RequireNoError(t, err)
-			if event.Kind != test.kind || event.NativeSessionID != test.session || event.Message != test.message || len(event.Raw) == 0 || (test.forbidden != "" && strings.Contains(string(event.Raw), test.forbidden)) {
-				t.Fatalf("event = %#v", event)
+			if test.reject {
+				requireClaude(t, err != nil, "malformed Claude assistant message was accepted")
+				return
 			}
+			testsupport.RequireNoError(t, err)
+			requireClaude(t, event.Kind == test.kind && event.NativeSessionID == test.session && event.Message == test.message && len(event.Raw) > 0 && (test.forbidden == "" || !strings.Contains(string(event.Raw), test.forbidden)), "event = ", event)
 		})
-	}
-	if _, err := (Claude{}).ParseEvent([]byte(`{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"unknown"}]}}`)); err == nil {
-		t.Fatal("unknown Claude assistant content was accepted")
 	}
 }
 
 func TestClaudeResumeCompatibilityFencesTaskAgentAndWorkspace(t *testing.T) {
 	base := SessionContext{AdapterID: "claude", AgentID: "agent-a", TaskID: "task-a", WorkspaceID: "workspace-a"}
-	if !(Claude{}).ResumeCompatible(base, base) {
-		t.Fatal("identical session context was not resumable")
-	}
+	requireClaude(t, (Claude{}).ResumeCompatible(base, base), "identical session context was not resumable")
 	for name, changed := range map[string]SessionContext{
 		"adapter":   {AdapterID: "other", AgentID: "agent-a", TaskID: "task-a", WorkspaceID: "workspace-a"},
 		"agent":     {AdapterID: "claude", AgentID: "agent-b", TaskID: "task-a", WorkspaceID: "workspace-a"},
@@ -88,9 +84,14 @@ func TestClaudeResumeCompatibilityFencesTaskAgentAndWorkspace(t *testing.T) {
 		"workspace": {AdapterID: "claude", AgentID: "agent-a", TaskID: "task-a", WorkspaceID: "workspace-b"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if (Claude{}).ResumeCompatible(base, changed) {
-				t.Fatalf("incompatible context accepted: %#v", changed)
-			}
+			requireClaude(t, !(Claude{}).ResumeCompatible(base, changed), "incompatible context accepted: ", changed)
 		})
+	}
+}
+
+func requireClaude(t *testing.T, condition bool, details ...any) {
+	t.Helper()
+	if !condition {
+		t.Fatal(details...)
 	}
 }

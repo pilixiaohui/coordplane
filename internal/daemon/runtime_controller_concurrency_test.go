@@ -518,13 +518,16 @@ func TestSupervisorStopsRunAfterSessionPersistenceFailure(t *testing.T) {
 func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 	for _, test := range []struct {
 		name, frame, session, evidence string
-		waitFirst                      bool
+		waitFirst, exitFirst           bool
 	}{
 		{name: "malformed wait first", waitFirst: true, evidence: "metadata"},
 		{name: "init without session", frame: `{"type":"system","subtype":"init"}`},
 		{name: "success without is_error", frame: `{"type":"result","subtype":"success"}`},
-		{name: "escaped rejected JSON is sanitized", session: "diagnostic-session", evidence: "sanitized"},
-		{name: "full log reserves rejected evidence", session: "reserve-session", evidence: "reserve"},
+		{name: "assistant missing message", frame: `{"type":"assistant"}`, exitFirst: true},
+		{name: "assistant null message", frame: `{"type":"assistant","message":null}`, exitFirst: true},
+		{name: "assistant empty message", frame: `{"type":"assistant","message":{}}`},
+		{name: "rejected assistant reasoning is metadata only", session: "diagnostic-session", evidence: "assistant"},
+		{name: "rejected invalid tool input is metadata only", session: "reserve-session", evidence: "reserve", exitFirst: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			service, claim := claimRuntimeTestRun(t)
@@ -550,22 +553,22 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 				t.Setenv(providerName, secret)
 				controller.config.Runtime.ProviderEnvAllowlist = []string{providerName}
 				ordinary = "stderr: " + string(requireRuntimeValue(json.Marshal(secret))) + " " + lowerDigest + " " + upperDigest
-				padding := "short"
-				if test.evidence == "reserve" {
-					padding = strings.Repeat("x", 2048)
-				}
 				accepted = requireRuntimeValue(json.Marshal(map[string]any{"type": "assistant", "message": map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "thinking", "thinking": "private reasoning", "signature": "private signature"}, map[string]any{"type": "text", "text": "visible text"}, map[string]any{"type": "tool_use", "id": "tool-1", "name": "Read", "input": map[string]any{secret: map[string]any{"secret": secret, "digests": []string{lowerDigest, upperDigest}}}}}}}))
-				rejected := requireRuntimeValue(json.Marshal(map[string]any{
-					"type": "system", "subtype": "init", "z_padding": padding,
-					"a_sensitive": map[string]any{"secret": secret, "digests": []string{lowerDigest, upperDigest}},
-				}))
 				if test.evidence == "metadata" {
+					rejected := requireRuntimeValue(json.Marshal(map[string]any{"type": "system", "subtype": "init", "secret": secret}))
 					frame = string(rejected[:len(rejected)-1])
 				} else {
+					content := []any{map[string]any{"type": "thinking", "thinking": "private-reasoning-canary", "signature": "signature-canary"}}
+					if test.evidence == "assistant" {
+						content = append(content, map[string]any{"type": "unknown", "secret": secret})
+					} else {
+						content = append(content, map[string]any{"type": "tool_use", "id": "tool-1", "name": "Read", "input": []any{secret}})
+					}
+					rejected := requireRuntimeValue(json.Marshal(map[string]any{"type": "assistant", "message": map[string]any{"type": "message", "role": "assistant", "content": content}}))
 					init := fmt.Sprintf(`{"type":"system","subtype":"init","session_id":%q}`, test.session)
 					frame = strings.Join([]string{init, string(accepted), "[" + string(accepted), ordinary, string(rejected)}, "\n")
 					if test.evidence == "reserve" {
-						filler := `{"type":"assistant","padding":"` + strings.Repeat("o", 512<<10) + "\"}\n"
+						filler := `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":"` + strings.Repeat("o", 512<<10) + `"}]}}` + "\n"
 						frame = strings.Repeat(filler, runtimeLogLimit/len(filler)+1) + frame
 					}
 					executor.beforeStop = func() []byte {
@@ -577,6 +580,10 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 				}
 			}
 			executor.payload = frame
+			if test.exitFirst {
+				executor.releaseWait = make(chan struct{}, 1)
+				executor.releaseWait <- struct{}{}
+			}
 			if test.waitFirst {
 				executor.releaseWait, executor.releaseLogs = make(chan struct{}), make(chan struct{})
 				monitor := controller.newMonitor(active, ref, adapter.Claude{}, nil)
@@ -602,68 +609,58 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 				text := strings.TrimSuffix(string(raw), "\n")
 				line := text[strings.LastIndex(text, "\n")+1:]
 				const prefix = `[coordplane: adapter frame rejected] `
-				if !strings.HasPrefix(line, prefix+`{"error":`) || !strings.Contains(line, `,"frame":`) || !strings.Contains(line, `,"truncated":`) {
-					t.Fatalf("rejected-frame diagnostic shape/order = %q", raw)
-				}
+				requireRuntimeCondition(t, strings.HasPrefix(line, prefix+`{"error":`) && strings.Contains(line, `,"frame":`), "rejected-frame diagnostic shape/order = ", string(raw))
 				var evidence map[string]any
 				requireNoError(t, json.Unmarshal([]byte(strings.TrimPrefix(line, prefix)), &evidence))
 				savedFrame, _ := evidence["frame"].(string)
-				wantError := "adapter: Claude system init omitted session_id"
+				wantError := "adapter: unsupported Claude assistant content block"
 				if test.evidence == "metadata" {
 					wantError = "adapter: invalid Claude JSON event"
+				} else if test.evidence == "reserve" {
+					wantError = "adapter: invalid Claude tool_use block"
 				}
-				if evidence["error"] != wantError {
-					t.Fatalf("rejected-frame diagnostic = %#v", evidence)
-				}
+				requireRuntimeCondition(t, evidence["error"] == wantError, "rejected-frame diagnostic = ", evidence)
 				encodedSecret := requireRuntimeValue(json.Marshal(secret))
 				escapedSecret := string(encodedSecret[1 : len(encodedSecret)-1])
 				doubleEncoded := requireRuntimeValue(json.Marshal(escapedSecret))
-				for _, forbidden := range []string{secret, escapedSecret, string(doubleEncoded[1 : len(doubleEncoded)-1]), lowerDigest, upperDigest} {
-					if strings.Contains(string(raw), forbidden) || strings.Contains(savedFrame, forbidden) {
-						t.Fatalf("rejected-frame diagnostic leaked sensitive value %q", forbidden)
-					}
+				for _, forbidden := range []string{secret, escapedSecret, string(doubleEncoded[1 : len(doubleEncoded)-1]), lowerDigest, upperDigest, "private-reasoning-canary", "signature-canary"} {
+					requireRuntimeCondition(t, !strings.Contains(string(raw), forbidden) && !strings.Contains(savedFrame, forbidden), "rejected-frame diagnostic leaked sensitive value ", forbidden)
 				}
 				switch test.evidence {
 				case "metadata":
-					if savedFrame != fmt.Sprintf(`{"bytes":%d,"sanitized":false}`, len(frame)) || evidence["truncated"] != false {
-						t.Fatalf("unsafe malformed-frame fallback = %#v", evidence)
-					}
-				case "sanitized":
-					want := `"a_sensitive":{"digests":["[REDACTED_SECRET]","[REDACTED_SECRET]"],"secret":"[REDACTED_SECRET]"}`
+					requireRuntimeCondition(t, savedFrame == fmt.Sprintf(`{"bytes":%d,"sanitized":false}`, len(frame)), "unsafe malformed-frame fallback = ", evidence)
+				case "assistant":
 					streamLines := strings.Split(text, "\n")
 					var decoded []any
 					requireNoError(t, json.Unmarshal([]byte("["+strings.Join(streamLines[1:4], ",")+"]"), &decoded))
 					decodedStream := requireRuntimeValue(json.Marshal(decoded))
 					wantStream := fmt.Sprintf(`[{"message":{"content":[{"text":"visible text","type":"text"},{"id":"tool-1","input":{"[REDACTED_SECRET]":{"digests":["[REDACTED_SECRET]","[REDACTED_SECRET]"],"secret":"[REDACTED_SECRET]"}},"name":"Read","type":"tool_use"}],"role":"assistant","type":"message"},"type":"assistant"},{"bytes":%d,"sanitized":false},{"bytes":%d,"sanitized":false}]`, len(accepted)+1, len(ordinary))
-					if string(decodedStream) != wantStream || !strings.Contains(savedFrame, want) || evidence["truncated"] != false {
-						t.Fatalf("structured runtime diagnostics = %s; rejected=%#v", decodedStream, evidence)
-					}
+					requireRuntimeCondition(t, string(decodedStream) == wantStream && savedFrame == fmt.Sprintf(`{"bytes":%d,"sanitized":false}`, len(strings.Split(frame, "\n")[4])), "structured runtime diagnostics = ", string(decodedStream), "; rejected=", evidence)
 				case "reserve":
-					if len(raw) > runtimeLogLimit || strings.Count(string(raw), runtimeLogTruncatedMarker) != 1 || len(savedFrame) != 1024 || evidence["truncated"] != true {
-						t.Fatalf("reserved rejected-frame boundary: bytes=%d evidence=%#v", len(raw), evidence)
-					}
+					requireRuntimeCondition(t, len(raw) <= runtimeLogLimit && strings.Count(string(raw), runtimeLogTruncatedMarker) == 1 && savedFrame == fmt.Sprintf(`{"bytes":%d,"sanitized":false}`, len(strings.Split(frame, "\n")[len(strings.Split(frame, "\n"))-1])), "reserved rejected-frame boundary: bytes=", len(raw), " evidence=", evidence)
 				}
-				if test.evidence != "metadata" && (core.IsRunTerminal(beforeFailure.State) || beforeFailure.CleanupState == core.CleanupRemoved || beforeFailure.NativeSessionID != test.session ||
-					beforeFailure.RequestedOutcome != "" || beforeTask.LatestProgress != nil || beforeTask.Task.Status != core.TaskRunning ||
-					beforeTask.Task.HeadSHA != "" || beforeTask.Task.IntegrationTaskID != "" || beforeTask.Task.FinalCanonicalSHA != "" || beforeCleanup.Projects[0].CanonicalSHA != canonical) {
-					t.Fatalf("protocol diagnostic advanced state before failure/cleanup: Run=%#v Task=%#v Project=%#v", beforeFailure, beforeTask, beforeCleanup.Projects[0])
+				if test.evidence != "metadata" && !test.exitFirst {
+					requireRuntimeCondition(t, !core.IsRunTerminal(beforeFailure.State) && beforeFailure.CleanupState != core.CleanupRemoved && beforeFailure.NativeSessionID == test.session &&
+						beforeFailure.RequestedOutcome == "" && beforeTask.LatestProgress == nil && beforeTask.Task.Status == core.TaskRunning &&
+						beforeTask.Task.HeadSHA == "" && beforeTask.Task.IntegrationTaskID == "" && beforeTask.Task.FinalCanonicalSHA == "" && beforeCleanup.Projects[0].CanonicalSHA == canonical, "protocol diagnostic advanced state before failure/cleanup: Run=", beforeFailure, " Task=", beforeTask, " Project=", beforeCleanup.Projects[0])
 				}
 			}
-			if executor.stopCalls.Load() == 0 || executor.removeCalls.Load() == 0 {
-				t.Fatalf("protocol failure cleanup calls stop=%d remove=%d", executor.stopCalls.Load(), executor.removeCalls.Load())
-			}
+			requireRuntimeCondition(t, executor.stopCalls.Load() > 0 && executor.removeCalls.Load() > 0, "protocol failure cleanup calls stop=", executor.stopCalls.Load(), " remove=", executor.removeCalls.Load())
 			persisted := requireRuntimeValue(service.Run(context.Background(), active.ID))
 			task := requireRuntimeValue(service.Task(context.Background(), claim.Task.ID)).Task
-			if persisted.State != core.RunInterrupted || persisted.RuntimeErrorCode != runtimeLogFailureCode ||
-				persisted.NativeSessionID != test.session || persisted.RequestedOutcome != "" || persisted.CleanupState != core.CleanupRemoved || persisted.LastError == "" ||
-				task.Status != core.TaskFailed || task.CurrentRunID != "" {
-				t.Fatalf("protocol frame did not fail closed: Run=%#v Task=%#v", persisted, task)
-			}
+			requireRuntimeCondition(t, persisted.State == core.RunInterrupted && persisted.RuntimeErrorCode == runtimeLogFailureCode &&
+				persisted.NativeSessionID == test.session && persisted.RequestedOutcome == "" && persisted.CleanupState == core.CleanupRemoved && persisted.LastError != "" &&
+				task.Status == core.TaskFailed && task.CurrentRunID == "", "protocol frame did not fail closed: Run=", persisted, " Task=", task)
 			messages := requireRuntimeValue(service.ListMessages(context.Background(), core.MessageFilter{TaskID: claim.Task.ID}))
-			if len(messages.Items) != 1 || messages.Items[0].ID != message.ID || messages.Items[0].State == core.MessageAcknowledged {
-				t.Fatalf("protocol frame acknowledged a Message: %#v", messages.Items)
-			}
+			requireRuntimeCondition(t, len(messages.Items) == 1 && messages.Items[0].ID == message.ID && messages.Items[0].State != core.MessageAcknowledged, "protocol frame acknowledged a Message: ", messages.Items)
 		})
+	}
+}
+
+func requireRuntimeCondition(t *testing.T, condition bool, details ...any) {
+	t.Helper()
+	if !condition {
+		t.Fatal(details...)
 	}
 }
 

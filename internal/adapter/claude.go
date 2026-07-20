@@ -120,14 +120,18 @@ type claudeAssistantMessage struct {
 	Content    []json.RawMessage
 }
 
-type claudeContentBlock struct {
-	Type, Text, Thinking, Signature, ID, Name string
-	Input                                     json.RawMessage
+type claudeTextBlock struct{ Type, Text string }
+type claudeThinkingBlock struct{ Type, Thinking, Signature string }
+
+type claudeToolUseBlock struct {
+	Type, ID, Name string
+	Input          json.RawMessage
 }
 
 func parseClaudeAssistantEvent(event Event, rawMessage json.RawMessage) (Event, error) {
+	rawMessage = bytes.TrimSpace(rawMessage)
 	var legacy string
-	if len(rawMessage) == 0 || json.Unmarshal(rawMessage, &legacy) == nil {
+	if len(rawMessage) > 0 && rawMessage[0] == '"' && json.Unmarshal(rawMessage, &legacy) == nil {
 		return event, nil
 	}
 	var message claudeAssistantMessage
@@ -154,25 +158,38 @@ func parseClaudeAssistantEvent(event Event, rawMessage json.RawMessage) (Event, 
 }
 
 func parseClaudeContentBlock(raw []byte) (any, bool, error) {
-	var block claudeContentBlock
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&block); err != nil {
+	var typed struct{ Type string }
+	if err := json.Unmarshal(raw, &typed); err != nil {
 		return nil, false, errors.New("adapter: invalid Claude assistant content block")
 	}
-	switch block.Type {
+	switch typed.Type {
 	case "thinking":
+		var block claudeThinkingBlock
+		if decodeStrictClaudeJSON(raw, &block) != nil || strings.TrimSpace(block.Thinking) == "" || strings.TrimSpace(block.Signature) == "" {
+			return nil, false, errors.New("adapter: invalid Claude assistant content block")
+		}
 		return nil, false, nil
 	case "text":
+		var block claudeTextBlock
+		if decodeStrictClaudeJSON(raw, &block) != nil || strings.TrimSpace(block.Text) == "" {
+			return nil, false, errors.New("adapter: invalid Claude assistant content block")
+		}
 		return map[string]any{"type": "text", "text": block.Text}, true, nil
 	case "tool_use":
-		if block.ID == "" || block.Name == "" || len(block.Input) == 0 || !json.Valid(block.Input) {
+		var block claudeToolUseBlock
+		if decodeStrictClaudeJSON(raw, &block) != nil || strings.TrimSpace(block.ID) == "" || strings.TrimSpace(block.Name) == "" || json.Unmarshal(block.Input, &struct{}{}) != nil || bytes.Equal(bytes.TrimSpace(block.Input), []byte("null")) {
 			return nil, false, errors.New("adapter: invalid Claude tool_use block")
 		}
 		return map[string]any{"type": "tool_use", "id": block.ID, "name": block.Name, "input": block.Input}, true, nil
 	default:
 		return nil, false, errors.New("adapter: unsupported Claude assistant content block")
 	}
+}
+
+func decodeStrictClaudeJSON(raw []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(target)
 }
 
 func validateLaunch(spec LaunchSpec) error {

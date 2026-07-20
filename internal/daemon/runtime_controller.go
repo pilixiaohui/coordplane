@@ -26,7 +26,6 @@ const (
 	runtimeLogDrainTimeout    = 10 * time.Second
 	runtimeTmpfsLimit         = 64 << 20
 	runtimeLogLimit           = 8 << 20
-	runtimeRejectedFrameLimit = 1 << 10
 	runtimeRejectedErrorLimit = 256
 	runtimeRejectedLogReserve = 8 << 10
 	runtimeLogTruncatedMarker = "[coordplane: runtime log truncated]\n"

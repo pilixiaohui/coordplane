@@ -121,23 +121,14 @@ func (c *runtimeController) streamLogs(ctx context.Context, run core.Run, ref co
 }
 
 func rejectedFrameLogLine(redact runtimeRedaction, frame []byte, parseErr error) []byte {
-	redactedFrame, err := sanitizeJSONFrame(redact, frame)
-	if err != nil {
-		redactedFrame = rejectedFrameMetadata(frame)
-	}
-	truncated := len(redactedFrame) > runtimeRejectedFrameLimit
-	if truncated {
-		redactedFrame = redactedFrame[:runtimeRejectedFrameLimit]
-	}
 	redactedError := redact.Text(parseErr.Error())
 	if len(redactedError) > runtimeRejectedErrorLimit {
 		redactedError = redactedError[:runtimeRejectedErrorLimit]
 	}
 	evidence, _ := json.Marshal(struct {
-		Error     string `json:"error"`
-		Frame     string `json:"frame"`
-		Truncated bool   `json:"truncated"`
-	}{Error: redactedError, Frame: string(redactedFrame), Truncated: truncated})
+		Error string `json:"error"`
+		Frame string `json:"frame"`
+	}{Error: redactedError, Frame: string(rejectedFrameMetadata(frame))})
 	return append([]byte("[coordplane: adapter frame rejected] "), evidence...)
 }
 
