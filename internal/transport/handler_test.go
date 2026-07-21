@@ -320,6 +320,67 @@ func TestRunHandlerReturnsCoreErrorsAndRejectsMalformedJSONBeforeSideEffects(t *
 	}
 }
 
+func TestHandlersFenceEveryMutationUntilDaemonReady(t *testing.T) {
+	operatorRoutes := []string{
+		"/v1/projects", "/v1/projects/prj-1/repair", "/v1/projects/prj-1/archive",
+		"/v1/agents", "/v1/agents/agt-1/pause", "/v1/agents/agt-1/resume", "/v1/agents/agt-1/archive",
+		"/v1/chat", "/v1/tasks", "/v1/tasks/tsk-1/checkout", "/v1/tasks/tsk-1/close",
+		"/v1/tasks/tsk-1/wake", "/v1/tasks/tsk-1/retry", "/v1/tasks/tsk-1/cancel",
+		"/v1/tasks/tsk-1/accept", "/v1/tasks/tsk-1/rework", "/v1/runs/run-1/stop",
+		"/v1/messages", "/v1/messages/msg-1/read", "/v1/messages/msg-1/ack", "/v1/messages/msg-1/retry",
+		"/v1/gc/run", "/v1/gc/discard-workspace", "/v1/gc/discard-task-ref",
+	}
+	for _, path := range operatorRoutes {
+		t.Run("operator "+path, func(t *testing.T) {
+			operations := &operatorFake{readyErr: core.NewError(core.CodeRuntimeUnavailable, "recovering", true)}
+			recorder := invoke(t, transport.NewOperatorHandler(operations), http.MethodPost, path, `{}`, "")
+			assertNotReady(t, recorder)
+			if len(operations.calls) != 0 || operations.readyChecks != 1 {
+				t.Fatalf("calls=%+v ready checks=%d, want no operation and one readiness check", operations.calls, operations.readyChecks)
+			}
+		})
+	}
+
+	runRoutes := []string{
+		"/v1/task/create", "/v1/task/outcome", "/v1/task/task-1/accept", "/v1/task/task-1/rework",
+		"/v1/inbox/ack", "/v1/progress", "/v1/message",
+	}
+	for _, path := range runRoutes {
+		t.Run("run "+path, func(t *testing.T) {
+			operations := &runFake{readyErr: core.NewError(core.CodeRuntimeUnavailable, "recovering", true)}
+			recorder := invoke(t, transport.NewRunHandler(operations), http.MethodPost, path, `{}`, "run-secret")
+			assertNotReady(t, recorder)
+			if len(operations.calls) != 0 || operations.readyChecks != 1 {
+				t.Fatalf("calls=%+v ready checks=%d, want no operation and one readiness check", operations.calls, operations.readyChecks)
+			}
+		})
+	}
+}
+
+func TestHandlersKeepReadsAvailableAndForwardReadyMutationOnce(t *testing.T) {
+	operator := &operatorFake{}
+	handler := transport.NewOperatorHandler(operator)
+	assertOK(t, invoke(t, handler, http.MethodGet, "/v1/status", "", ""))
+	if operator.readyChecks != 0 || !reflect.DeepEqual(operator.callNames(), []string{"status"}) {
+		t.Fatalf("GET ready checks=%d calls=%v", operator.readyChecks, operator.callNames())
+	}
+	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/projects", `{}`, ""))
+	if operator.readyChecks != 1 || !reflect.DeepEqual(operator.callNames(), []string{"status", "add_project"}) {
+		t.Fatalf("ready POST checks=%d calls=%v", operator.readyChecks, operator.callNames())
+	}
+
+	run := &runFake{}
+	runHandler := transport.NewRunHandler(run)
+	assertOK(t, invoke(t, runHandler, http.MethodGet, "/v1/task/current", "", "run-secret"))
+	if run.readyChecks != 0 || len(run.calls) != 1 || run.calls[0].name != "current_task" {
+		t.Fatalf("run GET ready checks=%d calls=%+v", run.readyChecks, run.calls)
+	}
+	assertOK(t, invoke(t, runHandler, http.MethodPost, "/v1/progress", `{}`, "run-secret"))
+	if run.readyChecks != 1 || len(run.calls) != 2 || run.calls[1].name != "progress" {
+		t.Fatalf("run POST ready checks=%d calls=%+v", run.readyChecks, run.calls)
+	}
+}
+
 func TestCoreErrorsAlwaysMapToNonSuccessHTTPStatuses(t *testing.T) {
 	tests := []struct {
 		code core.ErrorCode
@@ -379,8 +440,15 @@ type actionCall struct {
 }
 
 type operatorFake struct {
-	calls []recordedCall
-	err   error
+	calls       []recordedCall
+	err         error
+	readyErr    error
+	readyChecks int
+}
+
+func (f *operatorFake) RequireReady() error {
+	f.readyChecks++
+	return f.readyErr
 }
 
 func (f *operatorFake) record(name string, value any) error {
@@ -541,8 +609,15 @@ func (f *operatorFake) ListEvents(_ context.Context, filter core.EventFilter) (c
 }
 
 type runFake struct {
-	calls []recordedCall
-	err   error
+	calls       []recordedCall
+	err         error
+	readyErr    error
+	readyChecks int
+}
+
+func (f *runFake) RequireReady() error {
+	f.readyChecks++
+	return f.readyErr
 }
 
 func (f *runFake) CurrentTask(_ context.Context, token string) (core.CurrentTaskResult, error) {
@@ -622,6 +697,15 @@ func assertOK(t *testing.T, recorder *httptest.ResponseRecorder) transport.Envel
 		t.Fatalf("response = status:%d envelope:%+v body:%s", recorder.Code, envelope, recorder.Body.String())
 	}
 	return envelope
+}
+
+func assertNotReady(t *testing.T, recorder *httptest.ResponseRecorder) {
+	t.Helper()
+	envelope := decodeEnvelope(t, recorder)
+	if recorder.Code != http.StatusServiceUnavailable || envelope.OK || envelope.Error == nil ||
+		envelope.Error.Code != core.CodeRuntimeUnavailable || !envelope.Error.Retryable {
+		t.Fatalf("not-ready response = status:%d envelope:%+v body:%s", recorder.Code, envelope, recorder.Body.String())
+	}
 }
 
 func decodeEnvelope(t *testing.T, recorder *httptest.ResponseRecorder) transport.Envelope {

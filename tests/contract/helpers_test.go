@@ -23,6 +23,7 @@ func newContractServiceFixture(t *testing.T, options core.ServiceOptions) (conte
 	git := &contractGit{sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", root: filepath.Join(root, "repos")}
 	service, err := core.NewService(database, git, options)
 	requireNoError(t, err)
+	service.SetReady(true, "")
 	return ctx, root, database, git, service
 }
 

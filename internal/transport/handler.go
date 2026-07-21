@@ -52,7 +52,7 @@ func NewOperatorHandler(operations OperatorOperations) http.Handler {
 	})))
 	registerMessageEventGCRoutes(mux, operations)
 	mux.HandleFunc("/", notFound)
-	return mux
+	return fenceMutations(operations, mux)
 }
 
 func registerProjectAgentRoutes(mux *http.ServeMux, operations OperatorOperations) {
@@ -256,6 +256,10 @@ func NewRunHandler(operations RunOperations) http.Handler {
 	if operations == nil {
 		return unavailableHandler("run operations are required")
 	}
+	return fenceMutations(operations, newRunHandler(operations))
+}
+
+func newRunHandler(operations RunOperations) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/task/current", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
 		result, err := operations.CurrentTask(r.Context(), bearerToken(r))
@@ -320,11 +324,24 @@ func NewScopedRunHandler(operations ScopedRunOperations, expected core.RunScope)
 	if operations == nil {
 		return unavailableHandler("scoped run operations are required")
 	}
-	next := NewRunHandler(operations)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	next := newRunHandler(operations)
+	scoped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := operations.AuthorizeRunScope(r.Context(), bearerToken(r), expected); err != nil {
 			writeError(w, err)
 			return
+		}
+		next.ServeHTTP(w, r)
+	})
+	return fenceMutations(operations, scoped)
+}
+
+func fenceMutations(readiness Readiness, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			if err := readiness.RequireReady(); err != nil {
+				writeError(w, err)
+				return
+			}
 		}
 		next.ServeHTTP(w, r)
 	})

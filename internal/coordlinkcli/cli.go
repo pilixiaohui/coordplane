@@ -81,7 +81,7 @@ func (c *retryingClient) CloseIdleConnections() {
 }
 
 func retryableRunRequest(err error) bool {
-	return core.IsCode(err, core.CodeRunStarting) ||
+	return core.IsCode(err, core.CodeRunStarting) || core.IsCode(err, core.CodeRuntimeUnavailable) ||
 		errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED) ||
 		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) ||
 		errors.Is(err, syscall.EPIPE) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)

@@ -26,6 +26,28 @@ func TestServiceTimestampsRemainLexicallySortable(t *testing.T) {
 	}
 }
 
+func TestServiceRequireReadyFencesMutationsUntilRecoveryCompletes(t *testing.T) {
+	service := &Service{}
+	service.SetReady(false, "startup reconciliation")
+
+	err := service.RequireReady()
+	var coreErr *Error
+	if !errors.As(err, &coreErr) {
+		t.Fatalf("RequireReady() error = %v, want *Error", err)
+	}
+	if coreErr.Code != CodeRuntimeUnavailable || !coreErr.Retryable {
+		t.Fatalf("RequireReady() error = %+v, want retryable %s", coreErr, CodeRuntimeUnavailable)
+	}
+	if coreErr.Message != "daemon is not ready: startup reconciliation" {
+		t.Fatalf("RequireReady() message = %q", coreErr.Message)
+	}
+
+	service.SetReady(true, "")
+	if err := service.RequireReady(); err != nil {
+		t.Fatalf("RequireReady() after recovery = %v", err)
+	}
+}
+
 func TestRunnableTasksUseCanonicalPriorityCreatedAndIDOrder(t *testing.T) {
 	tasks := []Task{
 		{ID: "tsk-later", Priority: 10, CreatedAt: "2026-07-12T00:00:01.000000000Z"},

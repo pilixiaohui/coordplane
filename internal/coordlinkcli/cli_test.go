@@ -44,16 +44,17 @@ func TestRetryingClientRetriesOnlyTransientErrorsWithStableRequestID(t *testing.
 	transient := []error{
 		fmt.Errorf("dial: %w", syscall.ECONNREFUSED),
 		core.NewError(core.CodeRunStarting, "starting", true),
+		core.NewError(core.CodeRuntimeUnavailable, "recovering", true),
 	}
 	next := &retryScriptClient{errors: transient}
-	client := &retryingClient{next: next, maxAttempts: 3}
+	client := &retryingClient{next: next, maxAttempts: 4}
 	input := core.ProgressInput{Summary: "working", RequestID: "stable-request"}
 	var output core.Event
 	if err := client.JSON(context.Background(), http.MethodPost, "/v1/progress", input, &output); err != nil {
 		t.Fatal(err)
 	}
-	if next.calls != 3 {
-		t.Fatalf("calls = %d, want 3", next.calls)
+	if next.calls != 4 {
+		t.Fatalf("calls = %d, want 4", next.calls)
 	}
 	for index, requestID := range next.requestIDs {
 		if requestID != input.RequestID {
@@ -350,6 +351,8 @@ type runOperations struct {
 	requestID     string
 	progressCalls int
 }
+
+func (o *runOperations) RequireReady() error { return nil }
 
 func (o *runOperations) CurrentTask(context.Context, string) (core.CurrentTaskResult, error) {
 	return core.CurrentTaskResult{}, nil

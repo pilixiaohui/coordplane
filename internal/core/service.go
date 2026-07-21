@@ -95,6 +95,23 @@ func (s *Service) SetReady(ready bool, reason string) {
 	s.readyReason = strings.TrimSpace(reason)
 }
 
+// RequireReady fences mutations until startup recovery has reconciled the
+// durable ledger with the actual runtime and Git state.
+func (s *Service) RequireReady() error {
+	s.readyMu.RLock()
+	ready := s.ready
+	reason, _ := boundedStatusText(s.readyReason, 1024)
+	s.readyMu.RUnlock()
+	if ready {
+		return nil
+	}
+	message := "daemon is not ready"
+	if reason != "" {
+		message += ": " + reason
+	}
+	return NewError(CodeRuntimeUnavailable, message, true)
+}
+
 func (s *Service) SetRuntimeStatus(status RuntimeStatus) {
 	s.readyMu.Lock()
 	defer s.readyMu.Unlock()

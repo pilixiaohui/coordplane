@@ -6,8 +6,14 @@ import (
 	"coordplane/internal/core"
 )
 
+// Readiness is the process-local recovery fence shared by both HTTP surfaces.
+type Readiness interface {
+	RequireReady() error
+}
+
 // OperatorOperations is the fixed Boss-facing operation surface.
 type OperatorOperations interface {
+	Readiness
 	Status(context.Context, string) (core.Status, error)
 	Project(context.Context, string) (core.ProjectDetail, error)
 	Agent(context.Context, string) (core.Agent, error)
@@ -48,6 +54,7 @@ type OperatorOperations interface {
 // RunOperations is the fixed Agent-facing operation surface. The transport
 // forwards the bearer token; scope and generation checks remain in core.
 type RunOperations interface {
+	Readiness
 	CurrentTask(context.Context, string) (core.CurrentTaskResult, error)
 	TaskForRun(context.Context, string, string) (core.Task, error)
 	CreateChildTask(context.Context, core.CreateChildTaskInput) (core.Task, error)
