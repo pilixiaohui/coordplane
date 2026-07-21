@@ -68,6 +68,12 @@ func TestRMA02EvidenceValidatorRejectsIncompleteOrUnsafeProof(t *testing.T) {
 		{"stale creation canonical", func(e *rma02Evidence) { e.Integrations[1].ObservedCanonical = e.InitialSHA }},
 		{"canonical lineage broken", func(e *rma02Evidence) { e.Integrations[0].CanonicalAncestor = false }},
 		{"nested integration", func(e *rma02Evidence) { e.Integrations[0].NestedIntegration = true }},
+		{"integration fixture wrong task", func(e *rma02Evidence) { e.Integrations[0].FixtureTaskID = e.Integrations[1].TaskID }},
+		{"integration fixture wrong run", func(e *rma02Evidence) { e.Integrations[0].FixtureRunID = e.Integrations[1].RunID }},
+		{"integration fixture marker missing", func(e *rma02Evidence) { e.Integrations[0].FixtureMarker = "" }},
+		{"integration fixture event missing", func(e *rma02Evidence) { e.Integrations[0].FixtureEventCount = 0 }},
+		{"integration fixture event duplicated", func(e *rma02Evidence) { e.Integrations[0].FixtureEventCount = 2 }},
+		{"integration fixture failed", func(e *rma02Evidence) { e.Integrations[0].FixtureExitCode = 1 }},
 		{"fixture failed", func(e *rma02Evidence) { e.Final.FixtureExitCode = 1 }},
 		{"fsck failed", func(e *rma02Evidence) { e.Final.FSCKExitCode = 1 }},
 		{"restart fence drift", func(e *rma02Evidence) { e.Restart.After[0].ContainerID = "ctr-replaced" }},
@@ -208,7 +214,7 @@ func TestRMA02FormalArtifactWriterSurvivesProductionCapture(t *testing.T) {
 			if observed.Task.ID != taskID || observed.Run.ID != runID || marker != wantMarker || exitCode != 0 {
 				t.Fatalf("controlled artifacts after Capture = task:%s run:%s marker:%s exit:%d", observed.Task.ID, observed.Run.ID, marker, exitCode)
 			}
-			if strings.Count(progress, "progress ") != 1 || !strings.Contains(progress, taskID) || !strings.Contains(progress, runID) {
+			if strings.Count(progress, "\n") != 1 || !strings.Contains(progress, taskID) || !strings.Contains(progress, runID) {
 				t.Fatalf("formal fixture progress = %q, want one Task/Run-bound Event", progress)
 			}
 		})
@@ -631,10 +637,14 @@ func validRMA02Evidence() rma02Evidence {
 	for index := 1; index < len(sources); index++ {
 		source := sources[index]
 		integrations = append(integrations, rma02IntegrationProof{
-			TaskID: "integration-" + source.Role, SourceTaskID: source.TaskID, SourceRunID: source.RunID,
+			TaskID: "integration-" + source.Role, RunID: "run-integration-" + source.Role, SourceTaskID: source.TaskID, SourceRunID: source.RunID,
 			SourceTaskRef: source.TaskRef, SourceHeadSHA: source.HeadSHA, ObservedCanonical: observedCanonical,
 			HeadSHA: strings.Repeat(string(rune('1'+index)), 40), SourceAncestor: true, CanonicalAncestor: true, SubmitEventCount: 1,
 		})
+		integrations[len(integrations)-1].FixtureTaskID = integrations[len(integrations)-1].TaskID
+		integrations[len(integrations)-1].FixtureRunID = integrations[len(integrations)-1].RunID
+		integrations[len(integrations)-1].FixtureMarker = "integration"
+		integrations[len(integrations)-1].FixtureEventCount = 1
 		observedCanonical = integrations[len(integrations)-1].HeadSHA
 	}
 	finalSHA := integrations[len(integrations)-1].HeadSHA

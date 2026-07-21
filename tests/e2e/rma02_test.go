@@ -157,7 +157,7 @@ func runRMA02(t *testing.T) {
 			LiveFrom: terminalRun.StartedAt, LiveUntil: terminalRun.EndedAt, ProgressMarker: sources[index].marker,
 			CoordlinkOperations: 1 + countRMA02Events(events, terminalRun.ID, "task.progress"),
 			TaskCurrentObserved: taskCurrentObserved, TaskCurrentTaskID: sources[index].taskCurrent.Task.ID, TaskCurrentRunID: sources[index].taskCurrent.Run.ID,
-			FixtureMarker: sources[index].fixture, FixtureEventCount: countRMA02ProgressMarkers(events, terminalRun.ID, "RMA02-FIXTURE-"+sources[index].role), FixtureExitCode: sources[index].fixtureExit,
+			FixtureMarker: sources[index].fixture, FixtureEventCount: countRMA02ProgressMarkers(events, terminalRun.ID, rma02FixtureEventMarker(sources[index].task.ID, terminalRun.ID)), FixtureExitCode: sources[index].fixtureExit,
 			CommitSHA: sources[index].task.HeadSHA, HeadSHA: sources[index].task.HeadSHA, HeadRunID: sources[index].task.HeadRunID,
 			TaskRef: sources[index].task.TaskRef, SubmitEventCount: countRMA02EntityEvents(events, sources[index].task.ID, "task.submit_requested"),
 		})
@@ -217,6 +217,8 @@ func runRMA02(t *testing.T) {
 	for _, run := range afterFinalRestart.runs.Items {
 		_ = runJSON[core.Run](t, ctx, coordplane, "run", "show", run.ID, "--socket", socket, "--output", "json")
 	}
+	messageEvents := allRMA02Events(t, ctx, coordplane, socket, project.ID)
+	integrationEvidence := buildRMA02IntegrationEvidence(t, ctx, controlRepo, dataDir, integrations, integrationCanonicals, sources, messageEvents)
 	for _, source := range sources {
 		runJSON[core.Agent](t, ctx, coordplane, "agent", "archive", source.agent.ID,
 			"--socket", socket, "--request-id", "rma02-archive-"+source.role, "--output", "json")
@@ -230,8 +232,6 @@ func runRMA02(t *testing.T) {
 		t.Fatalf("RMA-02 GC result = %#v", result)
 	}
 	cleanup := collectRMA02Cleanup(t, ctx, coordplane, socket, dataDir, controlRepo, project.ID, allTasks, afterFinalRestart.runs.Items)
-	messageEvents := allRMA02Events(t, ctx, coordplane, socket, project.ID)
-	integrationEvidence := buildRMA02IntegrationEvidence(t, ctx, controlRepo, integrations, integrationCanonicals, sources, messageEvents)
 	databaseCanonical := rma02SQLiteCanonical(t, filepath.Join(dataDir, "coordplane.db"), project.ID)
 	evidence := rma02Evidence{
 		SchemaVersion: 1, ScenarioID: "RMA-02", ScenarioExecutions: 1, Result: "PASS_REAL_MULTI_AGENT_LOCAL",
@@ -283,7 +283,7 @@ func createRMA02Tasks(t *testing.T, ctx context.Context, binary, socket, project
 			peerAgent = sources[1].agent.ID
 			peerTask = sources[1].task.ID
 		}
-		description := fmt.Sprintf("rma_role=%s\ntask_marker=%s\nfile=agent-%s.txt\ncontent=agent-%s\\n\nfixture=./fixture-test.sh source %s\npeer_agent_id=%s\npeer_task_id=%s",
+		description := fmt.Sprintf("rma_role=%s\ntask_marker=%s\nfile=agent-%s.txt\ncontent=agent-%s\\n\nfixture=./fixture-test.sh source %s TASK_ID RUN_ID\npeer_agent_id=%s\npeer_task_id=%s",
 			sources[index].role, sources[index].marker, sources[index].role, sources[index].role, sources[index].role, peerAgent, peerTask)
 		sources[index].task = runJSON[core.Task](t, ctx, binary,
 			"task", "create", "--socket", socket, "--project", projectID, "--agent", sources[index].agent.ID,
@@ -432,7 +432,14 @@ func acceptRMA02Sources(t *testing.T, ctx context.Context, binary, socket, dataD
 			t.Fatalf("RMA-02 integration source/canonical mapping drift for %s: source=%#v integration=%#v observed=%s",
 				sources[index].role, sources[index].task, integration, beforeAccept.ActualCanonicalSHA)
 		}
-		requireRMA02FixtureMarker(t, dataDir, sources[0].agent.ID, integration.ID, "integration")
+		current := requireRMA02FixtureMarker(t, dataDir, sources[0].agent.ID, integration.ID, "integration")
+		if current.Run.ID != integration.HeadRunID {
+			t.Fatalf("RMA-02 integration %s fixture Run = %s, want captured Run %s", integration.ID, current.Run.ID, integration.HeadRunID)
+		}
+		fixtureEvents := countRMA02ProgressMarkers(allRMA02Events(t, ctx, binary, socket, project.ID), integration.HeadRunID, rma02FixtureEventMarker(integration.ID, integration.HeadRunID))
+		if fixtureEvents != 1 {
+			t.Fatalf("RMA-02 integration %s fixture Event count = %d, want 1", integration.ID, fixtureEvents)
+		}
 		sources[index].task = waitForTaskWithin(t, ctx, binary, socket, sources[index].task.ID, "RMA-02 source completion", 2*time.Minute,
 			func(task core.Task) bool {
 				return task.Status == core.TaskCompleted && task.FinalCanonicalSHA == integration.HeadSHA
@@ -443,18 +450,21 @@ func acceptRMA02Sources(t *testing.T, ctx context.Context, binary, socket, dataD
 	return integrations, observedCanonicals
 }
 
-func buildRMA02IntegrationEvidence(t *testing.T, ctx context.Context, controlRepo string, integrations []core.Task, observedCanonicals []string, sources []rma02Source, events []core.Event) []rma02IntegrationProof {
+func buildRMA02IntegrationEvidence(t *testing.T, ctx context.Context, controlRepo, dataDir string, integrations []core.Task, observedCanonicals []string, sources []rma02Source, events []core.Event) []rma02IntegrationProof {
 	t.Helper()
 	result := make([]rma02IntegrationProof, 0, len(integrations))
 	for index, integration := range integrations {
 		source := sources[index+1].task
+		current, marker, exitCode := readRMA02SourceArtifacts(t, dataDir, sources[0].agent.ID, integration.ID)
 		gitDirSucceeds(t, ctx, controlRepo, "merge-base", "--is-ancestor", integration.SourceHeadSHA, integration.HeadSHA)
 		gitDirSucceeds(t, ctx, controlRepo, "merge-base", "--is-ancestor", observedCanonicals[index], integration.HeadSHA)
 		result = append(result, rma02IntegrationProof{
-			TaskID: integration.ID, SourceTaskID: integration.SourceTaskID, SourceRunID: integration.SourceRunID,
+			TaskID: integration.ID, RunID: integration.HeadRunID, SourceTaskID: integration.SourceTaskID, SourceRunID: integration.SourceRunID,
 			SourceTaskRef: integration.SourceTaskRef, SourceHeadSHA: integration.SourceHeadSHA, ObservedCanonical: observedCanonicals[index],
 			HeadSHA: integration.HeadSHA, SourceAncestor: integration.SourceHeadSHA == source.HeadSHA,
 			CanonicalAncestor: true, NestedIntegration: source.Kind == core.TaskIntegration,
+			FixtureTaskID: current.Task.ID, FixtureRunID: current.Run.ID, FixtureMarker: marker,
+			FixtureEventCount: countRMA02ProgressMarkers(events, integration.HeadRunID, rma02FixtureEventMarker(integration.ID, integration.HeadRunID)), FixtureExitCode: exitCode,
 			SubmitEventCount: countRMA02EntityEvents(events, integration.ID, "task.submit_requested"),
 		})
 	}
@@ -684,23 +694,36 @@ func rma02SourceHeads(sources []rma02Source) []string {
 	return result
 }
 
-func requireRMA02FixtureMarker(t *testing.T, dataDir, agentID, taskID, marker string) {
+func requireRMA02FixtureMarker(t *testing.T, dataDir, agentID, taskID, marker string) core.CurrentTaskResult {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join(rma02ArtifactRoot(dataDir, agentID), "fixture"))
-	if err != nil || strings.TrimSpace(string(raw)) != marker {
-		t.Fatalf("Task %s fixture marker = %q err=%v, want %s", taskID, raw, err, marker)
+	current, actual, exitCode := readRMA02SourceArtifacts(t, dataDir, agentID, taskID)
+	if actual != marker || exitCode != 0 {
+		t.Fatalf("Task %s fixture marker = %q exit=%d, want %s/0", taskID, actual, exitCode, marker)
 	}
+	return current
 }
 
 func readRMA02SourceArtifacts(t *testing.T, dataDir, agentID, taskID string) (core.CurrentTaskResult, string, int) {
 	t.Helper()
-	root := rma02ArtifactRoot(dataDir, agentID)
+	taskRoot := filepath.Join(rma02ArtifactRoot(dataDir, agentID), taskID)
+	entries, err := os.ReadDir(taskRoot)
+	if err != nil {
+		t.Fatalf("read Task %s artifact directory: %v", taskID, err)
+	}
+	if len(entries) != 1 || !entries[0].IsDir() {
+		t.Fatalf("Task %s artifact Runs = %d, want exactly one Run directory", taskID, len(entries))
+	}
+	runID := entries[0].Name()
+	root := filepath.Join(taskRoot, runID)
 	raw, err := os.ReadFile(filepath.Join(root, "task-current.json"))
 	if err != nil {
 		t.Fatalf("read Task %s current artifact: %v", taskID, err)
 	}
 	var current core.CurrentTaskResult
 	requireNoError(t, json.Unmarshal(raw, &current))
+	if current.Task.ID != taskID || current.Run.ID != runID {
+		t.Fatalf("Task %s artifact identity = task:%s run:%s path-run:%s", taskID, current.Task.ID, current.Run.ID, runID)
+	}
 	marker, err := os.ReadFile(filepath.Join(root, "fixture"))
 	requireNoError(t, err)
 	exitRaw, err := os.ReadFile(filepath.Join(root, "fixture-exit"))
@@ -712,6 +735,10 @@ func readRMA02SourceArtifacts(t *testing.T, dataDir, agentID, taskID string) (co
 
 func rma02ArtifactRoot(dataDir, agentID string) string {
 	return filepath.Join(dataDir, "agent-homes", agentID, ".coordplane-rma02")
+}
+
+func rma02FixtureEventMarker(taskID, runID string) string {
+	return "RMA02-FIXTURE-" + taskID + "-" + runID
 }
 
 func parseRMA02Time(t *testing.T, value string) time.Time {
@@ -757,21 +784,36 @@ func collectRMA02FailureFacts(ctx context.Context, binary, socket, projectID str
 		fact.Role = source.role
 		facts.Sources = append(facts.Sources, fact)
 	}
-	page, err := commandJSON[core.TaskPage](ctx, binary, "task", "list", "--socket", socket, "--project", projectID, "--limit", "500", "--output", "json")
-	if err != nil {
-		return rma02FailureFacts{}, err
-	}
-	for _, task := range page.Items {
-		if task.Kind != core.TaskIntegration {
-			continue
+	cursor := ""
+	for pageNumber := 0; pageNumber < 100; pageNumber++ {
+		args := []string{"task", "list", "--socket", socket, "--project", projectID, "--limit", "500"}
+		if cursor != "" {
+			args = append(args, "--cursor", cursor)
 		}
-		fact, err := collectRMA02FailureTask(ctx, binary, socket, task.ID)
+		args = append(args, "--output", "json")
+		page, err := commandJSON[core.TaskPage](ctx, binary, args...)
 		if err != nil {
 			return rma02FailureFacts{}, err
 		}
-		facts.Integrations = append(facts.Integrations, fact)
+		for _, task := range page.Items {
+			if task.Kind != core.TaskIntegration {
+				continue
+			}
+			fact, err := collectRMA02FailureTask(ctx, binary, socket, task.ID)
+			if err != nil {
+				return rma02FailureFacts{}, err
+			}
+			facts.Integrations = append(facts.Integrations, fact)
+		}
+		if page.NextCursor == "" {
+			return facts, nil
+		}
+		if page.NextCursor == cursor {
+			return rma02FailureFacts{}, errors.New("RMA-02 Task cursor did not advance")
+		}
+		cursor = page.NextCursor
 	}
-	return facts, nil
+	return rma02FailureFacts{}, errors.New("RMA-02 Task history exceeded 100 pages")
 }
 
 func collectRMA02FailureTask(ctx context.Context, binary, socket, taskID string) (rma02FailureTaskFact, error) {
@@ -786,13 +828,31 @@ func collectRMA02FailureTask(ctx context.Context, binary, socket, taskID string)
 	}
 	runID := detail.Task.HeadRunID
 	if runID == "" {
-		page, err := commandJSON[core.RunPage](ctx, binary, "run", "list", "--task", taskID, "--limit", "500", "--socket", socket, "--output", "json")
-		if err != nil {
-			return rma02FailureTaskFact{}, err
-		}
-		for _, run := range page.Items {
-			if core.IsRunTerminal(run.State) {
-				runID = run.ID
+		cursor := ""
+		for pageNumber := 0; pageNumber < 100; pageNumber++ {
+			args := []string{"run", "list", "--task", taskID, "--limit", "500"}
+			if cursor != "" {
+				args = append(args, "--cursor", cursor)
+			}
+			args = append(args, "--socket", socket, "--output", "json")
+			page, err := commandJSON[core.RunPage](ctx, binary, args...)
+			if err != nil {
+				return rma02FailureTaskFact{}, err
+			}
+			for _, run := range page.Items {
+				if core.IsRunTerminal(run.State) {
+					runID = run.ID
+				}
+			}
+			if page.NextCursor == "" {
+				break
+			}
+			if page.NextCursor == cursor {
+				return rma02FailureTaskFact{}, errors.New("RMA-02 Run cursor did not advance")
+			}
+			cursor = page.NextCursor
+			if pageNumber == 99 {
+				return rma02FailureTaskFact{}, errors.New("RMA-02 Run history exceeded 100 pages")
 			}
 		}
 	}
@@ -849,10 +909,9 @@ func classifyRMA02Failure(facts rma02FailureFacts) string {
 		}
 	}
 	if len(facts.Integrations) != 0 {
-		for _, fact := range facts.Integrations {
-			if fact.Run.ID == "" || fact.Run.RequestedOutcome != "" || fact.Task.PendingAction != "" {
-				return "product"
-			}
+		latest := facts.Integrations[len(facts.Integrations)-1]
+		if latest.Run.ID == "" || latest.Run.RequestedOutcome != "" || latest.Task.PendingAction != "" {
+			return "product"
 		}
 		return "task_spec"
 	}
@@ -920,8 +979,14 @@ func createRMA02SourceRepository(t *testing.T, ctx context.Context, root string)
 set -eu
 mode=${1:-}
 role=${2:-}
-artifact_root=$HOME/.coordplane-rma02
-mkdir -p "$artifact_root"
+task_id=${3:-}
+run_id=${4:-}
+coordlink=${RMA02_COORDLINK_BIN:-/usr/local/bin/coordlink}
+if [ "$mode" != final ]; then
+  [ -n "$task_id" ] && [ -n "$run_id" ]
+  artifact_root=$HOME/.coordplane-rma02/$task_id/$run_id
+  mkdir -p "$artifact_root"
+fi
 test "$(cat base.txt)" = C0
 case "$mode" in
 source)
@@ -931,7 +996,6 @@ source)
     [ "$peer" = "$role" ] || [ ! -e "agent-$peer.txt" ]
   done
 	marker=source-$role
-	/usr/local/bin/coordlink progress --summary "RMA02-FIXTURE-$role" --request-id "rma02-fixture-$role" --output json >/dev/null
   ;;
 integration)
   found=0
@@ -950,8 +1014,13 @@ final)
 *) exit 2 ;;
 esac
 if [ "$mode" != final ]; then
-	printf '%s\n' "$marker" >"$artifact_root/fixture"
-	printf '0\n' >"$artifact_root/fixture-exit"
+	"$coordlink" task current --output json >"$artifact_root/task-current.json.tmp"
+	mv "$artifact_root/task-current.json.tmp" "$artifact_root/task-current.json"
+	"$coordlink" progress --summary "RMA02-FIXTURE-$task_id-$run_id" --request-id "rma02-fixture-$task_id-$run_id" --output json >/dev/null
+	printf '%s\n' "$marker" >"$artifact_root/fixture.tmp"
+	mv "$artifact_root/fixture.tmp" "$artifact_root/fixture"
+	printf '0\n' >"$artifact_root/fixture-exit.tmp"
+	mv "$artifact_root/fixture-exit.tmp" "$artifact_root/fixture-exit"
 fi
 `
 	testsupport.WriteFile(t, filepath.Join(source, "fixture-test.sh"), []byte(fixture), 0o755)
@@ -970,9 +1039,9 @@ func writeRMA02Evidence(t *testing.T, path string, evidence rma02Evidence) {
 }
 
 const rma02Instructions = `You are running RMA-02, the real four-Agent CoordPlane reliability gate.
-Read the complete bootstrap, create $HOME/.coordplane-rma02, and run /usr/local/bin/coordlink task current --output json >$HOME/.coordplane-rma02/task-current.json before doing any work. Never infer completion from prose or process exit.
+Read the complete bootstrap and run /usr/local/bin/coordlink task current --output json before doing any work. Never infer completion from prose or process exit. The fixture writer records Task/Run-bound evidence below $HOME/.coordplane-rma02.
 
-For a work Task, read rma_role, task_marker, file, content, fixture, and any peer IDs from the public Task description. Call coordlink progress with the exact task_marker and a request ID containing the current Run ID. Role A must send RMA02-DIRECT to role B with coordlink message send --to-agent peer_agent_id --task peer_task_id; role B must poll its inbox and acknowledge that Message exactly once. Poll the inbox until RMA02-CONTINUE for this role arrives, acknowledge it, and only then continue. Configure native Git in /workspace/project. Write exactly the requested file/content, run ./fixture-test.sh source ROLE, verify $HOME/.coordplane-rma02/fixture, commit only agent-ROLE.txt, resolve HEAD with git rev-parse HEAD, and submit that exact SHA with coordlink task submit. Do not create child Tasks.
+For a work Task, read rma_role, task_marker, file, content, fixture, and any peer IDs from the public Task description. Call coordlink progress with the exact task_marker and a request ID containing the current Run ID. Role A must send RMA02-DIRECT to role B with coordlink message send --to-agent peer_agent_id --task peer_task_id; role B must poll its inbox and acknowledge that Message exactly once. Poll the inbox until RMA02-CONTINUE for this role arrives, acknowledge it, and only then continue. Configure native Git in /workspace/project. Write exactly the requested file/content, run ./fixture-test.sh source ROLE TASK_ID RUN_ID using the current bootstrap IDs, verify $HOME/.coordplane-rma02/TASK_ID/RUN_ID/fixture, commit only agent-ROLE.txt, resolve HEAD with git rev-parse HEAD, and submit that exact SHA with coordlink task submit. Do not create child Tasks.
 
-For an integration Task, use the source head and current canonical recorded in the bootstrap. Merge the source into the canonical-based workspace with native git merge --no-ff, run ./fixture-test.sh integration, verify $HOME/.coordplane-rma02/fixture, commit if needed, resolve HEAD, and submit that exact SHA. Never create nested integration Tasks or accept a source Task yourself.
+For an integration Task, use the source head and current canonical recorded in the bootstrap. Merge the source into the canonical-based workspace with native git merge --no-ff, run ./fixture-test.sh integration _ TASK_ID RUN_ID using the current bootstrap IDs, verify $HOME/.coordplane-rma02/TASK_ID/RUN_ID/fixture, commit if needed, resolve HEAD, and submit that exact SHA. Never create nested integration Tasks or accept a source Task yourself.
 `

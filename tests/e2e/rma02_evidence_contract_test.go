@@ -119,6 +119,7 @@ type rma02RestartEvidence struct {
 
 type rma02IntegrationProof struct {
 	TaskID            string `json:"task_id"`
+	RunID             string `json:"run_id"`
 	SourceTaskID      string `json:"source_task_id"`
 	SourceRunID       string `json:"source_run_id"`
 	SourceTaskRef     string `json:"source_task_ref"`
@@ -128,6 +129,11 @@ type rma02IntegrationProof struct {
 	SourceAncestor    bool   `json:"source_ancestor"`
 	CanonicalAncestor bool   `json:"canonical_ancestor"`
 	NestedIntegration bool   `json:"nested_integration"`
+	FixtureTaskID     string `json:"fixture_task_id"`
+	FixtureRunID      string `json:"fixture_run_id"`
+	FixtureMarker     string `json:"fixture_marker"`
+	FixtureEventCount int    `json:"fixture_event_count"`
+	FixtureExitCode   int    `json:"fixture_exit_code"`
 	SubmitEventCount  int    `json:"submit_event_count"`
 }
 
@@ -272,10 +278,12 @@ func validateRMA02Integrations(e rma02Evidence) error {
 	for index, role := range []string{"B", "C", "D"} {
 		integration := e.Integrations[index]
 		source := sourceByRole(e.Sources, role)
-		if integration.TaskID == "" || reservedTasks[integration.TaskID] || integration.SourceTaskID != source.TaskID ||
+		if integration.TaskID == "" || integration.RunID == "" || reservedTasks[integration.TaskID] || integration.SourceTaskID != source.TaskID ||
 			integration.SourceRunID != source.RunID || integration.SourceTaskRef != source.TaskRef || integration.SourceHeadSHA != source.HeadSHA ||
 			integration.ObservedCanonical != expectedCanonical || !validObjectID(integration.HeadSHA) || heads[integration.HeadSHA] ||
-			!integration.SourceAncestor || !integration.CanonicalAncestor || integration.NestedIntegration || integration.SubmitEventCount != 1 {
+			!integration.SourceAncestor || !integration.CanonicalAncestor || integration.NestedIntegration ||
+			integration.FixtureTaskID != integration.TaskID || integration.FixtureRunID != integration.RunID ||
+			integration.FixtureMarker != "integration" || integration.FixtureEventCount != 1 || integration.FixtureExitCode != 0 || integration.SubmitEventCount != 1 {
 			return fmt.Errorf("integration identity or lineage proof is invalid")
 		}
 		reservedTasks[integration.TaskID] = true
