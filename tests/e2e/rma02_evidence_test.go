@@ -149,7 +149,7 @@ func TestRMA02OwnedResidueScannerRejectsUnknownLeaves(t *testing.T) {
 	}
 }
 
-func TestRMA02ProducerArtifactsSurviveProductionCapture(t *testing.T) {
+func TestRMA02FormalArtifactWriterSurvivesProductionCapture(t *testing.T) {
 	t.Run("producer routes artifacts outside workspace", func(t *testing.T) {
 		root := t.TempDir()
 		workspace, _ := createRMA02SourceRepository(t, context.Background(), root)
@@ -159,8 +159,9 @@ func TestRMA02ProducerArtifactsSurviveProductionCapture(t *testing.T) {
 		}
 		producer := rma02Instructions + "\n" + string(fixture)
 		for _, required := range []string{
-			`$HOME/.coordplane-rma02/task-current.json`,
-			`artifact_root=$HOME/.coordplane-rma02`,
+			`artifact_root=$HOME/.coordplane-rma02/$task_id/$run_id`,
+			`RMA02_COORDLINK_BIN`,
+			`task current --output json`,
 			`$artifact_root/fixture`, `$artifact_root/fixture-exit`,
 		} {
 			if !strings.Contains(producer, required) {
@@ -182,26 +183,15 @@ func TestRMA02ProducerArtifactsSurviveProductionCapture(t *testing.T) {
 			if mode == "integration" {
 				testsupport.WriteFile(t, filepath.Join(workspace, "agent-B.txt"), []byte("agent-B\n"), 0o600)
 			}
+			dataDir, agentID, taskID, runID := filepath.Join(root, "data"), "agent-A", "task-"+mode, "run-"+mode
+			home := filepath.Join(dataDir, "agent-homes", agentID)
+			progress := executeRMA02FixtureWriter(t, workspace, home, mode, "A", taskID, runID)
 			git(t, context.Background(), workspace, "add", "agent-A.txt")
 			if mode == "integration" {
 				git(t, context.Background(), workspace, "add", "agent-B.txt")
 			}
 			git(t, context.Background(), workspace, "commit", "--quiet", "-m", mode+" result")
 			head := git(t, context.Background(), workspace, "rev-parse", "HEAD")
-
-			dataDir, agentID, taskID := filepath.Join(root, "data"), "agent-A", "task-"+mode
-			artifacts := filepath.Join(dataDir, "agent-homes", agentID, ".coordplane-rma02")
-			if err := os.MkdirAll(artifacts, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			current := core.CurrentTaskResult{Task: core.Task{ID: taskID}, Run: core.Run{ID: "run-" + mode}}
-			currentJSON, err := json.Marshal(current)
-			if err != nil {
-				t.Fatal(err)
-			}
-			testsupport.WriteFile(t, filepath.Join(artifacts, "task-current.json"), currentJSON, 0o600)
-			testsupport.WriteFile(t, filepath.Join(artifacts, "fixture"), []byte(mode+"\n"), 0o600)
-			testsupport.WriteFile(t, filepath.Join(artifacts, "fixture-exit"), []byte("0\n"), 0o600)
 
 			fact, err := gitcapture.Capture(context.Background(), gitcapture.Request{
 				Workspace: workspace, Handoff: t.TempDir(), ExpectedHead: head, BaseSHA: base,
@@ -211,11 +201,74 @@ func TestRMA02ProducerArtifactsSurviveProductionCapture(t *testing.T) {
 				t.Fatalf("production Capture rejected %s artifact sequence: fact=%#v err=%v", mode, fact, err)
 			}
 			observed, marker, exitCode := readRMA02SourceArtifacts(t, dataDir, agentID, taskID)
-			if observed.Task.ID != taskID || marker != mode || exitCode != 0 {
-				t.Fatalf("controlled artifacts after Capture = task:%s marker:%s exit:%d", observed.Task.ID, marker, exitCode)
+			wantMarker := mode
+			if mode == "source" {
+				wantMarker = "source-A"
+			}
+			if observed.Task.ID != taskID || observed.Run.ID != runID || marker != wantMarker || exitCode != 0 {
+				t.Fatalf("controlled artifacts after Capture = task:%s run:%s marker:%s exit:%d", observed.Task.ID, observed.Run.ID, marker, exitCode)
+			}
+			if strings.Count(progress, "progress ") != 1 || !strings.Contains(progress, taskID) || !strings.Contains(progress, runID) {
+				t.Fatalf("formal fixture progress = %q, want one Task/Run-bound Event", progress)
 			}
 		})
 	}
+}
+
+func TestRMA02RejectsStaleArtifactForSameIntegrationAgent(t *testing.T) {
+	if os.Getenv("RMA02_STALE_ARTIFACT_CHILD") == "1" {
+		requireRMA02FixtureMarker(t, os.Getenv("RMA02_STALE_DATA_DIR"), "agent-A", "integration-C", "integration")
+		return
+	}
+	root := t.TempDir()
+	workspace, _ := createRMA02SourceRepository(t, context.Background(), root)
+	testsupport.WriteFile(t, filepath.Join(workspace, "agent-A.txt"), []byte("agent-A\n"), 0o600)
+	testsupport.WriteFile(t, filepath.Join(workspace, "agent-B.txt"), []byte("agent-B\n"), 0o600)
+	dataDir := filepath.Join(root, "data")
+	executeRMA02FixtureWriter(t, workspace, filepath.Join(dataDir, "agent-homes", "agent-A"), "integration", "A", "integration-B", "run-integration-B")
+
+	command := exec.Command(os.Args[0], "-test.run=^TestRMA02RejectsStaleArtifactForSameIntegrationAgent$")
+	command.Env = append(os.Environ(), "RMA02_STALE_ARTIFACT_CHILD=1", "RMA02_STALE_DATA_DIR="+dataDir)
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("integration C accepted integration B artifact: %s", output)
+	}
+}
+
+func executeRMA02FixtureWriter(t *testing.T, workspace, home, mode, role, taskID, runID string) string {
+	t.Helper()
+	root := t.TempDir()
+	currentPath := filepath.Join(root, "current.json")
+	current, err := json.Marshal(core.CurrentTaskResult{Task: core.Task{ID: taskID}, Run: core.Run{ID: runID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	testsupport.WriteFile(t, currentPath, current, 0o600)
+	progressPath := filepath.Join(root, "progress.log")
+	stub := testsupport.WriteFile(t, filepath.Join(root, "coordlink"), []byte(`#!/bin/sh
+set -eu
+case "$1:$2" in
+task:current) cat "$RMA02_CURRENT_JSON" ;;
+progress:*) printf 'progress %s\n' "$*" >>"$RMA02_PROGRESS_LOG"; printf '{}\n' ;;
+*) exit 2 ;;
+esac
+`), 0o700)
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(filepath.Join(workspace, "fixture-test.sh"), mode, role, taskID, runID)
+	command.Dir = workspace
+	command.Env = append(os.Environ(), "HOME="+home, "RMA02_COORDLINK_BIN="+stub, "RMA02_CURRENT_JSON="+currentPath, "RMA02_PROGRESS_LOG="+progressPath)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("formal %s fixture writer: %v output=%s", mode, err, output)
+	}
+	raw, err := os.ReadFile(progressPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return ""
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
 }
 
 func TestRMA02FailureClassComesFromDurableFacts(t *testing.T) {
@@ -232,9 +285,18 @@ func TestRMA02FailureClassComesFromDurableFacts(t *testing.T) {
 		}},
 		{name: "barrier task spec failure", want: "task_spec", facts: rma02FailureFacts{Sources: rma02FailureSources(), Events: rma02BarrierEvents(false)}},
 		{name: "recovery product failure", want: "product", facts: rma02FailureFacts{Sources: completeBarrier, Events: rma02BarrierEvents(true)}},
+		{name: "source continue task spec failure", want: "task_spec", facts: rma02FailureFacts{Sources: completeBarrier, Events: append(rma02BarrierEvents(true), rma02ContinueEvents()...)}},
+		{name: "unrelated ack does not complete barrier", want: "task_spec", facts: rma02FailureFacts{Sources: completeBarrier, Events: append(rma02BarrierEvents(false), core.Event{RunID: "run-unrelated", Kind: "message.acknowledged"})}},
 		{name: "integration task spec failure", want: "task_spec", facts: rma02FailureFacts{
 			Sources: completeBarrier, Events: rma02BarrierEvents(true),
 			Integrations: []rma02FailureTaskFact{{Task: core.Task{ID: "integration-B", Kind: core.TaskIntegration}, Run: core.Run{ID: "run-integration-B", TaskID: "integration-B", State: core.RunExited}}},
+		}},
+		{name: "latest integration task spec beats prior capture", want: "task_spec", facts: rma02FailureFacts{
+			Sources: completeBarrier, Events: rma02BarrierEvents(true),
+			Integrations: []rma02FailureTaskFact{
+				{Task: core.Task{ID: "integration-B", Kind: core.TaskIntegration, Status: core.TaskCompleted}, Run: core.Run{ID: "run-integration-B", TaskID: "integration-B", State: core.RunExited, RequestedOutcome: "submit"}},
+				{Task: core.Task{ID: "integration-C", Kind: core.TaskIntegration, Status: core.TaskFailed}, Run: core.Run{ID: "run-integration-C", TaskID: "integration-C", State: core.RunExited}},
+			},
 		}},
 		{name: "integration capture product failure", want: "product", facts: rma02FailureFacts{
 			Sources: completeBarrier, Events: rma02BarrierEvents(true),
@@ -261,6 +323,101 @@ func TestRMA02FailureClassComesFromDurableFacts(t *testing.T) {
 	}
 }
 
+func TestRMA02FailureCollectorPaginatesAndWritesClassification(t *testing.T) {
+	root := t.TempDir()
+	writeRMA02CollectorFixture(t, root, "events-1", core.EventPage{Items: []core.Event{{RunID: "run-A", Kind: "task.progress"}}, NextCursor: "events-next"})
+	writeRMA02CollectorFixture(t, root, "events-2", core.EventPage{Items: []core.Event{{RunID: "run-B-new", Kind: "message.acknowledged"}}})
+	writeRMA02CollectorFixture(t, root, "tasks-1", core.TaskPage{Items: []core.TaskSummary{{ID: "task-A", Kind: core.TaskWork}}, NextCursor: "tasks-next"})
+	writeRMA02CollectorFixture(t, root, "tasks-2", core.TaskPage{Items: []core.TaskSummary{{ID: "integration-B", Kind: core.TaskIntegration}}})
+
+	sources := make([]rma02Source, 4)
+	for index, role := range []string{"A", "B", "C", "D"} {
+		taskID, runID := "task-"+role, "run-"+role
+		sources[index] = rma02Source{role: role, task: core.Task{ID: taskID}}
+		detail := core.TaskDetail{Task: core.Task{ID: taskID, Kind: core.TaskWork}}
+		if role != "B" {
+			detail.CurrentRun = &core.Run{ID: runID, TaskID: taskID, State: core.RunActive}
+		}
+		writeRMA02CollectorFixture(t, root, "task-"+taskID, detail)
+	}
+	writeRMA02CollectorFixture(t, root, "runs-task-B-1", core.RunPage{Items: []core.RunSummary{{ID: "run-B-old", TaskID: "task-B", State: core.RunExited}}, NextCursor: "runs-next"})
+	writeRMA02CollectorFixture(t, root, "runs-task-B-2", core.RunPage{Items: []core.RunSummary{{ID: "run-B-new", TaskID: "task-B", State: core.RunExited}}})
+	writeRMA02CollectorFixture(t, root, "run-run-B-old", core.Run{ID: "run-B-old", TaskID: "task-B", State: core.RunExited})
+	writeRMA02CollectorFixture(t, root, "run-run-B-new", core.Run{ID: "run-B-new", TaskID: "task-B", State: core.RunExited})
+	writeRMA02CollectorFixture(t, root, "task-integration-B", core.TaskDetail{Task: core.Task{ID: "integration-B", Kind: core.TaskIntegration, HeadRunID: "run-integration-B"}})
+	writeRMA02CollectorFixture(t, root, "run-run-integration-B", core.Run{ID: "run-integration-B", TaskID: "integration-B", State: core.RunExited})
+
+	stub := testsupport.WriteFile(t, filepath.Join(root, "coordplane"), []byte(`#!/bin/sh
+set -eu
+cursor=
+task=
+previous=
+for argument in "$@"; do
+  [ "$previous" != --cursor ] || cursor=$argument
+  [ "$previous" != --task ] || task=$argument
+  previous=$argument
+done
+case "$1:$2" in
+events:tail) [ "$cursor" = events-next ] && page=events-2 || page=events-1 ;;
+task:list) [ "$cursor" = tasks-next ] && page=tasks-2 || page=tasks-1 ;;
+task:show) page=task-$3 ;;
+run:list) [ "$cursor" = runs-next ] && page=runs-$task-2 || page=runs-$task-1 ;;
+run:show) page=run-$3 ;;
+*) exit 2 ;;
+esac
+cat "$RMA02_COLLECTOR_ROOT/$page.json"
+`), 0o700)
+	t.Setenv("RMA02_COLLECTOR_ROOT", root)
+	facts, err := collectRMA02FailureFacts(context.Background(), stub, "/stub/socket", "project-rma02", sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(facts.Events) != 2 {
+		t.Errorf("collector Event count = %d, want paginated 2", len(facts.Events))
+	}
+	if facts.Sources[1].Run.ID != "run-B-new" {
+		t.Errorf("collector selected Run %q, want latest terminal run-B-new", facts.Sources[1].Run.ID)
+	}
+	if len(facts.Integrations) != 1 || facts.Integrations[0].Task.ID != "integration-B" {
+		t.Errorf("collector integrations = %#v, want second-page integration-B", facts.Integrations)
+	}
+	path := filepath.Join(root, "failure-class")
+	t.Setenv("E2E_RMA02_FAILURE_CLASS_FILE", path)
+	raw, err := json.Marshal(facts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setRMA02FailureClass(t, string(raw))
+	if class, err := os.ReadFile(path); err != nil || strings.TrimSpace(string(class)) != "task_spec" {
+		t.Fatalf("collector classification file = %q err=%v, want task_spec", class, err)
+	}
+}
+
+func TestRMA02FailureCollectorFallsBackToProduct(t *testing.T) {
+	if os.Getenv("RMA02_FAILURE_FALLBACK_CHILD") == "1" {
+		registerRMA02FailureClassification(t, filepath.Join(t.TempDir(), "missing-coordplane"), "/missing/socket", "project-rma02", []rma02Source{{role: "A", task: core.Task{ID: "task-A"}}})
+		t.Fatal("force RMA-02 failure cleanup")
+	}
+	path := filepath.Join(t.TempDir(), "failure-class")
+	command := exec.Command(os.Args[0], "-test.run=^TestRMA02FailureCollectorFallsBackToProduct$")
+	command.Env = append(os.Environ(), "RMA02_FAILURE_FALLBACK_CHILD=1", "E2E_RMA02_FAILURE_CLASS_FILE="+path)
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("failure fallback child unexpectedly passed: %s", output)
+	}
+	if class, err := os.ReadFile(path); err != nil || strings.TrimSpace(string(class)) != "product" {
+		t.Fatalf("collector failure class = %q err=%v, want product", class, err)
+	}
+}
+
+func writeRMA02CollectorFixture(t *testing.T, root, name string, value any) {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testsupport.WriteFile(t, filepath.Join(root, name+".json"), raw, 0o600)
+}
+
 func rma02FailureSources() []rma02FailureTaskFact {
 	result := make([]rma02FailureTaskFact, 4)
 	for index, role := range []string{"A", "B", "C", "D"} {
@@ -279,6 +436,14 @@ func rma02BarrierEvents(complete bool) []core.Event {
 	}
 	if complete {
 		events = append(events, core.Event{RunID: "run-B", Kind: "message.acknowledged"})
+	}
+	return events
+}
+
+func rma02ContinueEvents() []core.Event {
+	events := make([]core.Event, 0, 4)
+	for _, role := range []string{"A", "B", "C", "D"} {
+		events = append(events, core.Event{Kind: "message.created", ActorKind: "boss", RequestID: "rma02-continue-" + role})
 	}
 	return events
 }
