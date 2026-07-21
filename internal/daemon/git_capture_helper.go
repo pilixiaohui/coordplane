@@ -18,7 +18,6 @@ import (
 	"coordplane/internal/config"
 	"coordplane/internal/gitcapture"
 	"coordplane/internal/gitrepo"
-	"coordplane/internal/perfobs"
 	containerruntime "coordplane/internal/runtime"
 )
 
@@ -357,11 +356,6 @@ func (h *dockerCaptureHelper) runContainer(ctx context.Context, spec containerru
 	if !live.Running && live.Status != containerruntime.StatusExited {
 		return h.cleanupContainerError(errors.New("capture helper: started container is not running"), ref)
 	}
-	role := "git_capture"
-	if strings.HasPrefix(ref.ContainerName, "coordplane-git-inspect-") {
-		role = "git_inspect"
-	}
-	perfobs.RuntimeLimit(perfobs.Fields{ProjectID: ref.ProjectID, TaskID: ref.TaskID, RunID: ref.RunID}, role, live.MemoryBytes, live.NanoCPUs, live.PIDsLimit)
 	exit, waitErr := h.executor.Wait(runCtx, ref)
 	logs := h.containerLogs(runCtx, ref)
 	removeErr := h.removeContainer(context.Background(), ref)

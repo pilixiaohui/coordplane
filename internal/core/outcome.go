@@ -3,8 +3,6 @@ package core
 import (
 	"context"
 	"strings"
-
-	"coordplane/internal/perfobs"
 )
 
 func (s *Service) RequestOutcome(ctx context.Context, input OutcomeInput) (OutcomeResult, error) {
@@ -133,16 +131,6 @@ func (s *Service) RequestOutcome(ctx context.Context, input OutcomeInput) (Outco
 		result = OutcomeResult{Task: task, Run: run, Acknowledged: acknowledged}
 		return nil
 	})
-	if err == nil {
-		fields := perfobs.Fields{
-			RequestID: requestID, OperationID: result.Task.PendingActionID,
-			ProjectID: result.Task.ProjectID, TaskID: result.Task.ID, RunID: result.Run.ID,
-		}
-		perfobs.Point("core.outcome.accepted_commit", fields, "success")
-		if result.Task.PendingActionID != "" {
-			perfobs.StartStage("git.capture.freeze", result.Run.ID, fields)
-		}
-	}
 	return result, err
 }
 

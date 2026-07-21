@@ -1,9 +1,5 @@
 # pattern|atomic bucket|owner module
 internal/architecture/*|handwritten_tests|static_fsm
-internal/perfobs/hooks_perf.go|handwritten_tests|perf
-internal/perfobs/hooks_perf_test.go|handwritten_tests|perf
-internal/coordlinkcli/perf_observer.go|handwritten_tests|perf
-internal/perfobs/*|handwritten_production|daemon_config_shared
 internal/buildinfo/*_test.go|handwritten_tests|static_fsm
 internal/core/fsm*_test.go|handwritten_tests|static_fsm
 internal/core/bounds_contract_test.go|handwritten_tests|static_fsm
@@ -15,7 +11,6 @@ internal/daemon/git_capture_helper*_test.go|handwritten_tests|git_component
 internal/runtime/*_test.go|handwritten_tests|docker_runtime
 internal/daemon/runtime*_test.go|handwritten_tests|docker_runtime
 internal/daemon/components_test.go|handwritten_tests|docker_runtime
-tests/e2e/perf*_test.go|handwritten_tests|perf
 tests/e2e/*|handwritten_tests|e2e
 tests/testsupport/*|handwritten_tests|e2e
 tests/contract/fixtures/*|excluded|test_fixture
@@ -52,4 +47,3 @@ README.md|excluded|documentation
 need/*|excluded|documentation
 go.sum|excluded|dependency_lock
 loc-budget*.json|excluded|generated_report
-perf-v1*.json|excluded|generated_report

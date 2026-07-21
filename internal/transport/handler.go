@@ -11,7 +11,6 @@ import (
 	"strings"
 
 	"coordplane/internal/core"
-	"coordplane/internal/perfobs"
 )
 
 const maxRequestBytes = 1 << 20
@@ -301,13 +300,7 @@ func newRunHandler(operations RunOperations) http.Handler {
 	})))
 	mux.HandleFunc("/v1/progress", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.ProgressInput) (any, error) {
 		input.Token = ctx.Token
-		fields := perfobs.Fields{RequestID: input.RequestID}
-		perfobs.Received("api.progress.received", fields, "received")
-		result, err := operations.Progress(ctx.Context, input)
-		if err != nil {
-			perfobs.FailedReceived("api.progress.received", fields)
-		}
-		return result, err
+		return operations.Progress(ctx.Context, input)
 	})))
 	mux.HandleFunc("/v1/message", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.SendMessageInput) (any, error) {
 		input.Token = ctx.Token

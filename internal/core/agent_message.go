@@ -3,8 +3,6 @@ package core
 import (
 	"context"
 	"strings"
-
-	"coordplane/internal/perfobs"
 )
 
 func (s *Service) SendAgentMessage(ctx context.Context, input SendMessageInput) (Message, error) {
@@ -145,16 +143,7 @@ func (s *Service) SendAgentMessage(ctx context.Context, input SendMessageInput) 
 		}
 		return dedupe.record(tx, message.ID, "", now)
 	})
-	observeMessageCommit(message, requestID, err)
 	return message, err
-}
-
-func observeMessageCommit(message Message, requestID string, err error) {
-	if err == nil {
-		perfobs.Point("core.message.created_commit", perfobs.Fields{
-			RequestID: requestID, ProjectID: message.ProjectID, TaskID: message.TaskID, MessageID: message.ID,
-		}, "success")
-	}
 }
 
 func runCanReadTask(run Run, current, target Task) bool {

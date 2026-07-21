@@ -16,7 +16,6 @@ import (
 	"coordplane/internal/config"
 	"coordplane/internal/core"
 	"coordplane/internal/gitrepo"
-	"coordplane/internal/perfobs"
 	containerruntime "coordplane/internal/runtime"
 	"coordplane/internal/transport"
 )
@@ -336,7 +335,6 @@ func (c *runtimeController) launchOwned(ctx context.Context, claim core.Claim, o
 	}
 	for _, step := range runtimePrepareSteps {
 		if err := step.run(state); err != nil {
-			perfobs.EndStage("runtime.container.create_start", state.run.ID, "error")
 			return fail(fmt.Errorf("%s: %w", step.name, err), step.failureCode)
 		}
 		if state.complete {
@@ -422,13 +420,8 @@ func createRuntimeContainer(state *runtimePrepareState) error {
 	if err != nil {
 		return err
 	}
-	perfobs.StartStage("runtime.container.create_start", state.run.ID, perfobs.Fields{
-		OperationID: state.run.LaunchOperationID, ProjectID: state.run.ProjectID,
-		TaskID: state.run.TaskID, RunID: state.run.ID,
-	})
 	state.ref, err = state.controller.executor.Create(state.ctx, spec)
 	if err != nil {
-		perfobs.EndStage("runtime.container.create_start", state.run.ID, "error")
 		return err
 	}
 	state.run, err = state.controller.service.RecordContainerCreated(
@@ -436,7 +429,6 @@ func createRuntimeContainer(state *runtimePrepareState) error {
 		runtimeFactInput(state.run, state.ref, "created"),
 	)
 	if err != nil {
-		perfobs.EndStage("runtime.container.create_start", state.run.ID, "error")
 		return err
 	}
 	return afterRuntimeContractPhase(state.ctx, runtimePhaseContainerCreated, state.run)
@@ -453,18 +445,15 @@ func startRuntimeCLI(state *runtimePrepareState) error {
 		runtimeFactInput(state.run, state.ref, "start-issued"),
 	)
 	if err != nil {
-		perfobs.EndStage("runtime.container.create_start", state.run.ID, "error")
 		return err
 	}
 	state.run = started
 	startedRef, err := state.controller.executor.Start(state.ctx, state.ref)
 	if errors.Is(err, containerruntime.ErrExited) {
 		state.quickExit = true
-		perfobs.EndStage("runtime.container.create_start", state.run.ID, "exited")
 		return nil
 	}
 	if err != nil {
-		perfobs.EndStage("runtime.container.create_start", state.run.ID, "error")
 		return err
 	}
 	state.ref = startedRef
@@ -475,7 +464,6 @@ func verifyRuntimeLive(state *runtimePrepareState) error {
 	monitor := state.controller.newMonitor(state.run, state.ref, state.entry, state.control)
 	if err := state.controller.registerMonitor(monitor); err != nil {
 		_ = monitor.cancelAndCollectLogs(time.Second)
-		perfobs.EndStage("runtime.container.create_start", state.run.ID, "error")
 		return err
 	}
 	finish := func(result waitResult) {
@@ -491,15 +479,12 @@ func verifyRuntimeLive(state *runtimePrepareState) error {
 	if err != nil {
 		state.controller.unregisterMonitor(monitor)
 		_ = monitor.cancelAndCollectLogs(time.Second)
-		perfobs.EndStage("runtime.container.create_start", state.run.ID, "error")
 		return err
 	}
 	if !live.Running {
 		finish(<-monitor.wait)
 		return nil
 	}
-	perfobs.RuntimeLimit(perfobs.Fields{ProjectID: state.run.ProjectID, TaskID: state.run.TaskID, RunID: state.run.ID}, "agent", live.MemoryBytes, live.NanoCPUs, live.PIDsLimit)
-	perfobs.EndStage("runtime.container.create_start", state.run.ID, "success")
 	select {
 	case result := <-monitor.wait:
 		finish(result)

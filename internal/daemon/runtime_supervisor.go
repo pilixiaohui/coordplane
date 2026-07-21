@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"coordplane/internal/core"
-	"coordplane/internal/perfobs"
 	containerruntime "coordplane/internal/runtime"
 )
 
@@ -325,17 +324,7 @@ func (c *runtimeController) cleanupRun(
 	ref containerruntime.RuntimeRef,
 	control *runControl,
 	monitor *runMonitor,
-) (resultErr error) {
-	perfobs.StartStage("runtime.cleanup", run.ID, perfobs.Fields{
-		OperationID: run.CleanupOperationID, ProjectID: run.ProjectID, TaskID: run.TaskID, RunID: run.ID,
-	})
-	defer func() {
-		result := "success"
-		if resultErr != nil {
-			result = "error"
-		}
-		perfobs.EndStage("runtime.cleanup", run.ID, result)
-	}()
+) error {
 	if run.CleanupState == core.CleanupRemoved || run.CleanupState == core.CleanupNotNeeded {
 		return nil
 	}

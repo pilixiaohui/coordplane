@@ -9,8 +9,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-
-	"coordplane/internal/perfobs"
 )
 
 // CaptureSpec contains only durable task/run inputs and deterministic daemon
@@ -20,7 +18,6 @@ type CaptureSpec struct {
 	RunID           string
 	ExpectedHead    string
 	ControlRepoPath string
-	OperationID     string
 }
 
 type CaptureFact struct {
@@ -92,9 +89,6 @@ const (
 
 type AdvanceSpec struct {
 	ProjectID       string
-	TaskID          string
-	RunID           string
-	OperationID     string
 	ControlRepoPath string
 	CanonicalRef    string
 	TaskRef         string
@@ -205,17 +199,6 @@ func (m *WorkspaceManager) Capture(ctx context.Context, spec CaptureSpec) (fact 
 	if m.capture == nil {
 		return CaptureFact{}, errors.New("trusted capture helper is not configured")
 	}
-	fields := perfobs.Fields{
-		OperationID: spec.OperationID, ProjectID: spec.Workspace.ProjectID,
-		TaskID: spec.Workspace.TaskID, RunID: spec.RunID,
-	}
-	defer func() {
-		if resultErr == nil {
-			return
-		}
-		perfobs.EndOpenStages(spec.RunID, "error", "git.capture.handoff", "git.capture.lock_wait", "git.capture.import", "git.capture.fsck", "git.capture.ref")
-	}()
-	perfobs.EndOpenStages(spec.RunID, "success", "git.capture.freeze")
 	if err := runCapturePhaseHook(ctx, capturePhaseIntentChecked, spec); err != nil {
 		return CaptureFact{}, err
 	}
@@ -254,21 +237,16 @@ func (m *WorkspaceManager) Capture(ctx context.Context, spec CaptureSpec) (fact 
 	if spec.Workspace.Source != nil {
 		helperRequest.SourceSHA = spec.Workspace.Source.HeadSHA
 	}
-	perfobs.StartStage("git.capture.handoff", spec.RunID, fields)
 	handoff, err := m.capture.Capture(ctx, helperRequest)
 	if err != nil {
-		perfobs.EndStage("git.capture.handoff", spec.RunID, "error")
 		return CaptureFact{}, err
 	}
 	if handoff.HeadSHA != spec.ExpectedHead || handoff.ObjectCount <= 0 || handoff.BundleBytes <= 0 {
-		perfobs.EndStage("git.capture.handoff", spec.RunID, "error")
 		return CaptureFact{}, &InvariantError{message: "capture helper facts do not match durable intent"}
 	}
 	if err := runCapturePhaseHook(ctx, capturePhaseHandoffReady, spec); err != nil {
-		perfobs.EndStage("git.capture.handoff", spec.RunID, "error")
 		return CaptureFact{}, err
 	}
-	perfobs.EndStage("git.capture.handoff", spec.RunID, "success")
 	info, err := os.Lstat(handoff.ReadyBundle)
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return CaptureFact{}, errors.New("capture handoff is not a direct regular file")
@@ -277,15 +255,12 @@ func (m *WorkspaceManager) Capture(ctx context.Context, spec CaptureSpec) (fact 
 		return CaptureFact{}, &InvariantError{message: "capture bundle size does not match helper fact"}
 	}
 
-	perfobs.StartStage("git.capture.lock_wait", spec.RunID, fields)
 	unlock, err = m.initializer.maintenance.lock(ctx, spec.Workspace.ProjectID)
 	if err != nil {
-		perfobs.EndStage("git.capture.lock_wait", spec.RunID, "error")
 		return CaptureFact{}, err
 	}
-	perfobs.EndStage("git.capture.lock_wait", spec.RunID, "success")
 	defer unlock()
-	return m.importCapture(ctx, spec, handoff, taskRef, fields)
+	return m.importCapture(ctx, spec, handoff, taskRef)
 }
 
 func (m *WorkspaceManager) importCapture(
@@ -293,7 +268,6 @@ func (m *WorkspaceManager) importCapture(
 	spec CaptureSpec,
 	handoff CaptureHelperFact,
 	taskRef string,
-	fields perfobs.Fields,
 ) (CaptureFact, error) {
 	actualRef, exists, err := m.initializer.resolveRef(ctx, spec.ControlRepoPath, taskRef)
 	if err != nil {
@@ -311,9 +285,7 @@ func (m *WorkspaceManager) importCapture(
 		}
 		return CaptureFact{HeadSHA: actualRef, TaskRef: taskRef}, nil
 	}
-	perfobs.StartStage("git.capture.import", spec.RunID, fields)
 	if _, err := m.git(ctx, "verify capture bundle", "--git-dir="+spec.ControlRepoPath, "bundle", "verify", handoff.ReadyBundle); err != nil {
-		perfobs.EndStage("git.capture.import", spec.RunID, "error")
 		return CaptureFact{}, &InvariantError{message: "capture bundle verification failed", cause: err}
 	}
 	if err := runCapturePhaseHook(ctx, capturePhaseBundleVerified, spec); err != nil {
@@ -339,22 +311,17 @@ func (m *WorkspaceManager) importCapture(
 		return CaptureFact{}, &InvariantError{message: "imported capture is not a commit", cause: err}
 	}
 	if err := runCapturePhaseHook(ctx, capturePhaseObjectsImported, spec); err != nil {
-		perfobs.EndStage("git.capture.import", spec.RunID, "error")
 		return CaptureFact{}, err
 	}
-	perfobs.EndStage("git.capture.import", spec.RunID, "success")
-	perfobs.StartStage("git.capture.fsck", spec.RunID, fields)
 	if err := m.validateCapturedAncestry(ctx, spec.ControlRepoPath, spec.Workspace, imported); err != nil {
 		return CaptureFact{}, err
 	}
 	if _, err := m.initializer.git(ctx, "--git-dir="+spec.ControlRepoPath, "fsck", "--connectivity-only", "--strict"); err != nil {
 		return CaptureFact{}, &InvariantError{message: "control repository fsck failed", cause: err}
 	}
-	perfobs.EndStage("git.capture.fsck", spec.RunID, "success")
 	if err := runCapturePhaseHook(ctx, capturePhaseIntegrityChecked, spec); err != nil {
 		return CaptureFact{}, err
 	}
-	perfobs.StartStage("git.capture.ref", spec.RunID, fields)
 	if _, err := m.initializer.git(ctx, "--git-dir="+spec.ControlRepoPath, "update-ref", taskRef, imported, zeroObjectID(imported)); err != nil {
 		current, exists, resolveErr := m.initializer.resolveRef(ctx, spec.ControlRepoPath, taskRef)
 		if resolveErr != nil || !exists || current != imported {
@@ -366,10 +333,8 @@ func (m *WorkspaceManager) importCapture(
 	}
 	current, exists, err := m.initializer.resolveRef(ctx, spec.ControlRepoPath, taskRef)
 	if err != nil || !exists || current != imported {
-		perfobs.EndStage("git.capture.ref", spec.RunID, "error")
 		return CaptureFact{}, &InvariantError{message: "task ref read-back mismatch", cause: err}
 	}
-	perfobs.EndStage("git.capture.ref", spec.RunID, "success")
 	return CaptureFact{HeadSHA: current, TaskRef: taskRef}, nil
 }
 
@@ -474,16 +439,10 @@ func (i *Initializer) Advance(ctx context.Context, spec AdvanceSpec) (AdvanceFac
 		return AdvanceFact{}, errors.New("gitrepo: invalid task ref")
 	}
 
-	advanceFields := perfobs.Fields{
-		OperationID: spec.OperationID, ProjectID: spec.ProjectID, TaskID: spec.TaskID, RunID: spec.RunID,
-	}
-	perfobs.StartStage("git.advance.lock_wait", spec.TaskRef, advanceFields)
 	unlock, err := i.maintenance.lock(ctx, spec.ProjectID)
 	if err != nil {
-		perfobs.EndStage("git.advance.lock_wait", spec.TaskRef, "error")
 		return AdvanceFact{}, err
 	}
-	perfobs.EndStage("git.advance.lock_wait", spec.TaskRef, "success")
 	defer unlock()
 
 	target, exists, err := i.resolveRef(ctx, spec.ControlRepoPath, spec.TaskRef)
@@ -494,42 +453,31 @@ func (i *Initializer) Advance(ctx context.Context, spec AdvanceSpec) (AdvanceFac
 		return AdvanceFact{}, &InvariantError{message: "task ref does not match advance target"}
 	}
 	for attempt := 0; attempt < 3; attempt++ {
-		perfobs.StartStage("git.advance.ancestry", spec.TaskRef, advanceFields)
 		actual, exists, err := i.resolveRef(ctx, spec.ControlRepoPath, spec.CanonicalRef)
 		if err != nil {
-			perfobs.EndStage("git.advance.ancestry", spec.TaskRef, "error")
 			return AdvanceFact{}, err
 		}
 		if !exists {
-			perfobs.EndStage("git.advance.ancestry", spec.TaskRef, "error")
 			return AdvanceFact{}, &InvariantError{message: "canonical ref is missing"}
 		}
 		if actual == target {
-			perfobs.EndStage("git.advance.ancestry", spec.TaskRef, "included")
 			return AdvanceFact{Outcome: AdvanceIncluded, ActualSHA: actual}, nil
 		}
 		included, err := i.isAncestor(ctx, spec.ControlRepoPath, true, target, actual)
 		if err != nil {
-			perfobs.EndStage("git.advance.ancestry", spec.TaskRef, "error")
 			return AdvanceFact{}, &InvariantError{message: "inspect target ancestry", cause: err}
 		}
 		if included {
-			perfobs.EndStage("git.advance.ancestry", spec.TaskRef, "included")
 			return AdvanceFact{Outcome: AdvanceIncluded, ActualSHA: actual}, nil
 		}
 		fastForward, err := i.isAncestor(ctx, spec.ControlRepoPath, true, actual, target)
 		if err != nil {
-			perfobs.EndStage("git.advance.ancestry", spec.TaskRef, "error")
 			return AdvanceFact{}, &InvariantError{message: "inspect canonical ancestry", cause: err}
 		}
 		if !fastForward {
-			perfobs.EndStage("git.advance.ancestry", spec.TaskRef, "stale")
 			return AdvanceFact{Outcome: AdvanceStale, ActualSHA: actual}, nil
 		}
-		perfobs.EndStage("git.advance.ancestry", spec.TaskRef, "success")
-		perfobs.StartStage("git.advance.update_ref", spec.TaskRef, advanceFields)
 		if _, err := i.git(ctx, "--git-dir="+spec.ControlRepoPath, "update-ref", spec.CanonicalRef, target, actual); err != nil {
-			perfobs.EndStage("git.advance.update_ref", spec.TaskRef, "error")
 			if ctx.Err() != nil {
 				return AdvanceFact{}, ctx.Err()
 			}
@@ -537,17 +485,11 @@ func (i *Initializer) Advance(ctx context.Context, spec AdvanceSpec) (AdvanceFac
 		}
 		readBack, exists, err := i.resolveRef(ctx, spec.ControlRepoPath, spec.CanonicalRef)
 		if err != nil || !exists {
-			perfobs.EndStage("git.advance.update_ref", spec.TaskRef, "error")
 			return AdvanceFact{}, &InvariantError{message: "canonical read-back failed", cause: err}
 		}
 		if readBack == target {
-			perfobs.EndStage("git.advance.update_ref", spec.TaskRef, "success")
-			if err := perfobs.Fault(ctx, "git.advance.after_update_ref"); err != nil {
-				return AdvanceFact{}, err
-			}
 			return AdvanceFact{Outcome: AdvanceUpdated, ActualSHA: readBack}, nil
 		}
-		perfobs.EndStage("git.advance.update_ref", spec.TaskRef, "stale")
 	}
 	actual, exists, err := i.resolveRef(ctx, spec.ControlRepoPath, spec.CanonicalRef)
 	if err != nil || !exists {

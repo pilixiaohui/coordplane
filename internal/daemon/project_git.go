@@ -72,7 +72,7 @@ func (a projectGitAdapter) Capture(ctx context.Context, intent core.GitCaptureIn
 	}
 	fact, err := a.workspaces.Capture(ctx, gitrepo.CaptureSpec{
 		Workspace: workspace, RunID: intent.RunID, ExpectedHead: intent.ExpectedHead,
-		ControlRepoPath: intent.ControlRepo, OperationID: intent.OperationID,
+		ControlRepoPath: intent.ControlRepo,
 	})
 	return core.GitCaptureFact{HeadSHA: fact.HeadSHA, TaskRef: fact.TaskRef}, err
 }
@@ -86,8 +86,7 @@ func (a projectGitAdapter) CleanupCapture(ctx context.Context, intent core.GitCa
 
 func (a projectGitAdapter) Advance(ctx context.Context, intent core.GitAdvanceIntent) (core.GitAdvanceFact, error) {
 	fact, err := a.initializer.Advance(ctx, gitrepo.AdvanceSpec{
-		ProjectID: intent.ProjectID, TaskID: intent.TaskID, RunID: intent.RunID,
-		OperationID: intent.OperationID, ControlRepoPath: intent.ControlRepo,
+		ProjectID: intent.ProjectID, ControlRepoPath: intent.ControlRepo,
 		CanonicalRef: intent.CanonicalRef, TaskRef: intent.TaskRef,
 		ExpectedOldSHA: intent.ExpectedOldSHA, TargetSHA: intent.TargetSHA,
 	})

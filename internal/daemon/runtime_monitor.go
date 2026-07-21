@@ -14,7 +14,6 @@ import (
 
 	"coordplane/internal/adapter"
 	"coordplane/internal/core"
-	"coordplane/internal/perfobs"
 	containerruntime "coordplane/internal/runtime"
 )
 
@@ -86,9 +85,6 @@ func (c *runtimeController) streamLogs(ctx context.Context, run core.Run, ref co
 	}
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		perfobs.ClientLine(line, perfobs.Fields{
-			ProjectID: run.ProjectID, TaskID: run.TaskID, RunID: run.ID, OperationID: run.LaunchOperationID,
-		})
 		event, parseErr := entry.ParseEvent(line)
 		if parseErr != nil && bytes.HasPrefix(bytes.TrimSpace(line), []byte("{")) {
 			writeLine(rejectedFrameLogLine(monitor.redact, line, parseErr), true)

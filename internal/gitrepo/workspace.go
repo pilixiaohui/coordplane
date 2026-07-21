@@ -10,8 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"coordplane/internal/perfobs"
 )
 
 const workspaceMarkerVersion = 1
@@ -127,22 +125,15 @@ func (m *WorkspaceManager) Materialize(ctx context.Context, spec WorkspaceSpec) 
 	if err := m.validateSpec(ctx, spec); err != nil {
 		return WorkspaceFact{}, m.publicError("materialize", err)
 	}
-	fields := perfobs.Fields{ProjectID: spec.ProjectID, TaskID: spec.TaskID}
-	perfobs.StartStage("git.clone.lock_wait", spec.TaskID, fields)
 	unlock, err := m.initializer.maintenance.lock(ctx, spec.ProjectID)
 	if err != nil {
-		perfobs.EndStage("git.clone.lock_wait", spec.TaskID, "error")
 		return WorkspaceFact{}, m.publicError("materialize", err)
 	}
-	perfobs.EndStage("git.clone.lock_wait", spec.TaskID, "success")
 	defer unlock()
-	perfobs.StartStage("git.clone.prepare", spec.TaskID, fields)
 	fact, err := m.materializeLocked(ctx, spec)
 	if err != nil {
-		perfobs.EndStage("git.clone.prepare", spec.TaskID, "error")
 		return WorkspaceFact{}, m.publicError("materialize", err)
 	}
-	perfobs.EndStage("git.clone.prepare", spec.TaskID, "success")
 	return fact, nil
 }
 

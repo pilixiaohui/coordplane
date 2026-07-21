@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-
-	"coordplane/internal/perfobs"
 )
 
 var contractCaptureFinalizedHook func(context.Context, GitCaptureIntent) error
@@ -167,9 +165,6 @@ func (s *Service) reconcileCapture(ctx context.Context, executor TaskGit, snapsh
 	if err := s.finalizeCapture(ctx, task, run, fact, actualCanonical); err != nil {
 		return err
 	}
-	perfobs.Point("git.capture.submitted_commit", perfobs.Fields{
-		OperationID: task.PendingActionID, ProjectID: task.ProjectID, TaskID: task.ID, RunID: run.ID,
-	}, "success")
 	if contractCaptureFinalizedHook != nil {
 		if err := contractCaptureFinalizedHook(ctx, intent); err != nil {
 			return err
