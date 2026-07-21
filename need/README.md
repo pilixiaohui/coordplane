@@ -183,8 +183,8 @@ Manager、Developer、Reviewer、Integrator 只是 Agent 指令或显示标签�
 
 - 第一版以一个production one-shot CLI adapter为基线；scripted adapter只属于测试。第二个provider adapter必须单独增加预算，不能挤占Core、Runtime或Git恢复逻辑。
 - Owner已批准在产品范围和物理行统计口径均不变的前提下透明重基线：Budgeted maintained production SLOC目标/软阈值/发布阈值为`18,500 / 19,500 / 20,500`；tests为`20,000 / 21,500 / 22,500`；build/test infrastructure仍为`250 / 400 / 600`；三类合计为`38,750 / 41,400 / 43,600`。总量合格不能覆盖production超限。
-- 上述envelope替换旧`10,500 / 12,550 / 14,650`、`12,300 / 15,450 / 19,000`和总计`23,050 / 28,400 / 34,250`，只改变预算，不删除或降级任何Core、Runtime、Git、CLI、PF-01或真实边界合同。
-- PF-01 observer、fault matrix和release profile全部落地后，必须冻结一个clean revision，并在该同一revision生成完整PF-01 release报告和LOC JSON；owner依据两份报告最终批准该revision及首个固定baseline。任一源码、测试、脚本、manifest或需求变更都会使先前批准失效并要求重跑。
+- 上述envelope替换旧`10,500 / 12,550 / 14,650`、`12,300 / 15,450 / 19,000`和总计`23,050 / 28,400 / 34,250`，只改变预算，不删除或降级任何Core、Runtime、Git、CLI或真实多Agent边界合同。
+- 第一版候选必须在clean revision生成LOC JSON，并完成`acceptance.md`定义的真实双Agent和四Agent可靠性场景。固定硬件性能baseline、reference manifest和长时间soak不属于第一版完成条件；真实live证据能否复用按受影响文件的精确diff判断，不能因纯文档变更重复消耗provider调用。
 - LOC低于预算不代表完成；所有状态、隔离、recovery、Git CAS和真实Docker/Git验收仍必须通过。
 - 不允许通过压缩语句、超长函数、把逻辑搬进generated code/脚本/test helper或保留第二套隐藏路径规避预算。
 
@@ -266,6 +266,6 @@ runtime:
 - 消息在 Run/Daemon 失败和 resume 后不丢失。
 - 两个 Agent 的提交都被 task ref 保存，并通过 Git CAS/integration Task 收敛到 canonical ref。
 - Daemon 重启不会产生重复 active Run、伪完成、丢提交或错误覆盖 canonical ref。
-- `PF-01`四Agent reference性能场景通过，Daemon控制面、Docker/Git阶段、恢复和资源使用满足冻结阈值；其完整release报告与LOC JSON来自同一clean implementation revision。
-- Budgeted maintained production/tests/infra/total分别不超过`20,500 / 22,500 / 600 / 43,600`，且owner已基于同一revision的PF-01和LOC报告最终批准该revision；没有为省LOC弱化测试或关键恢复合同。
+- 两个真实CLI Agent完成端到端闭环；另有一个fresh四Agent真实场景证明4个source Run并发、Message、task ref、integration和canonical CAS能够在一次Daemon重启后继续收敛。
+- Budgeted maintained production/tests/infra/total分别不超过`20,500 / 22,500 / 600 / 43,600`，质量blocker清零；没有为省LOC弱化测试或关键恢复合同。
 - `acceptance.md` 的静态约束、合同测试、真实 Docker/Git gate 和真实 CLI gate全部通过。

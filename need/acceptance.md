@@ -547,163 +547,100 @@ Boundary：真实Git ref/reachability + workspace filesystem。
 
 真实CLI gate需要provider凭据或网络时可以在普通CI标记SKIP，但任何SKIP结果只能声明“自动测试通过，live未验收”，不能声明产品完成。
 
-## 11. 第一版性能场景
+## 11. 第一版真实多 Agent 可靠性验收
 
-### 11.1 PF-01：四 Agent 并发开发、收敛和恢复
+### 11.1 目标和边界
 
-第一版只设置一个正式性能场景`PF-01`。它测量CoordPlane控制面、file-SQLite、Docker和Git路径，不把provider网络排队或模型生成时间算成CoordPlane性能。
+第一版验收关注CoordPlane在真实使用方式下能否让多个CLI Agent可靠协作并收敛，不建立跨机器性能SLA，也不要求专用benchmark runner或人工冻结性能baseline。
 
-Boundary：正式`coordplane`/`coordlink`、真实Daemon、file-backed SQLite、真实Git、真实Docker和确定性scripted one-shot CLI。除模型provider外不得mock被测边界。Scripted CLI必须在真实容器中使用正式socket、token、private clone和原生Git。
+正式live边界必须包含production adapter、真实provider/CLI、真实Daemon、file-backed SQLite、真实Docker、真实private clone和原生Git。Scripted adapter只用于第9节确定性回归，不能替代真实Agent证据；真实Agent的模型等待时间是端到端体验的一部分，必须报告但不设置固定耗时门槛。
 
-PF-01只补充性能和soak证据，不替代第3至10节的最低真实边界测试。场景内任何重复Run、消息丢失、错误task ref/CAS、伪完成、Git损坏或cleanup不收敛都直接FAIL，耗时再短也不能抵消。
+第一版可靠性由“少量真实live场景 + 完整确定性故障矩阵”共同证明。不得用大量重复provider调用代替低层回归，也不得因为某台机器较慢就把正确结果判为产品失败。
 
-### 11.2 固定环境和fixture
+### 11.2 环境和结果分类
 
-正式阈值只适用于项目登记的原生Linux reference runner：
+真实live场景可以在项目日常开发使用的原生Linux主机执行，不设置8 CPU、16 GiB、精确磁盘容量、特定Docker storage driver或独占Docker daemon要求。执行前必须记录但不据此自动拒绝：
 
-- 测试job使用cgroup/cpuset固定为8 logical CPU、16 GiB RAM和10 GiB磁盘额度；Daemon及其Git helper合计最多4 CPU/512 MiB，4个Agent container各为`1 CPU / 512 MiB / 256 PIDs`。
-- 数据目录、Docker `overlay2`和临时目录位于同一本地ext4/xfs SSD/NVMe；不得使用Docker Desktop、网络盘或远程Docker daemon。
-- 没有其他重负载job/container；报告记录runner ID、CPU型号、内存、filesystem/mount、kernel、Docker storage driver以及Docker/Git/Go版本。
-- Agent image预先build/pull并固定digest；冷启动Daemon和image pull单列报告，不进入warm-cache发布分布。
-- Agent不注入provider凭据，使用`network=none`；coordlink只走per-Run Unix socket，fixture测试不访问网络。
-- Perf配置把`retention.completed_workspace`和`retention.run_log`设为`0`。每波只调用正式`gc preview`和`gc run --confirm`；所有clean、ref、pending action和ownership fence仍必须满足，不能由benchmark直接删除产品目录。
+- implementation revision、worktree clean状态和Agent image digest；
+- logical CPU、可用内存、可用磁盘、filesystem、kernel以及Docker/Git/Go/CLI版本；
+- 当前运行容器和其他明显负载；
+- production adapter名称以及安全的provider/model标识，不记录凭据、请求正文或私有reasoning。
 
-其他主机只能输出观察结果，不能声明reference性能PASS。环境额度、fixture/hash、image digest或storage driver不符时结果为`INVALID_ENVIRONMENT`；它不是PASS。
+环境只需满足本次场景可启动：Docker daemon可用、固定image可用、provider凭据和网络可用、数据目录可写且剩余空间足以完成fixture。结果固定为：
 
-Git fixture由固定seed程序化生成：
+- `PASS_REAL_MULTI_AGENT_LOCAL`：第11.5节全部不变量在已记录环境中成立；只声明该环境上的第一版可靠性，不外推跨机器吞吐或延迟。
+- `FAIL_REAL_MULTI_AGENT`：真实产品边界发生重复Run、消息丢失、伪完成、提交丢失、错误CAS、恢复不收敛、隔离/secret泄漏或其他不变量失败。
+- `INVALID_ENVIRONMENT`：Docker、provider、凭据、网络、磁盘或测试fixture在产品场景开始前不可用，无法形成产品结论。
 
-- 2,048个确定性文件、32个线性commit，checkout约16-24 MiB、pack约24-40 MiB。
-- 固定author/time、生成器hash、manifest和初始`C0`；体积或hash不匹配时场景`INVALID_ENVIRONMENT`。
-- 每波四个work Task共享同一actual canonical base，分别只修改`bench/a.txt`至`bench/d.txt`，形成真实分叉但不制造文本冲突。
-- 项目只使用标准库并运行固定、离线测试；测试退出0是scripted Agent提交前置，不是Daemon智能验收。
+不得因CPU数量、总内存、磁盘总容量、`overlay2`/`overlayfs`名称或存在无关轻负载容器单独返回`INVALID_ENVIRONMENT`。资源不足只有在实际阻止Run启动或导致可归因的系统失败时才属于环境阻塞。
 
-### 11.3 样本拓扑和正常负载
+### 11.3 必须执行的真实场景
 
-配置Agent A/B/C/D、Project默认integration Agent=A和`max_parallel_runs=4`。Scripted work模式用正式coordlink报告READY并等待GO；integration模式只使用Task固定source ref和原生Git。每个Run在收到GO前保持live，socket短暂不可用时以`50-500 ms`退避重连最多30秒，恢复前不请求outcome。
+`RMA-01`复用第10.2节两个真实Agent并发闭环，证明production adapter、Message、task ref、stale integration、canonical CAS和cleanup可以端到端工作。
 
-Release样本由4个相互独立的fresh data directory/Daemon批次组成；每批先做1个不计分warm-up，再做5个相关计分波次，共20个计分波次。第一批随后额外运行15波，连同其5个计分波次形成同一Daemon连续20波soak；额外15波不进入release延迟分位数。每波内容唯一，不能复用旧Task、workspace或commit。
+`RMA-02`只执行一个fresh四Agent场景：
 
-每个并发波次固定为：
+1. 使用fresh data directory、fresh Project和同一初始`C0`，配置4个真实CLI Agent与`max_parallel_runs=4`。
+2. 创建4个范围独立、结果可由离线测试机械验证的work Task；任务必须产生不同文件或不冲突修改，不能依赖模型猜测隐藏验收文本。
+3. 证明4个source Run存在真实live重叠；每个Agent至少读取当前Task、报告一次progress、使用一次coordlink协作入口、运行fixture test、commit并submit。
+4. 至少发送一条跨Agent direct Message并在接收方形成durable ack；完整正文不进入公开报告。
+5. 在至少2个source Run仍live且已有durable progress或Message后受控重启一次Daemon。原Run/container必须被接管或按正式恢复合同明确终结，不能为同一attempt创建重复active Run。
+6. 恢复后继续完成4个source Task。Boss依次accept结果；一个允许直接CAS，其余stale结果通过真实integration Task收敛，不能由Daemon后台merge。
+7. 最终canonical必须包含4个被接受source head的lineage；运行fixture test和`git fsck --full --strict`。
+8. 完全停止并重启Daemon后重新查询Task、Run、Message、task ref和canonical SHA，随后走正式cleanup/GC并验证资源收敛。
 
-1. 从同一canonical SHA以相同priority和A/B/C/D固定顺序创建4个明确指派的work Task；该顺序也保证串行对照中D最后运行。
-2. 等待4个Run均写出durable READY progress且由Docker事实证明process live；barrier保持1秒后，Harness通过正式Boss Message入口并发向四个Task各发送一条`GO`。GO正文使用固定benchmark schema，包含`wave_id`和4个work Task ID，因此A/B/C能机械取得D Task ID且D能区分GO和peer Message。这4条控制Message同样必须durable/ack，但不计入步骤4的200条peer Message延迟样本。该hold单列，不计`T_work4`。
-3. 四个Agent各执行50次`coordlink progress`，每个请求使用唯一request ID，共200次并发mutation。
-4. A/B/C分别向步骤1创建的D work Task发送`4/3/3`条Message。D每50 ms轮询inbox，在收到10条后逐ID ack；ack请求可因超时重试，但每个Message只能发生一次durable `acknowledged`状态转移和一次对应Event。
-5. 四者修改各自文件、执行同一固定测试、commit并`task submit`；等待Run terminal、静止workspace capture和4个不可变task refs。
-6. Boss先accept A，显式/默认固定integration Agent=A并直接fast-forward CAS。随后依次accept B/C/D，每次等上一个integration Task完成；每波必须恰好创建3个且没有嵌套integration Task。
-7. Scripted integration Agent用原生Git合并固定source、运行同一测试、commit和submit；Daemon只做capture、ancestry和expected-old CAS。
-8. 断言最终canonical包含四个source head，SQLite投影一致，并运行`git fsck`和项目测试。
-9. 等待全部Run cleanup，先确认test observer已收齐client record，再执行`gc preview`和`gc run --confirm`；断言本波eligible workspace和Run log实际absent。下一波前不得有starting/active Run、owned container、blocked cleanup、未知control目录或未解释pending action。
+同一candidate只要求`RMA-01`和`RMA-02`各有一份有效PASS证据。provider调用失败后不得自动连续重试；先分类为产品、provider/环境或Task spec问题。只有产品问题需要增加最低层回归并修复，新一次真实provider调用必须得到单独授权。
 
-串行对照使用相同fixture、消息、200次progress、Git修改、测试和submit负载，但配置`max_parallel_runs=1`；每个Run达到READY+live后Harness立即通过同一Boss Message入口发送该Task的GO，D最后消费已持久化的10条Message，不等待“四Run同时READY”。在2个fresh Daemon批次各做1个warm-up和5个计分波次，共10个样本。`T1`从第一条串行GO request write到第四个source submitted；`T4`从4条并发GO中最早的request write到第四个source submitted。取得T1后，Boss显式cancel四个submitted Task，等待cleanup并走正式GC，使下一波不积累submitted workspace；task ref仍服从Git保留合同。`median(T4)/median(T1)`只作为并发收益诊断，不作为发布Gate，因为它同时受磁盘、per-Project Git锁和Docker并发度影响。
+### 11.4 证据和观测
 
-`scripts/perf-v1.sh --profile smoke`可只跑1个warm-up、3个并发波次、1个串行对照和每类1个故障样本，用于开发反馈；它只能证明场景可执行。正式结论只能来自`--profile release`的完整样本。
+每个真实场景至少保存以下安全证据：
 
-### 11.4 故障恢复段
+- 命令、起止时间、退出码、revision、image digest和第11.2节环境事实；
+- Project、Agent、Task和Run ID，以及4个source Run的live重叠事实；
+- Message创建/ack、Task状态、Run状态和关键Event计数；
+- initial/candidate/task/integration/final canonical SHA及ancestry、`git fsck`和fixture test结果；
+- Daemon重启前后的ownership、pending action、listener和`daemon_ready`事实；
+- 验收结束时starting/active Run、owned container、control socket、blocked cleanup和pending Git action计数；
+- 整体耗时、各Run耗时、CPU/内存/磁盘峰值的观察值，以及provider等待或限流对结果的影响。
 
-故障样本使用独立fresh data directory，与正常延迟分布分开报告，不能混入或删除：
+耗时和资源值用于发现明显卡死、泄漏和后续趋势，不是第一版硬SLA。watchdog只用于终止无界等待；触发后必须依据最后的durable状态和Docker/provider事实分类，不能一律归咎于CoordPlane。
 
-1. 5次live crash：4个Run均READY且有未ack Message时SIGKILL Daemon，1秒后重启。Scripted进程按11.3节持续存活/重连；Daemon必须接管原4个Run/container、重建socket并在ready前完成runtime/Git reconciliation，不能创建第5个Run；消息最终ack且工作继续收敛。
-2. 3次capture crash：test-only failpoint在task ref已创建、SQLite submitted事务前退出。重启只能依据Task pending action和actual ref补齐。
-3. 3次CAS crash：test-only failpoint在`update-ref`成功、SQLite completed事务前退出。重启识别actual canonical已包含head，不重复CAS或创建integration Task。
+报告不得保存token、认证环境变量、完整provider请求/响应、Message私密正文、thinking或signature。真实CLI transcript必须继续服从Runtime的redaction和保留合同。
 
-Failpoint只存在于测试构建，不得形成production fallback。每个故障样本仍须完成最终lineage、`git fsck`、消息、cleanup和对象计数断言。
+### 11.5 通过不变量
 
-### 11.5 计时和统计口径
+`RMA-01`和`RMA-02`都必须满足适用项，任一失败均不能用较快耗时抵消：
 
-外部harness使用自己的单调时钟。Boss CLI计时从写请求前开始，到收到已durable响应或正式查询/Git/Docker事实结束；状态轮询间隔20 ms且开销计入结果。Event UTC时间只验证顺序，不用于延迟统计。所有公式固定写为`end - start`，任何负duration直接使报告INVALID，不能按0截断。
+- 没有重复active Run、重复submit副作用、伪完成或无法解释的terminal状态。
+- 不同Agent的container、workspace、home和token保持隔离。
+- Message在ack前durable，Daemon重启后不丢失且最多一次形成acknowledged状态转移/Event。
+- Run退出不替代Task submit；每个已提交结果都有可解析且不可变的task ref。
+- actual workspace HEAD被捕获；canonical只通过ancestry核验和expected-old CAS推进。
+- stale结果只通过普通integration Task处理，Daemon不执行隐藏merge/rebase/cherry-pick。
+- Daemon重启后Run ownership、socket/listener、pending action和Git事实先对账，再开放mutation。
+- 最终canonical lineage、SQLite投影、Boss查询、fixture test和`git fsck`一致。
+- 日志、Event和公开证据不泄漏credential、thinking、signature、其他Agent token或宿主私有路径。
+- 验收结束后没有starting/active Run、owned orphan container、blocked cleanup、未知control目录或未解释pending Git action。
 
-Scripted CLI对每个coordlink请求使用本进程单调时钟，并把`schema_version/record_type=client/request_id/task_id/run_id/operation/duration_ns/result`作为带固定前缀的单行JSON写stdout。Test-build observer在Runtime正常写Run log的同时，只校验并tee该固定schema到harness output；其他stdout不解析、不复制，production hook为no-op。Harness在GC前要求每个progress request恰好一个client record。Client record只计算同一进程内的`R_progress`，绝不在不同Agent或Harness时钟之间相减。
+### 11.6 当前第一版收敛范围
 
-同一harness output除上述client tee外，Daemon test-build observer自产生三种普通JSONL record：
+当前已有的有效`RMA-01`证据可以继续使用，只要候选revision相对已验证revision仅修改需求文档或其他不影响production/runtime/fixture的文件，并提供精确diff证明；文档修订本身不强制再次消耗provider调用。
 
-- `stage`：`schema_version/daemon_origin_id/sample_id/request_id/operation_id/attempt_index/project_id/task_id/run_id/stage_id/start_offset_ns/duration_ns/result`。
-- `point`：`schema_version/daemon_origin_id/sample_id/request_id/operation_id/project_id/task_id/run_id/message_id/point_id/mono_offset_ns/result`。
-- `resource`：每100 ms及stage边界输出`daemon_origin_id/sample_id/mono_offset_ns/rss_bytes/goroutines/open_fds`；RSS/FD与外部`/proc`交叉检查，goroutine来自`runtime.NumGoroutine`。
+当前剩余工作按以下顺序收敛：
 
-不适用ID明确为null。每个Daemon进程启动时生成只用于perf输出的唯一`daemon_origin_id`；Offset相对该进程单调起点，只允许同origin相减，跨重启只使用外部`T_recover`。Production build对应hook/sampler为no-op，不提供产品metrics端点；observer不得改变控制流、写SQLite/Event、记录Message正文/路径/secret或复制Git/Runtime实现。Daemon不识别wave/benchmark Task；Harness保存`task_id/run_id -> batch/wave`映射并用stage边界给resource sample分窗。正确性仍只来自正式状态和外部事实，observer只是耗时/资源证据。
+1. 盘点旧PF harness中的正确性断言；仍未被Core/Runtime/Git低层故障矩阵覆盖的断言先迁移到对应owner测试。
+2. 删除仅服务于固定runner、`PF01_REFERENCE_MANIFEST`、长波次统计、性能baseline和`BASELINE_BOOTSTRAP`的脚本、observer、validator及调用方；不得保留与新Gate竞争的release入口。
+3. 将`RMA-02`作为独立场景函数加入静态场景列表，并提供一个薄的`scripts/e2e-real-multi-agent.sh`入口；执行器不得按角色、provider或场景名称增加`if/else`特判。
+4. 在获得一次明确provider授权后执行一个fresh `RMA-02`，失败时按11.3节先分类和归约，不自动重试。
+5. `RMA-02`通过后，在同一候选上重跑第13节非provider Gate和LOC检查，形成第一版本轮可靠性结论。
 
-Point的`mono_offset_ns`在`point_id`所指时刻捕获，不等于JSONL写出时间。`api.progress.received`在完整request frame读入后、auth/scope/排队前捕获并暂存；只有关联事务durable后才与`core.progress.committed`一起输出，失败请求另以result记录且不混入成功延迟。其他`*_commit` point在对应SQLite commit返回成功后立即捕获/输出。
-
-Point ID固定为`api.progress.received`、`core.progress.committed`、`core.message.created_commit`、`core.message.acknowledged_commit`、`core.outcome.accepted_commit`和`git.capture.submitted_commit`。每个request/message/run只能产生合同允许的一组point；缺失、重复、跨`daemon_origin_id`或ID无法join时结果INVALID。
-
-Stage边界固定如下；每次调用恰好一条terminal record，重试沿用业务operation ID并递增`attempt_index`，失败样本保留：
-
-| Stage ID | start | end/聚合 |
-| --- | --- | --- |
-| `git.clone.lock_wait` | 请求per-Project维护锁前 | 取得锁；只诊断，不并入clone work |
-| `git.clone.prepare` | 已取得锁、即将执行clone准备 | private clone完成，HEAD/base回读和ownership marker核验完成；不含lock wait/SQLite finalize |
-| `runtime.container.create_start` | Docker Create请求前 | Start后Inspect证明process live且wait/log attach已安装；不含clone和active事务 |
-| `git.capture.freeze` | outcome accepted commit后 | writer已停止、Run terminal且workspace静止 |
-| `git.capture.handoff` | 开始生成bundle/pack | `.ready`原子发布并回读成功 |
-| `git.capture.lock_wait` | 请求per-Project维护锁前 | 取得锁 |
-| `git.capture.import` | 打开`.ready`前 | 对象导入且captured head可解析 |
-| `git.capture.fsck` | controller bare完整性检查前 | fsck/commit类型/ancestry核验完成 |
-| `git.capture.ref` | expected task-ref update前 | update和read-back等于captured head；不含submitted事务 |
-| `git.advance.lock_wait` | 请求per-Project维护锁前 | 取得锁 |
-| `git.advance.ancestry` | 解析actual canonical/task ref前 | current/head关系完成分类 |
-| `git.advance.update_ref` | expected-old `update-ref`前 | update后read-back完成；不含completed/stale事务 |
-| `runtime.cleanup` | Run terminal且cleanup intent可执行 | container/control资源全部absent或写blocked结果 |
-
-每波clone work指标是4个source Task `git.clone.prepare` duration之和；等待由`git.clone.lock_wait`和外部`T_fanout4`单列。Docker逐Run统计；capture/advance子阶段分别统计，不把并发duration相加伪造成wall time。
-
-必须分别报告：
-
-```text
-R_progress   = client durable response read - same-client request write
-T_progress_burst = max(core.progress.committed) - min(api.progress.received)
-T_message    = core.message.acknowledged_commit - core.message.created_commit
-T_queue      = Run row first observable - eligible Task create request write
-T_fanout4    = fourth process observed - last of four Task create request writes
-T_capture    = git.capture.submitted_commit - core.outcome.accepted_commit
-T_cas        = completed/stale first observable - task accept request write
-T_work4      = fourth source Task submitted - earliest GO request write
-T_integration = both source and integration completed first observable - integration Task first observable
-T_integrations3 = D source completed first observable - B task accept request write
-T_wave       = final canonical externally verified - first Task create request write
-T_container_absent = container absent first observed - Run terminal first observable
-T_cleanup    = all Run-owned resources absent - Run terminal first observable
-T_recover    = first `daemon_ready=true` status response - replacement Daemon exec
-```
-
-Harness轮询正式`status --output json`的顶层`daemon_ready`。`true`沿用Core合同：Project ref、pending Git action、Run ownership、原live Run attach/wait/log和per-Run listener均已对账且mutation已开放；因此不另设可在ready之后完成的“reattach”宽限。Provider阶段只在真实CLI smoke中单列；真实Codex/Claude总耗时只设15分钟watchdog，不设性能SLA。
-
-短操作合并20个计分波次的原始样本：progress共4,000个、peer Message共200个；每个Agent的50次progress串行发送、同一发送方的peer Message一次最多一个in-flight，四个Agent之间并发。每波吞吐使用同一Daemon origin的`200/T_progress_burst`。`status --output json`在soak达到至少70 Task/1,000 Event后，于最后5波四Run READY+live但尚未发GO时单线程连续采样200次，共1,000个；它测大账本+4 live Run查询，不声称与mutation burst重叠。该额外hold不进入20个release波次分布。所有分位数使用nearest-rank：升序样本的`ceil(p*N)`项，不插值。阶段/波次的20样本只报告p50/p90/max；故障恢复的11个样本逐个判定。失败和timeout作为FAIL保留，不能删除或当离群值。
-
-Gate样本集合固定：`T_queue`取20个release波次的80个source work Task，`T_fanout4`每波一个共20个；Docker create/start取80个source work Run，60个integration Run另列诊断；`T_capture/T_container_absent/T_cleanup`取80个source和60个integration共140个Run；direct `T_cas`只取每波A的20次直接advance，stale检测和integration advance另列；`T_integration`取B/C/D的60个integration Task，`T_integrations3/T_wave`各取20个release波次。Integration当前状态可直接越过submitted，但`submitted_at + head_sha + task_ref`必须永久可查询，`T_capture`以submitted commit point为终点。
-
-RSS/goroutine/FD每100 ms采样；harness每1秒并在handoff/import/capture/GC stage边界以固定`du -sb`等价口径采样fresh data directory。Idle窗口在fresh Daemon ready、无可运行Task且稳定30秒后开始，持续60秒；每批idle RSS取窗口median、idle CPU取窗口CPU time，四批均须通过。Load RSS取20个release波次全部样本的全局max；磁盘取每个fresh data directory的采样max且每个目录都须通过。Soak每波cleanup/GC后再稳定5秒取RSS/goroutine/FD中位数，以前5波和后5波中位数及20点最小二乘slope判定泄漏。
-
-### 11.6 第一版冻结阈值
-
-| 指标 | 第一版reference PASS条件 |
-| --- | --- |
-| 4,000次progress | 每波`200 / T_progress_burst`的median `>=100 ops/s`、min `>=50 ops/s`；`R_progress` p95 `<=100 ms`、p99 `<=250 ms`；零外显`SQLITE_BUSY`、丢失或重复副作用 |
-| 200条Message | `T_message` p95 `<=1 s`、max `<=2 s`；每个ID恰好一次durable acknowledged transition/Event |
-| 1,000次大账本+4 live Run status | p95 `<=200 ms`、p99 `<=500 ms`，输出始终可解析且投影一致 |
-| `T_queue` | p90 `<=500 ms`、max `<=2 s`；只统计Agent和slot在Task创建时均可用的样本 |
-| Git private clone work | 每波4个`git.clone.prepare` duration之和p90 `<=8 s`、max `<=12 s`；lock wait单列 |
-| Docker create/start stage | 单Run p90 `<=3 s`、max `<=5 s`；`T_fanout4` p90 `<=12 s`、max `<=20 s` |
-| `T_capture` | p90 `<=5 s`且max `<=10 s`；handoff/import/fsck/ref子阶段分别报告 |
-| `T_cas` | direct ancestry/CAS p90 `<=1 s`、max `<=2 s`；lock wait和update-ref分别报告 |
-| Integration | `T_integration` p90 `<=15 s`、max `<=30 s`；`T_integrations3` p90 `<=35 s`、max `<=60 s` |
-| `T_wave` | p50 `<=60 s`、p90 `<=90 s`、max `<=180 s` |
-| Runtime cleanup | `T_container_absent` p90 `<=5 s`；`T_cleanup` max `<=10 s` |
-| `T_recover` | 5个live crash和6个pending action crash每次`<=8 s`；ready时已完成required reconciliation/reattach |
-| Daemon内存 | idle RSS `<=128 MiB`；四Run load peak RSS `<=384 MiB`，不含Agent/containerd/Docker daemon |
-| Daemon idle CPU | 60秒窗口CPU time `<=1.2 s`（单核2%），不得busy poll |
-| 20波soak泄漏 | goroutine后5波相对前5波`<=16`、FD `<=8`、RSS `<=64 MiB`；RSS slope `<=2 MiB/波` |
-| 峰值磁盘 | 每个fresh data directory相对创建后峰值`<=1.5 GiB`，无未知workspace/handoff/control目录 |
-
-Reference绝对阈值是发布硬Gate，任何一项失败都不能被baseline抵消。另设独立同机回归Gate，只比较人工批准、不可自动滚动的固定baseline revision：它必须绑定runner/environment fingerprint、fixture manifest、image digest、实现revision和本节统计版本；失败/INVALID结果不能更新baseline。延迟/阶段的同名Gate统计值超过`max(1.25*baseline, baseline+5 ms)`，或progress吞吐低于其80%，回归Gate失败；RSS、CPU time、磁盘分别超过`max(1.25*baseline, baseline+8 MiB/0.1 s/64 MiB)`时失败。Goroutine/FD增量和RSS slope只使用绝对Gate，不做可能以0/负数为分母的相对比较。首个通过绝对Gate的owner批准结果冻结为baseline，该次记`BASELINE_BOOTSTRAP`；后续发布必须同时通过绝对和回归Gate。非reference主机只给warning/趋势，不建立“环境无关”结论。
-
-性能报告写普通JSON/文本，至少包含环境指纹、fixture manifest、image digest、实现/baseline revision、每个原始样本、nearest-rank结果、阶段duration、对象计数、并发诊断比值和PASS/FAIL/INVALID_ENVIRONMENT原因；不为此建设产品内metrics、artifact或acceptance数据库。
+第一版live工作只新增上述一次`RMA-02`。原`PF-01`固定环境、20波release/soak、绝对性能阈值和人工冻结baseline不再属于完成条件；如未来需要可重复性能SLA，必须作为独立性能项目重新提出需求，不能恢复为本轮隐性门禁。
 
 ## 12. 第一版代码行数预算
 
 ### 12.1 预算基线
 
-预算以一个production one-shot adapter、一个scripted test adapter、Docker-only runtime、local-Git-only（每Project一个repo）和两个薄CLI为基线。产品仍可管理多个Project，PF-01只测一个Project。不包含TUI/Web、host/external runtime、remote Git、Inject必选实现、第二provider adapter或平台化预留。
+预算以一个production one-shot adapter、一个scripted test adapter、Docker-only runtime、local-Git-only（每Project一个repo）和两个薄CLI为基线。产品仍可管理多个Project，第一版真实可靠性验收只使用一个Project。不包含TUI/Web、host/external runtime、remote Git、Inject必选实现、第二provider adapter或平台化预留。
 
 SLOC是规划和架构漂移信号，不是质量分数。低于预算仍必须满足全部不变量；超过预算先检查重复边界和范围偏移，不能删除错误处理、recovery或测试来换取数字。
 
@@ -716,7 +653,7 @@ Owner已批准保留上述完整产品范围和本节非空、非纯注释物理
 | Build/test infra | `250 / 400 / 600` | `250 / 400 / 600` | `0 / 0 / 0` |
 | Budgeted total | `23,050 / 28,400 / 34,250` | `38,750 / 41,400 / 43,600` | `+15,700 / +13,000 / +9,350` |
 
-Production和Tests新增空间先以透明、未分配的重基线reserve列入下表，保留原模块/测试边界审查值以持续暴露重复和owner漂移。PF-01完整落地后按12.6节在同一revision报告实际模块分布；reserve不是忽略模块超限或弱化合同的授权。
+Production和Tests新增空间先以透明、未分配的重基线reserve列入下表，保留原模块/测试边界审查值以持续暴露重复和owner漂移。第一版候选按12.6节报告实际模块分布；reserve不是忽略模块超限或弱化合同的授权。
 
 ### 12.2 Budgeted maintained production预算
 
@@ -733,7 +670,7 @@ Production和Tests新增空间先以透明、未分配的重基线reserve列入�
 | Owner批准的未分配重基线reserve | 8,000 | 6,950 | 5,850 |
 | **Production合计** | **18,500** | **19,500** | **20,500** |
 
-模块超过软阈值可以在production总软阈值内小幅调剂，但必须在变更说明中列出净增量、所属不变量和删除/合并计划。任一模块超过模块审查阈值时必须复核owner边界和重复实现，不能靠把语义搬到其他目录消除命中；只要production总量仍`<=20,500`、12.6节同revision最终批准已完成且复核未发现范围漂移，模块命中本身不阻断发布。Production总量严格`>20,500`时阻断第一版发布，直到删除旧/重复路径，或owner先显式修改需求和预算。
+模块超过软阈值可以在production总软阈值内小幅调剂，但必须在变更说明中列出净增量、所属不变量和删除/合并计划。任一模块超过模块审查阈值时必须复核owner边界和重复实现，不能靠把语义搬到其他目录消除命中；只要production总量仍`<=20,500`、12.6节候选证据审查已完成且复核未发现范围漂移，模块命中本身不阻断发布。Production总量严格`>20,500`时阻断第一版发布，直到删除旧/重复路径，或owner先显式修改需求和预算。
 
 第二个production adapter不在基线内。确需第一版加入时，规划增量为adapter production目标/软/审查`+450/+550/+650` SLOC、adapter tests`+500/+650/+800` SLOC；完整预算将变为Production `18,950/20,050/21,150`、Tests `20,500/22,150/23,300`、budgeted总计`39,700/42,600/45,050`。必须先把完整表和README改成新基线，再实现并说明为什么一个adapter不能完成产品验收；只有更新后的完整表可作为`loc-budget`输入。
 
@@ -747,13 +684,13 @@ Production和Tests新增空间先以透明、未分配的重基线reserve列入�
 | 真实Git component/fault matrix | 2,500 | 3,200 | 4,000 |
 | 真实Docker runtime/fault matrix | 2,200 | 2,800 | 3,500 |
 | Deterministic + real CLI E2E harness | 1,500 | 1,900 | 2,300 |
-| PF-01 harness、fixture generator、phase observer和报告 | 800 | 1,100 | 1,500 |
+| 多Agent可靠性观测、故障编排和安全报告 | 800 | 1,100 | 1,500 |
 | Owner批准的未分配重基线reserve | 7,700 | 6,050 | 3,500 |
 | **Tests合计** | **20,000** | **21,500** | **22,500** |
 
 测试超过审查阈值只触发重复fixture/helper和边界重叠审查，不得仅因LOC删除测试。测试能否删除只由对应不变量已删除或已由更低、更真实边界完整替代决定。
 
-PF-01必须复用既有public CLI、Docker/Git fixture helper、静态stage wrapper和状态断言；它只新增负载编排、采样和报告，不得复制Core/Runtime/Git实现到benchmark harness。
+多Agent可靠性harness必须复用既有public CLI、Docker/Git fixture helper和状态断言；它只新增场景编排、环境观测和安全报告，不得复制Core/Runtime/Git实现，也不得把角色或provider特判写入主执行器。
 
 Budgeted build/test infrastructure（shell、Dockerfile、Makefile、手写YAML及语义型generated输入/输出）目标250、软阈值400、审查阈值600 SLOC。Budgeted maintained surface目标/软/审查为`38,750/41,400/43,600`；该总数包含语义型generated SLOC，不含机械generated输出和静态fixture，不能覆盖production超限，也不是减少测试的理由。
 
@@ -790,21 +727,21 @@ first_party_source_total = 所有上述源码物理行集合去重后的总数
 1. 删除已被替代的旧路径、重复DTO/renderer/store wrapper和第二套CLI/transport逻辑。
 2. 删除第一版非目标或可选项：Inject实现、第二adapter、TUI/fancy formatter、host runtime、remote/平台化预留。
 3. 将真正新增的产品能力移出第一版，先修改需求再实现。
-4. 只有无法通过上述方式收敛时，由owner基于实际模块报告调整预算；调整必须同时更新本节和baseline，不能在代码中加ignore名单。
+4. 只有无法通过上述方式收敛时，由owner基于实际模块报告调整预算；调整必须先更新本节，不能在代码中加ignore名单。
 
 无论是否超预算，以下内容不得因LOC删减：version/generation/token/nonce fence、pending action/operation ID、durable Message ack/redelivery、finishing两阶段submit、actual HEAD capture、expected-old CAS、Runtime attach/stop/cleanup/reconcile、Project fail-closed及对应SQLite/Git/Docker crash/race测试。
 
 禁止通过一行多个语句、超长函数、大switch、删除有价值错误上下文或把逻辑搬进脚本/generated/test helper降LOC。Production单文件500/800 SLOC、单函数80/140 SLOC分别触发warning/阻断审查；拆分仍必须按静态注册和owner边界，不得制造无意义薄文件。
 
-### 12.6 PF-01落地后的同revision最终批准
+### 12.6 第一版候选证据审查
 
-上述envelope已获准用于继续实现和审查，但第一版完成仍要求owner对PF-01落地后的精确revision作最终批准：
+第一版完成要求对精确候选revision `R`保留可复核证据，不要求人工创建环境manifest或批准性能baseline：
 
-1. PF-01 client/point/stage/resource observer、5+3+3 fault raw table、smoke/release profile、环境preflight、全部阈值和fail-closed报告完成后，冻结一个clean implementation revision `R`。
-2. 在不修改源码、测试、脚本、manifest或需求的情况下，对同一`R`运行`scripts/perf-v1.sh --profile release --output perf-v1.json`和`scripts/loc-budget.sh --check --output loc-budget.json`。两份JSON必须记录并匹配`R`；worktree dirty、revision缺失/不一致或任一报告来自其他revision时结果无效。
-3. LOC最终报告必须保留全部原子桶、`budgeted_production/tests/infra/total`、每模块实际值、generated/fixture可见性、Git diff以及unknown path、file/function和gofmt质量blocker；不得只报告四个合计数。PF-01最终报告必须保留环境/fixture/image/baseline指纹、全部raw样本、nearest-rank、11个故障行、对象计数、资源/cleanup事实和PASS/FAIL/INVALID原因。
-4. 只有PF-01 reference绝对Gate通过、LOC四个发布值分别`<=20,500/22,500/600/43,600`、质量blocker清零且owner明确记录对revision `R`和首个`BASELINE_BOOTSTRAP`的批准，预算Gate才完成。报告生成后任何tracked或untracked maintained source变化都必须生成新revision并重跑两份报告；失败或INVALID报告不能获批或更新baseline。
-5. 最终批准只确认同一revision的实际分布，没有改变12.4统计口径或12.5禁止规避条款。若要扩大envelope、排除源码或删减产品/测试合同，必须在实现前再次显式修改五份need；不得在脚本、manifest或批准评论中暗改。
+1. 冻结一个clean候选revision `R`，运行第13节全部非provider Gate和`scripts/loc-budget.sh --check --output loc-budget.json`。
+2. LOC JSON必须记录并匹配`R`，保留全部原子桶、`budgeted_production/tests/infra/total`、每模块实际值、generated/fixture可见性、Git diff以及unknown path、file/function和gofmt质量blocker；不得只报告四个合计数。
+3. 第11节真实live报告必须记录其已验证revision。若候选`R`只比该revision多需求文档或其他不影响production/runtime/fixture的变更，可以通过精确diff复用证据；任何相关代码、测试fixture、image或adapter配置变化都必须重跑受影响的真实场景。
+4. 只有LOC四个发布值分别`<=20,500/22,500/600/43,600`、质量blocker清零、第11节真实场景通过且第14节不变量全部满足，第一版Gate才完成。
+5. 若要扩大envelope、排除源码或删减产品/测试合同，必须在实现前显式修改五份need；不得在脚本、报告或评论中暗改。
 
 ## 13. 验证命令和Gate
 
@@ -816,9 +753,9 @@ go test -race ./... -count=1
 go vet ./...
 go test -tags=docker ./... -count=1
 scripts/e2e-deterministic.sh
-scripts/perf-v1.sh --profile release --output perf-v1.json
 scripts/loc-budget.sh --check --output loc-budget.json
 scripts/e2e-real-cli.sh
+scripts/e2e-real-multi-agent.sh
 ```
 
 Gate顺序：
@@ -829,12 +766,13 @@ Gate顺序：
 4. Full Go和race。
 5. Docker integration。
 6. Deterministic双Agent E2E。
-7. 同一clean revision的PF-01性能、LOC预算gate和12.6节owner最终批准。
-8. Real CLI E2E。
+7. LOC预算和12.6节候选证据审查。
+8. `RMA-01`真实双Agent E2E。
+9. `RMA-02`真实四Agent恢复与收敛E2E。
 
 E2E失败后不得直接反复改E2E脚本或prompt。必须先分类到Core、Runtime、Git、环境/provider或Task spec，并增加最低层可复现测试。
 
-所有外部gate输出明确的 `PASS`、`FAIL` 或 `SKIP(reason)`。脚本exit 0但内部SKIP不能伪装PASS。
+所有外部gate输出明确的`PASS`、`FAIL`、`INVALID_ENVIRONMENT(reason)`或`SKIP(reason)`。脚本exit 0但内部SKIP不能伪装PASS。真实provider Gate禁止自动重试；每次新调用必须有明确授权。
 
 ## 14. 完成判定
 
@@ -847,12 +785,12 @@ E2E失败后不得直接反复改E2E脚本或prompt。必须先分类到Core、R
 - 真实Git capture/CAS/crash/GC测试通过且`git fsck`成功。
 - 真实Docker隔离、取消、resume、reconcile和cleanup通过。
 - Deterministic双Agent E2E通过。
-- PF-01 reference性能场景通过，原始样本和环境信息完整；没有用provider时间或删除失败样本美化结果；PF-01和LOC报告来自同一clean revision。
-- `budgeted_production/tests/infra/total <= 20,500/22,500/600/43,600`，质量blocker清零，且owner已按12.6节最终批准该revision和首个固定baseline；测试未因LOC被弱化。
-- 两个真实CLI Agent E2E通过且未SKIP。
+- `RMA-01`真实双Agent E2E通过且未SKIP；production adapter、Message、task ref、integration和canonical CAS形成完整证据。
+- `RMA-02`真实四Agent场景通过且未SKIP；4个source Run真实重叠，并在一次Daemon重启后继续收敛。
+- `budgeted_production/tests/infra/total <= 20,500/22,500/600/43,600`，质量blocker清零，测试未因LOC被弱化。
 - 验收结束后没有starting/active Run、owned orphan container、未解释capture/CAS intent或误删的task ref。
 - Boss能从正式命令读取最终Task、Run、Message、base/head和canonical SHA。
 - Boss和Reviewer能从正式入口实际读取、检出和测试精确未集成task head，而不获得control repo写权限。
 - 验收没有依赖remote Git平台、动态registry、TeamConfig、validation engine、artifact平台或per-tool-call审计。
 
-若真实CLI或Docker gate未运行，报告必须明确剩余runtime风险；不得用更多mock测试替代。
+若真实CLI、四Agent或Docker gate未运行，报告必须明确剩余runtime风险，只能声明已实际通过的较窄范围；不得用更多mock测试替代。第一版完成不包含跨机器吞吐、延迟、容量或长期soak声明。
