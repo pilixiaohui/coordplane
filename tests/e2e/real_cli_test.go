@@ -220,7 +220,7 @@ func preserveLiveFailureDiagnostics(collect func() string, emit func(string), cl
 
 func liveFailureDiagnostics(ctx context.Context, binary, socket, dataDir string, providerEnv []string, taskIDs ...string) string {
 	var evidence strings.Builder
-	redact := func(value string) string { return redactLiveDiagnostics(value, dataDir, providerEnv) }
+	redact := func(value string) string { return redactE2EFailure(value, dataDir, providerEnv) }
 	for _, taskID := range taskIDs {
 		detail, taskErr := commandJSON[core.TaskDetail](ctx, binary, "task", "show", taskID, "--socket", socket, "--output", "json")
 		fmt.Fprintf(&evidence, "task=%s status=%s current_run=%t failure_reason=%q query_error=%t\n", redact(taskID), redact(string(detail.Task.Status)), detail.CurrentRun != nil, redact(detail.Task.FailureReason), taskErr != nil)
@@ -286,7 +286,7 @@ func readLiveRunLogTail(path string) (string, error) {
 	return string(raw), err
 }
 
-func redactLiveDiagnostics(value, dataDir string, providerEnv []string) string {
+func redactE2EFailure(value, dataDir string, providerEnv []string) string {
 	var forbidden []string
 	for _, name := range providerEnv {
 		secret := os.Getenv(name)

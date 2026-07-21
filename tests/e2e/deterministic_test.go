@@ -619,7 +619,8 @@ func runJSON[T any](t *testing.T, ctx context.Context, binary string, args ...st
 	t.Helper()
 	value, err := commandJSON[T](ctx, binary, args...)
 	if err != nil {
-		t.Fatalf("%s %s: %v", binary, strings.Join(args, " "), err)
+		message := fmt.Sprintf("%s failed: %v", filepath.Base(binary), err)
+		t.Fatal(redactE2EFailure(message, "", strings.Split(realProviderEnv, ",")))
 	}
 	return value
 }
@@ -631,7 +632,7 @@ func commandJSON[T any](ctx context.Context, binary string, args ...string) (T, 
 		return value, err
 	}
 	if err := json.Unmarshal(raw, &value); err != nil {
-		return value, fmt.Errorf("decode JSON: %w; output=%s", err, raw)
+		return value, fmt.Errorf("decode JSON response: %w", err)
 	}
 	return value, nil
 }
@@ -711,7 +712,13 @@ func commandOutput(ctx context.Context, directory, command string, args ...strin
 	cmd.Dir = directory
 	raw, err := cmd.CombinedOutput()
 	if err != nil {
-		return raw, fmt.Errorf("%s %s: %w; output=%s", command, strings.Join(args, " "), err, raw)
+		exitCode := -1
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		}
+		message := fmt.Sprintf("command %s failed (exit_code=%d)", filepath.Base(command), exitCode)
+		return raw, errors.New(redactE2EFailure(message, "", strings.Split(realProviderEnv, ",")))
 	}
 	return raw, nil
 }

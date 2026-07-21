@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -698,39 +700,127 @@ func requireRMA02FixtureMarker(t *testing.T, dataDir, agentID, taskID, marker st
 	t.Helper()
 	current, actual, exitCode := readRMA02SourceArtifacts(t, dataDir, agentID, taskID)
 	if actual != marker || exitCode != 0 {
-		t.Fatalf("Task %s fixture marker = %q exit=%d, want %s/0", taskID, actual, exitCode, marker)
+		t.Fatalf("Task %s fixture marker or exit code is invalid", taskID)
 	}
 	return current
 }
 
 func readRMA02SourceArtifacts(t *testing.T, dataDir, agentID, taskID string) (core.CurrentTaskResult, string, int) {
 	t.Helper()
-	taskRoot := filepath.Join(rma02ArtifactRoot(dataDir, agentID), taskID)
-	entries, err := os.ReadDir(taskRoot)
+	current, marker, exitCode, err := readRMA02Artifacts(dataDir, agentID, taskID)
 	if err != nil {
-		t.Fatalf("read Task %s artifact directory: %v", taskID, err)
+		t.Fatalf("Task %s artifacts rejected: %v", taskID, err)
 	}
-	if len(entries) != 1 || !entries[0].IsDir() {
-		t.Fatalf("Task %s artifact Runs = %d, want exactly one Run directory", taskID, len(entries))
+	return current, marker, exitCode
+}
+
+func readRMA02Artifacts(dataDir, agentID, taskID string) (core.CurrentTaskResult, string, int, error) {
+	var current core.CurrentTaskResult
+	if !rma02SafePathComponent(agentID) || !rma02SafePathComponent(taskID) {
+		return current, "", 0, errors.New("invalid artifact identity")
+	}
+	canonicalDataDir, err := filepath.EvalSymlinks(dataDir)
+	if err != nil || filepath.Clean(canonicalDataDir) != filepath.Clean(dataDir) {
+		return current, "", 0, errors.New("artifact data root is not canonical")
+	}
+	dataRoot, err := openRMA02Directory(dataDir)
+	if err != nil {
+		return current, "", 0, err
+	}
+	defer dataRoot.Close()
+
+	directory := dataRoot
+	var opened []*os.File
+	defer func() {
+		for index := len(opened) - 1; index >= 0; index-- {
+			_ = opened[index].Close()
+		}
+	}()
+	for _, name := range []string{"agent-homes", agentID, ".coordplane-rma02", taskID} {
+		directory, err = openRMA02DirectoryAt(directory, name)
+		if err != nil {
+			return current, "", 0, err
+		}
+		opened = append(opened, directory)
+	}
+	entries, readErr := directory.ReadDir(2)
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return current, "", 0, errors.New("read artifact Run directory")
+	}
+	if len(entries) != 1 || !rma02SafePathComponent(entries[0].Name()) {
+		return current, "", 0, errors.New("expected exactly one artifact Run directory")
 	}
 	runID := entries[0].Name()
-	root := filepath.Join(taskRoot, runID)
-	raw, err := os.ReadFile(filepath.Join(root, "task-current.json"))
+	runRoot, err := openRMA02DirectoryAt(directory, runID)
 	if err != nil {
-		t.Fatalf("read Task %s current artifact: %v", taskID, err)
+		return current, "", 0, err
 	}
-	var current core.CurrentTaskResult
-	requireNoError(t, json.Unmarshal(raw, &current))
+	opened = append(opened, runRoot)
+
+	raw, err := readRMA02ArtifactFile(runRoot, "task-current.json", 64<<10)
+	if err != nil {
+		return current, "", 0, err
+	}
+	if err := json.Unmarshal(raw, &current); err != nil {
+		return current, "", 0, errors.New("decode current Task artifact")
+	}
 	if current.Task.ID != taskID || current.Run.ID != runID {
-		t.Fatalf("Task %s artifact identity = task:%s run:%s path-run:%s", taskID, current.Task.ID, current.Run.ID, runID)
+		return current, "", 0, errors.New("artifact Task or Run identity mismatch")
 	}
-	marker, err := os.ReadFile(filepath.Join(root, "fixture"))
-	requireNoError(t, err)
-	exitRaw, err := os.ReadFile(filepath.Join(root, "fixture-exit"))
-	requireNoError(t, err)
+	marker, err := readRMA02ArtifactFile(runRoot, "fixture", 4<<10)
+	if err != nil {
+		return current, "", 0, err
+	}
+	exitRaw, err := readRMA02ArtifactFile(runRoot, "fixture-exit", 64)
+	if err != nil {
+		return current, "", 0, err
+	}
 	exitCode, err := strconv.Atoi(strings.TrimSpace(string(exitRaw)))
-	requireNoError(t, err)
-	return current, strings.TrimSpace(string(marker)), exitCode
+	if err != nil {
+		return current, "", 0, errors.New("decode fixture exit artifact")
+	}
+	return current, strings.TrimSpace(string(marker)), exitCode, nil
+}
+
+func openRMA02Directory(path string) (*os.File, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, errors.New("open artifact data root")
+	}
+	return os.NewFile(uintptr(fd), "artifact-data-root"), nil
+}
+
+func openRMA02DirectoryAt(parent *os.File, name string) (*os.File, error) {
+	if !rma02SafePathComponent(name) {
+		return nil, errors.New("invalid artifact path component")
+	}
+	fd, err := syscall.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, errors.New("open artifact directory")
+	}
+	return os.NewFile(uintptr(fd), name), nil
+}
+
+func readRMA02ArtifactFile(directory *os.File, name string, maximum int64) ([]byte, error) {
+	fd, err := syscall.Openat(int(directory.Fd()), name, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open artifact file %s", name)
+	}
+	file := os.NewFile(uintptr(fd), name)
+	defer file.Close()
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(fd, &stat); err != nil || stat.Mode&syscall.S_IFMT != syscall.S_IFREG || stat.Size < 0 || stat.Size > maximum {
+		return nil, fmt.Errorf("artifact file %s is not a bounded regular file", name)
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, maximum+1))
+	if err != nil || int64(len(raw)) > maximum {
+		return nil, fmt.Errorf("artifact file %s exceeds its read limit", name)
+	}
+	return raw, nil
+}
+
+func rma02SafePathComponent(value string) bool {
+	return value != "" && value != "." && value != ".." && filepath.Base(value) == value && !strings.ContainsRune(value, filepath.Separator)
 }
 
 func rma02ArtifactRoot(dataDir, agentID string) string {
@@ -758,7 +848,7 @@ func registerRMA02FailureClassification(t *testing.T, binary, socket, projectID 
 		defer cancel()
 		facts, err := collectRMA02FailureFacts(ctx, binary, socket, projectID, sources)
 		if err != nil {
-			t.Logf("RMA-02 durable failure fact collection failed; class defaults to product: %v", err)
+			t.Log("RMA-02 durable failure fact collection failed; class defaults to product")
 			facts = rma02FailureFacts{}
 		}
 		raw, err := json.Marshal(facts)
@@ -915,13 +1005,13 @@ func classifyRMA02Failure(facts rma02FailureFacts) string {
 		}
 		return "task_spec"
 	}
-	for _, fact := range facts.Sources {
-		if fact.Run.RequestedOutcome != "" || fact.Task.PendingAction != "" {
-			return "product"
-		}
-	}
 	if rma02ContinueMessagesComplete(facts) {
-		return "task_spec"
+		for _, fact := range facts.Sources {
+			if !rma02FailureTaskConverged(fact) {
+				return "task_spec"
+			}
+		}
+		return "product"
 	}
 	if rma02BarrierFactsComplete(facts) {
 		return "product"
@@ -930,6 +1020,10 @@ func classifyRMA02Failure(facts rma02FailureFacts) string {
 		return "task_spec"
 	}
 	return "product"
+}
+
+func rma02FailureTaskConverged(fact rma02FailureTaskFact) bool {
+	return fact.Run.RequestedOutcome != "" || fact.Task.PendingAction != "" || fact.Task.Status == core.TaskSubmitted || fact.Task.Status == core.TaskCompleted
 }
 
 func rma02BarrierFactsComplete(facts rma02FailureFacts) bool {
@@ -1033,9 +1127,25 @@ func writeRMA02Evidence(t *testing.T, path string, evidence rma02Evidence) {
 	t.Helper()
 	raw, err := json.MarshalIndent(evidence, "", "  ")
 	requireNoError(t, err)
-	temporary := path + ".tmp"
-	requireNoError(t, os.WriteFile(temporary, append(raw, '\n'), 0o600))
-	requireNoError(t, os.Rename(temporary, path))
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	requireNoError(t, err)
+	completed := false
+	defer func() {
+		_ = file.Close()
+		if !completed {
+			_ = os.Remove(path)
+		}
+	}()
+	if _, err := file.Write(append(raw, '\n')); err != nil {
+		t.Fatalf("write RMA-02 evidence: %v", err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatalf("sync RMA-02 evidence: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close RMA-02 evidence: %v", err)
+	}
+	completed = true
 }
 
 const rma02Instructions = `You are running RMA-02, the real four-Agent CoordPlane reliability gate.
