@@ -1,8 +1,10 @@
 package architecture_test
 
 import (
+	"bytes"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -34,31 +36,57 @@ func TestPF01ReleasePlatformIsDeleted(t *testing.T) {
 		"pf01=true", "withPerfObserver", "pf01-fixturecheck", "perf-v1.sh",
 		"go:build perf", "coordplane.perf.",
 	}
-	for _, top := range []string{"cmd", "internal", "scripts", "tests"} {
-		err := filepath.WalkDir(filepath.Join(root, top), func(path string, entry os.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return walkErr
-			}
-			if entry.IsDir() {
-				return nil
-			}
-			relative, err := filepath.Rel(root, path)
-			if err != nil || filepath.ToSlash(relative) == "internal/architecture/pf_cutover_test.go" {
-				return err
-			}
-			raw, err := os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			for _, token := range forbidden {
-				if strings.Contains(string(raw), token) {
-					t.Errorf("obsolete PF-01 token %q remains in %s", token, filepath.ToSlash(relative))
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			t.Fatal(err)
+	command := exec.Command("git", "-C", root, "ls-files", "-z")
+	raw, err := command.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := strings.Split(string(bytes.TrimSuffix(raw, []byte{0})), "\x00")
+	var maintained []string
+	for _, relative := range files {
+		if relative != "internal/architecture/pf_cutover_test.go" && !strings.HasPrefix(relative, "need/") {
+			maintained = append(maintained, relative)
 		}
 	}
+	offenders, err := scanPF01Tokens(root, maintained, forbidden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, offender := range offenders {
+		t.Errorf("obsolete PF-01 token remains in %s", offender)
+	}
+}
+
+func TestPF01GuardScansMaintainedRootIngress(t *testing.T) {
+	for _, relative := range []string{"Makefile", "Dockerfile"} {
+		t.Run(relative, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, relative), []byte("PF01_REINTRODUCED\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			offenders, err := scanPF01Tokens(root, []string{relative}, []string{"PF01_"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(offenders) == 0 {
+				t.Fatal("maintained root ingress escaped PF-01 guard")
+			}
+		})
+	}
+}
+
+func scanPF01Tokens(root string, files, forbidden []string) ([]string, error) {
+	var offenders []string
+	for _, relative := range files {
+		raw, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(relative)))
+		if err != nil {
+			return nil, err
+		}
+		for _, token := range forbidden {
+			if strings.Contains(string(raw), token) {
+				offenders = append(offenders, relative+":"+token)
+			}
+		}
+	}
+	return offenders, nil
 }

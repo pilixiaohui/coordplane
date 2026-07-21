@@ -8,7 +8,7 @@ provider_env=ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL,ANTHROPIC_MODEL,ANTHROPIC_D
 expected_claude_version='2.1.126 (Claude Code)'
 
 invalid() { echo "INVALID_ENVIRONMENT($1)"; exit 77; }
-fail() { echo "FAIL_REAL_MULTI_AGENT"; exit 1; }
+fail() { class=product; [ ! -s "$failure_class" ] || class=$(cat "$failure_class"); case "$class" in product|provider_environment|task_spec) ;; *) class=product;; esac; echo "failure_class=$class"; echo "FAIL_REAL_MULTI_AGENT"; exit 1; }
 
 case "$image" in
 sha256:*) digest=${image#sha256:} ;;
@@ -22,7 +22,9 @@ results=$(mktemp "${TMPDIR:-/tmp}/coordplane-rma02-results.XXXXXX")
 report=${RMA02_OUTPUT:-}
 [ -n "$report" ] || report=$(mktemp "${TMPDIR:-/tmp}/coordplane-rma02-evidence.XXXXXX.json")
 case "$report" in /*) ;; *) invalid "RMA02_OUTPUT must be absolute" ;; esac
-cleanup() { rm -rf "$docker_config" "$results"; }
+failure_class=$(mktemp "${TMPDIR:-/tmp}/coordplane-rma02-failure-class.XXXXXX")
+rm -f "$report"
+cleanup() { rm -rf "$docker_config" "$results" "$failure_class"; }
 trap cleanup EXIT HUP INT TERM
 export DOCKER_CONFIG="$docker_config"
 
@@ -46,7 +48,7 @@ fi
 
 cd "$root"
 [ -z "$(git status --porcelain --untracked-files=normal)" ] || invalid "candidate worktree is not clean"
-make build
+make build || fail
 E2E_REAL_MULTI_AGENT=1 \
 	E2E_COORDPLANE_BIN="$root/build/bin/coordplane" \
 	E2E_COORDLINK_BIN="$root/build/bin/coordlink" \
@@ -55,7 +57,7 @@ E2E_REAL_MULTI_AGENT=1 \
 	E2E_DOCKER_NETWORK="$network" \
 	E2E_PROVIDER_ENV_ALLOWLIST="$provider_env" \
 	E2E_SOURCE_CLEAN=1 \
-	E2E_RMA02_REPORT="$report" \
+	E2E_RMA02_REPORT="$report" E2E_RMA02_FAILURE_CLASS_FILE="$failure_class" \
 	go test -tags=e2e ./tests/e2e -run '^TestRealMultiAgentScenarios$' -count=1 -json -timeout 30m >"$results" || { cat "$results"; fail; }
 cat "$results"
 go run ./tests/e2e/e2emultiresult <"$results" || fail

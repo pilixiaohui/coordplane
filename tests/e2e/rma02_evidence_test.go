@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -29,19 +31,33 @@ func TestRMA02EvidenceValidatorRejectsIncompleteOrUnsafeProof(t *testing.T) {
 		{"duplicate active run", func(e *rma02Evidence) { e.Sources[1].RunID = e.Sources[0].RunID }},
 		{"missing progress", func(e *rma02Evidence) { e.Sources[1].ProgressMarker = "" }},
 		{"missing coordlink operation", func(e *rma02Evidence) { e.Sources[2].CoordlinkOperations = 0 }},
+		{"task current not observed", func(e *rma02Evidence) { e.Sources[0].TaskCurrentObserved = false }},
+		{"task current belongs to another task", func(e *rma02Evidence) { e.Sources[0].TaskCurrentTaskID = e.Sources[1].TaskID }},
+		{"task current belongs to another run", func(e *rma02Evidence) { e.Sources[0].TaskCurrentRunID = e.Sources[1].RunID }},
+		{"fixture marker forged without event", func(e *rma02Evidence) { e.Sources[0].FixtureEventCount = 0 }},
+		{"fixture execution marker missing", func(e *rma02Evidence) { e.Sources[0].FixtureMarker = "" }},
 		{"message not acknowledged", func(e *rma02Evidence) { e.Message.State = "delivered" }},
 		{"duplicate ack event", func(e *rma02Evidence) { e.Message.AckEventCount = 2 }},
 		{"missing task ref", func(e *rma02Evidence) { e.Sources[0].TaskRef = "" }},
 		{"duplicate submit side effect", func(e *rma02Evidence) { e.Sources[0].SubmitEventCount = 2 }},
 		{"multiple direct CAS", func(e *rma02Evidence) { e.DirectCASCount = 2 }},
+		{"direct CAS assigned to source B", func(e *rma02Evidence) { e.DirectCASTaskID = e.Sources[1].TaskID }},
 		{"missing integration", func(e *rma02Evidence) { e.Integrations = e.Integrations[:2] }},
 		{"extra integration", func(e *rma02Evidence) { e.Integrations = append(e.Integrations, e.Integrations[0]) }},
 		{"source lineage broken", func(e *rma02Evidence) { e.Integrations[0].SourceAncestor = false }},
+		{"wrong integration source run", func(e *rma02Evidence) { e.Integrations[0].SourceRunID = e.Sources[2].RunID }},
+		{"crossed integration source ref", func(e *rma02Evidence) { e.Integrations[0].SourceTaskRef = e.Sources[2].TaskRef }},
+		{"wrong integration source head", func(e *rma02Evidence) { e.Integrations[0].SourceHeadSHA = e.Sources[2].HeadSHA }},
+		{"integration task reuses source identity", func(e *rma02Evidence) { e.Integrations[0].TaskID = e.Sources[1].TaskID }},
+		{"duplicate integration head", func(e *rma02Evidence) { e.Integrations[1].HeadSHA = e.Integrations[0].HeadSHA }},
+		{"stale creation canonical", func(e *rma02Evidence) { e.Integrations[1].ObservedCanonical = e.InitialSHA }},
 		{"canonical lineage broken", func(e *rma02Evidence) { e.Integrations[0].CanonicalAncestor = false }},
 		{"nested integration", func(e *rma02Evidence) { e.Integrations[0].NestedIntegration = true }},
 		{"fixture failed", func(e *rma02Evidence) { e.Final.FixtureExitCode = 1 }},
 		{"fsck failed", func(e *rma02Evidence) { e.Final.FSCKExitCode = 1 }},
 		{"restart fence drift", func(e *rma02Evidence) { e.Restart.After[0].ContainerID = "ctr-replaced" }},
+		{"readiness observation missing", func(e *rma02Evidence) { e.Restart.ReadyObservedAt = "" }},
+		{"continue predates readiness", func(e *rma02Evidence) { e.Restart.FirstContinueAt = e.StartedAt }},
 		{"mutation before ready", func(e *rma02Evidence) { e.Restart.MutationsBeforeReady = 1 }},
 		{"post restart state drift", func(e *rma02Evidence) { e.Final.StateStableAfterRestart = false }},
 		{"pending git action", func(e *rma02Evidence) { e.Cleanup.PendingGitActions = 1 }},
@@ -49,6 +65,8 @@ func TestRMA02EvidenceValidatorRejectsIncompleteOrUnsafeProof(t *testing.T) {
 		{"owned container residue", func(e *rma02Evidence) { e.Cleanup.OwnedContainers = 1 }},
 		{"unknown control residue", func(e *rma02Evidence) { e.Cleanup.UnknownControlEntries = 1 }},
 		{"workspace residue", func(e *rma02Evidence) { e.Cleanup.WorkspaceResidue = 1 }},
+		{"handoff residue", func(e *rma02Evidence) { e.Cleanup.HandoffResidue = 1 }},
+		{"log residue", func(e *rma02Evidence) { e.Cleanup.LogResidue = 1 }},
 		{"task ref residue", func(e *rma02Evidence) { e.Cleanup.TaskRefResidue = 1 }},
 		{"Agent home residue", func(e *rma02Evidence) { e.Cleanup.AgentHomeResidue = 1 }},
 		{"scenario omitted", func(e *rma02Evidence) { e.ScenarioExecutions = 0 }},
@@ -73,6 +91,145 @@ func TestRMA02EvidenceValidatorRejectsIncompleteOrUnsafeProof(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRMA02OwnedResidueScannerRejectsUnknownLeaves(t *testing.T) {
+	tests := []struct {
+		name         string
+		path         string
+		directory    bool
+		allowedDirs  map[string]bool
+		allowedFiles map[string]bool
+	}{
+		{name: "workspace", path: "project/unknown-task", directory: true, allowedDirs: map[string]bool{"project": true}},
+		{name: "handoff", path: "project/task/unknown-run", directory: true, allowedDirs: map[string]bool{"project": true, "project/task": true}},
+		{name: "run control", path: "unknown-run", directory: true},
+		{name: "log", path: "unknown-run/run.log", allowedDirs: map[string]bool{"known-run": true}, allowedFiles: map[string]bool{"known-run/run.log": true}},
+		{name: "Agent home", path: "unknown-agent", directory: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, filepath.FromSlash(test.path))
+			if test.directory {
+				if err := os.MkdirAll(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("residue"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			count, err := countRMA02UnexpectedEntries(root, test.allowedDirs, test.allowedFiles)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if count == 0 {
+				t.Fatal("unknown owned residue was accepted")
+			}
+		})
+	}
+}
+
+func TestRealMultiAgentShellMapsStubbedBoundariesToThreeTerminalStates(t *testing.T) {
+	tests := []struct {
+		name, image, makeMode, testMode, checkerMode string
+		staleReport, pass, invalid                   bool
+		wantClass                                    string
+		wantCount                                    int
+	}{
+		{name: "admission", invalid: true},
+		{name: "build failure", image: rma02StubImage(), makeMode: "fail", wantClass: "product"},
+		{name: "test failure", image: rma02StubImage(), testMode: "fail", wantClass: "task_spec", wantCount: 1},
+		{name: "provider failure", image: rma02StubImage(), testMode: "provider-fail", wantClass: "provider_environment", wantCount: 1},
+		{name: "checker failure", image: rma02StubImage(), checkerMode: "fail", wantClass: "product", wantCount: 1},
+		{name: "missing fresh report", image: rma02StubImage(), testMode: "no-report", wantClass: "product", wantCount: 1},
+		{name: "stale report cannot pass", image: rma02StubImage(), testMode: "no-report", staleReport: true, wantClass: "product", wantCount: 1},
+		{name: "success", image: rma02StubImage(), pass: true, wantCount: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			command, countPath := rma02StubbedShell(t, test.image, test.makeMode, test.testMode, test.checkerMode, test.staleReport)
+			output, err := command.CombinedOutput()
+			text := string(output)
+			count := 0
+			if raw, readErr := os.ReadFile(countPath); readErr == nil {
+				count = strings.Count(string(raw), "test\n")
+			} else if !errors.Is(readErr, os.ErrNotExist) {
+				t.Fatal(readErr)
+			}
+			if strings.Contains(text, realTokenCanary) {
+				t.Fatal("RMA-02 shell leaked credential canary")
+			}
+			if test.invalid {
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) || exitErr.ExitCode() != 77 || count != 0 || !strings.Contains(text, "INVALID_ENVIRONMENT(") || strings.Contains(text, "FAIL_REAL_MULTI_AGENT") || strings.Contains(text, "PASS_REAL_MULTI_AGENT_LOCAL") {
+					t.Fatalf("invalid admission err=%v count=%d output=%s", err, count, text)
+				}
+				return
+			}
+			if test.pass {
+				if err != nil || count != test.wantCount || !strings.Contains(text, "PASS_REAL_MULTI_AGENT_LOCAL") || strings.Contains(text, "FAIL_REAL_MULTI_AGENT") || strings.Contains(text, "INVALID_ENVIRONMENT(") {
+					t.Fatalf("success err=%v count=%d output=%s", err, count, text)
+				}
+				return
+			}
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || count != test.wantCount || !strings.Contains(text, "FAIL_REAL_MULTI_AGENT") || !strings.Contains(text, "failure_class="+test.wantClass) || strings.Contains(text, "PASS_REAL_MULTI_AGENT_LOCAL") || strings.Contains(text, "INVALID_ENVIRONMENT(") {
+				t.Fatalf("failure err=%v count=%d output=%s", err, count, text)
+			}
+		})
+	}
+}
+
+func rma02StubImage() string { return "sha256:" + strings.Repeat("a", 64) }
+
+func rma02StubbedShell(t *testing.T, image, makeMode, testMode, checkerMode string, staleReport bool) (*exec.Cmd, string) {
+	t.Helper()
+	root, stubs := t.TempDir(), t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "scripts"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	script, err := os.ReadFile(filepath.Join(testsupport.RepositoryRoot(), "scripts", "e2e-real-multi-agent.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := testsupport.WriteFile(t, filepath.Join(root, "scripts", "e2e-real-multi-agent.sh"), script, 0o700)
+	testsupport.WriteFile(t, filepath.Join(stubs, "docker"), []byte("#!/bin/sh\ncase \"$1\" in version) exit 0;; image) for last do :; done; printf '%s\\n' \"$last\";; run) printf '%s\\n' '"+realClaudeVersion+"';; *) exit 2;; esac\n"), 0o700)
+	testsupport.WriteFile(t, filepath.Join(stubs, "git"), []byte("#!/bin/sh\ncase \"$1:$2\" in status:--porcelain) exit 0;; *) exit 2;; esac\n"), 0o700)
+	testsupport.WriteFile(t, filepath.Join(stubs, "make"), []byte("#!/bin/sh\n[ \"${STUB_MAKE_MODE:-}\" != fail ]\n"), 0o700)
+	goStub := `#!/bin/sh
+case "$1" in
+test)
+  printf 'test\n' >>"$STUB_TEST_COUNT"
+  case "${STUB_TEST_MODE:-success}" in
+		fail) [ -z "${E2E_RMA02_FAILURE_CLASS_FILE:-}" ] || printf 'task_spec\n' >"$E2E_RMA02_FAILURE_CLASS_FILE"; exit 4;;
+		provider-fail) [ -z "${E2E_RMA02_FAILURE_CLASS_FILE:-}" ] || printf 'provider_environment\n' >"$E2E_RMA02_FAILURE_CLASS_FILE"; exit 4;;
+    no-report) ;;
+    *) printf '{"result":"PASS_REAL_MULTI_AGENT_LOCAL"}\n' >"$E2E_RMA02_REPORT";;
+  esac
+  printf '{"Action":"pass","Test":"TestRealMultiAgentScenarios"}\n'
+  ;;
+run) [ "${STUB_CHECKER_MODE:-}" != fail ];;
+*) exit 2;;
+esac
+`
+	testsupport.WriteFile(t, filepath.Join(stubs, "go"), []byte(goStub), 0o700)
+	report, countPath := filepath.Join(root, "report.json"), filepath.Join(root, "test-count")
+	if staleReport {
+		testsupport.WriteFile(t, report, []byte("stale-report\n"), 0o600)
+	}
+	command := exec.Command(scriptPath)
+	command.Env = append(os.Environ(),
+		"PATH="+stubs+string(os.PathListSeparator)+os.Getenv("PATH"), "E2E_RUNTIME_IMAGE="+image,
+		"RMA02_OUTPUT="+report, "ANTHROPIC_AUTH_TOKEN="+realTokenCanary, "STUB_MAKE_MODE="+makeMode,
+		"STUB_TEST_MODE="+testMode, "STUB_CHECKER_MODE="+checkerMode, "STUB_TEST_COUNT="+countPath,
+		"HTTP_PROXY=", "HTTPS_PROXY=", "ALL_PROXY=",
+	)
+	return command, countPath
 }
 
 func TestRealMultiAgentRegistryIsStaticAndDataDriven(t *testing.T) {
@@ -149,22 +306,26 @@ func validRMA02Evidence() rma02Evidence {
 			Role: role, TaskID: "task-" + role, AgentID: "agent-" + role, BaseSHA: c0,
 			RunID: "run-" + role, ContainerID: "container-" + role, Generation: 1, LaunchNonce: "nonce-" + role,
 			LiveFrom: started.Add(time.Duration(index) * time.Second).Format(time.RFC3339Nano), LiveUntil: started.Add(2 * time.Minute).Format(time.RFC3339Nano),
-			ProgressMarker: "RMA02-READY-" + role, CoordlinkOperations: 3, FixtureExitCode: 0,
+			ProgressMarker: "RMA02-READY-" + role, CoordlinkOperations: 3,
+			TaskCurrentObserved: true, TaskCurrentTaskID: "task-" + role, TaskCurrentRunID: "run-" + role,
+			FixtureMarker: "source-" + role, FixtureEventCount: 1, FixtureExitCode: 0,
 			CommitSHA: head, HeadSHA: head, HeadRunID: "run-" + role, TaskRef: "refs/coordplane/tasks/task-" + role + "/runs/run-" + role, SubmitEventCount: 1,
 		}
 		before[index] = rma02RunFence{TaskID: "task-" + role, AgentID: "agent-" + role, RunID: "run-" + role, ContainerID: "container-" + role, Generation: 1, LaunchNonce: "nonce-" + role}
 		after[index] = before[index]
 	}
 	integrations := make([]rma02IntegrationProof, 0, 3)
+	observedCanonical := sources[0].HeadSHA
 	for index := 1; index < len(sources); index++ {
 		source := sources[index]
 		integrations = append(integrations, rma02IntegrationProof{
 			TaskID: "integration-" + source.Role, SourceTaskID: source.TaskID, SourceRunID: source.RunID,
-			SourceTaskRef: source.TaskRef, SourceHeadSHA: source.HeadSHA, ObservedCanonical: strings.Repeat("f", 40),
+			SourceTaskRef: source.TaskRef, SourceHeadSHA: source.HeadSHA, ObservedCanonical: observedCanonical,
 			HeadSHA: strings.Repeat(string(rune('1'+index)), 40), SourceAncestor: true, CanonicalAncestor: true, SubmitEventCount: 1,
 		})
+		observedCanonical = integrations[len(integrations)-1].HeadSHA
 	}
-	finalSHA := strings.Repeat("f", 40)
+	finalSHA := integrations[len(integrations)-1].HeadSHA
 	return rma02Evidence{
 		SchemaVersion: 1, ScenarioID: "RMA-02", ScenarioExecutions: 1, Result: "PASS_REAL_MULTI_AGENT_LOCAL",
 		Revision: strings.Repeat("1", 40), SourceClean: true, ImageDigest: "sha256:" + strings.Repeat("2", 64),
@@ -174,7 +335,7 @@ func validRMA02Evidence() rma02Evidence {
 		ProjectID: "project-rma02", InitialSHA: c0, Sources: sources,
 		Overlap:         rma02OverlapEvidence{ObservedAt: overlap.Format(time.RFC3339Nano), ActiveRunIDs: []string{"run-A", "run-B", "run-C", "run-D"}, RunningContainerIDs: []string{"container-A", "container-B", "container-C", "container-D"}},
 		Message:         rma02MessageEvidence{ID: "message-A-B", SenderRunID: "run-A", DeliveryTaskID: "task-B", RecipientAgentID: "agent-B", AcknowledgerRunID: "run-B", State: "acknowledged", CreatedEventCount: 1, AckEventCount: 1, DurableBeforeRestart: true},
-		Restart:         rma02RestartEvidence{Count: 1, LiveRunsBefore: 4, Before: before, After: after, ListenerRestored: true, MessageStable: true, PendingActionsStable: true, GitFactsStable: true, ReadyBeforeContinue: true},
+		Restart:         rma02RestartEvidence{Count: 1, LiveRunsBefore: 4, Before: before, After: after, ListenerRestored: true, MessageStable: true, PendingActionsStable: true, GitFactsStable: true, ReadyObservedAt: started.Add(2 * time.Minute).Format(time.RFC3339Nano), FirstContinueAt: started.Add(3 * time.Minute).Format(time.RFC3339Nano), ReadyBeforeContinue: true},
 		DirectCASTaskID: "task-A", DirectCASCount: 1, Integrations: integrations,
 		Final:   rma02FinalEvidence{SQLiteCanonical: finalSHA, BossCanonical: finalSHA, ActualCanonical: finalSHA, SourceAncestors: []string{sources[0].HeadSHA, sources[1].HeadSHA, sources[2].HeadSHA, sources[3].HeadSHA}, TaskRefsVerified: 7, FixtureExitCode: 0, FSCKExitCode: 0, FinalRestartCount: 1, TasksQueried: 7, RunsQueried: 7, MessagesQueried: 5, StateStableAfterRestart: true},
 		Cleanup: rma02CleanupEvidence{GCRan: true},

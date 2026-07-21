@@ -62,6 +62,11 @@ type rma02SourceEvidence struct {
 	LiveUntil           string `json:"live_until"`
 	ProgressMarker      string `json:"progress_marker"`
 	CoordlinkOperations int    `json:"coordlink_operations"`
+	TaskCurrentObserved bool   `json:"task_current_observed"`
+	TaskCurrentTaskID   string `json:"task_current_task_id"`
+	TaskCurrentRunID    string `json:"task_current_run_id"`
+	FixtureMarker       string `json:"fixture_marker"`
+	FixtureEventCount   int    `json:"fixture_event_count"`
 	FixtureExitCode     int    `json:"fixture_exit_code"`
 	CommitSHA           string `json:"commit_sha"`
 	HeadSHA             string `json:"head_sha"`
@@ -106,6 +111,8 @@ type rma02RestartEvidence struct {
 	MessageStable        bool            `json:"message_stable"`
 	PendingActionsStable bool            `json:"pending_actions_stable"`
 	GitFactsStable       bool            `json:"git_facts_stable"`
+	ReadyObservedAt      string          `json:"ready_observed_at"`
+	FirstContinueAt      string          `json:"first_continue_at"`
 	ReadyBeforeContinue  bool            `json:"ready_before_continue"`
 	MutationsBeforeReady int             `json:"mutations_before_ready"`
 }
@@ -147,6 +154,8 @@ type rma02CleanupEvidence struct {
 	PendingGitActions     int  `json:"pending_git_actions"`
 	UnknownControlEntries int  `json:"unknown_control_entries"`
 	WorkspaceResidue      int  `json:"workspace_residue"`
+	HandoffResidue        int  `json:"handoff_residue"`
+	LogResidue            int  `json:"log_residue"`
 	TaskRefResidue        int  `json:"task_ref_residue"`
 	AgentHomeResidue      int  `json:"agent_home_residue"`
 }
@@ -176,7 +185,7 @@ func validateRMA02Evidence(e rma02Evidence, forbidden ...string) error {
 		e.Message.CreatedEventCount != 1 || e.Message.AckEventCount != 1 || !e.Message.DurableBeforeRestart {
 		return fmt.Errorf("direct Message acknowledgement is not durable and unique")
 	}
-	if err := validateRMA02Restart(e.Restart); err != nil {
+	if err := validateRMA02Restart(e.Restart, started, ended); err != nil {
 		return err
 	}
 	if e.DirectCASCount != 1 || !containsSourceTask(e.Sources, e.DirectCASTaskID) || len(e.Integrations) != 3 {
@@ -188,7 +197,7 @@ func validateRMA02Evidence(e rma02Evidence, forbidden ...string) error {
 	if err := validateRMA02Final(e); err != nil {
 		return err
 	}
-	if !e.Cleanup.GCRan || e.Cleanup.LiveRuns != 0 || e.Cleanup.OwnedContainers != 0 || e.Cleanup.BlockedCleanup != 0 || e.Cleanup.PendingGitActions != 0 || e.Cleanup.UnknownControlEntries != 0 || e.Cleanup.WorkspaceResidue != 0 || e.Cleanup.TaskRefResidue != 0 || e.Cleanup.AgentHomeResidue != 0 {
+	if !e.Cleanup.GCRan || e.Cleanup.LiveRuns != 0 || e.Cleanup.OwnedContainers != 0 || e.Cleanup.BlockedCleanup != 0 || e.Cleanup.PendingGitActions != 0 || e.Cleanup.UnknownControlEntries != 0 || e.Cleanup.WorkspaceResidue != 0 || e.Cleanup.HandoffResidue != 0 || e.Cleanup.LogResidue != 0 || e.Cleanup.TaskRefResidue != 0 || e.Cleanup.AgentHomeResidue != 0 {
 		return fmt.Errorf("runtime or Git cleanup did not converge")
 	}
 	return rejectRMA02Secrets(e, forbidden)
@@ -205,7 +214,9 @@ func validateRMA02Sources(e rma02Evidence, observed time.Time) error {
 		if fromErr != nil || untilErr != nil || observed.Before(from) || observed.After(until) {
 			return fmt.Errorf("source %s was not live at overlap witness", source.Role)
 		}
-		if source.BaseSHA != e.InitialSHA || source.ProgressMarker != "RMA02-READY-"+source.Role || source.CoordlinkOperations < 1 || source.FixtureExitCode != 0 ||
+		if source.BaseSHA != e.InitialSHA || source.ProgressMarker != "RMA02-READY-"+source.Role || source.CoordlinkOperations < 2 ||
+			!source.TaskCurrentObserved || source.TaskCurrentTaskID != source.TaskID || source.TaskCurrentRunID != source.RunID ||
+			source.FixtureMarker != "source-"+source.Role || source.FixtureEventCount != 1 || source.FixtureExitCode != 0 ||
 			!validObjectID(source.CommitSHA) || source.CommitSHA != source.HeadSHA || source.HeadRunID != source.RunID || source.TaskRef == "" || source.SubmitEventCount != 1 ||
 			roles[source.Role] || tasks[source.TaskID] || agents[source.AgentID] || runs[source.RunID] || containers[source.ContainerID] || heads[source.HeadSHA] {
 			return fmt.Errorf("source identity or submission proof is incomplete or duplicated")
@@ -223,9 +234,12 @@ func validateRMA02Sources(e rma02Evidence, observed time.Time) error {
 	return nil
 }
 
-func validateRMA02Restart(restart rma02RestartEvidence) error {
+func validateRMA02Restart(restart rma02RestartEvidence, started, ended time.Time) error {
+	ready, readyErr := time.Parse(time.RFC3339Nano, restart.ReadyObservedAt)
+	continued, continueErr := time.Parse(time.RFC3339Nano, restart.FirstContinueAt)
 	if restart.Count != 1 || restart.LiveRunsBefore < 2 || len(restart.Before) != 4 || len(restart.After) != 4 ||
 		!restart.ListenerRestored || !restart.MessageStable || !restart.PendingActionsStable || !restart.GitFactsStable ||
+		readyErr != nil || continueErr != nil || ready.Before(started) || continued.Before(ready) || continued.After(ended) ||
 		!restart.ReadyBeforeContinue || restart.MutationsBeforeReady != 0 {
 		return fmt.Errorf("mid-run restart proof is incomplete")
 	}
@@ -245,24 +259,31 @@ func validateRMA02Restart(restart rma02RestartEvidence) error {
 }
 
 func validateRMA02Integrations(e rma02Evidence) error {
-	want := map[string]bool{}
-	for _, source := range e.Sources {
-		if source.TaskID != e.DirectCASTaskID {
-			want[source.TaskID] = true
-		}
+	direct := sourceByRole(e.Sources, "A")
+	if direct.TaskID == "" || e.DirectCASTaskID != direct.TaskID {
+		return fmt.Errorf("direct CAS is not owned by source A")
 	}
-	seenTask := map[string]bool{}
-	for _, integration := range e.Integrations {
-		if integration.TaskID == "" || seenTask[integration.TaskID] || !want[integration.SourceTaskID] || integration.SourceRunID == "" ||
-			integration.SourceTaskRef == "" || !validObjectID(integration.SourceHeadSHA) || !validObjectID(integration.ObservedCanonical) ||
-			!validObjectID(integration.HeadSHA) || !integration.SourceAncestor || !integration.CanonicalAncestor || integration.NestedIntegration || integration.SubmitEventCount != 1 {
+	reservedTasks, heads := map[string]bool{}, map[string]bool{}
+	for _, source := range e.Sources {
+		reservedTasks[source.TaskID] = true
+		heads[source.HeadSHA] = true
+	}
+	expectedCanonical := direct.HeadSHA
+	for index, role := range []string{"B", "C", "D"} {
+		integration := e.Integrations[index]
+		source := sourceByRole(e.Sources, role)
+		if integration.TaskID == "" || reservedTasks[integration.TaskID] || integration.SourceTaskID != source.TaskID ||
+			integration.SourceRunID != source.RunID || integration.SourceTaskRef != source.TaskRef || integration.SourceHeadSHA != source.HeadSHA ||
+			integration.ObservedCanonical != expectedCanonical || !validObjectID(integration.HeadSHA) || heads[integration.HeadSHA] ||
+			!integration.SourceAncestor || !integration.CanonicalAncestor || integration.NestedIntegration || integration.SubmitEventCount != 1 {
 			return fmt.Errorf("integration identity or lineage proof is invalid")
 		}
-		delete(want, integration.SourceTaskID)
-		seenTask[integration.TaskID] = true
+		reservedTasks[integration.TaskID] = true
+		heads[integration.HeadSHA] = true
+		expectedCanonical = integration.HeadSHA
 	}
-	if len(want) != 0 {
-		return fmt.Errorf("integration proof omitted stale sources")
+	if e.Final.ActualCanonical != expectedCanonical {
+		return fmt.Errorf("final canonical is not the last integration head")
 	}
 	return nil
 }
