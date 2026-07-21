@@ -292,8 +292,7 @@ func TestRealMultiAgentShellMapsStubbedBoundariesToThreeTerminalStates(t *testin
 	}{
 		{name: "admission", invalid: true},
 		{name: "build failure", image: rma02StubImage(), makeMode: "fail", wantClass: "product"},
-		{name: "test failure", image: rma02StubImage(), testMode: "fail", wantClass: "task_spec", wantCount: 1},
-		{name: "provider failure", image: rma02StubImage(), testMode: "provider-fail", wantClass: "provider_environment", wantCount: 1},
+		{name: "test failure without durable class", image: rma02StubImage(), testMode: "fail", wantClass: "product", wantCount: 1},
 		{name: "checker failure", image: rma02StubImage(), checkerMode: "fail", wantClass: "product", wantCount: 1},
 		{name: "missing fresh report", image: rma02StubImage(), testMode: "no-report", wantClass: "product", wantCount: 1},
 		{name: "stale report cannot pass", image: rma02StubImage(), testMode: "no-report", staleReport: true, wantClass: "product", wantCount: 1},
@@ -355,8 +354,7 @@ case "$1" in
 test)
   printf 'test\n' >>"$STUB_TEST_COUNT"
   case "${STUB_TEST_MODE:-success}" in
-		fail) [ -z "${E2E_RMA02_FAILURE_CLASS_FILE:-}" ] || printf 'task_spec\n' >"$E2E_RMA02_FAILURE_CLASS_FILE"; exit 4;;
-		provider-fail) [ -z "${E2E_RMA02_FAILURE_CLASS_FILE:-}" ] || printf 'provider_environment\n' >"$E2E_RMA02_FAILURE_CLASS_FILE"; exit 4;;
+		fail) exit 4;;
     no-report) ;;
     *) printf '{"result":"PASS_REAL_MULTI_AGENT_LOCAL"}\n' >"$E2E_RMA02_REPORT";;
   esac
