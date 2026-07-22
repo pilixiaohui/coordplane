@@ -1000,7 +1000,7 @@ func classifyRMA02Failure(facts rma02FailureFacts) string {
 	}
 	if len(facts.Integrations) != 0 {
 		latest := facts.Integrations[len(facts.Integrations)-1]
-		if latest.Run.ID == "" || latest.Run.RequestedOutcome != "" || latest.Task.PendingAction != "" {
+		if latest.Run.ID == "" || rma02FailureTaskConverged(latest) {
 			return "product"
 		}
 		return "task_spec"
@@ -1023,7 +1023,7 @@ func classifyRMA02Failure(facts rma02FailureFacts) string {
 }
 
 func rma02FailureTaskConverged(fact rma02FailureTaskFact) bool {
-	return fact.Run.RequestedOutcome != "" || fact.Task.PendingAction != "" || fact.Task.Status == core.TaskSubmitted || fact.Task.Status == core.TaskCompleted
+	return fact.Run.RequestedOutcome == string(core.OutcomeSubmit) || fact.Task.PendingAction == "capture" || fact.Task.Status == core.TaskSubmitted || fact.Task.Status == core.TaskCompleted
 }
 
 func rma02BarrierFactsComplete(facts rma02FailureFacts) bool {

@@ -44,7 +44,7 @@ if [ -z "$network" ]; then network=bridge; for name in HTTP_PROXY HTTPS_PROXY AL
 
 cd "$root"
 [ -z "$(git status --porcelain --untracked-files=normal)" ] || invalid "candidate worktree is not clean"
-make build || fail
+make build >"$results" 2>&1 || fail
 E2E_REAL_MULTI_AGENT=1 \
 	E2E_COORDPLANE_BIN="$root/build/bin/coordplane" \
 	E2E_COORDLINK_BIN="$root/build/bin/coordlink" \
