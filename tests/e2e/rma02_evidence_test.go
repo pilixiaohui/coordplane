@@ -306,6 +306,49 @@ func TestRMA02ArtifactReaderRejectsUntrustedFilesWithoutLeaking(t *testing.T) {
 	}
 }
 
+func TestRMA02ArtifactReaderRejectsSymlinkedDirectoriesAndOversizedArtifacts(t *testing.T) {
+	for _, component := range []string{"agent-homes", "agent-A", ".coordplane-rma02", "task-A", "run-A"} {
+		t.Run("symlink directory "+component, func(t *testing.T) {
+			dataDir := writeRMA02ArtifactFixture(t)
+			path := dataDir
+			for _, part := range []string{"agent-homes", "agent-A", ".coordplane-rma02", "task-A", "run-A"} {
+				path = filepath.Join(path, part)
+				if part == component {
+					break
+				}
+			}
+			moved := filepath.Join(t.TempDir(), "rma02-artifact-secret-canary")
+			requireNoError(t, os.Rename(path, moved))
+			requireNoError(t, os.Symlink(moved, path))
+			if _, _, _, err := readRMA02Artifacts(dataDir, "agent-A", "task-A"); err == nil || strings.Contains(err.Error(), "rma02-artifact-secret-canary") {
+				t.Fatalf("artifact reader accepted or leaked symlinked %s: %v", component, err)
+			}
+		})
+	}
+
+	limits := []struct {
+		name    string
+		maximum int64
+	}{
+		{name: "task-current.json", maximum: 64 << 10},
+		{name: "fixture", maximum: 4 << 10},
+		{name: "fixture-exit", maximum: 64},
+	}
+	for _, test := range limits {
+		t.Run("oversized "+test.name, func(t *testing.T) {
+			dataDir := writeRMA02ArtifactFixture(t)
+			runRoot := filepath.Join(rma02ArtifactRoot(dataDir, "agent-A"), "task-A", "run-A")
+			requireNoError(t, os.WriteFile(filepath.Join(runRoot, test.name), []byte(strings.Repeat("x", int(test.maximum+1))), 0o600))
+			directory, err := openRMA02Directory(runRoot)
+			requireNoError(t, err)
+			defer directory.Close()
+			if _, err := readRMA02ArtifactFile(directory, test.name, test.maximum); err == nil {
+				t.Fatalf("artifact reader accepted %s above %d bytes", test.name, test.maximum)
+			}
+		})
+	}
+}
+
 func writeRMA02ArtifactFixture(t *testing.T) string {
 	t.Helper()
 	dataDir := filepath.Join(t.TempDir(), "data")
@@ -413,6 +456,68 @@ func TestRMA02FailureClassComesFromDurableFacts(t *testing.T) {
 				t.Fatalf("failure class = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestRMA02FailureClassRequiresDurableConvergence(t *testing.T) {
+	for _, kind := range []string{"source", "integration"} {
+		for _, outcome := range []string{"", "wait", "fail", "submit"} {
+			name := outcome
+			if name == "" {
+				name = "empty"
+			}
+			t.Run(kind+" "+name, func(t *testing.T) {
+				facts := rma02FailureFacts{Sources: rma02FailureSources(), Events: append(rma02BarrierEvents(true), rma02ContinueEvents()...)}
+				if kind == "source" {
+					for index := range facts.Sources {
+						facts.Sources[index].Run.RequestedOutcome = outcome
+					}
+				} else {
+					facts.Integrations = []rma02FailureTaskFact{{
+						Task: core.Task{ID: "integration-B", Kind: core.TaskIntegration},
+						Run:  core.Run{ID: "run-integration-B", TaskID: "integration-B", State: core.RunExited, RequestedOutcome: outcome},
+					}}
+				}
+				want := "task_spec"
+				if outcome == "submit" {
+					want = "product"
+				}
+				if got := classifyRMA02Failure(facts); got != want {
+					t.Fatalf("%s outcome %q classified as %q, want %q", kind, outcome, got, want)
+				}
+			})
+		}
+	}
+
+	for _, state := range []struct {
+		name          string
+		status        core.TaskStatus
+		pending, want string
+	}{
+		{name: "capture", pending: "capture", want: "product"},
+		{name: "submitted", status: core.TaskSubmitted, want: "product"},
+		{name: "completed", status: core.TaskCompleted, want: "product"},
+		{name: "unrelated advance", pending: "advance", want: "task_spec"},
+	} {
+		for _, kind := range []string{"source", "integration"} {
+			t.Run(kind+" "+state.name, func(t *testing.T) {
+				facts := rma02FailureFacts{Sources: rma02FailureSources(), Events: append(rma02BarrierEvents(true), rma02ContinueEvents()...)}
+				if kind == "source" {
+					for index := range facts.Sources {
+						facts.Sources[index].Task.Status = state.status
+						facts.Sources[index].Task.PendingAction = state.pending
+					}
+				} else {
+					facts.Integrations = []rma02FailureTaskFact{{
+						Task: core.Task{ID: "integration-B", Kind: core.TaskIntegration, Status: state.status, PendingAction: state.pending},
+						Run:  core.Run{ID: "run-integration-B", TaskID: "integration-B", State: core.RunExited},
+					}}
+				}
+				if got := classifyRMA02Failure(facts); got != state.want {
+					t.Fatalf("%s %s state classified as %q, want %q", kind, state.name, got, state.want)
+				}
+			})
+		}
 	}
 }
 
@@ -626,6 +731,7 @@ func TestRealMultiAgentShellMapsStubbedBoundariesToThreeTerminalStates(t *testin
 	}{
 		{name: "admission", invalid: true},
 		{name: "build failure", image: rma02StubImage(), makeMode: "fail", wantClass: "product"},
+		{name: "build failure output is redacted", image: rma02StubImage(), makeMode: "leak-fail", wantClass: "product"},
 		{name: "test failure without durable class", image: rma02StubImage(), testMode: "fail", wantClass: "product", wantCount: 1},
 		{name: "checker failure", image: rma02StubImage(), checkerMode: "fail", wantClass: "product", wantCount: 1},
 		{name: "missing fresh report", image: rma02StubImage(), testMode: "no-report", wantClass: "product", wantCount: 1},
@@ -667,6 +773,10 @@ func TestRealMultiAgentShellMapsStubbedBoundariesToThreeTerminalStates(t *testin
 				if err != nil || count != test.wantCount || !strings.Contains(text, "PASS_REAL_MULTI_AGENT_LOCAL") || strings.Contains(text, "FAIL_REAL_MULTI_AGENT") || strings.Contains(text, "INVALID_ENVIRONMENT(") {
 					t.Fatalf("success err=%v count=%d output=%s", err, count, text)
 				}
+				raw, readErr := os.ReadFile(report)
+				if readErr != nil || string(raw) != rma02StubReport {
+					t.Fatalf("published report = %q err=%v, want exact staged evidence", raw, readErr)
+				}
 				return
 			}
 			var exitErr *exec.ExitError
@@ -678,6 +788,8 @@ func TestRealMultiAgentShellMapsStubbedBoundariesToThreeTerminalStates(t *testin
 }
 
 func rma02StubImage() string { return "sha256:" + strings.Repeat("a", 64) }
+
+const rma02StubReport = "{\"result\":\"PASS_REAL_MULTI_AGENT_LOCAL\"}\n"
 
 func rma02StubbedShell(t *testing.T, image, makeMode, testMode, checkerMode string, staleReport bool) (*exec.Cmd, string, string) {
 	t.Helper()
@@ -692,7 +804,12 @@ func rma02StubbedShell(t *testing.T, image, makeMode, testMode, checkerMode stri
 	scriptPath := testsupport.WriteFile(t, filepath.Join(root, "scripts", "e2e-real-multi-agent.sh"), script, 0o700)
 	testsupport.WriteFile(t, filepath.Join(stubs, "docker"), []byte("#!/bin/sh\ncase \"$1\" in version) exit 0;; image) for last do :; done; printf '%s\\n' \"$last\";; run) printf '%s\\n' '"+realClaudeVersion+"';; *) exit 2;; esac\n"), 0o700)
 	testsupport.WriteFile(t, filepath.Join(stubs, "git"), []byte("#!/bin/sh\ncase \"$1:$2\" in status:--porcelain) exit 0;; *) exit 2;; esac\n"), 0o700)
-	testsupport.WriteFile(t, filepath.Join(stubs, "make"), []byte("#!/bin/sh\n[ \"${STUB_MAKE_MODE:-}\" != fail ]\n"), 0o700)
+	testsupport.WriteFile(t, filepath.Join(stubs, "make"), []byte(`#!/bin/sh
+case "${STUB_MAKE_MODE:-}" in
+fail) exit 1 ;;
+leak-fail) printf '%s\n' 'real-gate-auth-token-canary'; printf '%s\n' 'real-gate-auth-token-canary' >&2; exit 1 ;;
+esac
+`), 0o700)
 	goStub := `#!/bin/sh
 case "$1" in
 test)
@@ -700,9 +817,9 @@ test)
 	case "${STUB_TEST_MODE:-success}" in
 			fail) exit 4;;
 			leak-fail) printf '%s\n' 'rma02-host-path-canary real-gate-auth-token-canary'; exit 4;;
-			concurrent) printf '%s\n' 'attacker-owned' >"$RMA02_REQUESTED_OUTPUT"; printf '{"result":"PASS_REAL_MULTI_AGENT_LOCAL"}\n' >"$E2E_RMA02_REPORT";;
-	    no-report) ;;
-    *) printf '{"result":"PASS_REAL_MULTI_AGENT_LOCAL"}\n' >"$E2E_RMA02_REPORT";;
+			concurrent) printf '%s\n' 'attacker-owned' >"$RMA02_REQUESTED_OUTPUT"; printf '%s' '` + rma02StubReport + `' >"$E2E_RMA02_REPORT";;
+		    no-report) ;;
+	    *) printf '%s' '` + rma02StubReport + `' >"$E2E_RMA02_REPORT";;
   esac
   printf '{"Action":"pass","Test":"TestRealMultiAgentScenarios"}\n'
   ;;
@@ -727,6 +844,28 @@ esac
 }
 
 func TestRealMultiAgentShellPublishesReportWithoutClobbering(t *testing.T) {
+	t.Run("default output publishes exact report", func(t *testing.T) {
+		command, _, report := rma02StubbedShell(t, rma02StubImage(), "", "", "", false)
+		command.Env = replaceRMA02CommandEnv(command.Env, "RMA02_OUTPUT", "")
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("default report success: %v output=%s", err, output)
+		}
+		var published string
+		for _, line := range strings.Split(string(output), "\n") {
+			if strings.HasPrefix(line, "RMA02_EVIDENCE=") {
+				published = strings.TrimPrefix(line, "RMA02_EVIDENCE=")
+			}
+		}
+		if published == "" || filepath.Dir(filepath.Dir(published)) != filepath.Dir(report) {
+			t.Fatalf("default evidence path = %q, want controlled TMPDIR", published)
+		}
+		raw, readErr := os.ReadFile(published)
+		if readErr != nil || string(raw) != rma02StubReport {
+			t.Fatalf("default published report = %q err=%v, want exact staged evidence", raw, readErr)
+		}
+	})
+
 	t.Run("symlink target", func(t *testing.T) {
 		command, countPath, report := rma02StubbedShell(t, rma02StubImage(), "", "", "", false)
 		target := filepath.Join(t.TempDir(), "target")
