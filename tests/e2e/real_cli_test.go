@@ -396,7 +396,7 @@ func TestRealClaudeAdapterSmoke(t *testing.T) {
 		}
 		return run, run.State == core.RunCancelled && run.CleanupState == "removed", fmt.Sprintf("state=%s cleanup=%s", run.State, run.CleanupState)
 	})
-	waitForNoProjectContainers(t, ctx, project.ID)
+	waitForNoProjectContainers(t, ctx, project.ID, daemon.logPath)
 	assertAgentBossMessages(t, ctx, coordplane, socket, project.ID, agent.ID, 2)
 }
 
@@ -517,7 +517,7 @@ func TestRealClaudeTwoAgentConvergence(t *testing.T) {
 	runIn(t, ctx, finalCheckout, "./fixture-test.sh")
 	assertOneIntegrationTask(t, ctx, coordplane, socket, project.ID, integration.ID)
 	waitForLiveDirectMessage(t, ctx, coordplane, socket, project.ID, agentB.ID, taskA.ID)
-	waitForNoProjectContainers(t, ctx, project.ID)
+	waitForNoProjectContainers(t, ctx, project.ID, daemon.logPath)
 
 	if err := daemon.Stop(); err != nil {
 		t.Fatalf("stop live daemon before recovery: %v\n%s", err, readLog(daemon.logPath))

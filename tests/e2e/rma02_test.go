@@ -198,7 +198,7 @@ func runRMA02(t *testing.T) {
 	run(t, ctx, "git", "clone", "--quiet", controlRepo, finalCheckout)
 	git(t, ctx, finalCheckout, "checkout", "--quiet", finalSHA)
 	runIn(t, ctx, finalCheckout, "./fixture-test.sh", "final")
-	waitForNoProjectContainers(t, ctx, project.ID)
+	waitForNoProjectContainers(t, ctx, project.ID, daemon.logPath)
 
 	beforeFinalRestart := rma02PublicState(t, ctx, coordplane, socket, project.ID)
 	if err := daemon.Stop(); err != nil {
@@ -1232,6 +1232,8 @@ func writeRMA02Evidence(t *testing.T, path string, evidence rma02Evidence) {
 const rma02Instructions = `You are running RMA-02, the real four-Agent CoordPlane reliability gate.
 Read the complete bootstrap and run /usr/local/bin/coordlink task current --output json before doing any work. Never infer completion from prose or process exit. The fixture writer records Task/Run-bound evidence below $HOME/.coordplane-rma02.
 
+First, determine the Task Kind: read the literal kind field of the task in the coordlink task current JSON output (task.kind). If it is exactly "integration", execute ONLY the integration Steps below. If it is exactly "work", execute ONLY the work Steps below. NEVER apply the work steps to an integration Task: an integration Task has no marker progress, no RMA02-CONTINUE gate, and no role message duty — do not send RMA02-READY-style progress, do not poll or wait for RMA02-CONTINUE, and do not expect or send a peer message.
+
 For a work Task, read rma_role, task_marker, file, content, fixture, and any peer IDs from the public Task description. Follow the numbered steps in exact order; each step gates the next.
 
 Step 1 (marker progress, first and unique): immediately after coordlink task current, before any other operation, call coordlink progress with the summary set to the EXACT literal of task_marker — RMA02-READY-<role> — and a request ID containing the current Run ID. This marker is the only barrier evidence the harness accepts for your role. After it, do NOT send any other progress until Step 3 has been completed: any later progress overwrites the marker, invalidates your barrier evidence, and fails this round.
@@ -1242,5 +1244,15 @@ Step 3 (CONTINUE gate): poll the inbox until RMA02-CONTINUE <role> arrives for y
 
 Step 4 (work sequence, only after Step 3): configure native Git in /workspace/project. Write exactly the requested file/content, run ./fixture-test.sh source ROLE TASK_ID RUN_ID using the current bootstrap IDs, verify $HOME/.coordplane-rma02/TASK_ID/RUN_ID/fixture, commit only agent-ROLE.txt, resolve HEAD with git rev-parse HEAD, and submit that exact SHA with coordlink task submit. Do not create child Tasks.
 
-For an integration Task, use the source head and current canonical recorded in the bootstrap. Merge the source into the canonical-based workspace with native git merge --no-ff, run ./fixture-test.sh integration _ TASK_ID RUN_ID using the current bootstrap IDs, verify $HOME/.coordplane-rma02/TASK_ID/RUN_ID/fixture, commit if needed, resolve HEAD, and submit that exact SHA. Never create nested integration Tasks or accept a source Task yourself.
+For an integration Task, use the source head and current canonical recorded in the bootstrap. Follow the numbered steps in exact order; each step gates the next.
+
+Step 1 (merge source): merge the source head into the canonical-based workspace with native git merge --no-ff.
+
+Step 2 (fixture evidence): run ./fixture-test.sh integration _ TASK_ID RUN_ID using the current bootstrap IDs, then verify $HOME/.coordplane-rma02/TASK_ID/RUN_ID/fixture records this Run.
+
+Step 3 (commit): commit the merge result if it is not already committed.
+
+Step 4 (submit exact head): resolve HEAD with git rev-parse HEAD and submit that exact SHA with coordlink task submit. Never create nested integration Tasks or accept a source Task yourself.
+
+Discipline: outside the operations listed above — coordlink task current, progress, message send, inbox polling and ack, task submit, native git, and the fixture script — run NO other coordlink subcommand (in particular chat, agent, project, run, gc) and start NO additional container, session, or process. Keep the environment exactly as provisioned; unexpected side effects invalidate the round.
 `

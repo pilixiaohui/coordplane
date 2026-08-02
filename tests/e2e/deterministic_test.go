@@ -176,7 +176,7 @@ func TestDeterministicTwoAgentConvergence(t *testing.T) {
 	assertOneIntegrationTask(t, ctx, coordplane, socket, project.ID, integrationID)
 	waitForMessageEvidence(t, ctx, coordplane, socket, project.ID, agentB.ID, taskA.ID, bootA.ID, bootB.ID)
 	assertPublicProjection(t, ctx, coordplane, socket, project.ID, finalSHA, taskA.ID, taskB.ID, integrationID)
-	waitForNoProjectContainers(t, ctx, project.ID)
+	waitForNoProjectContainers(t, ctx, project.ID, daemon.logPath)
 
 	if err := daemon.Stop(); err != nil {
 		t.Fatalf("stop daemon before recovery: %v\n%s", err, readLog(daemon.logPath))
@@ -535,16 +535,69 @@ func assertIsolatedRuns(t *testing.T, dataDir string, runA, runB core.Run, a, b 
 	}
 }
 
-func waitForNoProjectContainers(t *testing.T, ctx context.Context, projectID string) {
+func waitForNoProjectContainers(t *testing.T, ctx context.Context, projectID, daemonLog string) {
 	t.Helper()
-	eventually(t, ctx, 30*time.Second, "all project containers removed", func() (string, bool, string) {
+	deadline := time.Now().Add(30 * time.Second)
+	var last string
+	for time.Now().Before(deadline) && ctx.Err() == nil {
 		raw, err := commandOutput(ctx, "", "docker", "ps", "-aq", "--filter", "label=coordplane.project_id="+projectID)
 		if err != nil {
-			return "", false, err.Error()
+			t.Fatalf("list project containers: %v", err)
 		}
-		value := strings.TrimSpace(string(raw))
-		return value, value == "", value
-	})
+		last = strings.TrimSpace(string(raw))
+		if last == "" {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for all project containers removed (context=%v)\n%s", ctx.Err(),
+		containerCleanupEvidence(t, projectID, last, daemonLog))
+}
+
+// containerCleanupEvidence makes a container-cleanup timeout attributable:
+// it captures the full docker inspect of every leftover container (labels,
+// name, image, created, state) plus the daemon log tail, and persists both
+// outside the test's t.TempDir (live #8: daemon logs were destroyed with the
+// temp dir, leaving leftover containers unidentifiable). The returned string
+// is the in-band failure evidence; the persisted copies survive the run.
+func containerCleanupEvidence(t *testing.T, projectID, containerIDs, daemonLog string) string {
+	t.Helper()
+	var evidence strings.Builder
+	inspected := ""
+	for _, containerID := range strings.Fields(containerIDs) {
+		raw, err := exec.CommandContext(context.Background(), "docker", "inspect", containerID).CombinedOutput()
+		if err != nil {
+			inspected += fmt.Sprintf("docker inspect %s failed: %v\n", containerID, err)
+		}
+		inspected += string(raw)
+	}
+	fmt.Fprintf(&evidence, "leftover containers for project %s: %s\n", projectID, containerIDs)
+	fmt.Fprintf(&evidence, "docker inspect (labels, name, image, created, state):\n%s\n", inspected)
+	tail, tailErr := readLiveRunLogTail(daemonLog)
+	fmt.Fprintf(&evidence, "daemon log %s tail (error=%t):\n%s\n", daemonLog, tailErr != nil, tail)
+	persistDir := filepath.Join(os.TempDir(), "coordplane-rma02-forensics")
+	if err := os.MkdirAll(persistDir, 0o700); err != nil {
+		fmt.Fprintf(&evidence, "persist forensics (mkdir): %v\n", err)
+	} else {
+		stamp := time.Now().UTC().Format("20060102-150405.000000000")
+		containerPath := filepath.Join(persistDir, "leftover-containers-"+stamp+".json")
+		if err := os.WriteFile(containerPath, []byte(inspected), 0o600); err != nil {
+			fmt.Fprintf(&evidence, "persist forensics (containers): %v\n", err)
+		} else {
+			fmt.Fprintf(&evidence, "persisted container evidence: %s\n", containerPath)
+		}
+		if raw, err := os.ReadFile(daemonLog); err != nil {
+			fmt.Fprintf(&evidence, "persist forensics (log): %v\n", err)
+		} else {
+			logPath := filepath.Join(persistDir, filepath.Base(daemonLog))
+			if err := os.WriteFile(logPath, raw, 0o600); err != nil {
+				fmt.Fprintf(&evidence, "persist forensics (log): %v\n", err)
+			} else {
+				fmt.Fprintf(&evidence, "persisted daemon log: %s\n", logPath)
+			}
+		}
+	}
+	return redactE2EFailure(evidence.String(), "", strings.Split(realProviderEnv, ","))
 }
 
 func waitForWorkspacesRemoved(t *testing.T, ctx context.Context, dataDir, projectID string, taskIDs ...string) {
