@@ -164,32 +164,40 @@ func parseClaudeContentBlock(raw []byte) (any, bool, error) {
 	}
 	switch typed.Type {
 	case "thinking":
+		// Thinking is private reasoning: always discarded, never enters events.
+		// Real streaming paths omit the signature and may emit hollow or
+		// signature-only blocks, and blocks may carry extra fields (id); all of
+		// these are dropped with the block, so only structural validity matters.
 		var block claudeThinkingBlock
-		if decodeStrictClaudeJSON(raw, &block) != nil || strings.TrimSpace(block.Thinking) == "" || strings.TrimSpace(block.Signature) == "" {
+		if json.Unmarshal(raw, &block) != nil {
 			return nil, false, errors.New("adapter: invalid Claude assistant content block")
 		}
 		return nil, false, nil
 	case "text":
+		// Real text blocks carry extra fields (id, citations); the event
+		// projection below is a whitelist, so extra fields never leak in.
 		var block claudeTextBlock
-		if decodeStrictClaudeJSON(raw, &block) != nil || strings.TrimSpace(block.Text) == "" {
+		if json.Unmarshal(raw, &block) != nil {
 			return nil, false, errors.New("adapter: invalid Claude assistant content block")
+		}
+		// Empty text blocks appear in real streaming frames; dropping them is
+		// lossless (no visible content) and must not fail the whole run.
+		if strings.TrimSpace(block.Text) == "" {
+			return nil, false, nil
 		}
 		return map[string]any{"type": "text", "text": block.Text}, true, nil
 	case "tool_use":
 		var block claudeToolUseBlock
-		if decodeStrictClaudeJSON(raw, &block) != nil || strings.TrimSpace(block.ID) == "" || strings.TrimSpace(block.Name) == "" || json.Unmarshal(block.Input, &struct{}{}) != nil || bytes.Equal(bytes.TrimSpace(block.Input), []byte("null")) {
+		// Unknown fields (e.g. streaming "partial") are tolerated, but the
+		// input safety validation stays strict: id/name must be non-blank and
+		// input must be a non-null JSON object.
+		if json.Unmarshal(raw, &block) != nil || strings.TrimSpace(block.ID) == "" || strings.TrimSpace(block.Name) == "" || json.Unmarshal(block.Input, &struct{}{}) != nil || bytes.Equal(bytes.TrimSpace(block.Input), []byte("null")) {
 			return nil, false, errors.New("adapter: invalid Claude tool_use block")
 		}
 		return map[string]any{"type": "tool_use", "id": block.ID, "name": block.Name, "input": block.Input}, true, nil
 	default:
 		return nil, false, errors.New("adapter: unsupported Claude assistant content block")
 	}
-}
-
-func decodeStrictClaudeJSON(raw []byte, target any) error {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	return decoder.Decode(target)
 }
 
 func validateLaunch(spec LaunchSpec) error {
