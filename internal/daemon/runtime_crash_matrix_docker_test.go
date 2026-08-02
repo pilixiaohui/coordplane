@@ -705,3 +705,144 @@ func assertRT05OutcomeDurable(t *testing.T, ctx context.Context, root, taskID, r
 		t.Fatalf("outcome was not durable before SIGKILL: Run=%#v Task=%#v dedupe=%t Events=%#v", run, task, dedupeExists, events)
 	}
 }
+
+// TestRT05HelperContainersDoNotTripOrphanIsolation locks the COD-64 Part 2
+// orphan-isolation boundary at the RT-05 boundary (real SQLite + real Docker):
+// the daemon's own short-lived helper containers (coordplane-git-inspect-* /
+// coordplane-git-capture-* fingerprint: AgentID git-helper, generation 1,
+// LaunchNonce equal to the 12-hex name digest, RunID an operation digest with
+// no Run row by design) must NOT trip fail-closed orphan detection — they
+// exist in every capture/inspect window and would otherwise flap the daemon
+// degraded (live #11). The fail-closed property itself is unchanged: a run
+// container (coordplane-run-*) without a Run row must still degrade the daemon
+// with the orphan quarantine reason.
+func TestRT05HelperContainersDoNotTripOrphanIsolation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	executor, err := containerruntime.NewDockerExecutorFromEnvironment()
+	requireNoError(t, err)
+	if err := executor.Ping(ctx); err != nil {
+		t.Fatalf("real Docker is required for RT-05: %v", err)
+	}
+	artifacts := buildRT05ProcessArtifacts(t, ctx)
+	root, err := os.MkdirTemp("/tmp", "cp-rt05-helper-orphan-")
+	requireNoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	configPath := writeTestConfig(t, root)
+	rawConfig, err := os.ReadFile(configPath)
+	requireNoError(t, err)
+	rawConfig = []byte(strings.ReplaceAll(string(rawConfig), "  docker_network: coordplane\n", "  docker_network: none\n"))
+	requireNoError(t, os.WriteFile(configPath, rawConfig, 0o600))
+
+	socket := filepath.Join(root, "data", "operator.sock")
+	daemon := startP3DaemonProcessWithEnv(t, artifacts.daemon, configPath, socket, filepath.Join(root, "daemon.log"), nil)
+	t.Cleanup(func() { killP3DaemonProcess(t, daemon) })
+	client, err := transport.NewUnixClient(socket)
+	requireNoError(t, err)
+	waitForRT05DaemonReady(t, client)
+
+	digest := "5185ed5d780f"
+	helperLabels := map[string]string{
+		"coordplane.managed":          "true",
+		"coordplane.runtime_contract": "v1",
+		"coordplane.project_id":       "prj_rt05_helper",
+		"coordplane.task_id":          "tsk_rt05_helper",
+		"coordplane.agent_id":         "git-helper",
+		"coordplane.run_id":           "0123456789abcdef0123456789abcdef",
+		"coordplane.generation":       "1",
+		"coordplane.launch_nonce":     digest,
+	}
+	createRT05ManagedContainer(t, ctx, "coordplane-git-inspect-"+digest, helperLabels, artifacts.image)
+	assertRT05ManagedVisible(t, executor, "coordplane-git-inspect-"+digest)
+	// The helper-shaped container must not degrade the daemon across several
+	// reconciler ticks (2s period); any degraded observation here is the
+	// flapping live #11 hit.
+	assertRT05DaemonStaysReady(t, client, 5*time.Second)
+
+	runID := "run_abcdef0123456789abcdef0123456789"
+	runLabels := map[string]string{
+		"coordplane.managed":          "true",
+		"coordplane.runtime_contract": "v1",
+		"coordplane.project_id":       "prj_rt05_helper",
+		"coordplane.task_id":          "tsk_rt05_helper",
+		"coordplane.agent_id":         "agt_rt05_helper",
+		"coordplane.run_id":           runID,
+		"coordplane.generation":       "1",
+		"coordplane.launch_nonce":     "9abcdef01234",
+	}
+	createRT05ManagedContainer(t, ctx, "coordplane-run-"+runID, runLabels, artifacts.image)
+	assertRT05ManagedVisible(t, executor, "coordplane-run-"+runID)
+	// Fail-closed property unchanged: a run-shaped container with no Run row
+	// must still be quarantined/manual and degrade the daemon.
+	assertRT05DaemonDegradedOrphan(t, client, 10*time.Second)
+}
+
+func waitForRT05DaemonReady(t *testing.T, client *transport.Client) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	var last core.Status
+	for time.Now().Before(deadline) {
+		if err := client.JSON(context.Background(), http.MethodGet, "/v1/status", nil, &last); err == nil && last.DaemonReady {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("RT-05 daemon did not become ready: %#v", last)
+}
+
+func createRT05ManagedContainer(t *testing.T, ctx context.Context, name string, labels map[string]string, image string) {
+	t.Helper()
+	args := []string{"create", "--name", name}
+	for key, value := range labels {
+		args = append(args, "--label", key+"="+value)
+	}
+	args = append(args, image)
+	command := exec.CommandContext(ctx, "docker", args...)
+	if raw, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("docker create %s: %v\n%s", name, err, raw)
+	}
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", name).Run() })
+}
+
+func assertRT05ManagedVisible(t *testing.T, executor *containerruntime.DockerExecutor, name string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	states, err := executor.Managed(ctx)
+	requireNoError(t, err)
+	for _, state := range states {
+		if state.Ref.ContainerName == name {
+			return
+		}
+	}
+	t.Fatalf("fixture container %s is not visible to daemon Managed()", name)
+}
+
+func assertRT05DaemonStaysReady(t *testing.T, client *transport.Client, duration time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(duration)
+	var last core.Status
+	for time.Now().Before(deadline) {
+		if err := client.JSON(context.Background(), http.MethodGet, "/v1/status", nil, &last); err != nil {
+			t.Fatalf("RT-05 status query: %v", err)
+		}
+		if !last.DaemonReady {
+			t.Fatalf("RT-05 daemon degraded while only a helper-shaped managed container was present: %s", last.Reason)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func assertRT05DaemonDegradedOrphan(t *testing.T, client *transport.Client, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last core.Status
+	for time.Now().Before(deadline) {
+		if err := client.JSON(context.Background(), http.MethodGet, "/v1/status", nil, &last); err == nil &&
+			!last.DaemonReady && strings.Contains(last.Reason, "orphan") {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("RT-05 daemon did not fail closed on a run container without a Run row: last status=%#v", last)
+}

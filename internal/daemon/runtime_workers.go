@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"coordplane/internal/adapter"
@@ -493,6 +494,43 @@ func (c *runtimeController) cleanupTerminalRuns(ctx context.Context) {
 	}
 }
 
+// isDaemonHelperRef reports whether a managed container is one of the daemon's
+// own short-lived Git helper containers (git-capture/git-inspect, created in
+// git_capture_helper.go). Helper refs carry a deterministic fingerprint: name
+// coordplane-git-(capture|inspect)-<12-hex digest>, AgentID git-helper,
+// generation 1, and the same 12-hex digest as LaunchNonce; their RunID is an
+// operation digest with no Run row by design. Without this exclusion
+// detectOrphans would fail-closed on them and flap the daemon degraded during
+// every capture/inspect window (COD-64, live #11). The match is deliberately
+// narrow so the fail-closed property is preserved: run containers
+// (coordplane-run-*, real Agent and Run IDs) never match, so a running
+// container without a Run row still requires manual quarantine.
+func isDaemonHelperRef(ref containerruntime.RuntimeRef) bool {
+	digest, ok := helperRefDigest(ref.ContainerName)
+	if !ok {
+		return false
+	}
+	return ref.AgentID == "git-helper" && ref.Generation == 1 && ref.LaunchNonce == digest
+}
+
+// helperRefDigest returns the 12-hex operation digest suffix of a known helper
+// container name, or ok=false for any other name shape.
+func helperRefDigest(name string) (string, bool) {
+	for _, prefix := range []string{"coordplane-git-capture-", "coordplane-git-inspect-"} {
+		rest, found := strings.CutPrefix(name, prefix)
+		if !found || len(rest) != 12 {
+			continue
+		}
+		for _, r := range rest {
+			if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+				return "", false
+			}
+		}
+		return rest, true
+	}
+	return "", false
+}
+
 func (c *runtimeController) detectOrphans(ctx context.Context) error {
 	states, err := c.executor.Managed(ctx)
 	if err != nil {
@@ -500,6 +538,12 @@ func (c *runtimeController) detectOrphans(ctx context.Context) error {
 	}
 	liveAgents := make(map[string]string)
 	for _, state := range states {
+		if isDaemonHelperRef(state.Ref) {
+			// daemon 自身短生命周期 helper 容器:无 Run row 是设计行为,不是 orphan。
+			// 排除面为确定性 helper 指纹(见 isDaemonHelperRef),coordplane-run-* 运行
+			// 容器不匹配,无 Run row 仍 fail-closed 隔离(COD-52 同源安全属性不放松)。
+			continue
+		}
 		run, runErr := c.service.Run(ctx, state.Ref.RunID)
 		if core.IsCode(runErr, core.CodeNotFound) {
 			return fmt.Errorf("managed orphan container %s requires manual quarantine", state.Ref.ContainerName)
