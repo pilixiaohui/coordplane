@@ -96,7 +96,7 @@ func buildComponents(ctx context.Context, configPath string) (*components, error
 	if err != nil {
 		return fail(err)
 	}
-	agentHomes, err := newAgentHomeGC(cfg.Runtime.AgentHomeRoot)
+	agentHomes, err := newAgentHomeGC(cfg.Runtime.AgentHomeRoot, cfg.Runtime.DefaultImage)
 	if err != nil {
 		return fail(err)
 	}
