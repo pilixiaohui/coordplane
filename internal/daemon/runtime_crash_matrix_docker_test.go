@@ -710,7 +710,7 @@ func assertRT05OutcomeDurable(t *testing.T, ctx context.Context, root, taskID, r
 // orphan-isolation boundary at the RT-05 boundary (real SQLite + real Docker):
 // the daemon's own short-lived helper containers (coordplane-git-inspect-* /
 // coordplane-git-capture-* fingerprint: AgentID git-helper, generation 1,
-// LaunchNonce equal to the 12-hex name digest, RunID an operation digest with
+// LaunchNonce equal to the 24-hex name digest, RunID an operation digest with
 // no Run row by design) must NOT trip fail-closed orphan detection — they
 // exist in every capture/inspect window and would otherwise flap the daemon
 // degraded (live #11). The fail-closed property itself is unchanged: a run
@@ -741,7 +741,11 @@ func TestRT05HelperContainersDoNotTripOrphanIsolation(t *testing.T) {
 	requireNoError(t, err)
 	waitForRT05DaemonReady(t, client)
 
-	digest := "5185ed5d780f"
+	// 24-hex digest — the production shape captureRuntimeRef / inspectRuntimeRef
+	// emit (hex.EncodeToString(digest[:12]) = 24 hex chars). The pre-rework
+	// fixture used a 12-hex digest that production never generates, so the
+	// exclusion matched the fixture while missing every real helper container.
+	digest := "a3b4c5d6e7f80123456789ab"
 	helperLabels := map[string]string{
 		"coordplane.managed":          "true",
 		"coordplane.runtime_contract": "v1",
