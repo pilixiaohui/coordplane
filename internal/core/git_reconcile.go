@@ -324,8 +324,13 @@ func (s *Service) projectCaptureFailure(ctx context.Context, intent Task, intent
 		if task.Status == TaskFailed {
 			kind = "task.failed"
 		}
-		_, err = tx.AppendEvent(event(task.ProjectID, "task", task.ID, kind, "daemon", "", run.ID, "", intent.PendingActionID, eventPayload(map[string]any{"reason": task.FailureReason}), now))
-		return err
+		if _, err := tx.AppendEvent(event(task.ProjectID, "task", task.ID, kind, "daemon", "", run.ID, "", intent.PendingActionID, eventPayload(map[string]any{"reason": task.FailureReason}), now)); err != nil {
+			return err
+		}
+		if task.Status == TaskFailed {
+			return s.disposeUnresolvedMessages(tx, task, "daemon", "", run.ID, "", now)
+		}
+		return nil
 	})
 }
 
@@ -614,8 +619,10 @@ func (s *Service) projectAdvanceInvariantFailure(ctx context.Context, intent Tas
 				return err
 			}
 		}
-		_, err = tx.AppendEvent(event(task.ProjectID, "task", task.ID, "task.failed", "daemon", "", task.HeadRunID, "", intent.PendingActionID, eventPayload(map[string]any{"reason": reason}), now))
-		return err
+		if _, err := tx.AppendEvent(event(task.ProjectID, "task", task.ID, "task.failed", "daemon", "", task.HeadRunID, "", intent.PendingActionID, eventPayload(map[string]any{"reason": reason}), now)); err != nil {
+			return err
+		}
+		return s.disposeUnresolvedMessages(tx, task, "daemon", "", task.HeadRunID, "", now)
 	})
 }
 
