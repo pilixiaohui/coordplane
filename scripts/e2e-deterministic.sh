@@ -33,8 +33,8 @@ if ! go run ./scripts/locguard --live-integration tests/e2e/real_cli_test.go >/d
 	! E2E_COORDPLANE_BIN="$build_dir/bin/coordplane" \
 	E2E_COORDLINK_BIN="$build_dir/bin/coordlink" \
 	E2E_RUNTIME_IMAGE="$image" \
-	go test -tags=e2e ./tests/e2e -run '^(TestDeterministicTwoAgentConvergence|TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests|TestRealCLIGatePreservesFailureDiagnosticsBeforeCleanupWithoutProvider)$' -count=1 -v; then
-	abort "FAIL(deterministic two-Agent E2E, real image admission negatives, or live failure diagnostics)" 1
+	go test -tags=e2e ./tests/e2e -run '^(TestDeterministicTwoAgentConvergence|TestDeterministicSevenWorkspaceGCSegment|TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests|TestRealCLIGatePreservesFailureDiagnosticsBeforeCleanupWithoutProvider)$' -count=1 -v; then
+	abort "FAIL(deterministic two-Agent E2E, deterministic GC-segment offline gate, real image admission negatives, or live failure diagnostics)" 1
 fi
 
-echo "PASS(deterministic two-Agent E2E, real image admission negatives, and live failure diagnostics)"
+echo "PASS(deterministic two-Agent E2E, deterministic GC-segment offline gate, real image admission negatives, and live failure diagnostics)"

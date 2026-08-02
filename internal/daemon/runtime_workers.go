@@ -497,8 +497,8 @@ func (c *runtimeController) cleanupTerminalRuns(ctx context.Context) {
 // isDaemonHelperRef reports whether a managed container is one of the daemon's
 // own short-lived Git helper containers (git-capture/git-inspect, created in
 // git_capture_helper.go). Helper refs carry a deterministic fingerprint: name
-// coordplane-git-(capture|inspect)-<12-hex digest>, AgentID git-helper,
-// generation 1, and the same 12-hex digest as LaunchNonce; their RunID is an
+// coordplane-git-(capture|inspect)-<24-hex digest>, AgentID git-helper,
+// generation 1, and the same 24-hex digest as LaunchNonce; their RunID is an
 // operation digest with no Run row by design. Without this exclusion
 // detectOrphans would fail-closed on them and flap the daemon degraded during
 // every capture/inspect window (COD-64, live #11). The match is deliberately
@@ -513,12 +513,14 @@ func isDaemonHelperRef(ref containerruntime.RuntimeRef) bool {
 	return ref.AgentID == "git-helper" && ref.Generation == 1 && ref.LaunchNonce == digest
 }
 
-// helperRefDigest returns the 12-hex operation digest suffix of a known helper
-// container name, or ok=false for any other name shape.
+// helperRefDigest returns the 24-hex operation digest suffix of a known helper
+// container name, or ok=false for any other name shape. The digest is
+// hex.EncodeToString(digest[:12]) from git_capture_helper.go — a 12-byte
+// SHA-256 prefix, 24 hex characters.
 func helperRefDigest(name string) (string, bool) {
 	for _, prefix := range []string{"coordplane-git-capture-", "coordplane-git-inspect-"} {
 		rest, found := strings.CutPrefix(name, prefix)
-		if !found || len(rest) != 12 {
+		if !found || len(rest) != 24 {
 			continue
 		}
 		for _, r := range rest {
