@@ -193,6 +193,27 @@ func TestAgentHomeGCDeleteBoundaryFailureFailsClosed(t *testing.T) {
 	}
 }
 
+func TestAgentHomeGCDeletePreservesHostErrorWhenBoundaryFails(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	const agentID = "agent-host-error-preserved"
+	// The 000-mode subdirectory makes the host os.RemoveAll fail
+	// deterministically with permission denied (an empty 000-mode home
+	// would be removed by a plain rmdir, never reaching the boundary).
+	hostUndeletableHome(t, root, agentID)
+	want := errors.New("trusted boundary unavailable")
+	boundary := &recordingBoundary{err: want}
+	gc := &agentHomeGC{root: root, boundary: boundary}
+
+	_, err := gc.Delete(ctx, agentID, func() (bool, error) { return true, nil })
+	if !errors.Is(err, want) {
+		t.Fatalf("boundary failure = %v, want %v", err, want)
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("host os.RemoveAll error must be preserved in the wrap, got %v", err)
+	}
+}
+
 func TestAgentHomeGCDeleteUnconfiguredBoundaryFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

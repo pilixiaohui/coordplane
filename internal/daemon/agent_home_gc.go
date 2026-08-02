@@ -77,14 +77,17 @@ func (g *agentHomeGC) Delete(ctx context.Context, agentID string, authorize func
 	// trusted Docker boundary. This escalation keeps hosts without a usable
 	// boundary on today's semantics and never reports success while a
 	// deletion the host cannot perform was skipped.
-	if err := os.RemoveAll(path); err == nil {
+	hostErr := os.RemoveAll(path)
+	if hostErr == nil {
 		return true, nil
 	}
 	if g.boundary == nil {
-		return false, errors.New("Agent home cleanup boundary is not configured")
+		return false, fmt.Errorf("Agent home cleanup boundary is not configured (host os.RemoveAll: %v)", hostErr)
 	}
 	if err := g.boundary.RemoveTree(ctx, path); err != nil {
-		return false, err
+		// Keep the host's original deletion error alongside the boundary
+		// failure so the root permission problem stays diagnosable.
+		return false, fmt.Errorf("%w (host os.RemoveAll: %v)", err, hostErr)
 	}
 	return true, nil
 }

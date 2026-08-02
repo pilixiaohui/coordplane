@@ -127,3 +127,68 @@ func TestAgentHomeGCDockerBoundaryUnavailableFailClosed(t *testing.T) {
 		t.Fatalf("Agent home must be left in place when the boundary fails, got %v", err)
 	}
 }
+
+// TestAgentHomeGCDockerDeletesHomeUnder65532OwnedRoot pins the second
+// dockerCleanupBoundary branch (COD-67 review hygiene): when the emptied
+// Agent home root itself cannot be removed by the host because its parent
+// directory is 65532-owned without host write permission, RemoveTree must
+// escalate to mounting the parent and removing the root from inside the
+// container. Reachability in production is low (AgentHomeRoot is
+// daemon-owned), so this is a defensive closure; before COD-67 the branch
+// had no automated coverage and was only exercised by manual runs.
+func TestAgentHomeGCDockerDeletesHomeUnder65532OwnedRoot(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	executor, err := containerruntime.NewDockerExecutorFromEnvironment()
+	requireNoError(t, err)
+	if err := executor.Ping(ctx); err != nil {
+		t.Fatalf("real Docker is required for the Agent home GC boundary regression: %v", err)
+	}
+	image := dockerGitHelperImage(t, ctx, t.TempDir())
+	root := filepath.Join(t.TempDir(), "root")
+	requireNoError(t, os.Mkdir(root, 0o700))
+	const agentID = "agent-red-parent-65532"
+	home := filepath.Join(root, agentID)
+	writeContainerHome(t, ctx, image, home)
+
+	// Make the Agent home root's parent 65532-owned without host write
+	// permission: the host can still traverse it (so State and the docker
+	// bind mounts work) but can no longer unlink the emptied home root,
+	// which forces the second dockerCleanupBoundary branch.
+	chown := exec.CommandContext(ctx, "docker", "run", "--rm", "--network", "none", "--user", "0:0",
+		"-v", root+":/agent-root", "--entrypoint", "sh", image,
+		"-c", "chown 65532:65532 /agent-root && chmod 755 /agent-root")
+	if raw, err := chown.CombinedOutput(); err != nil {
+		t.Fatalf("chown Agent home root to 65532: %v\n%s", err, raw)
+	}
+	rootStat, err := os.Lstat(root)
+	requireNoError(t, err)
+	if stat, ok := rootStat.Sys().(*syscall.Stat_t); !ok || stat.Uid != 65532 {
+		t.Fatalf("expected uid 65532 on Agent home root, got %#v", rootStat.Sys())
+	}
+	if rootStat.Mode().Perm() != 0o755 {
+		t.Fatalf("expected 0755 Agent home root, got %v", rootStat.Mode().Perm())
+	}
+
+	// On failure the 65532-owned tree survives and would break t.TempDir
+	// cleanup; empty it through the same trusted boundary.
+	t.Cleanup(func() {
+		cleanup, stop := context.WithTimeout(context.Background(), 30*time.Second)
+		defer stop()
+		_ = exec.CommandContext(cleanup, "docker", "run", "--rm", "--network", "none", "--user", "0:0",
+			"-v", root+":/cleanup", "--entrypoint", "sh", image, "-c", "find /cleanup -mindepth 1 -delete").Run()
+	})
+
+	gc, err := newAgentHomeGC(root, image)
+	requireNoError(t, err)
+	deleted, err := gc.Delete(ctx, agentID, func() (bool, error) { return true, nil })
+	if err != nil {
+		t.Fatalf("Delete of 65532-owned Agent home: %v", err)
+	}
+	if !deleted {
+		t.Fatal("Delete returned not deleted")
+	}
+	if _, err := os.Lstat(home); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Agent home must be fully removed, got %v", err)
+	}
+}
