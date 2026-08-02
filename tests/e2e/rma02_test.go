@@ -78,6 +78,10 @@ func runRMA02(t *testing.T) {
 	if project.InitialSHA != initialSHA || project.CanonicalSHA != initialSHA {
 		t.Fatalf("RMA-02 Project did not register C0: %#v", project)
 	}
+	for _, source := range sources {
+		runJSON[core.Agent](t, ctx, coordplane, "agent", "pause", source.agent.ID, "--socket", socket,
+			"--request-id", "rma02-pause-"+source.role, "--output", "json")
+	}
 	createRMA02Tasks(t, ctx, coordplane, socket, project.ID, initialSHA, sources)
 	registerRMA02FailureClassification(t, coordplane, socket, project.ID, sources)
 	for index := range sources {
@@ -270,8 +274,6 @@ func addRMA02Sources(t *testing.T, ctx context.Context, binary, socket, image, i
 			"agent", "add", "--socket", socket, "--id", "agt_rma02_"+strings.ToLower(role), "--display-name", "RMA-02 Agent "+role,
 			"--adapter", "claude", "--image", image, "--instructions-file", instructions,
 			"--request-id", "rma02-agent-"+strings.ToLower(role), "--output", "json")
-		runJSON[core.Agent](t, ctx, binary, "agent", "pause", agent.ID, "--socket", socket,
-			"--request-id", "rma02-pause-"+role, "--output", "json")
 		sources[index] = rma02Source{role: role, marker: "RMA02-READY-" + role, agent: agent}
 	}
 	return sources
