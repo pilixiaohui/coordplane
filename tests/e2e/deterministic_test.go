@@ -3,6 +3,7 @@
 package e2e_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -197,12 +198,12 @@ func TestDeterministicTwoAgentConvergence(t *testing.T) {
 		}
 	}
 
-	preview := runJSON[core.GCPreview](t, ctx, coordplane,
+	preview := runGCJSON[core.GCPreview](t, ctx, coordplane, daemon.logPath,
 		"gc", "preview", "--socket", socket, "--output", "json")
 	if len(preview.Workspaces) == 0 || len(preview.TaskRefs) == 0 {
 		t.Fatalf("GC preview omitted maintained resources: %#v", preview)
 	}
-	gcResult := runJSON[core.GCRunResult](t, ctx, coordplane,
+	gcResult := runGCJSON[core.GCRunResult](t, ctx, coordplane, daemon.logPath,
 		"gc", "run", "--socket", socket, "--confirm", "--request-id", "p5-gc", "--output", "json")
 	if !gcResult.Completed {
 		t.Fatalf("GC run = %#v", gcResult)
@@ -602,6 +603,163 @@ func containerCleanupEvidence(t *testing.T, projectID, containerIDs, daemonLog s
 		}
 	}
 	return redactE2EFailure(evidence.String(), "", strings.Split(realProviderEnv, ","))
+}
+
+// waitForManagedContainersDrained waits until no daemon-managed container
+// remains, bounded at 90s, using the exact filter the daemon's Managed()
+// (detectOrphans input) uses: coordplane.managed=true plus
+// coordplane.runtime_contract=v1. Retention-0 auto-GC deletes each terminal
+// workspace through one inspect helper container (Delete→inspectWorkspaceState
+// has no absent fast path); detectOrphans fail-closes on those short-lived
+// helpers (no Run row by design) and flaps the daemon degraded until the last
+// one is removed (COD-52 same-source safety). The GC segment must drain this
+// set completely before its operator CLI calls, or it can hit the degraded
+// window (live #11 at 7-workspace scale). Only the daemon-visible set can flap
+// the daemon, so foreign managed-labeled containers without the contract label
+// (e.g. other harnesses sharing the host) are deliberately not part of the
+// settle condition.
+func waitForManagedContainersDrained(t *testing.T, ctx context.Context, daemonLog string) {
+	t.Helper()
+	started := time.Now()
+	deadline := started.Add(90 * time.Second)
+	var last string
+	for time.Now().Before(deadline) && ctx.Err() == nil {
+		raw, err := commandOutput(ctx, "", "docker", "ps", "-aq",
+			"--filter", "label=coordplane.managed=true", "--filter", "label=coordplane.runtime_contract=v1")
+		if err != nil {
+			t.Fatalf("list managed containers: %v", err)
+		}
+		last = strings.TrimSpace(string(raw))
+		if last == "" {
+			t.Logf("managed containers drained after %s", time.Since(started).Round(time.Millisecond))
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for managed containers drained (context=%v): %s\n%s", ctx.Err(), last,
+		containerCleanupEvidence(t, "", last, daemonLog))
+}
+
+// runGCJSON invokes an operator GC CLI command with bounded retry on
+// RUNTIME_UNAVAILABLE, mirroring the agent-side coordlink retry semantics
+// (retryableRunRequest) for the operator side. The GC segment previously
+// called the operator CLI without any retry, so a single degraded tick (auto-GC
+// inspect helper window) made it exit 1. On final failure it captures the CLI
+// stderr — which commandOutput discards today — plus the daemon log tail, and
+// persists both outside t.TempDir (COD-60/61 evidence discipline).
+func runGCJSON[T any](t *testing.T, ctx context.Context, binary, daemonLog string, args ...string) T {
+	t.Helper()
+	const (
+		maxAttempts = 3
+		retryDelay  = 2 * time.Second
+	)
+	var value T
+	var lastRaw []byte
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		raw, err := commandOutput(ctx, "", binary, args...)
+		if err == nil {
+			if err := json.Unmarshal(raw, &value); err != nil {
+				t.Fatalf("decode JSON response: %v", err)
+			}
+			return value
+		}
+		lastRaw, lastErr = raw, err
+		if !bytes.Contains(raw, []byte("RUNTIME_UNAVAILABLE")) {
+			break
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		t.Logf("%s answered RUNTIME_UNAVAILABLE (attempt %d/%d); retrying in %s",
+			filepath.Base(binary), attempt, maxAttempts, retryDelay)
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
+	}
+	t.Fatal(gcSegmentFailureEvidence(t, filepath.Base(binary), lastErr, lastRaw, daemonLog))
+	return value
+}
+
+// gcSegmentFailureEvidence makes a GC-segment CLI failure attributable and
+// durable: CLI stderr plus the daemon log tail are persisted to the shared
+// forensics directory outside t.TempDir and returned redacted for the in-band
+// failure message (live #11: both were unrecoverable).
+func gcSegmentFailureEvidence(t *testing.T, command string, err error, cliRaw []byte, daemonLog string) string {
+	t.Helper()
+	var evidence strings.Builder
+	fmt.Fprintf(&evidence, "%s failed: %v\nCLI stderr:\n%s\n", command, err, string(cliRaw))
+	tail, tailErr := readLiveRunLogTail(daemonLog)
+	fmt.Fprintf(&evidence, "daemon log %s tail (error=%t):\n%s\n", daemonLog, tailErr != nil, tail)
+	persistDir := filepath.Join(os.TempDir(), "coordplane-rma02-forensics")
+	if err := os.MkdirAll(persistDir, 0o700); err != nil {
+		fmt.Fprintf(&evidence, "persist forensics (mkdir): %v\n", err)
+		return redactE2EFailure(evidence.String(), "", strings.Split(realProviderEnv, ","))
+	}
+	stamp := time.Now().UTC().Format("20060102-150405.000000000")
+	cliPath := filepath.Join(persistDir, "gc-cli-"+stamp+".log")
+	if err := os.WriteFile(cliPath, []byte(redactE2EFailure(string(cliRaw), "", strings.Split(realProviderEnv, ","))), 0o600); err != nil {
+		fmt.Fprintf(&evidence, "persist forensics (cli): %v\n", err)
+	} else {
+		fmt.Fprintf(&evidence, "persisted GC CLI stderr: %s\n", cliPath)
+	}
+	if raw, err := os.ReadFile(daemonLog); err != nil {
+		fmt.Fprintf(&evidence, "persist forensics (log): %v\n", err)
+	} else {
+		logPath := filepath.Join(persistDir, filepath.Base(daemonLog))
+		if err := os.WriteFile(logPath, raw, 0o600); err != nil {
+			fmt.Fprintf(&evidence, "persist forensics (log): %v\n", err)
+		} else {
+			fmt.Fprintf(&evidence, "persisted daemon log: %s\n", logPath)
+		}
+	}
+	return redactE2EFailure(evidence.String(), "", strings.Split(realProviderEnv, ","))
+}
+
+// watchDaemonReadyStable polls operator status and fails the test if the
+// daemon is observed not-ready before stop is called: the GC segment must
+// observe zero degraded windows once the managed-container settle wait has
+// drained. The probe covers the afterGC preview, readiness fence and gc run
+// calls and returns the first degraded observation, if any.
+func watchDaemonReadyStable(t *testing.T, ctx context.Context, binary, socket string) func() {
+	t.Helper()
+	observed := make(chan string, 1)
+	stop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				close(observed)
+				return
+			case <-ticker.C:
+				status, err := commandJSON[core.Status](ctx, binary, "status", "--socket", socket, "--output", "json")
+				if err != nil || status.DaemonReady {
+					continue
+				}
+				select {
+				case observed <- status.Reason:
+				default:
+				}
+				return
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		if reason := <-observed; reason != "" {
+			t.Fatalf("daemon observed not-ready during GC segment settle window: %s", reason)
+		}
+	}
 }
 
 func waitForWorkspacesRemoved(t *testing.T, ctx context.Context, dataDir, projectID string, taskIDs ...string) {

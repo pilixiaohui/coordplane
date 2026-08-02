@@ -80,6 +80,22 @@ elif [ "$kind" = "integration" ]; then
 	sleep 30
 else
 	role=$(printf '%s\n' "$description" | sed -n 's/.*p5_role=\([ABCD]\).*/\1/p')
+	if printf '%s\n' "$description" | grep -q 'gc_only=1'; then
+		gc_name=$(printf '%s\n' "$description" | sed -n 's/.*gc_name=\([^ ;]*\).*/\1/p')
+		[ -n "$gc_name" ]
+		# Generic GC-segment fixture: no P5-DIRECT/P5-GO messaging, no
+		# trailing sleep — the run exits as soon as the commit is submitted.
+		configure_git gc
+		file="agent-$gc_name.txt"
+		printf 'agent-%s\n' "$gc_name" >"$file"
+		git add "$file"
+		git commit -m "GC $gc_name result"
+		head=$(git rev-parse HEAD)
+		/usr/local/bin/coordlink task submit --summary "GC $gc_name result" --expected-head "$head" \
+			--request-id "gc-submit-$gc_name-$run_id" --output json
+		echo '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
+		exit 0
+	fi
 	[ -n "$role" ]
 	configure_git "$role"
 	wait_for_body "P5-GO" >/dev/null
