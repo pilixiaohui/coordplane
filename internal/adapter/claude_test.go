@@ -38,7 +38,7 @@ func TestClaudeTypedStreamJSONConformance(t *testing.T) {
 	for _, test := range []struct {
 		name, frame, session, message, forbidden string
 		kind                                     EventKind
-		reject                                   bool
+		reject, noRaw                            bool
 	}{
 		{name: "init", frame: `{"type":"system","subtype":"init","session_id":"0190f8b7-acde"}`, kind: EventSessionStarted, session: "0190f8b7-acde"},
 		{name: "success", frame: `{"type":"result","subtype":"success","is_error":false,"result":"done"}`, kind: EventProtocol},
@@ -51,16 +51,24 @@ func TestClaudeTypedStreamJSONConformance(t *testing.T) {
 		{name: "empty object message", frame: `{"type":"assistant","message":{}}`, reject: true},
 		{name: "empty array message", frame: `{"type":"assistant","message":[]}`, reject: true},
 		{name: "unknown block", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"unknown"}]}}`, reject: true},
-		{name: "blank text", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":" "}]}}`, reject: true},
-		{name: "text with tool field", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":"visible","id":"cross-variant"}]}}`, reject: true},
-		{name: "thinking without signature", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"thinking","thinking":"private"}]}}`, reject: true},
-		{name: "thinking with text field", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"thinking","thinking":"private","signature":"sig","text":"cross-variant"}]}}`, reject: true},
+		{name: "thinking without signature dropped", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"thinking","thinking":"private"}]}}`, kind: EventProtocol, noRaw: true},
+		{name: "signature only thinking dropped", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"thinking","signature":"sig"}]}}`, kind: EventProtocol, noRaw: true},
+		{name: "hollow thinking dropped", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"thinking","thinking":"","signature":"sig"},{"type":"text","text":"visible"}]}}`, kind: EventProtocol, forbidden: "sig"},
+		{name: "thinking with extra text field dropped", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"thinking","thinking":"private","signature":"sig","text":"cross-variant"},{"type":"text","text":"visible"}]}}`, kind: EventProtocol, forbidden: "cross-variant"},
+		{name: "blank text dropped", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":" "},{"type":"text","text":"visible"}]}}`, kind: EventProtocol, forbidden: `"text":" "`},
+		{name: "empty text dropped", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":""},{"type":"text","text":"visible"}]}}`, kind: EventProtocol, forbidden: `"text":""`},
+		{name: "text with extra id field", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":"visible","id":"cross-variant"}]}}`, kind: EventProtocol, forbidden: "cross-variant"},
+		{name: "text with null citations", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":"visible","citations":null}]}}`, kind: EventProtocol, forbidden: "citations"},
+		{name: "text with citation objects", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":"visible","citations":[{"type":"page_location","url":"https://example.com"}]}]}}`, kind: EventProtocol, forbidden: "citations"},
+		{name: "tool use with partial field", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Read","input":{"path":"README.md"},"partial":true}]}}`, kind: EventProtocol, forbidden: "partial"},
 		{name: "tool blank id", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"tool_use","id":" ","name":"Read","input":{}}]}}`, reject: true},
 		{name: "tool missing name", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"tool-1","input":{}}]}}`, reject: true},
 		{name: "tool null input", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Read","input":null}]}}`, reject: true},
 		{name: "tool string input", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Read","input":"path"}]}}`, reject: true},
 		{name: "tool number input", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Read","input":1}]}}`, reject: true},
 		{name: "tool array input", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Read","input":[]}]}}`, reject: true},
+		{name: "text non-string", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":123}]}}`, reject: true},
+		{name: "thinking non-string", frame: `{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"thinking","thinking":123}]}}`, reject: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			event, err := (Claude{}).ParseEvent([]byte(test.frame))
@@ -69,7 +77,11 @@ func TestClaudeTypedStreamJSONConformance(t *testing.T) {
 				return
 			}
 			testsupport.RequireNoError(t, err)
-			requireClaude(t, event.Kind == test.kind && event.NativeSessionID == test.session && event.Message == test.message && len(event.Raw) > 0 && (test.forbidden == "" || !strings.Contains(string(event.Raw), test.forbidden)), "event = ", event)
+			rawOK := len(event.Raw) > 0
+			if test.noRaw {
+				rawOK = len(event.Raw) == 0
+			}
+			requireClaude(t, event.Kind == test.kind && event.NativeSessionID == test.session && event.Message == test.message && rawOK && (test.forbidden == "" || !strings.Contains(string(event.Raw), test.forbidden)), "event = ", event)
 		})
 	}
 }
