@@ -249,6 +249,9 @@ func (s *Service) finalizeCapture(ctx context.Context, intent Task, intentRun Ru
 		if _, err := tx.AppendEvent(event(task.ProjectID, "task", task.ID, "task.submitted", "daemon", "", run.ID, "", intent.PendingActionID, payload, now)); err != nil {
 			return err
 		}
+		if err := s.disposeUnresolvedMessages(tx, task, "daemon", "", run.ID, "", now); err != nil {
+			return err
+		}
 		if task.Kind == TaskIntegration {
 			advancePayload := eventPayload(map[string]any{"expected_sha": actualCanonical, "target_sha": fact.HeadSHA})
 			_, err = tx.AppendEvent(event(task.ProjectID, "task", task.ID, "git.canonical_advance_requested", "system", "", run.ID, "", task.PendingActionID, advancePayload, now))
@@ -410,6 +413,9 @@ func (s *Service) finalizeSuccessfulAdvance(ctx context.Context, intent Task, fa
 			if _, err := tx.AppendEvent(event(source.ProjectID, "task", source.ID, "task.completed", "daemon", "", task.HeadRunID, "", intent.PendingActionID, sourcePayload, now)); err != nil {
 				return err
 			}
+			if err := s.disposeUnresolvedMessages(tx, source, "daemon", "", task.HeadRunID, "", now); err != nil {
+				return err
+			}
 			if err := s.notifyParentOfChild(tx, source, "daemon", "", task.HeadRunID, "", now); err != nil {
 				return err
 			}
@@ -430,6 +436,9 @@ func (s *Service) finalizeSuccessfulAdvance(ctx context.Context, intent Task, fa
 			return err
 		}
 		if _, err := tx.AppendEvent(event(task.ProjectID, "task", task.ID, "task.completed", "daemon", "", task.HeadRunID, "", intent.PendingActionID, payload, now)); err != nil {
+			return err
+		}
+		if err := s.disposeUnresolvedMessages(tx, task, "daemon", "", task.HeadRunID, "", now); err != nil {
 			return err
 		}
 		if task.Kind != TaskIntegration {

@@ -89,13 +89,24 @@ func TestCT06AdvanceCompletedDisposesUnresolvedAgentMessages(t *testing.T) {
 	if integrationAfter.Status != core.TaskCompleted {
 		t.Fatalf("integration status after advance = %#v", integrationAfter)
 	}
-	if messages := taskMessages(t, h, integration.ID); len(messages) != 0 {
-		t.Fatalf("messages still owned by completed integration task = %#v", messages)
+	var unresolved []core.Message
+	for _, m := range taskMessages(t, h, integration.ID) {
+		if m.State == core.MessagePending || m.State == core.MessageDelivered {
+			unresolved = append(unresolved, m)
+		}
 	}
-	rerouted := taskMessages(t, h, fixtureID)
-	if len(rerouted) != 1 || rerouted[0].TaskID != conversation.ID ||
-		rerouted[0].State != core.MessagePending ||
-		rerouted[0].LastDeliveryError != "rerouted from non-delivery task" {
+	if len(unresolved) != 0 {
+		t.Fatalf("unresolved messages still owned by completed integration task = %#v", unresolved)
+	}
+	var rerouted core.Message
+	for _, m := range taskMessages(t, h, conversation.ID) {
+		if m.ID == fixtureID {
+			rerouted = m
+		}
+	}
+	if rerouted.ID != fixtureID || rerouted.TaskID != conversation.ID ||
+		rerouted.State != core.MessagePending ||
+		rerouted.LastDeliveryError != "rerouted from non-delivery task" {
 		t.Fatalf("unresolved message disposition on advance completed = %#v", rerouted)
 	}
 	conversationAfter, err := h.database.Task(context.Background(), conversation.ID)
