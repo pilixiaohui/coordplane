@@ -559,7 +559,9 @@ func waitForNoProjectContainers(t *testing.T, ctx context.Context, projectID, da
 // name, image, created, state) plus the daemon log tail, and persists both
 // outside the test's t.TempDir (live #8: daemon logs were destroyed with the
 // temp dir, leaving leftover containers unidentifiable). The returned string
-// is the in-band failure evidence; the persisted copies survive the run.
+// is the in-band failure evidence; the persisted copies survive the run. The
+// persisted docker inspect copy is redacted with the same provider-env
+// redaction as the in-band evidence (acceptance.md 11.4: no tokens saved).
 func containerCleanupEvidence(t *testing.T, projectID, containerIDs, daemonLog string) string {
 	t.Helper()
 	var evidence strings.Builder
@@ -581,7 +583,9 @@ func containerCleanupEvidence(t *testing.T, projectID, containerIDs, daemonLog s
 	} else {
 		stamp := time.Now().UTC().Format("20060102-150405.000000000")
 		containerPath := filepath.Join(persistDir, "leftover-containers-"+stamp+".json")
-		if err := os.WriteFile(containerPath, []byte(inspected), 0o600); err != nil {
+		// Redact the persisted copy (same provider-env redaction as the in-band
+		// evidence): docker inspect embeds Config.Env, which may carry tokens.
+		if err := os.WriteFile(containerPath, []byte(redactE2EFailure(inspected, "", strings.Split(realProviderEnv, ","))), 0o600); err != nil {
 			fmt.Fprintf(&evidence, "persist forensics (containers): %v\n", err)
 		} else {
 			fmt.Fprintf(&evidence, "persisted container evidence: %s\n", containerPath)
