@@ -3,6 +3,7 @@
 package e2e_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -63,7 +64,10 @@ func runRMA02(t *testing.T) {
 	instructions := testsupport.WriteFile(t, filepath.Join(root, "rma02-instructions.md"), []byte(rma02Instructions), 0o600)
 	configPath := testsupport.WriteFile(t, filepath.Join(root, "rma02.yaml"), testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{
 		DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: 4,
-		CompletedWorkspace: "0", TerminalTaskRef: "0", RunLog: "24h",
+		// 场景期 retention 非零(refs/workspaces 存活 24h):验收核验逐 ref rev-parse
+		// 断言与 final fixture 之前,自动 GC(2s 周期)不得删除任何资源;
+		// GC 段由 runRMA02GCSegment 重写为 0/0 并受控重启(与 deterministic_test.go 一致)。
+		CompletedWorkspace: "24h", TerminalTaskRef: "24h", RunLog: "24h",
 		DockerNetwork: network, DefaultImage: image, ProviderEnv: providerEnv,
 		Tail: "  run_timeout: 18m\n  shutdown_grace: 5s\ngit:\n  capture_helper_image: " + image + "\n  capture_timeout: 30s\n  maximum_bundle_bytes: 67108864\n  maximum_objects: 250000\n  maximum_handoff_bytes: 268435456\n",
 	}), 0o600)
@@ -229,14 +233,7 @@ func runRMA02(t *testing.T) {
 		runJSON[core.Agent](t, ctx, coordplane, "agent", "archive", source.agent.ID,
 			"--socket", socket, "--request-id", "rma02-archive-"+source.role, "--output", "json")
 	}
-	preview := runJSON[core.GCPreview](t, ctx, coordplane, "gc", "preview", "--socket", socket, "--output", "json")
-	if len(preview.Workspaces) != 7 || len(preview.TaskRefs) != 7 {
-		t.Fatalf("RMA-02 GC preview cardinality = workspaces:%d refs:%d", len(preview.Workspaces), len(preview.TaskRefs))
-	}
-	if result := runJSON[core.GCRunResult](t, ctx, coordplane, "gc", "run", "--socket", socket,
-		"--confirm", "--request-id", "rma02-gc", "--output", "json"); !result.Completed {
-		t.Fatalf("RMA-02 GC result = %#v", result)
-	}
+	daemon = runRMA02GCSegment(t, ctx, coordplane, configPath, socket, controlRepo, daemon)
 	cleanup := collectRMA02Cleanup(t, ctx, coordplane, socket, dataDir, controlRepo, project.ID, allTasks, afterFinalRestart.runs.Items)
 	databaseCanonical := rma02SQLiteCanonical(t, filepath.Join(dataDir, "coordplane.db"), project.ID)
 	evidence := rma02Evidence{
@@ -264,6 +261,88 @@ func runRMA02(t *testing.T) {
 		t.Fatalf("RMA-02 evidence rejected: %v", err)
 	}
 	writeRMA02Evidence(t, reportPath, evidence)
+}
+
+// runRMA02GCSegment 是 RMA-02 GC 段,分两个阶段,均无时序竞态:
+//
+// 阶段 A(场景期 24h 配置,preview 前移):gc preview 断言 7 workspaces + 7 refs 全部
+// 存在——场景期 retention 非零正是验收核验(逐 ref rev-parse)与此刻 preview 的保障;
+// 此时所有 Task closed 不足 24h,自动 GC 无候选,preview 与自动 GC 之间不存在竞态。
+//
+// 阶段 B(GT-07 合同路径,见 tests/contract/p1_binary_test.go
+// TestGT07FormalOperatorBinaryChecksOutExactControllerTaskRef 的 config 重写模式):
+// 重写 retention 为 0/0 并受控重启 daemon。自动 GC 循环(runRuntimeGC, 2s 周期,
+// retention 0)首个 tick 即按当前配置对既有 closed Task 生效:先删 7 workspaces
+// (删除时 releaseSourceReference 放行 B/C/D 的源 ref),再删 7 refs。测试用
+// for-each-ref 轮询等待 7 refs 消失,可观测地证明「修改 retention 并重启后,自动 GC
+// 按当前配置作用于既有 closed Task」;随后 preview 全部 absent、gc run --confirm
+// 幂等收敛(dedupe + agent home GC),最终资源收敛由 collectRMA02Cleanup 断言。
+//
+// 为什么 preview 的「存在性」断言只能放在阶段 A:workspace 状态检查每次启动一个
+// capture helper 容器(7 个 workspace 串行约 2.6s),而自动 GC 首个 tick 在重启后
+// >=2s 触发——重启后立即 preview 必然与首个 tick 竞态,存在性断言无法确定完成;
+// 阶段 B 改为轮询 git refs 观察自动 GC 的确定性结果,不依赖时序运气。
+func runRMA02GCSegment(t *testing.T, ctx context.Context, binary, configPath, socket, controlRepo string, daemon *daemonProcess) *daemonProcess {
+	t.Helper()
+	preview := runJSON[core.GCPreview](t, ctx, binary, "gc", "preview", "--socket", socket, "--output", "json")
+	if len(preview.Workspaces) != 7 || len(preview.TaskRefs) != 7 {
+		t.Fatalf("RMA-02 GC preview cardinality = workspaces:%d refs:%d", len(preview.Workspaces), len(preview.TaskRefs))
+	}
+	for _, target := range preview.Workspaces {
+		if !target.Exists {
+			t.Fatalf("RMA-02 GC preview workspace %s was deleted during the scenario: %#v", target.TaskID, target)
+		}
+	}
+	// 源 Task B/C/D 的 ref 此时存在但不可 GC:其消费方(integration Task)的
+	// source_ref_released_at 仅在消费方 workspace 被 GC 时落库(TaskRefEligible 的
+	// blocker 查询),preview 阶段尚未释放;释放发生在阶段 B 的 workspace 删除中。
+	for _, target := range preview.TaskRefs {
+		if !target.Exists {
+			t.Fatalf("RMA-02 GC preview task ref %s was deleted during the scenario: %#v", target.TaskID, target)
+		}
+	}
+	gcRaw, err := os.ReadFile(configPath)
+	requireNoError(t, err)
+	gcRaw = bytes.ReplaceAll(gcRaw, []byte("completed_workspace: 24h"), []byte("completed_workspace: 0"))
+	gcRaw = bytes.ReplaceAll(gcRaw, []byte("terminal_task_ref: 24h"), []byte("terminal_task_ref: 0"))
+	gcConfigPath := testsupport.WriteFile(t, filepath.Join(filepath.Dir(configPath), "rma02-gc.yaml"), gcRaw, 0o600)
+	if err := daemon.Stop(); err != nil {
+		t.Fatalf("stop RMA-02 daemon before GC retention restart: %v", err)
+	}
+	daemon = startDaemon(t, binary, gcConfigPath, socket)
+	waitForReady(t, ctx, binary, socket, "RMA-02 GC retention restart")
+	// 自动 GC 首个 tick 于重启后 >=2s 触发,同一 tick 先删 workspaces(含源 ref 释放)
+	// 再删 refs;refs 全部消失 ⟹ workspace 阶段无错误完成,7 个资源已被 retention-0
+	// 自动 GC 删除。轮询只读 git,与自动 GC 无竞态。
+	eventually(t, ctx, 30*time.Second, "RMA-02 retention-0 auto-GC deleted all 7 task refs", func() (bool, bool, string) {
+		refs := strings.Fields(gitDir(t, ctx, controlRepo, "for-each-ref", "--format=%(refname)", "refs/coordplane/tasks/"))
+		return len(refs) == 0, len(refs) == 0, fmt.Sprintf("remaining task refs: %d", len(refs))
+	})
+	// workspace 已删 → 状态检查走 absent 快路径(无容器),preview 与自动 GC 无竞态。
+	afterGC := runJSON[core.GCPreview](t, ctx, binary, "gc", "preview", "--socket", socket, "--output", "json")
+	if len(afterGC.Workspaces) != 7 || len(afterGC.TaskRefs) != 7 {
+		t.Fatalf("RMA-02 GC preview cardinality after retention-0 restart = workspaces:%d refs:%d", len(afterGC.Workspaces), len(afterGC.TaskRefs))
+	}
+	for _, target := range afterGC.Workspaces {
+		if target.Exists {
+			t.Fatalf("RMA-02 GC preview workspace %s survived retention-0 auto-GC: %#v", target.TaskID, target)
+		}
+	}
+	for _, target := range afterGC.TaskRefs {
+		if target.Exists {
+			t.Fatalf("RMA-02 GC preview task ref %s survived retention-0 auto-GC: %#v", target.TaskID, target)
+		}
+	}
+	// 自动 GC 的 workspace 检查容器(每 workspace 一个,约 2.6s)运行期间,reconciler
+	// (2s 周期)可能把仍在列表中的 inspect 容器判为 orphan 并短暂置 degraded;inspect
+	// 容器完成后即被移除,下一次 reconciler tick 清除 degraded。此处等待 daemon 重新
+	// ready(上限 30s,实际 ~2-4s)再执行 gc run,避免命中瞬时 degraded。
+	waitForReady(t, ctx, binary, socket, "RMA-02 daemon ready after retention-0 auto-GC")
+	if result := runJSON[core.GCRunResult](t, ctx, binary, "gc", "run", "--socket", socket,
+		"--confirm", "--request-id", "rma02-gc", "--output", "json"); !result.Completed {
+		t.Fatalf("RMA-02 GC result = %#v", result)
+	}
+	return daemon
 }
 
 func addRMA02Sources(t *testing.T, ctx context.Context, binary, socket, image, instructions string) []rma02Source {
