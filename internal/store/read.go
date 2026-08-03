@@ -374,6 +374,10 @@ func (s *Store) StatusProjection(ctx context.Context, projectID string) (core.St
 		if task.CurrentRunID != "" {
 			currentRunIDs = append(currentRunIDs, task.CurrentRunID)
 		}
+		if task.AssigneeAgentID == "" {
+			// human-assigned task; there is no agent row to load
+			continue
+		}
 		if !seenAgents[task.AssigneeAgentID] {
 			seenAgents[task.AssigneeAgentID] = true
 			requiredAgentIDs = append(requiredAgentIDs, task.AssigneeAgentID)
@@ -558,7 +562,8 @@ func taskSummary(task core.Task) core.TaskSummary {
 		Generation: task.Generation, NextRunAt: task.NextRunAt, RetryCount: task.RetryCount, MaxRetries: task.MaxRetries,
 		WaitReason: waitReason, ResultSummary: resultSummary, FailureReason: failureReason,
 		TextTruncated: waitTruncated || resultTruncated || failureTruncated,
-		BaseSHA:       task.BaseSHA, HeadSHA: task.HeadSHA, TaskRef: task.TaskRef,
+		BaseSHA:       task.BaseSHA, HeadSHA: task.HeadSHA, EvidenceType: task.EvidenceType,
+		TaskRef:        task.TaskRef,
 		AcceptedByKind: task.AcceptedByKind, AcceptedByID: task.AcceptedByID,
 		AcceptedIntegrationAgentID: task.AcceptedIntegrationAgentID,
 		FinalCanonicalSHA:          task.FinalCanonicalSHA, IntegrationTaskID: task.IntegrationTaskID,

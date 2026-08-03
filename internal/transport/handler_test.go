@@ -591,6 +591,10 @@ func (f *operatorFake) CloseConversation(_ context.Context, id, requestID string
 	return core.Task{}, f.record("close_conversation", actionCall{id: id, requestID: requestID})
 }
 
+func (f *operatorFake) CompleteTask(_ context.Context, input core.CompleteTaskInput) (core.Task, error) {
+	return core.Task{}, f.record("complete_task", input)
+}
+
 func (f *operatorFake) WakeTask(_ context.Context, input core.TaskActionInput) (core.Task, error) {
 	return core.Task{}, f.record("wake_task", input)
 }

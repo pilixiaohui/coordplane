@@ -34,6 +34,11 @@ func (s *Service) ClaimNext(ctx context.Context, projectID string) (Claim, bool,
 			if task.Status != TaskQueued || task.CurrentRunID != "" {
 				continue
 			}
+			if task.AssigneeAgentID == "" {
+				// human-assigned task: no CLI run can exist; the human
+				// converges it via task complete instead.
+				continue
+			}
 			agent, err := tx.Agent(task.AssigneeAgentID)
 			if err != nil {
 				return err

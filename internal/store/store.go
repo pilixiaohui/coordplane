@@ -213,6 +213,16 @@ func (s *Store) Migrate(ctx context.Context) (MigrationResult, error) {
 		if err := s.applyParticipantRolesMigration(ctx); err != nil {
 			return MigrationResult{}, err
 		}
+		result.Applied = append(result.Applied, 3)
+		version = 3
+	}
+	if version == 3 {
+		if err := s.validateCanonicalDatabase(ctx, 3); err != nil {
+			return MigrationResult{}, err
+		}
+		if err := s.applyHumanTaskLifecycleMigration(ctx); err != nil {
+			return MigrationResult{}, err
+		}
 		result.Applied = append(result.Applied, schemaVersion)
 	}
 	if err := s.validateCanonicalDatabase(ctx, schemaVersion); err != nil {
@@ -269,11 +279,60 @@ VALUES(?,?,?,?,1,?,?)`
 	if _, err := tx.ExecContext(ctx, agentRole, core.DefaultAgentRoleID, "agent", "default CLI agent role", string(agentCapabilities), now, now); err != nil {
 		return core.WrapError(core.CodeInternal, "seed default agent role", false, err)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, schemaVersion, schemaName, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, 3, participantRolesMigrationName, now); err != nil {
 		return core.WrapError(core.CodeInternal, "record participant roles migration", false, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return core.WrapError(core.CodeInternal, "commit participant roles migration", false, err)
+	}
+	return nil
+}
+
+func (s *Store) applyHumanTaskLifecycleMigration(ctx context.Context) error {
+	// The migration rebuilds the tasks table while runs and messages still
+	// reference it, so foreign key enforcement is disabled for exactly the
+	// pinned connection running this migration, then verified and re-enabled.
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return core.WrapError(core.CodeInternal, "pin connection for human task lifecycle migration", false, err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
+		return core.WrapError(core.CodeInternal, "disable foreign keys for human task lifecycle migration", false, err)
+	}
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return core.WrapError(core.CodeInternal, "begin human task lifecycle migration", false, err)
+	}
+	defer tx.Rollback()
+	for _, statement := range splitStatements(humanTaskLifecycleMigrationSQL) {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return core.WrapError(core.CodeInternal, "apply human task lifecycle schema migration", false, err)
+		}
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, schemaVersion, schemaName, now); err != nil {
+		return core.WrapError(core.CodeInternal, "record human task lifecycle migration", false, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return core.WrapError(core.CodeInternal, "commit human task lifecycle migration", false, err)
+	}
+	// The store pins a single pooled connection (MaxOpenConns=1), so the
+	// rebuild and its verification must share the same connection.
+	rows, err := conn.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		return legacySchemaError("run SQLite foreign key check", err)
+	}
+	violations := 0
+	for rows.Next() {
+		violations++
+	}
+	rows.Close()
+	if violations != 0 {
+		return legacySchemaError("SQLite foreign key check failed after human task lifecycle migration", nil)
+	}
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys=ON`); err != nil {
+		return core.WrapError(core.CodeInternal, "re-enable foreign keys after human task lifecycle migration", false, err)
 	}
 	return nil
 }
@@ -283,7 +342,7 @@ func (s *Store) migrationVersion(ctx context.Context) (int, error) {
 	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil {
 		return 0, legacySchemaError("read SQLite migration version", err)
 	}
-	if version != 1 && version != 2 && version != schemaVersion {
+	if version != 1 && version != 2 && version != 3 && version != schemaVersion {
 		return 0, legacySchemaError("legacy database migration history requires backup and a new data_dir", nil)
 	}
 	return version, nil

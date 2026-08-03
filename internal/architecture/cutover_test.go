@@ -34,6 +34,10 @@ func TestV1SchemaBusinessTableAllowlist(t *testing.T) {
 		"projects", "agents", "tasks", "runs", "messages", "events",
 		"schema_migrations", "request_dedupes",
 		"participants", "roles", "participant_project_role", "credentials",
+		// tasks_v4 is the SQLite staging table of the v4 human task lifecycle
+		// migration: the tasks rebuild is created under this name, copied,
+		// then renamed to tasks within the same migration transaction.
+		"tasks_v4",
 	)
 	seen := map[string]bool{}
 	for _, match := range pattern.FindAllSubmatch(raw, -1) {

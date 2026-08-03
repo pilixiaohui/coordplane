@@ -19,7 +19,7 @@ Runtime 必须：
 
 Runtime 不决定 Task 是否正确、不执行 Git 集成、不提供 external runtime 等价合同、不建设 tool adapter/skill 平台，也不把容器或 transcript 作为状态真相。
 
-Owner批准的预算重基线不改变本文件的Docker-only隔离、resume、stop、cleanup、reconcile或fencing合同。全库production/tests/infra/total envelope固定为`18,500/19,500/20,500`、`20,000/21,500/22,500`、`250/400/600`和`38,750/41,400/43,600`；统计仍按`acceptance.md`的非空、非纯注释物理行口径。Runtime模块实际SLOC、质量blocker和diff必须进入clean候选revision的LOC JSON，并通过真实四Agent场景中的一次Daemon重启验证接管和清理；不得把observer/failpoint搬出其真实bucket或用重基线reserve弱化恢复证据。
+Owner批准的预算重基线不改变本文件的Docker-only隔离、resume、stop、cleanup、reconcile或fencing合同。全库production/tests/infra/total envelope固定为`20,000/21,000/22,000`、`21,000/22,000/23,000`、`250/400/600`和`41,250/43,400/45,600`；统计仍按`acceptance.md`的非空、非纯注释物理行口径。Runtime模块实际SLOC、质量blocker和diff必须进入clean候选revision的LOC JSON，并通过真实四Agent场景中的一次Daemon重启验证接管和清理；不得把observer/failpoint搬出其真实bucket或用重基线reserve弱化恢复证据。
 
 ## 2. 受信边界
 

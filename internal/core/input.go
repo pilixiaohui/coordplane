@@ -46,29 +46,40 @@ type BossMessageInput struct {
 }
 
 type CreateTaskInput struct {
-	ProjectID       string   `json:"project_id"`
-	Kind            TaskKind `json:"kind"`
-	AssigneeAgentID string   `json:"assignee_agent_id"`
-	Title           string   `json:"title"`
-	Description     string   `json:"description"`
-	Priority        int      `json:"priority"`
-	MaxRetries      int      `json:"max_retries"`
-	SourceTaskID    string   `json:"source_task_id,omitempty"`
-	RetryOfTaskID   string   `json:"retry_of_task_id,omitempty"`
-	AckMessageIDs   []string `json:"ack_message_ids,omitempty"`
-	RequestID       string   `json:"request_id"`
+	ProjectID             string   `json:"project_id"`
+	Kind                  TaskKind `json:"kind"`
+	AssigneeAgentID       string   `json:"assignee_agent_id"`
+	AssigneeParticipantID string   `json:"assignee_participant_id,omitempty"`
+	Title                 string   `json:"title"`
+	Description           string   `json:"description"`
+	Priority              int      `json:"priority"`
+	MaxRetries            int      `json:"max_retries"`
+	SourceTaskID          string   `json:"source_task_id,omitempty"`
+	RetryOfTaskID         string   `json:"retry_of_task_id,omitempty"`
+	AckMessageIDs         []string `json:"ack_message_ids,omitempty"`
+	RequestID             string   `json:"request_id"`
 }
 
 type CreateChildTaskInput struct {
-	Token           string   `json:"-"`
-	AssigneeAgentID string   `json:"assignee_agent_id"`
-	Title           string   `json:"title"`
-	Description     string   `json:"description"`
-	Priority        int      `json:"priority"`
-	MaxRetries      int      `json:"max_retries"`
-	SourceTaskID    string   `json:"source_task_id,omitempty"`
-	AckMessageIDs   []string `json:"ack_message_ids,omitempty"`
-	RequestID       string   `json:"request_id"`
+	Token                 string   `json:"-"`
+	AssigneeAgentID       string   `json:"assignee_agent_id"`
+	AssigneeParticipantID string   `json:"assignee_participant_id,omitempty"`
+	Title                 string   `json:"title"`
+	Description           string   `json:"description"`
+	Priority              int      `json:"priority"`
+	MaxRetries            int      `json:"max_retries"`
+	SourceTaskID          string   `json:"source_task_id,omitempty"`
+	AckMessageIDs         []string `json:"ack_message_ids,omitempty"`
+	RequestID             string   `json:"request_id"`
+}
+
+// CompleteTaskInput converges a human-assigned task with explicit confirmation.
+// The human participant is the operator CLI identity; the task must not be
+// bound to a CLI agent (no captured workspace result can exist).
+type CompleteTaskInput struct {
+	TaskID    string `json:"-"`
+	Summary   string `json:"summary,omitempty"`
+	RequestID string `json:"request_id,omitempty"`
 }
 
 type Claim struct {

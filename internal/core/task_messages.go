@@ -114,7 +114,7 @@ func (s *Service) notifyParentOfChild(
 		return parentErr
 	}
 	wake := false
-	if parentErr == nil && project.Status == ProjectActive && taskAcceptsDelivery(parent) {
+	if parentErr == nil && project.Status == ProjectActive && taskAcceptsDelivery(parent) && parent.AssigneeAgentID != "" {
 		agent, agentErr := tx.Agent(parent.AssigneeAgentID)
 		if agentErr != nil {
 			return agentErr
@@ -144,14 +144,19 @@ func (s *Service) notifyParentOfChild(
 		child.ID, child.Status, child.ResultSummary, child.HeadSHA, child.TaskRef,
 	), MaximumMessageBodyBytes)
 	maxDeliveries := 1
+	recipientParticipantID := ""
 	if recipientKind == "agent" {
 		maxDeliveries = 3
+		recipientParticipantID = parent.AssigneeParticipantID
+	} else if parentErr == nil && parent.AssigneeParticipantID != "" {
+		recipientParticipantID = parent.AssigneeParticipantID
 	}
 	payload := eventPayload(map[string]any{"child_task_id": child.ID, "child_status": child.Status})
 	_, err := s.insertMessage(tx, messageInsert{
 		projectID: child.ProjectID, taskID: deliveryTaskID, relatedTaskID: child.ID,
 		senderKind: "system", recipientKind: recipientKind, recipientID: recipientID,
-		systemCode: "child_result", body: body, wake: wake, maxDeliveries: maxDeliveries,
+		recipientParticipantID: recipientParticipantID,
+		systemCode:             "child_result", body: body, wake: wake, maxDeliveries: maxDeliveries,
 		idempotencyKey: "child-result:" + child.ID + ":" + string(child.Status),
 		actor:          taskMutationActor{kind: actorKind, id: actorID, runID: runID},
 		requestID:      requestID, now: now, payload: payload,

@@ -1,7 +1,8 @@
 package store
 
-const schemaVersion = 3
-const schemaName = "coordplane_v3_participant_roles"
+const schemaVersion = 4
+const schemaName = "coordplane_v4_human_task_lifecycle"
+const participantRolesMigrationName = "coordplane_v3_participant_roles"
 const initialSchemaName = "coordplane_v1_six_objects"
 const isolationSpecMigrationName = "coordplane_v2_run_isolation_spec"
 const isolationSpecMigrationSQL = `ALTER TABLE runs ADD COLUMN isolation_spec_version INTEGER NOT NULL DEFAULT 1 CHECK (isolation_spec_version IN (1,2))`
@@ -216,6 +217,7 @@ CREATE INDEX messages_order ON messages(task_id, created_at, id);
 CREATE INDEX events_project_order ON events(project_id, id);
 CREATE INDEX events_entity_order ON events(entity_type, entity_id, id);
 `
+
 // participantRolesMigrationSQL adds the unified participant framework tables:
 // participants (human and CLI agent identities), configurable roles, per-project
 // role bindings, and human credentials. Rows are seeded in Go by Store.Migrate
@@ -292,4 +294,93 @@ CREATE INDEX credentials_participant
   ON credentials(participant_id, status);
 `
 
-
+// humanTaskLifecycleMigrationSQL generalizes task/message references to the
+// unified participant framework: tasks carry the assignee participant and an
+// evidence grade, messages carry the recipient participant, existing agents
+// get participant rows, and historical rows are backfilled.
+//
+// The tasks table is rebuilt so assignee_agent_id loses its mandatory agent
+// foreign key: a human-assigned task has assignee_agent_id=” and
+// assignee_participant_id set, while agent-assigned tasks mirror the agent id
+// into assignee_participant_id. The rebuild runs with foreign_keys=OFF (see
+// applyHumanTaskLifecycleMigration) and recreates every tasks index; the open
+// conversation uniqueness moves to the participant column so a project can
+// hold one open conversation per participant (human or agent).
+const humanTaskLifecycleMigrationSQL = `
+CREATE TABLE tasks_v4 (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  kind TEXT NOT NULL CHECK (kind IN ('conversation','work','integration')),
+  parent_task_id TEXT NOT NULL DEFAULT '',
+  retry_of_task_id TEXT NOT NULL DEFAULT '',
+  created_by_kind TEXT NOT NULL CHECK (created_by_kind IN ('boss','agent','system')),
+  created_by_id TEXT NOT NULL DEFAULT '',
+  assignee_agent_id TEXT NOT NULL DEFAULT '',
+  assignee_participant_id TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL,
+  description TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL CHECK (status IN ('queued','running','finishing','waiting','submitted','completed','failed','cancelled')),
+  current_run_id TEXT NOT NULL DEFAULT '',
+  generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+  next_run_at TEXT NOT NULL,
+  retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+  max_retries INTEGER NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
+  wait_reason TEXT NOT NULL DEFAULT '',
+  result_summary TEXT NOT NULL DEFAULT '',
+  failure_reason TEXT NOT NULL DEFAULT '',
+  base_sha TEXT NOT NULL DEFAULT '',
+  head_sha TEXT NOT NULL DEFAULT '',
+  head_run_id TEXT NOT NULL DEFAULT '',
+  task_ref TEXT NOT NULL DEFAULT '',
+  accepted_by_kind TEXT NOT NULL DEFAULT '',
+  accepted_by_id TEXT NOT NULL DEFAULT '',
+  accepted_at TEXT NOT NULL DEFAULT '',
+  accepted_integration_agent_id TEXT NOT NULL DEFAULT '',
+  final_canonical_sha TEXT NOT NULL DEFAULT '',
+  integration_task_id TEXT NOT NULL DEFAULT '',
+  source_task_id TEXT NOT NULL DEFAULT '',
+  source_run_id TEXT NOT NULL DEFAULT '',
+  source_task_ref TEXT NOT NULL DEFAULT '',
+  source_head_sha TEXT NOT NULL DEFAULT '',
+  source_ref_released_at TEXT NOT NULL DEFAULT '',
+  source_accept_version INTEGER NOT NULL DEFAULT 0,
+  observed_canonical_sha TEXT NOT NULL DEFAULT '',
+  pending_action TEXT NOT NULL DEFAULT '' CHECK (pending_action IN ('','capture','advance')),
+  pending_action_id TEXT NOT NULL DEFAULT '',
+  pending_action_version INTEGER NOT NULL DEFAULT 0,
+  pending_action_run_id TEXT NOT NULL DEFAULT '',
+  pending_expected_sha TEXT NOT NULL DEFAULT '',
+  pending_target_sha TEXT NOT NULL DEFAULT '',
+  pending_started_at TEXT NOT NULL DEFAULT '',
+  evidence_type TEXT NOT NULL DEFAULT '' CHECK (evidence_type IN ('','captured','human_confirm')),
+  version INTEGER NOT NULL CHECK (version >= 1),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  submitted_at TEXT NOT NULL DEFAULT '',
+  completed_at TEXT NOT NULL DEFAULT '',
+  closed_at TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO tasks_v4(id,project_id,kind,parent_task_id,retry_of_task_id,created_by_kind,created_by_id,assignee_agent_id,title,description,priority,status,current_run_id,generation,next_run_at,retry_count,max_retries,wait_reason,result_summary,failure_reason,base_sha,head_sha,head_run_id,task_ref,accepted_by_kind,accepted_by_id,accepted_at,accepted_integration_agent_id,final_canonical_sha,integration_task_id,source_task_id,source_run_id,source_task_ref,source_head_sha,source_ref_released_at,source_accept_version,observed_canonical_sha,pending_action,pending_action_id,pending_action_version,pending_action_run_id,pending_expected_sha,pending_target_sha,pending_started_at,version,created_at,updated_at,submitted_at,completed_at,closed_at,assignee_participant_id,evidence_type)
+SELECT id,project_id,kind,parent_task_id,retry_of_task_id,created_by_kind,created_by_id,assignee_agent_id,title,description,priority,status,current_run_id,generation,next_run_at,retry_count,max_retries,wait_reason,result_summary,failure_reason,base_sha,head_sha,head_run_id,task_ref,accepted_by_kind,accepted_by_id,accepted_at,accepted_integration_agent_id,final_canonical_sha,integration_task_id,source_task_id,source_run_id,source_task_ref,source_head_sha,source_ref_released_at,source_accept_version,observed_canonical_sha,pending_action,pending_action_id,pending_action_version,pending_action_run_id,pending_expected_sha,pending_target_sha,pending_started_at,version,created_at,updated_at,submitted_at,completed_at,closed_at,assignee_agent_id,'' FROM tasks;
+DROP TABLE tasks;
+ALTER TABLE tasks_v4 RENAME TO tasks;
+CREATE UNIQUE INDEX tasks_one_open_conversation
+  ON tasks(project_id, assignee_participant_id)
+  WHERE kind = 'conversation' AND status NOT IN ('completed','cancelled');
+CREATE UNIQUE INDEX tasks_current_run_unique
+  ON tasks(current_run_id) WHERE current_run_id <> '';
+CREATE UNIQUE INDEX tasks_one_open_integration_source
+  ON tasks(project_id,source_task_ref)
+  WHERE kind='integration' AND source_task_ref<>'' AND status NOT IN ('completed','cancelled');
+CREATE INDEX tasks_schedule
+  ON tasks(status, next_run_at, priority DESC, created_at, id);
+CREATE INDEX tasks_assignee_status
+  ON tasks(assignee_agent_id, status);
+ALTER TABLE messages ADD COLUMN recipient_participant_id TEXT NOT NULL DEFAULT '';
+UPDATE tasks SET assignee_participant_id = assignee_agent_id WHERE assignee_agent_id <> '';
+UPDATE messages SET recipient_participant_id = CASE WHEN recipient_kind = 'boss' THEN 'participant-owner' ELSE recipient_id END;
+INSERT INTO participants(id,kind,display_name,status,adapter_id,image,instructions_file,version,created_at,updated_at)
+SELECT id,'cli_agent',display_name,status,adapter_id,image,instructions_file,1,created_at,updated_at FROM agents
+WHERE NOT EXISTS (SELECT 1 FROM participants WHERE participants.id = agents.id);
+`

@@ -63,6 +63,13 @@ func canonicalSchemaObjects(ctx context.Context, version int) (map[string]schema
 			}
 		}
 	}
+	if version >= 4 {
+		for _, statement := range splitStatements(humanTaskLifecycleMigrationSQL) {
+			if _, err := db.ExecContext(ctx, statement); err != nil {
+				return nil, err
+			}
+		}
+	}
 	return readSchemaObjects(ctx, db)
 }
 
@@ -152,6 +159,12 @@ func (s *Store) validateMigrationHistory(ctx context.Context, version int) error
 		}{2, isolationSpecMigrationName})
 	}
 	if version >= 3 {
+		want = append(want, struct {
+			version int
+			name    string
+		}{3, participantRolesMigrationName})
+	}
+	if version >= 4 {
 		want = append(want, struct {
 			version int
 			name    string

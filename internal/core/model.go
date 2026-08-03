@@ -100,6 +100,7 @@ type Task struct {
 	CreatedByKind              string     `json:"created_by_kind"`
 	CreatedByID                string     `json:"created_by_id,omitempty"`
 	AssigneeAgentID            string     `json:"assignee_agent_id"`
+	AssigneeParticipantID      string     `json:"assignee_participant_id,omitempty"`
 	Title                      string     `json:"title"`
 	Description                string     `json:"description"`
 	Priority                   int        `json:"priority"`
@@ -115,6 +116,7 @@ type Task struct {
 	BaseSHA                    string     `json:"base_sha,omitempty"`
 	HeadSHA                    string     `json:"head_sha,omitempty"`
 	HeadRunID                  string     `json:"head_run_id,omitempty"`
+	EvidenceType               string     `json:"evidence_type,omitempty"`
 	TaskRef                    string     `json:"task_ref,omitempty"`
 	AcceptedByKind             string     `json:"accepted_by_kind,omitempty"`
 	AcceptedByID               string     `json:"accepted_by_id,omitempty"`
@@ -197,29 +199,30 @@ const (
 )
 
 type Message struct {
-	ID                string       `json:"id"`
-	ProjectID         string       `json:"project_id"`
-	TaskID            string       `json:"task_id"`
-	RelatedTaskID     string       `json:"related_task_id,omitempty"`
-	SenderKind        string       `json:"sender_kind"`
-	SenderID          string       `json:"sender_id,omitempty"`
-	RecipientKind     string       `json:"recipient_kind"`
-	RecipientID       string       `json:"recipient_id,omitempty"`
-	ReplyToMessageID  string       `json:"reply_to_message_id,omitempty"`
-	SystemCode        string       `json:"system_code,omitempty"`
-	Body              string       `json:"body"`
-	Wake              bool         `json:"wake"`
-	State             MessageState `json:"state"`
-	DeliveredRunID    string       `json:"delivered_run_id,omitempty"`
-	DeliveryCount     int          `json:"delivery_count"`
-	MaxDeliveries     int          `json:"max_deliveries"`
-	NextDeliveryAt    string       `json:"next_delivery_at"`
-	LastDeliveryError string       `json:"last_delivery_error,omitempty"`
-	IdempotencyKey    string       `json:"idempotency_key"`
-	Version           int64        `json:"version"`
-	CreatedAt         string       `json:"created_at"`
-	DeliveredAt       string       `json:"delivered_at,omitempty"`
-	AcknowledgedAt    string       `json:"acknowledged_at,omitempty"`
+	ID                     string       `json:"id"`
+	ProjectID              string       `json:"project_id"`
+	TaskID                 string       `json:"task_id"`
+	RelatedTaskID          string       `json:"related_task_id,omitempty"`
+	SenderKind             string       `json:"sender_kind"`
+	SenderID               string       `json:"sender_id,omitempty"`
+	RecipientKind          string       `json:"recipient_kind"`
+	RecipientID            string       `json:"recipient_id,omitempty"`
+	RecipientParticipantID string       `json:"recipient_participant_id,omitempty"`
+	ReplyToMessageID       string       `json:"reply_to_message_id,omitempty"`
+	SystemCode             string       `json:"system_code,omitempty"`
+	Body                   string       `json:"body"`
+	Wake                   bool         `json:"wake"`
+	State                  MessageState `json:"state"`
+	DeliveredRunID         string       `json:"delivered_run_id,omitempty"`
+	DeliveryCount          int          `json:"delivery_count"`
+	MaxDeliveries          int          `json:"max_deliveries"`
+	NextDeliveryAt         string       `json:"next_delivery_at"`
+	LastDeliveryError      string       `json:"last_delivery_error,omitempty"`
+	IdempotencyKey         string       `json:"idempotency_key"`
+	Version                int64        `json:"version"`
+	CreatedAt              string       `json:"created_at"`
+	DeliveredAt            string       `json:"delivered_at,omitempty"`
+	AcknowledgedAt         string       `json:"acknowledged_at,omitempty"`
 }
 
 type Event struct {
@@ -362,6 +365,7 @@ type TaskSummary struct {
 	TextTruncated              bool       `json:"text_truncated,omitempty"`
 	BaseSHA                    string     `json:"base_sha,omitempty"`
 	HeadSHA                    string     `json:"head_sha,omitempty"`
+	EvidenceType               string     `json:"evidence_type,omitempty"`
 	TaskRef                    string     `json:"task_ref,omitempty"`
 	AcceptedByKind             string     `json:"accepted_by_kind,omitempty"`
 	AcceptedByID               string     `json:"accepted_by_id,omitempty"`

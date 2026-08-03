@@ -25,6 +25,7 @@ type messageInsert struct {
 	projectID, taskID, relatedTaskID string
 	senderKind, senderID             string
 	recipientKind, recipientID       string
+	recipientParticipantID           string
 	replyTo, body, systemCode        string
 	wake                             bool
 	maxDeliveries                    int
@@ -43,7 +44,8 @@ func (s *Service) insertMessage(tx Transaction, input messageInsert) (Message, e
 		ID: id, ProjectID: input.projectID, TaskID: input.taskID,
 		RelatedTaskID: input.relatedTaskID, SenderKind: input.senderKind, SenderID: input.senderID,
 		RecipientKind: input.recipientKind, RecipientID: input.recipientID,
-		ReplyToMessageID: input.replyTo, SystemCode: input.systemCode, Body: input.body,
+		RecipientParticipantID: input.recipientParticipantID,
+		ReplyToMessageID:       input.replyTo, SystemCode: input.systemCode, Body: input.body,
 		Wake: input.wake, State: MessagePending, MaxDeliveries: input.maxDeliveries,
 		NextDeliveryAt: input.now, IdempotencyKey: input.idempotencyKey,
 		Version: 1, CreatedAt: input.now,

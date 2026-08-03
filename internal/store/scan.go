@@ -8,11 +8,11 @@ import (
 
 const projectSelect = `SELECT id,name,source,source_ref,initial_sha,control_repo_path,canonical_ref,canonical_sha,integration_agent_id,status,pending_action,pending_action_id,pending_started_at,last_error,version,created_at,updated_at FROM projects`
 const agentSelect = `SELECT id,display_name,adapter_id,image,instructions_file,status,version,created_at,updated_at FROM agents`
-const taskSelect = `SELECT id,project_id,kind,parent_task_id,retry_of_task_id,created_by_kind,created_by_id,assignee_agent_id,title,description,priority,status,current_run_id,generation,next_run_at,retry_count,max_retries,wait_reason,result_summary,failure_reason,base_sha,head_sha,head_run_id,task_ref,accepted_by_kind,accepted_by_id,accepted_at,accepted_integration_agent_id,final_canonical_sha,integration_task_id,source_task_id,source_run_id,source_task_ref,source_head_sha,source_ref_released_at,source_accept_version,observed_canonical_sha,pending_action,pending_action_id,pending_action_version,pending_action_run_id,pending_expected_sha,pending_target_sha,pending_started_at,version,created_at,updated_at,submitted_at,completed_at,closed_at FROM tasks`
+const taskSelect = `SELECT id,project_id,kind,parent_task_id,retry_of_task_id,created_by_kind,created_by_id,assignee_agent_id,title,description,priority,status,current_run_id,generation,next_run_at,retry_count,max_retries,wait_reason,result_summary,failure_reason,base_sha,head_sha,head_run_id,task_ref,accepted_by_kind,accepted_by_id,accepted_at,accepted_integration_agent_id,final_canonical_sha,integration_task_id,source_task_id,source_run_id,source_task_ref,source_head_sha,source_ref_released_at,source_accept_version,observed_canonical_sha,pending_action,pending_action_id,pending_action_version,pending_action_run_id,pending_expected_sha,pending_target_sha,pending_started_at,assignee_participant_id,evidence_type,version,created_at,updated_at,submitted_at,completed_at,closed_at FROM tasks`
 const runSelect = `SELECT id,project_id,task_id,agent_id,generation,resumed_from_run_id,adapter_id,image,instructions_hash,state,workspace_path,container_id,native_session_id,log_path,token_hash,token_revoked_at,requested_outcome,requested_summary,expected_head,requested_at,stop_requested_at,stop_reason,stop_operation_id,heartbeat_at,exit_code,terminal_reason,last_error,cleanup_state,launch_nonce,launch_operation_id,launch_phase,home_path,container_name,deadline_at,last_observed_at,launch_mode,resume_native_session_id,runtime_error_code,cleanup_operation_id,isolation_spec_version,version,created_at,started_at,ended_at FROM runs`
-const messageSelect = `SELECT id,project_id,task_id,related_task_id,sender_kind,sender_id,recipient_kind,recipient_id,reply_to_message_id,system_code,body,wake,state,delivered_run_id,delivery_count,max_deliveries,next_delivery_at,last_delivery_error,idempotency_key,version,created_at,delivered_at,acknowledged_at FROM messages`
+const messageSelect = `SELECT id,project_id,task_id,related_task_id,sender_kind,sender_id,recipient_kind,recipient_id,recipient_participant_id,reply_to_message_id,system_code,body,wake,state,delivered_run_id,delivery_count,max_deliveries,next_delivery_at,last_delivery_error,idempotency_key,version,created_at,delivered_at,acknowledged_at FROM messages`
 const eventSelect = `SELECT id,project_id,entity_type,entity_id,kind,actor_kind,actor_id,run_id,request_id,operation_id,payload_json,created_at FROM events`
-const taskSummarySelect = `SELECT id,project_id,kind,parent_task_id,assignee_agent_id,title,priority,status,current_run_id,generation,next_run_at,retry_count,max_retries,wait_reason,result_summary,failure_reason,base_sha,head_sha,task_ref,accepted_by_kind,accepted_by_id,accepted_integration_agent_id,final_canonical_sha,integration_task_id,source_task_id,source_run_id,source_task_ref,source_head_sha,source_ref_released_at,pending_action,pending_action_id,version,created_at,updated_at,submitted_at,completed_at,closed_at FROM tasks`
+const taskSummarySelect = `SELECT id,project_id,kind,parent_task_id,assignee_agent_id,title,priority,status,current_run_id,generation,next_run_at,retry_count,max_retries,wait_reason,result_summary,failure_reason,base_sha,head_sha,evidence_type,task_ref,accepted_by_kind,accepted_by_id,accepted_integration_agent_id,final_canonical_sha,integration_task_id,source_task_id,source_run_id,source_task_ref,source_head_sha,source_ref_released_at,pending_action,pending_action_id,version,created_at,updated_at,submitted_at,completed_at,closed_at FROM tasks`
 const runSummarySelect = `SELECT id,project_id,task_id,agent_id,generation,state,container_id,native_session_id,heartbeat_at,deadline_at,last_observed_at,launch_phase,cleanup_state,terminal_reason,last_error,runtime_error_code,version,created_at,started_at,ended_at FROM runs`
 const projectSummarySelect = `SELECT id,substr(name,1,256),substr(canonical_ref,1,256),canonical_sha,integration_agent_id,status,pending_action,substr(last_error,1,256),version,created_at,updated_at FROM projects`
 const agentSummarySelect = `SELECT id,substr(display_name,1,256),substr(adapter_id,1,256),substr(image,1,256),status,version,created_at,updated_at FROM agents`
@@ -58,6 +58,7 @@ func scanTask(row scanner) (core.Task, error) {
 		&task.SourceAcceptVersion, &task.ObservedCanonicalSHA, &task.PendingAction,
 		&task.PendingActionID, &task.PendingActionVersion, &task.PendingActionRunID,
 		&task.PendingExpectedSHA, &task.PendingTargetSHA, &task.PendingStartedAt,
+		&task.AssigneeParticipantID, &task.EvidenceType,
 		&task.Version, &task.CreatedAt, &task.UpdatedAt, &task.SubmittedAt,
 		&task.CompletedAt, &task.ClosedAt,
 	)
@@ -93,7 +94,7 @@ func scanMessage(row scanner) (core.Message, error) {
 	err := row.Scan(
 		&message.ID, &message.ProjectID, &message.TaskID, &message.RelatedTaskID,
 		&message.SenderKind, &message.SenderID, &message.RecipientKind,
-		&message.RecipientID, &message.ReplyToMessageID, &message.SystemCode,
+		&message.RecipientID, &message.RecipientParticipantID, &message.ReplyToMessageID, &message.SystemCode,
 		&message.Body, &wake, &message.State, &message.DeliveredRunID,
 		&message.DeliveryCount, &message.MaxDeliveries, &message.NextDeliveryAt,
 		&message.LastDeliveryError, &message.IdempotencyKey, &message.Version,
@@ -120,7 +121,7 @@ func scanTaskSummary(row scanner) (core.TaskSummary, error) {
 		&task.AssigneeAgentID, &task.Title, &task.Priority, &task.Status,
 		&task.CurrentRunID, &task.Generation, &task.NextRunAt, &task.RetryCount,
 		&task.MaxRetries, &task.WaitReason, &task.ResultSummary, &task.FailureReason,
-		&task.BaseSHA, &task.HeadSHA, &task.TaskRef, &task.AcceptedByKind,
+		&task.BaseSHA, &task.HeadSHA, &task.EvidenceType, &task.TaskRef, &task.AcceptedByKind,
 		&task.AcceptedByID, &task.AcceptedIntegrationAgentID, &task.FinalCanonicalSHA,
 		&task.IntegrationTaskID, &task.SourceTaskID, &task.SourceRunID,
 		&task.SourceTaskRef, &task.SourceHeadSHA, &task.SourceRefReleasedAt, &task.PendingAction,

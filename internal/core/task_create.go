@@ -6,12 +6,13 @@ import (
 )
 
 type workTaskRequest struct {
-	token, projectID, agentID, title, description string
-	sourceTaskID, retryOfTaskID                   string
-	priority, maxRetries                          int
-	ackIDs                                        []string
-	requestID                                     string
-	dedupe                                        requestDedupe
+	token, projectID, agentID, assigneeParticipantID string
+	title, description                               string
+	sourceTaskID, retryOfTaskID                      string
+	priority, maxRetries                             int
+	ackIDs                                           []string
+	requestID                                        string
+	dedupe                                           requestDedupe
 }
 
 type taskCreationSnapshot struct {
@@ -23,13 +24,23 @@ type taskCreationSnapshot struct {
 }
 
 func (s *Service) normalizeWorkTask(
-	agentID, title, description, sourceTaskID string,
+	agentID, assigneeParticipantID, title, description, sourceTaskID string,
 	priority, maxRetries int, ackMessageIDs []string, requestID string,
 ) (workTaskRequest, error) {
 	var input workTaskRequest
 	var err error
-	if input.agentID, err = requireText("assignee_agent_id", agentID); err != nil {
-		return input, err
+	input.agentID = strings.TrimSpace(agentID)
+	input.assigneeParticipantID = strings.TrimSpace(assigneeParticipantID)
+	if input.agentID == "" && input.assigneeParticipantID == "" {
+		return input, NewError(CodeInvalidArgument, "assignee is required: assignee_agent_id or assignee_participant_id", false)
+	}
+	if input.agentID != "" && input.assigneeParticipantID != "" {
+		return input, NewError(CodeInvalidArgument, "assignee must be either an agent or a participant, not both", false)
+	}
+	if input.agentID == "" {
+		if _, err = requireText("assignee_participant_id", input.assigneeParticipantID); err != nil {
+			return input, err
+		}
 	}
 	if input.title, err = requireText("title", title); err != nil {
 		return input, err
@@ -207,12 +218,26 @@ func (s *Service) insertWorkTask(
 	tx Transaction, input workTaskRequest, actor taskMutationActor,
 	parent, source, retry Task, baseSHA string,
 ) (Task, error) {
-	agent, err := tx.Agent(input.agentID)
-	if err != nil {
-		return Task{}, err
-	}
-	if agent.Status == AgentArchived {
-		return Task{}, Conflict(CodeInvalidState, "archived agent cannot receive a task", string(agent.Status), agent.Version)
+	assigneeParticipantID := input.assigneeParticipantID
+	if input.agentID != "" {
+		agent, err := tx.Agent(input.agentID)
+		if err != nil {
+			return Task{}, err
+		}
+		if agent.Status == AgentArchived {
+			return Task{}, Conflict(CodeInvalidState, "archived agent cannot receive a task", string(agent.Status), agent.Version)
+		}
+		if assigneeParticipantID == "" {
+			assigneeParticipantID = input.agentID
+		}
+	} else {
+		participant, err := tx.Participant(input.assigneeParticipantID)
+		if err != nil {
+			return Task{}, err
+		}
+		if participant.Status != "active" {
+			return Task{}, Conflict(CodeInvalidState, "non-active participant cannot receive a task", participant.Status, participant.Version)
+		}
 	}
 	now := s.nowText()
 	if err := s.acknowledgeForActor(tx, input.ackIDs, input.projectID, actor, input.requestID, now); err != nil {
@@ -225,7 +250,8 @@ func (s *Service) insertWorkTask(
 	task := Task{
 		ID: id, ProjectID: input.projectID, Kind: TaskWork, ParentTaskID: parent.ID,
 		CreatedByKind: actor.kind, CreatedByID: actor.id, AssigneeAgentID: input.agentID,
-		Title: input.title, Description: input.description, Priority: input.priority,
+		AssigneeParticipantID: assigneeParticipantID,
+		Title:                 input.title, Description: input.description, Priority: input.priority,
 		Status: TaskQueued, NextRunAt: now, MaxRetries: input.maxRetries, BaseSHA: baseSHA,
 		RetryOfTaskID: retry.ID, Version: 1, CreatedAt: now, UpdatedAt: now,
 	}

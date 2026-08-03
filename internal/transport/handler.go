@@ -160,6 +160,10 @@ func registerTaskRoutes(mux *http.ServeMux, operations OperatorOperations) {
 	mux.HandleFunc("/v1/tasks/{id}/close", requireMethod(http.MethodPost, actionCall(func(ctx requestContext, id, requestID string) (any, error) {
 		return operations.CloseConversation(ctx.Context, id, requestID)
 	})))
+	mux.HandleFunc("/v1/tasks/{id}/complete", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.CompleteTaskInput) (any, error) {
+		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
+		return operations.CompleteTask(ctx.Context, input)
+	})))
 	mux.HandleFunc("/v1/tasks/{id}/wake", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.TaskActionInput) (any, error) {
 		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
 		return operations.WakeTask(ctx.Context, input)

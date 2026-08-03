@@ -147,6 +147,7 @@ func runTask(ctx context.Context, args []string, getenv environment, stdout, std
 		var acknowledged stringListFlag
 		flags.StringVar(&input.ProjectID, "project", "", "project ID")
 		flags.StringVar(&input.AssigneeAgentID, "agent", "", "assignee agent ID")
+		flags.StringVar(&input.AssigneeParticipantID, "participant", "", "assignee human participant ID (mutually exclusive with --agent)")
 		flags.StringVar(&input.Title, "title", "", "task title")
 		flags.StringVar(&input.Description, "description", "", "task description")
 		flags.IntVar(&input.Priority, "priority", 0, "task priority")
@@ -209,6 +210,22 @@ func runTask(ctx context.Context, args []string, getenv environment, stdout, std
 		var task core.Task
 		path := "/v1/tasks/" + url.PathEscape(id) + "/close"
 		if err := request(ctx, *cfg, clients, http.MethodPost, path, actionRequest{RequestID: *requestID}, &task); err != nil {
+			return err
+		}
+		return render(stdout, cfg.output, task)
+	case "complete":
+		flags, cfg := clientFlags("task complete", getenv, stderr)
+		var input core.CompleteTaskInput
+		flags.StringVar(&input.Summary, "summary", "", "result summary recorded as human_confirm evidence")
+		flags.StringVar(&input.RequestID, "request-id", "", "idempotency key")
+		id, err := parseID(flags, args[1:])
+		if err != nil {
+			return err
+		}
+		input.TaskID = id
+		var task core.Task
+		path := "/v1/tasks/" + url.PathEscape(id) + "/complete"
+		if err := request(ctx, *cfg, clients, http.MethodPost, path, input, &task); err != nil {
 			return err
 		}
 		return render(stdout, cfg.output, task)

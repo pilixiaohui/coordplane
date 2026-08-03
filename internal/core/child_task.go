@@ -6,7 +6,7 @@ import (
 )
 
 func (s *Service) CreateChildTask(ctx context.Context, input CreateChildTaskInput) (Task, error) {
-	request, err := s.normalizeWorkTask(input.AssigneeAgentID, input.Title, input.Description,
+	request, err := s.normalizeWorkTask(input.AssigneeAgentID, input.AssigneeParticipantID, input.Title, input.Description,
 		input.SourceTaskID, input.Priority, input.MaxRetries, input.AckMessageIDs, input.RequestID)
 	if err != nil {
 		return Task{}, err

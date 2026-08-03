@@ -27,6 +27,7 @@ type OperatorOperations interface {
 	ArchiveAgent(context.Context, string, string) (core.Agent, error)
 	Chat(context.Context, core.ChatInput) (core.ChatResult, error)
 	CreateTask(context.Context, core.CreateTaskInput) (core.Task, error)
+	CompleteTask(context.Context, core.CompleteTaskInput) (core.Task, error)
 	Task(context.Context, string) (core.TaskDetail, error)
 	CheckoutTask(context.Context, core.TaskCheckoutInput) (core.GitCheckoutFact, error)
 	Run(context.Context, string) (core.Run, error)

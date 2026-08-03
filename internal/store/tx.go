@@ -152,8 +152,8 @@ func (u *unitOfWork) Conversation(projectID, agentID string) (core.Task, error) 
 
 func (u *unitOfWork) InsertTask(task core.Task) error {
 	_, err := u.tx.ExecContext(u.ctx, `
-INSERT INTO tasks(id,project_id,kind,parent_task_id,retry_of_task_id,created_by_kind,created_by_id,assignee_agent_id,title,description,priority,status,current_run_id,generation,next_run_at,retry_count,max_retries,wait_reason,result_summary,failure_reason,base_sha,head_sha,head_run_id,task_ref,accepted_by_kind,accepted_by_id,accepted_at,accepted_integration_agent_id,final_canonical_sha,integration_task_id,source_task_id,source_run_id,source_task_ref,source_head_sha,source_ref_released_at,source_accept_version,observed_canonical_sha,pending_action,pending_action_id,pending_action_version,pending_action_run_id,pending_expected_sha,pending_target_sha,pending_started_at,version,created_at,updated_at,submitted_at,completed_at,closed_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+INSERT INTO tasks(id,project_id,kind,parent_task_id,retry_of_task_id,created_by_kind,created_by_id,assignee_agent_id,title,description,priority,status,current_run_id,generation,next_run_at,retry_count,max_retries,wait_reason,result_summary,failure_reason,base_sha,head_sha,head_run_id,task_ref,accepted_by_kind,accepted_by_id,accepted_at,accepted_integration_agent_id,final_canonical_sha,integration_task_id,source_task_id,source_run_id,source_task_ref,source_head_sha,source_ref_released_at,source_accept_version,observed_canonical_sha,pending_action,pending_action_id,pending_action_version,pending_action_run_id,pending_expected_sha,pending_target_sha,pending_started_at,assignee_participant_id,evidence_type,version,created_at,updated_at,submitted_at,completed_at,closed_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		taskValues(task)...,
 	)
 	return err
@@ -161,7 +161,7 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
 
 func (u *unitOfWork) UpdateTask(task core.Task, expectedVersion int64, expectedStatus core.TaskStatus) error {
 	result, err := u.tx.ExecContext(u.ctx, `
-UPDATE tasks SET status=?,current_run_id=?,generation=?,next_run_at=?,retry_count=?,max_retries=?,wait_reason=?,result_summary=?,failure_reason=?,base_sha=?,head_sha=?,head_run_id=?,task_ref=?,accepted_by_kind=?,accepted_by_id=?,accepted_at=?,accepted_integration_agent_id=?,final_canonical_sha=?,integration_task_id=?,source_task_id=?,source_run_id=?,source_task_ref=?,source_head_sha=?,source_ref_released_at=?,source_accept_version=?,observed_canonical_sha=?,pending_action=?,pending_action_id=?,pending_action_version=?,pending_action_run_id=?,pending_expected_sha=?,pending_target_sha=?,pending_started_at=?,version=?,updated_at=?,submitted_at=?,completed_at=?,closed_at=?
+UPDATE tasks SET status=?,current_run_id=?,generation=?,next_run_at=?,retry_count=?,max_retries=?,wait_reason=?,result_summary=?,failure_reason=?,base_sha=?,head_sha=?,head_run_id=?,task_ref=?,accepted_by_kind=?,accepted_by_id=?,accepted_at=?,accepted_integration_agent_id=?,final_canonical_sha=?,integration_task_id=?,source_task_id=?,source_run_id=?,source_task_ref=?,source_head_sha=?,source_ref_released_at=?,source_accept_version=?,observed_canonical_sha=?,pending_action=?,pending_action_id=?,pending_action_version=?,pending_action_run_id=?,pending_expected_sha=?,pending_target_sha=?,pending_started_at=?,assignee_participant_id=?,evidence_type=?,version=?,updated_at=?,submitted_at=?,completed_at=?,closed_at=?
 WHERE id=? AND version=? AND status=?`,
 		task.Status, task.CurrentRunID, task.Generation, task.NextRunAt, task.RetryCount,
 		task.MaxRetries, task.WaitReason, task.ResultSummary, task.FailureReason, task.BaseSHA,
@@ -171,7 +171,8 @@ WHERE id=? AND version=? AND status=?`,
 		task.SourceHeadSHA, task.SourceRefReleasedAt, task.SourceAcceptVersion, task.ObservedCanonicalSHA,
 		task.PendingAction, task.PendingActionID, task.PendingActionVersion,
 		task.PendingActionRunID, task.PendingExpectedSHA, task.PendingTargetSHA,
-		task.PendingStartedAt, task.Version, task.UpdatedAt, task.SubmittedAt,
+		task.PendingStartedAt, task.AssigneeParticipantID, task.EvidenceType,
+		task.Version, task.UpdatedAt, task.SubmittedAt,
 		task.CompletedAt, task.ClosedAt, task.ID, expectedVersion, expectedStatus,
 	)
 	return u.casResult(result, err, "task", task.ID)
@@ -285,10 +286,11 @@ func (u *unitOfWork) PendingWakeAt(taskID string) (string, bool, error) {
 
 func (u *unitOfWork) InsertMessage(message core.Message) error {
 	_, err := u.tx.ExecContext(u.ctx, `
-INSERT INTO messages(id,project_id,task_id,related_task_id,sender_kind,sender_id,recipient_kind,recipient_id,reply_to_message_id,system_code,body,wake,state,delivered_run_id,delivery_count,max_deliveries,next_delivery_at,last_delivery_error,idempotency_key,version,created_at,delivered_at,acknowledged_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+INSERT INTO messages(id,project_id,task_id,related_task_id,sender_kind,sender_id,recipient_kind,recipient_id,recipient_participant_id,reply_to_message_id,system_code,body,wake,state,delivered_run_id,delivery_count,max_deliveries,next_delivery_at,last_delivery_error,idempotency_key,version,created_at,delivered_at,acknowledged_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		message.ID, message.ProjectID, message.TaskID, message.RelatedTaskID,
 		message.SenderKind, message.SenderID, message.RecipientKind, message.RecipientID,
+		message.RecipientParticipantID,
 		message.ReplyToMessageID, message.SystemCode, message.Body, message.Wake,
 		message.State, message.DeliveredRunID, message.DeliveryCount, message.MaxDeliveries,
 		message.NextDeliveryAt, message.LastDeliveryError, message.IdempotencyKey,
@@ -299,9 +301,10 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 
 func (u *unitOfWork) UpdateMessage(message core.Message, expectedVersion int64, expectedState core.MessageState) error {
 	result, err := u.tx.ExecContext(u.ctx, `
-	UPDATE messages SET task_id=?,related_task_id=?,recipient_kind=?,recipient_id=?,system_code=?,body=?,wake=?,state=?,delivered_run_id=?,delivery_count=?,max_deliveries=?,next_delivery_at=?,last_delivery_error=?,version=?,delivered_at=?,acknowledged_at=?
+	UPDATE messages SET task_id=?,related_task_id=?,recipient_kind=?,recipient_id=?,recipient_participant_id=?,system_code=?,body=?,wake=?,state=?,delivered_run_id=?,delivery_count=?,max_deliveries=?,next_delivery_at=?,last_delivery_error=?,version=?,delivered_at=?,acknowledged_at=?
 	WHERE id=? AND version=? AND state=?`,
 		message.TaskID, message.RelatedTaskID, message.RecipientKind, message.RecipientID,
+		message.RecipientParticipantID,
 		message.SystemCode, message.Body, message.Wake, message.State, message.DeliveredRunID,
 		message.DeliveryCount, message.MaxDeliveries, message.NextDeliveryAt,
 		message.LastDeliveryError, message.Version, message.DeliveredAt,
@@ -371,6 +374,7 @@ func taskValues(task core.Task) []any {
 		task.SourceAcceptVersion, task.ObservedCanonicalSHA, task.PendingAction,
 		task.PendingActionID, task.PendingActionVersion, task.PendingActionRunID,
 		task.PendingExpectedSHA, task.PendingTargetSHA, task.PendingStartedAt,
+		task.AssigneeParticipantID, task.EvidenceType,
 		task.Version, task.CreatedAt, task.UpdatedAt, task.SubmittedAt, task.CompletedAt,
 		task.ClosedAt,
 	}

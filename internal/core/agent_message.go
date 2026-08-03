@@ -218,7 +218,8 @@ func (s *Service) agentDeliveryTask(
 		conversation = Task{
 			ID: conversationID, ProjectID: projectID, Kind: TaskConversation,
 			CreatedByKind: actorKind, CreatedByID: actorID, AssigneeAgentID: recipient.ID,
-			Title: "Conversation with " + recipient.DisplayName, Description: "Persistent Agent conversation",
+			AssigneeParticipantID: recipient.ID,
+			Title:                 "Conversation with " + recipient.DisplayName, Description: "Persistent Agent conversation",
 			Status: status, NextRunAt: now, MaxRetries: 3, Version: 1,
 			CreatedAt: now, UpdatedAt: now,
 		}
