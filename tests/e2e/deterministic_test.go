@@ -728,7 +728,10 @@ func gcSegmentFailureEvidence(t *testing.T, command string, err error, cliRaw []
 // daemon is observed not-ready before stop is called: the GC segment must
 // observe zero degraded windows once the managed-container settle wait has
 // drained. The probe covers the afterGC preview, readiness fence and gc run
-// calls and returns the first degraded observation, if any.
+// calls and returns the first degraded observation, if any. The polling
+// goroutine is guaranteed to stop: the returned stop func is also registered
+// as a t.Cleanup, so an early t.Fatal between probe start and stop cannot
+// leak it (COD-64 review F4).
 func watchDaemonReadyStable(t *testing.T, ctx context.Context, binary, socket string) func() {
 	t.Helper()
 	observed := make(chan string, 1)
@@ -754,12 +757,17 @@ func watchDaemonReadyStable(t *testing.T, ctx context.Context, binary, socket st
 			}
 		}
 	}()
-	return func() {
-		close(stop)
-		if reason := <-observed; reason != "" {
-			t.Fatalf("daemon observed not-ready during GC segment settle window: %s", reason)
-		}
+	var stopOnce sync.Once
+	stopProbe := func() {
+		stopOnce.Do(func() {
+			close(stop)
+			if reason := <-observed; reason != "" {
+				t.Fatalf("daemon observed not-ready during GC segment settle window: %s", reason)
+			}
+		})
 	}
+	t.Cleanup(stopProbe)
+	return stopProbe
 }
 
 func waitForWorkspacesRemoved(t *testing.T, ctx context.Context, dataDir, projectID string, taskIDs ...string) {
