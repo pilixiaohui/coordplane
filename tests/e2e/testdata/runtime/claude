@@ -101,7 +101,10 @@ else
 	wait_for_body "P5-GO" >/dev/null
 	/usr/local/bin/coordlink progress --summary "P5-$role progress 1" \
 		--request-id "p5-progress-$role-$run_id-1" --output json
-	if [ "$role" = "A" ]; then
+	if printf '%s\n' "$description" | grep -q 'no_direct=1'; then
+		: # PR-D1 two-project topology: agents live in different projects and
+		# have no cross-project delivery task, so the DIRECT dance is skipped.
+	elif [ "$role" = "A" ]; then
 		peer_agent=$(printf '%s\n' "$description" | sed -n 's/.*peer_agent_id=\([^ ;]*\).*/\1/p')
 		[ -n "$peer_agent" ]
 		/usr/local/bin/coordlink message send --to-agent "$peer_agent" --wake \
@@ -109,6 +112,13 @@ else
 		ack_all
 	else
 		wait_for_body "P5-DIRECT" >/dev/null
+	fi
+	if printf '%s\n' "$description" | grep -q 'human_review=1'; then
+		# PR-D1: the agent dispatches a review child task to the human
+		# participant; the human converges it with task complete.
+		/usr/local/bin/coordlink task create --participant participant-owner \
+			--title "P5 human review" --description "P5 human review of $role result" \
+			--request-id "p5-review-child-$run_id" --output json >/dev/null
 	fi
 	file="agent-$role.txt"
 	printf 'agent-%s\n' "$role" >"$file"

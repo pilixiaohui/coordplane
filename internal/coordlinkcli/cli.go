@@ -188,6 +188,7 @@ func runTask(ctx context.Context, client jsonClient, args []string, stdout, stde
 		var input core.CreateChildTaskInput
 		var ackMessageIDs stringListFlag
 		flags.StringVar(&input.AssigneeAgentID, "agent", "", "assignee Agent ID")
+		flags.StringVar(&input.AssigneeParticipantID, "participant", "", "assignee human participant ID (mutually exclusive with --agent)")
 		flags.StringVar(&input.Title, "title", "", "short task title")
 		flags.StringVar(&input.Description, "description", "", "task description")
 		flags.IntVar(&input.Priority, "priority", 0, "task priority")
