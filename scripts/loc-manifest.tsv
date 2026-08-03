@@ -14,6 +14,7 @@ internal/daemon/components_test.go|handwritten_tests|docker_runtime
 tests/e2e/*|handwritten_tests|e2e
 tests/testsupport/*|handwritten_tests|e2e
 tests/contract/fixtures/*|excluded|test_fixture
+tests/wordfreq/*|excluded|test_fixture
 tests/contract/*|handwritten_tests|core_store_cli
 *_test.go|handwritten_tests|core_store_cli
 internal/core/git_capture_contract.go|handwritten_tests|git_component

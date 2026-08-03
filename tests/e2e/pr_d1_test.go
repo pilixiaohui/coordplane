@@ -46,14 +46,7 @@ func TestPRD1HumanCollaboratesAcrossTwoProjectsWithHotRoleConfig(t *testing.T) {
 	projectA := runJSON[core.Project](t, ctx, coordplane, "project", "add", "--socket", socket, "--name", "PRD1 P1", "--repo", source, "--ref", "refs/heads/main", "--integration-agent", agentA.ID, "--request-id", "prd1-project-a", "--output", "json")
 	projectB := runJSON[core.Project](t, ctx, coordplane, "project", "add", "--socket", socket, "--name", "PRD1 P2", "--repo", source, "--ref", "refs/heads/main", "--integration-agent", agentB.ID, "--request-id", "prd1-project-b", "--output", "json")
 
-	coownerRole := runJSON[core.Role](t, ctx, coordplane, append([]string{"role", "create", "--socket", socket, "--name", "prd1-coowner", "--request-id", "prd1-role-coowner", "--output", "json"}, capabilityArgs(core.AllCapabilities())...)...)
-	globalOperator := runJSON[core.Role](t, ctx, coordplane, append([]string{"role", "create", "--socket", socket, "--name", "prd1-global-operator", "--request-id", "prd1-role-global", "--output", "json"}, capabilityArgs(core.AllCapabilities(), core.CapabilityProjectRepair)...)...)
-	developer := runJSON[core.Role](t, ctx, coordplane, append([]string{"role", "create", "--socket", socket, "--name", "prd1-developer", "--request-id", "prd1-role-developer", "--output", "json"}, capabilityArgs(core.AllCapabilities(), core.CapabilityProjectRepair)...)...)
-	runJSON[core.ParticipantRoleBinding](t, ctx, coordplane, "participant", "bind", coowner.ID, "--socket", socket, "--project", "global", "--role", coownerRole.ID, "--request-id", "prd1-bind-coowner", "--output", "json")
-	runJSON[core.ParticipantRoleBinding](t, ctx, coordplane, "participant", "bind", core.DefaultHumanParticipantID, "--socket", socket, "--project", "global", "--role", globalOperator.ID, "--request-id", "prd1-bind-global", "--output", "json")
-	runJSON[struct{ Unbound string }](t, ctx, coordplane, "participant", "unbind", core.DefaultHumanParticipantID, "--socket", socket, "--project", "global", "--role", core.DefaultOwnerRoleID, "--request-id", "prd1-unbind-global", "--output", "json")
-	runJSON[struct{ Unbound string }](t, ctx, coordplane, "participant", "unbind", core.DefaultHumanParticipantID, "--socket", socket, "--project", projectB.ID, "--role", core.DefaultOwnerRoleID, "--request-id", "prd1-unbind-b", "--output", "json")
-	runJSON[core.ParticipantRoleBinding](t, ctx, coordplane, "participant", "bind", core.DefaultHumanParticipantID, "--socket", socket, "--project", projectB.ID, "--role", developer.ID, "--request-id", "prd1-bind-b", "--output", "json")
+	coownerRole, _, developer := setupRoleLayer(t, ctx, coordplane, socket, coowner, projectB, "prd1")
 
 	taskA := runJSON[core.Task](t, ctx, coordplane, "task", "create", "--socket", socket, "--project", projectA.ID, "--agent", agentA.ID, "--title", "PRD1 work A", "--description", "p5_role=A;human_review=1;no_direct=1", "--request-id", "prd1-task-a", "--output", "json")
 	taskB := runJSON[core.Task](t, ctx, coordplane, "task", "create", "--socket", socket, "--project", projectB.ID, "--agent", agentB.ID, "--title", "PRD1 work B", "--description", "p5_role=B;no_direct=1", "--request-id", "prd1-task-b", "--output", "json")
@@ -167,4 +160,20 @@ func flipProjectError(t *testing.T, ctx context.Context, dbPath, projectID strin
 	defer db.Close()
 	_, err = db.ExecContext(ctx, `UPDATE projects SET status='error', last_error='e2e injected error state' WHERE id=?`, projectID)
 	requireNoError(t, err)
+}
+
+// setupRoleLayer grants a coowner participant.manage globally, swaps the
+// human's global role to one without project.repair, and binds a developer
+// role (no project.repair) in projectB.
+func setupRoleLayer(t *testing.T, ctx context.Context, binary, socket string, coowner core.Agent, projectB core.Project, prefix string) (coownerRole, globalOperator, developer core.Role) {
+	t.Helper()
+	coownerRole = runJSON[core.Role](t, ctx, binary, append([]string{"role", "create", "--socket", socket, "--name", prefix + "-coowner", "--request-id", prefix + "-role-coowner", "--output", "json"}, capabilityArgs(core.AllCapabilities())...)...)
+	globalOperator = runJSON[core.Role](t, ctx, binary, append([]string{"role", "create", "--socket", socket, "--name", prefix + "-global-operator", "--request-id", prefix + "-role-global", "--output", "json"}, capabilityArgs(core.AllCapabilities(), core.CapabilityProjectRepair)...)...)
+	developer = runJSON[core.Role](t, ctx, binary, append([]string{"role", "create", "--socket", socket, "--name", prefix + "-developer", "--request-id", prefix + "-role-developer", "--output", "json"}, capabilityArgs(core.AllCapabilities(), core.CapabilityProjectRepair)...)...)
+	runJSON[core.ParticipantRoleBinding](t, ctx, binary, "participant", "bind", coowner.ID, "--socket", socket, "--project", "global", "--role", coownerRole.ID, "--request-id", prefix+"-bind-coowner", "--output", "json")
+	runJSON[core.ParticipantRoleBinding](t, ctx, binary, "participant", "bind", core.DefaultHumanParticipantID, "--socket", socket, "--project", "global", "--role", globalOperator.ID, "--request-id", prefix+"-bind-global", "--output", "json")
+	runJSON[struct{ Unbound string }](t, ctx, binary, "participant", "unbind", core.DefaultHumanParticipantID, "--socket", socket, "--project", "global", "--role", core.DefaultOwnerRoleID, "--request-id", prefix+"-unbind-global", "--output", "json")
+	runJSON[struct{ Unbound string }](t, ctx, binary, "participant", "unbind", core.DefaultHumanParticipantID, "--socket", socket, "--project", projectB.ID, "--role", core.DefaultOwnerRoleID, "--request-id", prefix+"-unbind-b", "--output", "json")
+	runJSON[core.ParticipantRoleBinding](t, ctx, binary, "participant", "bind", core.DefaultHumanParticipantID, "--socket", socket, "--project", projectB.ID, "--role", developer.ID, "--request-id", prefix+"-bind-b", "--output", "json")
+	return coownerRole, globalOperator, developer
 }
