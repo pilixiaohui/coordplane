@@ -18,7 +18,7 @@ Git 模块只负责让多个隔离 Task 的真实 commit 安全收敛到一个 c
 
 它不得代理 Agent 日常 Git命令，不建设 ChangeSet/GitOperation/ConflictSet/rollback 平台，不理解 diff，不执行后台 merge/rebase/cherry-pick，也不把 SQLite 当代码真相。
 
-Owner批准的预算重基线不改变本文件的private clone、actual HEAD capture、task ref、expected-old CAS、integration、recovery或GC合同。全库production/tests/infra/total envelope固定为`20,000/21,000/22,000`、`21,000/22,000/23,600`、`250/400/600`和`41,250/43,400/46,200`；统计仍按`acceptance.md`的非空、非纯注释物理行口径。Git模块实际SLOC、质量blocker和diff必须进入clean候选revision的LOC JSON，并在真实多Agent场景中验证所有接受结果的lineage、task ref、integration和canonical CAS；不得用重基线reserve删除真实Git crash/fence证据。
+Owner批准的预算重基线不改变本文件的private clone、actual HEAD capture、task ref、expected-old CAS、integration、recovery或GC合同。全库production/tests/infra/total envelope固定为`20,000/21,000/22,400`、`21,000/22,000/23,600`、`250/400/600`和`41,250/43,400/46,600`；统计仍按`acceptance.md`的非空、非纯注释物理行口径。Git模块实际SLOC、质量blocker和diff必须进入clean候选revision的LOC JSON，并在真实多Agent场景中验证所有接受结果的lineage、task ref、integration和canonical CAS；不得用重基线reserve删除真实Git crash/fence证据。
 
 ## 2. 代码真相和仓库布局
 

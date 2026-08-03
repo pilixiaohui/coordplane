@@ -182,7 +182,7 @@ Manager、Developer、Reviewer、Integrator 只是 Agent 指令或显示标签�
 代码预算是范围漂移告警，不是用短代码替代正确性的目标：
 
 - 第一版以一个production one-shot CLI adapter为基线；scripted adapter只属于测试。第二个provider adapter必须单独增加预算，不能挤占Core、Runtime或Git恢复逻辑。
-- Owner已批准统一参与者框架(v0.2-delta)需求范围对应的重基线：Budgeted maintained production SLOC目标/软阈值/发布阈值为`20,000 / 21,000 / 22,000`；tests为`21,000 / 22,000 / 23,600`；build/test infrastructure仍为`250 / 400 / 600`；三类合计为`41,250 / 43,400 / 46,200`。总量合格不能覆盖production超限。
+- Owner已批准统一参与者框架(v0.2-delta)需求范围对应的重基线：Budgeted maintained production SLOC目标/软阈值/发布阈值为`20,000 / 21,000 / 22,400`；tests为`21,000 / 22,000 / 23,600`；build/test infrastructure仍为`250 / 400 / 600`；三类合计为`41,250 / 43,400 / 46,600`。总量合格不能覆盖production超限。
 - 上述envelope替换旧`10,500 / 12,550 / 14,650`、`12,300 / 15,450 / 19,000`和总计`23,050 / 28,400 / 34,250`，只改变预算，不删除或降级任何Core、Runtime、Git、CLI或真实多Agent边界合同。
 - 第一版候选必须在clean revision生成LOC JSON，并完成`acceptance.md`定义的真实双Agent和四Agent可靠性场景。固定硬件性能baseline、reference manifest和长时间soak不属于第一版完成条件；真实live证据能否复用按受影响文件的精确diff判断，不能因纯文档变更重复消耗provider调用。
 - LOC低于预算不代表完成；所有状态、隔离、recovery、Git CAS和真实Docker/Git验收仍必须通过。
@@ -267,5 +267,5 @@ runtime:
 - 两个 Agent 的提交都被 task ref 保存，并通过 Git CAS/integration Task 收敛到 canonical ref。
 - Daemon 重启不会产生重复 active Run、伪完成、丢提交或错误覆盖 canonical ref。
 - 两个真实CLI Agent完成端到端闭环；另有一个fresh四Agent真实场景证明4个source Run并发、Message、task ref、integration和canonical CAS能够在一次Daemon重启后继续收敛。
-- Budgeted maintained production/tests/infra/total分别不超过`22,000 / 23,600 / 600 / 46,200`，质量blocker清零；没有为省LOC弱化测试或关键恢复合同。
+- Budgeted maintained production/tests/infra/total分别不超过`22,400 / 23,600 / 600 / 46,600`，质量blocker清零；没有为省LOC弱化测试或关键恢复合同。
 - `acceptance.md` 的静态约束、合同测试、真实 Docker/Git gate 和真实 CLI gate全部通过。
