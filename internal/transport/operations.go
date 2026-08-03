@@ -49,6 +49,15 @@ type OperatorOperations interface {
 	GCRun(context.Context, core.GCRunInput) (core.GCRunResult, error)
 	GCDiscardWorkspace(context.Context, core.GCDiscardWorkspaceInput) (core.GCDiscardResult, error)
 	GCDiscardTaskRef(context.Context, core.GCDiscardTaskRefInput) (core.GCDiscardResult, error)
+	Role(context.Context, string) (core.Role, error)
+	ListRoles(context.Context) ([]core.Role, error)
+	CreateRole(context.Context, core.RoleInput) (core.Role, error)
+	UpdateRole(context.Context, core.RoleUpdateInput) (core.Role, error)
+	DeleteRole(context.Context, string, string) error
+	Participant(context.Context, string) (core.Participant, error)
+	ListParticipants(context.Context) ([]core.Participant, error)
+	BindParticipantRole(context.Context, core.BindRoleInput) (core.ParticipantRoleBinding, error)
+	UnbindParticipantRole(context.Context, core.BindRoleInput) error
 }
 
 // RunOperations is the fixed Agent-facing operation surface. The transport

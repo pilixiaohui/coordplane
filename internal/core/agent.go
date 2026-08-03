@@ -70,6 +70,15 @@ func (s *Service) AddAgent(ctx context.Context, input AddAgentInput) (Agent, err
 		if err := tx.InsertAgent(agent); err != nil {
 			return err
 		}
+		// Every CLI agent is also a participant in the unified framework, so
+		// role bindings can target it like any other participant.
+		if err := tx.InsertParticipant(Participant{
+			ID: agent.ID, Kind: ParticipantKindCLIAgent, DisplayName: displayName,
+			Status: string(AgentActive), AdapterID: adapterID, Image: image,
+			InstructionsFile: instructions, Version: 1, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			return err
+		}
 		if _, err := tx.AppendEvent(event("", "agent", agent.ID, "agent.created", "boss", "", "", requestID, "", "{}", now)); err != nil {
 			return err
 		}

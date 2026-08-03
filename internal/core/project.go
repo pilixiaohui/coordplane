@@ -83,6 +83,9 @@ func (s *Service) AddProject(ctx context.Context, input AddProjectInput) (Projec
 		if err := tx.InsertProject(project); err != nil {
 			return err
 		}
+		if err := s.bindOperatorGlobalRoles(tx, project.ID, now); err != nil {
+			return err
+		}
 		if _, err := tx.AppendEvent(event(project.ID, "project", project.ID, "project.creating", "boss", "", "", requestID, operationID, eventPayload(map[string]any{"initial_sha": project.InitialSHA}), now)); err != nil {
 			return err
 		}
@@ -103,8 +106,34 @@ func (s *Service) AddProject(ctx context.Context, input AddProjectInput) (Projec
 	return s.finishProjectAction(ctx, project.ID, operationID, requestID, gitFact, gitErr)
 }
 
+// bindOperatorGlobalRoles mirrors the operator participant's global-scope role
+// bindings into a new project scope, so the default human owner keeps its
+// capabilities inside every project it creates.
+func (s *Service) bindOperatorGlobalRoles(tx Transaction, projectID, now string) error {
+	global, err := tx.ParticipantRoles(operatorParticipant)
+	if err != nil {
+		return err
+	}
+	for _, binding := range global {
+		if binding.ProjectID != GlobalProjectID {
+			continue
+		}
+		if err := tx.InsertParticipantRole(ParticipantRoleBinding{
+			ParticipantID: operatorParticipant, ProjectID: projectID, RoleID: binding.RoleID,
+			RoleName: binding.RoleName, Capabilities: binding.Capabilities, Version: 1,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Service) RepairProject(ctx context.Context, projectID, requestID string) (Project, error) {
 	projectID = strings.TrimSpace(projectID)
+	if err := s.requireOperatorCapability(ctx, CapabilityProjectRepair, projectID); err != nil {
+		return Project{}, err
+	}
 	requestID, err := s.requestID(requestID)
 	if err != nil {
 		return Project{}, err

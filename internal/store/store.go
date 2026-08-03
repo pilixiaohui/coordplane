@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -22,7 +23,8 @@ const busyTimeoutMillis = 5000
 var allowedTables = map[string]bool{
 	"projects": true, "agents": true, "tasks": true, "runs": true,
 	"messages": true, "events": true, "schema_migrations": true,
-	"request_dedupes": true,
+	"request_dedupes": true, "participants": true, "roles": true,
+	"participant_project_role": true, "credentials": true,
 }
 
 type Store struct {
@@ -175,7 +177,7 @@ func (s *Store) Migrate(ctx context.Context) (MigrationResult, error) {
 		}
 		result.Applied = []int{1}
 	}
-	if len(tables) > 0 && len(tables) != len(allowedTables) {
+	if len(tables) > 0 && len(tables) < 8 {
 		return MigrationResult{}, core.NewError(core.CodeLegacySchemaRebuildRequired, "incomplete CoordPlane v1 schema requires backup and a new data_dir", false)
 	}
 	version, err := s.migrationVersion(ctx)
@@ -195,11 +197,21 @@ func (s *Store) Migrate(ctx context.Context) (MigrationResult, error) {
 			return MigrationResult{}, core.WrapError(core.CodeInternal, "persist Run isolation spec version", false, err)
 		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, schemaVersion, schemaName, now); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, 2, isolationSpecMigrationName, now); err != nil {
 			return MigrationResult{}, core.WrapError(core.CodeInternal, "record isolation-spec migration", false, err)
 		}
 		if err := tx.Commit(); err != nil {
 			return MigrationResult{}, core.WrapError(core.CodeInternal, "commit isolation-spec migration", false, err)
+		}
+		result.Applied = append(result.Applied, 2)
+		version = 2
+	}
+	if version == 2 {
+		if err := s.validateCanonicalDatabase(ctx, 2); err != nil {
+			return MigrationResult{}, err
+		}
+		if err := s.applyParticipantRolesMigration(ctx); err != nil {
+			return MigrationResult{}, err
 		}
 		result.Applied = append(result.Applied, schemaVersion)
 	}
@@ -209,12 +221,69 @@ func (s *Store) Migrate(ctx context.Context) (MigrationResult, error) {
 	return result, nil
 }
 
+// applyParticipantRolesMigration creates the unified participant framework
+// tables and seeds the deterministic identities: the default human owner
+// participant, the owner role (every capability), the default agent role, and
+// the owner's global-scope binding. Seed capability names come from the core
+// registry so the migration and the permission layer never drift.
+func (s *Store) applyParticipantRolesMigration(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return core.WrapError(core.CodeInternal, "begin participant roles migration", false, err)
+	}
+	defer tx.Rollback()
+	for _, statement := range splitStatements(participantRolesMigrationSQL) {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return core.WrapError(core.CodeInternal, "apply participant roles schema migration", false, err)
+		}
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	ownerCapabilities, err := json.Marshal(core.CapabilityNames(core.AllCapabilities()))
+	if err != nil {
+		return core.WrapError(core.CodeInternal, "serialize owner role capabilities", false, err)
+	}
+	agentCapabilities, err := json.Marshal(core.CapabilityNames(core.AgentDefaultCapabilities()))
+	if err != nil {
+		return core.WrapError(core.CodeInternal, "serialize agent role capabilities", false, err)
+	}
+	statements := []string{
+		`INSERT INTO participants(id,kind,display_name,status,version,created_at,updated_at)
+VALUES(?,?,?,?,1,?,?)`,
+		`INSERT INTO roles(id,name,description,capabilities,version,created_at,updated_at)
+VALUES(?,?,?,?,1,?,?)`,
+		`INSERT INTO participant_project_role(participant_id,project_id,role_id,version,created_at,updated_at)
+VALUES(?,?,?,1,?,?)`,
+	}
+	values := [][]any{
+		{core.DefaultHumanParticipantID, string(core.ParticipantKindHuman), "Owner", "active", now, now},
+		{core.DefaultOwnerRoleID, "owner", "default owner with every capability", string(ownerCapabilities), now, now},
+		{core.DefaultHumanParticipantID, core.GlobalProjectID, core.DefaultOwnerRoleID, now, now},
+	}
+	for index, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement, values[index]...); err != nil {
+			return core.WrapError(core.CodeInternal, "seed participant roles", false, err)
+		}
+	}
+	agentRole := `INSERT INTO roles(id,name,description,capabilities,version,created_at,updated_at)
+VALUES(?,?,?,?,1,?,?)`
+	if _, err := tx.ExecContext(ctx, agentRole, core.DefaultAgentRoleID, "agent", "default CLI agent role", string(agentCapabilities), now, now); err != nil {
+		return core.WrapError(core.CodeInternal, "seed default agent role", false, err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, schemaVersion, schemaName, now); err != nil {
+		return core.WrapError(core.CodeInternal, "record participant roles migration", false, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return core.WrapError(core.CodeInternal, "commit participant roles migration", false, err)
+	}
+	return nil
+}
+
 func (s *Store) migrationVersion(ctx context.Context) (int, error) {
 	var version int
 	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil {
 		return 0, legacySchemaError("read SQLite migration version", err)
 	}
-	if version != 1 && version != schemaVersion {
+	if version != 1 && version != 2 && version != schemaVersion {
 		return 0, legacySchemaError("legacy database migration history requires backup and a new data_dir", nil)
 	}
 	return version, nil

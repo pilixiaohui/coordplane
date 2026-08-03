@@ -1,8 +1,9 @@
 package store
 
-const schemaVersion = 2
-const schemaName = "coordplane_v2_run_isolation_spec"
+const schemaVersion = 3
+const schemaName = "coordplane_v3_participant_roles"
 const initialSchemaName = "coordplane_v1_six_objects"
+const isolationSpecMigrationName = "coordplane_v2_run_isolation_spec"
 const isolationSpecMigrationSQL = `ALTER TABLE runs ADD COLUMN isolation_spec_version INTEGER NOT NULL DEFAULT 1 CHECK (isolation_spec_version IN (1,2))`
 
 const schemaSQL = `
@@ -215,3 +216,80 @@ CREATE INDEX messages_order ON messages(task_id, created_at, id);
 CREATE INDEX events_project_order ON events(project_id, id);
 CREATE INDEX events_entity_order ON events(entity_type, entity_id, id);
 `
+// participantRolesMigrationSQL adds the unified participant framework tables:
+// participants (human and CLI agent identities), configurable roles, per-project
+// role bindings, and human credentials. Rows are seeded in Go by Store.Migrate
+// so capability names stay sourced from the core registry.
+const participantRolesMigrationSQL = `
+ALTER TABLE events RENAME TO events_legacy;
+CREATE TABLE events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL DEFAULT '',
+  entity_type TEXT NOT NULL CHECK (entity_type IN ('project','agent','task','run','message','daemon','participant','role')),
+  entity_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  actor_kind TEXT NOT NULL CHECK (actor_kind IN ('boss','agent','daemon','system')),
+  actor_id TEXT NOT NULL DEFAULT '',
+  run_id TEXT NOT NULL DEFAULT '',
+  request_id TEXT NOT NULL DEFAULT '',
+  operation_id TEXT NOT NULL DEFAULT '',
+  payload_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload_json)),
+  created_at TEXT NOT NULL
+);
+INSERT INTO events SELECT id,project_id,entity_type,entity_id,kind,actor_kind,actor_id,run_id,request_id,operation_id,payload_json,created_at FROM events_legacy;
+DROP TABLE events_legacy;
+CREATE INDEX events_project_order ON events(project_id, id);
+CREATE INDEX events_entity_order ON events(entity_type, entity_id, id);
+
+CREATE TABLE participants (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('human','cli_agent')),
+  display_name TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('active','paused','archived')),
+  credential_id TEXT NOT NULL DEFAULT '',
+  adapter_id TEXT NOT NULL DEFAULT '',
+  image TEXT NOT NULL DEFAULT '',
+  instructions_file TEXT NOT NULL DEFAULT '',
+  version INTEGER NOT NULL CHECK (version >= 1),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE roles (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT NOT NULL DEFAULT '',
+  capabilities TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(capabilities)),
+  version INTEGER NOT NULL CHECK (version >= 1),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE participant_project_role (
+  participant_id TEXT NOT NULL REFERENCES participants(id),
+  project_id TEXT NOT NULL,
+  role_id TEXT NOT NULL REFERENCES roles(id),
+  version INTEGER NOT NULL CHECK (version >= 1),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (participant_id, project_id, role_id)
+);
+
+CREATE TABLE credentials (
+  id TEXT PRIMARY KEY,
+  participant_id TEXT NOT NULL REFERENCES participants(id),
+  kind TEXT NOT NULL CHECK (kind IN ('ssh_key','operator_token')),
+  public_key TEXT NOT NULL DEFAULT '',
+  secret_hash TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL CHECK (status IN ('active','revoked')),
+  created_at TEXT NOT NULL,
+  revoked_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX participant_project_role_project
+  ON participant_project_role(project_id, participant_id);
+CREATE INDEX credentials_participant
+  ON credentials(participant_id, status);
+`
+
+

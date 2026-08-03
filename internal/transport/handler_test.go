@@ -544,6 +544,45 @@ func (f *operatorFake) GCDiscardTaskRef(_ context.Context, input core.GCDiscardT
 	return core.GCDiscardResult{TaskID: input.TaskID, RunID: input.RunID, Discarded: true}, nil
 }
 
+func (f *operatorFake) Role(_ context.Context, id string) (core.Role, error) {
+	return core.Role{}, f.record("role", id)
+}
+
+func (f *operatorFake) ListRoles(_ context.Context) ([]core.Role, error) {
+	return nil, f.record("roles_list", nil)
+}
+
+func (f *operatorFake) CreateRole(_ context.Context, input core.RoleInput) (core.Role, error) {
+	return core.Role{}, f.record("role_create", input)
+}
+
+func (f *operatorFake) UpdateRole(_ context.Context, input core.RoleUpdateInput) (core.Role, error) {
+	return core.Role{}, f.record("role_update", input)
+}
+
+func (f *operatorFake) DeleteRole(_ context.Context, id, requestID string) error {
+	return f.record("role_delete", struct {
+		ID        string `json:"id"`
+		RequestID string `json:"request_id"`
+	}{id, requestID})
+}
+
+func (f *operatorFake) Participant(_ context.Context, id string) (core.Participant, error) {
+	return core.Participant{}, f.record("participant", id)
+}
+
+func (f *operatorFake) ListParticipants(_ context.Context) ([]core.Participant, error) {
+	return nil, f.record("participants_list", nil)
+}
+
+func (f *operatorFake) BindParticipantRole(_ context.Context, input core.BindRoleInput) (core.ParticipantRoleBinding, error) {
+	return core.ParticipantRoleBinding{}, f.record("participant_bind", input)
+}
+
+func (f *operatorFake) UnbindParticipantRole(_ context.Context, input core.BindRoleInput) error {
+	return f.record("participant_unbind", input)
+}
+
 func (f *operatorFake) Run(_ context.Context, id string) (core.Run, error) {
 	return core.Run{}, f.record("run", id)
 }

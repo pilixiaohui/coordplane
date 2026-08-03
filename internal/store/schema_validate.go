@@ -56,6 +56,13 @@ func canonicalSchemaObjects(ctx context.Context, version int) (map[string]schema
 			return nil, err
 		}
 	}
+	if version >= 3 {
+		for _, statement := range splitStatements(participantRolesMigrationSQL) {
+			if _, err := db.ExecContext(ctx, statement); err != nil {
+				return nil, err
+			}
+		}
+	}
 	return readSchemaObjects(ctx, db)
 }
 
@@ -139,6 +146,12 @@ func (s *Store) validateMigrationHistory(ctx context.Context, version int) error
 		name    string
 	}{{1, initialSchemaName}}
 	if version >= 2 {
+		want = append(want, struct {
+			version int
+			name    string
+		}{2, isolationSpecMigrationName})
+	}
+	if version >= 3 {
 		want = append(want, struct {
 			version int
 			name    string

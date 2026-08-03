@@ -90,6 +90,10 @@ func run(ctx context.Context, args []string, getenv environment, stdout, stderr 
 		err = runEvents(ctx, args[1:], getenv, stdout, stderr, clients)
 	case "gc":
 		err = runGC(ctx, args[1:], getenv, stdout, stderr, clients)
+	case "role":
+		err = runRole(ctx, args[1:], getenv, stdout, stderr, clients)
+	case "participant":
+		err = runParticipant(ctx, args[1:], getenv, stdout, stderr, clients)
 	default:
 		err = fmt.Errorf("unknown coordplane command %q", args[0])
 	}
@@ -243,4 +247,6 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "  coordplane run list|show|stop ...")
 	fmt.Fprintln(writer, "  coordplane events tail ...")
 	fmt.Fprintln(writer, "  coordplane gc preview|run|discard-workspace|discard-task-ref ...")
+	fmt.Fprintln(writer, "  coordplane role create|update|delete|list|show ...")
+	fmt.Fprintln(writer, "  coordplane participant list|show|bind|unbind ...")
 }

@@ -23,6 +23,11 @@ type Repository interface {
 	Snapshot(context.Context, string) (Snapshot, error)
 	StatusProjection(context.Context, string) (StatusProjection, error)
 	TaskProjection(context.Context, string) (TaskProjection, error)
+	Role(context.Context, string) (Role, error)
+	Roles(context.Context) ([]Role, error)
+	Participant(context.Context, string) (Participant, error)
+	Participants(context.Context) ([]Participant, error)
+	ParticipantRoles(context.Context, string) ([]ParticipantRoleBinding, error)
 	Tasks(context.Context, TaskFilter) (TaskPage, error)
 	Runs(context.Context, RunFilter) (RunPage, error)
 	Messages(context.Context, MessageFilter) (MessagePage, error)
@@ -66,6 +71,20 @@ type Transaction interface {
 	PendingWakeAt(string) (string, bool, error)
 	InsertMessage(Message) error
 	UpdateMessage(Message, int64, MessageState) error
+
+	Role(string) (Role, error)
+	Roles() ([]Role, error)
+	InsertRole(Role) error
+	UpdateRole(Role, int64) error
+	DeleteRole(string) error
+	RoleBindingCount(string) (int, error)
+
+	Participant(string) (Participant, error)
+	Participants() ([]Participant, error)
+	InsertParticipant(Participant) error
+	ParticipantRoles(string) ([]ParticipantRoleBinding, error)
+	InsertParticipantRole(ParticipantRoleBinding) error
+	DeleteParticipantRole(string, string, string) error
 
 	AppendEvent(Event) (Event, error)
 }

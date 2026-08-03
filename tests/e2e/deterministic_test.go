@@ -802,7 +802,9 @@ func assertSQLiteTruth(t *testing.T, path, taskA, taskB, integrationID, finalSHA
 		}
 	}
 	requireNoError(t, rows.Close())
-	wantTables := []string{"agents", "events", "messages", "projects", "request_dedupes", "runs", "schema_migrations", "tasks"}
+	// Unified participant framework: the six business objects plus the
+	// participant/roles/binding/credentials tables and infrastructure.
+	wantTables := []string{"agents", "credentials", "events", "messages", "participant_project_role", "participants", "projects", "request_dedupes", "roles", "runs", "schema_migrations", "tasks"}
 	if strings.Join(tables, ",") != strings.Join(wantTables, ",") {
 		t.Fatalf("SQLite tables = %v, want six objects plus infrastructure %v", tables, wantTables)
 	}

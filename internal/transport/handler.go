@@ -27,6 +27,7 @@ func NewOperatorHandler(operations OperatorOperations) http.Handler {
 	mux := http.NewServeMux()
 	registerProjectAgentRoutes(mux, operations)
 	registerTaskRoutes(mux, operations)
+	registerParticipantRoleRoutes(mux, operations)
 
 	mux.HandleFunc("/v1/runs", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
@@ -179,6 +180,73 @@ func registerTaskRoutes(mux *http.ServeMux, operations OperatorOperations) {
 		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
 		return operations.ReworkTask(ctx.Context, input)
 	})))
+}
+
+func registerParticipantRoleRoutes(mux *http.ServeMux, operations OperatorOperations) {
+	createRole := decodeCall(func(ctx requestContext, input core.RoleInput) (any, error) {
+		return operations.CreateRole(ctx.Context, input)
+	})
+	mux.HandleFunc("/v1/roles", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			createRole(w, r)
+		case http.MethodGet:
+			result, err := operations.ListRoles(r.Context())
+			writeResult(w, result, err)
+		default:
+			methodNotAllowed(w, "GET, POST")
+		}
+	})
+	mux.HandleFunc("/v1/roles/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimSpace(r.PathValue("id"))
+		switch r.Method {
+		case http.MethodGet:
+			result, err := operations.Role(r.Context(), id)
+			writeResult(w, result, err)
+		case http.MethodPut:
+			updateRole := decodeCall(func(ctx requestContext, input core.RoleUpdateInput) (any, error) {
+				input.RoleID = id
+				return operations.UpdateRole(ctx.Context, input)
+			})
+			updateRole(w, r)
+		case http.MethodDelete:
+			var input actionRequest
+			if err := decodeJSON(w, r, &input, true); err != nil {
+				writeError(w, err)
+				return
+			}
+			writeResult(w, nil, operations.DeleteRole(r.Context(), id, input.RequestID))
+		default:
+			methodNotAllowed(w, "GET, PUT, DELETE")
+		}
+	})
+	mux.HandleFunc("/v1/participants", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		result, err := operations.ListParticipants(r.Context())
+		writeResult(w, result, err)
+	}))
+	mux.HandleFunc("/v1/participants/{id}", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		result, err := operations.Participant(r.Context(), strings.TrimSpace(r.PathValue("id")))
+		writeResult(w, result, err)
+	}))
+	mux.HandleFunc("/v1/participants/{id}/roles", func(w http.ResponseWriter, r *http.Request) {
+		participantID := strings.TrimSpace(r.PathValue("id"))
+		switch r.Method {
+		case http.MethodPost:
+			bindRole := decodeCall(func(ctx requestContext, input core.BindRoleInput) (any, error) {
+				input.ParticipantID = participantID
+				return operations.BindParticipantRole(ctx.Context, input)
+			})
+			bindRole(w, r)
+		case http.MethodDelete:
+			unbindRole := decodeCall(func(ctx requestContext, input core.BindRoleInput) (any, error) {
+				input.ParticipantID = participantID
+				return nil, operations.UnbindParticipantRole(ctx.Context, input)
+			})
+			unbindRole(w, r)
+		default:
+			methodNotAllowed(w, "POST, DELETE")
+		}
+	})
 }
 
 func registerMessageEventGCRoutes(mux *http.ServeMux, operations OperatorOperations) {

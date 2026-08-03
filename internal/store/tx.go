@@ -407,3 +407,141 @@ func quotePlaceholders(count int) string {
 	}
 	return strings.TrimSuffix(strings.Repeat("?,", count), ",")
 }
+
+func (u *unitOfWork) Role(id string) (core.Role, error) {
+	role, err := scanRole(u.tx.QueryRowContext(u.ctx, roleSelect+` WHERE id=?`, id))
+	return role, mapNotFound("role", id, err)
+}
+
+func (u *unitOfWork) Roles() ([]core.Role, error) {
+	rows, err := u.tx.QueryContext(u.ctx, roleSelect+` ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var roles []core.Role
+	for rows.Next() {
+		role, err := scanRole(rows)
+		if err != nil {
+			return nil, err
+		}
+		roles = append(roles, role)
+	}
+	return roles, rows.Err()
+}
+
+func (u *unitOfWork) InsertRole(role core.Role) error {
+	_, err := u.tx.ExecContext(u.ctx, `
+INSERT INTO roles(id,name,description,capabilities,version,created_at,updated_at)
+VALUES(?,?,?,?,?,?,?)`,
+		role.ID, role.Name, role.Description, jsonCapabilities(role.Capabilities), role.Version, role.CreatedAt, role.UpdatedAt)
+	return err
+}
+
+func (u *unitOfWork) UpdateRole(role core.Role, expectedVersion int64) error {
+	result, err := u.tx.ExecContext(u.ctx, `
+UPDATE roles SET name=?,description=?,capabilities=?,version=?,updated_at=?
+WHERE id=? AND version=?`,
+		role.Name, role.Description, jsonCapabilities(role.Capabilities), role.Version, role.UpdatedAt, role.ID, expectedVersion)
+	return u.casResult(result, err, "role", role.ID)
+}
+
+func (u *unitOfWork) DeleteRole(id string) error {
+	result, err := u.tx.ExecContext(u.ctx, `DELETE FROM roles WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return core.NewError(core.CodeNotFound, "role was not found", false)
+	}
+	return nil
+}
+
+func (u *unitOfWork) RoleBindingCount(roleID string) (int, error) {
+	var count int
+	err := u.tx.QueryRowContext(u.ctx, `SELECT COUNT(*) FROM participant_project_role WHERE role_id=?`, roleID).Scan(&count)
+	return count, err
+}
+
+func (u *unitOfWork) Participant(id string) (core.Participant, error) {
+	participant, err := scanParticipant(u.tx.QueryRowContext(u.ctx, participantSelect+` WHERE id=?`, id))
+	return participant, mapNotFound("participant", id, err)
+}
+
+func (u *unitOfWork) Participants() ([]core.Participant, error) {
+	rows, err := u.tx.QueryContext(u.ctx, participantSelect+` ORDER BY display_name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var participants []core.Participant
+	for rows.Next() {
+		participant, err := scanParticipant(rows)
+		if err != nil {
+			return nil, err
+		}
+		participants = append(participants, participant)
+	}
+	return participants, rows.Err()
+}
+
+func (u *unitOfWork) ParticipantRoles(participantID string) ([]core.ParticipantRoleBinding, error) {
+	rows, err := u.tx.QueryContext(u.ctx, `
+SELECT b.participant_id,b.project_id,b.role_id,r.name,r.capabilities,b.version,b.created_at,b.updated_at
+FROM participant_project_role b
+JOIN roles r ON r.id=b.role_id
+WHERE b.participant_id=?
+ORDER BY b.project_id,b.role_id`, participantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var bindings []core.ParticipantRoleBinding
+	for rows.Next() {
+		binding, err := scanBinding(rows)
+		if err != nil {
+			return nil, err
+		}
+		bindings = append(bindings, binding)
+	}
+	return bindings, rows.Err()
+}
+
+func (u *unitOfWork) InsertParticipant(participant core.Participant) error {
+	_, err := u.tx.ExecContext(u.ctx, `
+INSERT INTO participants(id,kind,display_name,status,credential_id,adapter_id,image,instructions_file,version,created_at,updated_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		participant.ID, string(participant.Kind), participant.DisplayName, participant.Status,
+		participant.CredentialID, participant.AdapterID, participant.Image,
+		participant.InstructionsFile, participant.Version, participant.CreatedAt, participant.UpdatedAt)
+	return err
+}
+
+func (u *unitOfWork) InsertParticipantRole(binding core.ParticipantRoleBinding) error {
+	_, err := u.tx.ExecContext(u.ctx, `
+INSERT INTO participant_project_role(participant_id,project_id,role_id,version,created_at,updated_at)
+VALUES(?,?,?,?,?,?)`,
+		binding.ParticipantID, binding.ProjectID, binding.RoleID, binding.Version, binding.CreatedAt, binding.UpdatedAt)
+	return err
+}
+
+func (u *unitOfWork) DeleteParticipantRole(participantID, projectID, roleID string) error {
+	result, err := u.tx.ExecContext(u.ctx, `
+DELETE FROM participant_project_role WHERE participant_id=? AND project_id=? AND role_id=?`,
+		participantID, projectID, roleID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return core.NewError(core.CodeNotFound, "participant role binding was not found", false)
+	}
+	return nil
+}

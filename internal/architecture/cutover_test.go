@@ -33,6 +33,7 @@ func TestV1SchemaBusinessTableAllowlist(t *testing.T) {
 	allowed := stringSet(
 		"projects", "agents", "tasks", "runs", "messages", "events",
 		"schema_migrations", "request_dedupes",
+		"participants", "roles", "participant_project_role", "credentials",
 	)
 	seen := map[string]bool{}
 	for _, match := range pattern.FindAllSubmatch(raw, -1) {

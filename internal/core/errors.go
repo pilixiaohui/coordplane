@@ -11,6 +11,7 @@ const (
 	CodeNotFound                    ErrorCode = "NOT_FOUND"
 	CodeInvalidArgument             ErrorCode = "INVALID_ARGUMENT"
 	CodeInvalidState                ErrorCode = "INVALID_STATE"
+	CodeInUse                       ErrorCode = "IN_USE"
 	CodeActionInProgress            ErrorCode = "ACTION_IN_PROGRESS"
 	CodeVersionConflict             ErrorCode = "VERSION_CONFLICT"
 	CodeScopeDenied                 ErrorCode = "SCOPE_DENIED"
