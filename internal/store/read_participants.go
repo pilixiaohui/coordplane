@@ -7,6 +7,8 @@ import (
 	"coordplane/internal/core"
 )
 
+const credentialSelect = `SELECT id,participant_id,kind,secret_hash,status,created_at,revoked_at FROM credentials`
+
 func scanRole(row rowScanner) (core.Role, error) {
 	var role core.Role
 	var capabilities string
@@ -62,6 +64,15 @@ func splitJSONStrings(raw string) []string {
 		return nil
 	}
 	return names
+}
+
+func scanCredential(row rowScanner) (core.Credential, error) {
+	var credential core.Credential
+	err := row.Scan(
+		&credential.ID, &credential.ParticipantID, &credential.Kind, &credential.SecretHash,
+		&credential.Status, &credential.CreatedAt, &credential.RevokedAt,
+	)
+	return credential, err
 }
 
 func (s *Store) Role(ctx context.Context, id string) (core.Role, error) {

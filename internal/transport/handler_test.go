@@ -67,8 +67,8 @@ func TestOperatorHandlerHasOnlyTheFixedRouteSurface(t *testing.T) {
 			if recorder.Code != http.StatusOK || !envelope.OK || envelope.Error != nil {
 				t.Fatalf("response = status:%d envelope:%+v body:%s", recorder.Code, envelope, recorder.Body.String())
 			}
-			if got := operations.callNames(); !reflect.DeepEqual(got, []string{test.call}) {
-				t.Fatalf("operation calls = %v, want [%s]", got, test.call)
+			if got := operations.callNames(); !reflect.DeepEqual(got, []string{"authenticate_operator", test.call}) {
+				t.Fatalf("operation calls = %v, want [authenticate_operator %s]", got, test.call)
 			}
 		})
 	}
@@ -82,8 +82,10 @@ func TestOperatorHandlerHasOnlyTheFixedRouteSurface(t *testing.T) {
 			t.Fatalf("legacy route %s response = status:%d envelope:%+v", path, recorder.Code, envelope)
 		}
 	}
-	if len(operations.calls) != 0 {
-		t.Fatalf("unknown routes invoked operations: %+v", operations.calls)
+	for _, call := range operations.calls {
+		if call.name != "authenticate_operator" {
+			t.Fatalf("unknown routes invoked operations: %+v", operations.calls)
+		}
 	}
 
 	recorder := invoke(t, handler, http.MethodPut, "/v1/projects", "", "")
@@ -184,7 +186,8 @@ func TestOperatorHandlerMapsBodiesPathsAndQueriesWithoutGenericDispatch(t *testi
 	if recorder.Code != http.StatusBadRequest || envelope.Error == nil || envelope.Error.Code != core.CodeInvalidArgument {
 		t.Fatalf("invalid query response = status:%d envelope:%+v", recorder.Code, envelope)
 	}
-	if len(operations.calls) != before {
+	// only the credential fence observes the request; core operations stay clean
+	if len(operations.calls) != before+1 {
 		t.Fatal("invalid query reached core operations")
 	}
 }
@@ -361,11 +364,11 @@ func TestHandlersKeepReadsAvailableAndForwardReadyMutationOnce(t *testing.T) {
 	operator := &operatorFake{}
 	handler := transport.NewOperatorHandler(operator)
 	assertOK(t, invoke(t, handler, http.MethodGet, "/v1/status", "", ""))
-	if operator.readyChecks != 0 || !reflect.DeepEqual(operator.callNames(), []string{"status"}) {
+	if operator.readyChecks != 0 || !reflect.DeepEqual(operator.callNames(), []string{"authenticate_operator", "status"}) {
 		t.Fatalf("GET ready checks=%d calls=%v", operator.readyChecks, operator.callNames())
 	}
 	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/projects", `{}`, ""))
-	if operator.readyChecks != 1 || !reflect.DeepEqual(operator.callNames(), []string{"status", "add_project"}) {
+	if operator.readyChecks != 1 || !reflect.DeepEqual(operator.callNames(), []string{"authenticate_operator", "status", "authenticate_operator", "add_project"}) {
 		t.Fatalf("ready POST checks=%d calls=%v", operator.readyChecks, operator.callNames())
 	}
 
@@ -593,6 +596,22 @@ func (f *operatorFake) CloseConversation(_ context.Context, id, requestID string
 
 func (f *operatorFake) CompleteTask(_ context.Context, input core.CompleteTaskInput) (core.Task, error) {
 	return core.Task{}, f.record("complete_task", input)
+}
+
+func (f *operatorFake) AuthenticateOperator(_ context.Context, secret string) error {
+	return f.record("authenticate_operator", secret)
+}
+
+func (f *operatorFake) AddCredential(_ context.Context, input core.AddCredentialInput) (core.Credential, error) {
+	return core.Credential{}, f.record("add_credential", input)
+}
+
+func (f *operatorFake) RotateCredential(_ context.Context, input core.AddCredentialInput) (core.Credential, error) {
+	return core.Credential{}, f.record("rotate_credential", input)
+}
+
+func (f *operatorFake) RevokeCredential(_ context.Context, id, requestID string) (core.Credential, error) {
+	return core.Credential{}, f.record("revoke_credential", actionCall{id: id, requestID: requestID})
 }
 
 func (f *operatorFake) WakeTask(_ context.Context, input core.TaskActionInput) (core.Task, error) {

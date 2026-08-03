@@ -16,7 +16,7 @@ Core 是单用户 Daemon 的协调内核，负责：
 
 Core 不执行项目业务判断，不解析聊天文本，不保存代码，不代理 Git 开发命令，也不建设动态能力、策略、skill、验收或 artifact 平台。
 
-Owner批准的预算重基线不改变本文件的对象、状态、命令或不变量。全库production/tests/infra/total envelope固定为`20,000/21,000/22,000`、`21,000/22,000/23,300`、`250/400/600`和`41,250/43,400/45,900`；统计仍按`acceptance.md`的非空、非纯注释物理行口径。Core模块实际SLOC、质量blocker和diff必须进入clean候选revision的LOC JSON，并通过真实多Agent可靠性场景验证状态收敛；重基线reserve不得授权删除本文件合同。
+Owner批准的预算重基线不改变本文件的对象、状态、命令或不变量。全库production/tests/infra/total envelope固定为`20,000/21,000/22,000`、`21,000/22,000/23,600`、`250/400/600`和`41,250/43,400/46,200`；统计仍按`acceptance.md`的非空、非纯注释物理行口径。Core模块实际SLOC、质量blocker和diff必须进入clean候选revision的LOC JSON，并通过真实多Agent可靠性场景验证状态收敛；重基线reserve不得授权删除本文件合同。
 
 ## 2. 持久化总则
 

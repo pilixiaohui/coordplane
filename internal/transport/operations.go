@@ -50,6 +50,10 @@ type OperatorOperations interface {
 	GCRun(context.Context, core.GCRunInput) (core.GCRunResult, error)
 	GCDiscardWorkspace(context.Context, core.GCDiscardWorkspaceInput) (core.GCDiscardResult, error)
 	GCDiscardTaskRef(context.Context, core.GCDiscardTaskRefInput) (core.GCDiscardResult, error)
+	AuthenticateOperator(context.Context, string) error
+	AddCredential(context.Context, core.AddCredentialInput) (core.Credential, error)
+	RotateCredential(context.Context, core.AddCredentialInput) (core.Credential, error)
+	RevokeCredential(context.Context, string, string) (core.Credential, error)
 	Role(context.Context, string) (core.Role, error)
 	ListRoles(context.Context) ([]core.Role, error)
 	CreateRole(context.Context, core.RoleInput) (core.Role, error)

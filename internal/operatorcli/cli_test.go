@@ -274,7 +274,7 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 			client := &recordingClient{status: status}
 			factoryCalls := 0
 			var stdout, stderr bytes.Buffer
-			code := run(context.Background(), test.args, socketEnv("/tmp/from-env.sock"), &stdout, &stderr, func(socket string) (jsonClient, error) {
+			code := run(context.Background(), test.args, socketEnv("/tmp/from-env.sock"), &stdout, &stderr, func(socket, credential string) (jsonClient, error) {
 				factoryCalls++
 				if socket != "/tmp/from-env.sock" {
 					t.Fatalf("socket = %q", socket)
@@ -319,7 +319,7 @@ func TestSocketEnvironmentAndOverride(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			client := &recordingClient{status: testStatus()}
 			var gotSocket string
-			code := run(context.Background(), test.args, socketEnv(test.environment), ioDiscard{}, ioDiscard{}, func(socket string) (jsonClient, error) {
+			code := run(context.Background(), test.args, socketEnv(test.environment), ioDiscard{}, ioDiscard{}, func(socket, credential string) (jsonClient, error) {
 				gotSocket = socket
 				return client, nil
 			}, nil)
@@ -346,7 +346,7 @@ func TestLegacyAndFutureCommandsFailBeforeClientSetup(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			factoryCalls, runnerCalls := 0, 0
 			var stderr bytes.Buffer
-			code := run(context.Background(), test.args, socketEnv("/tmp/environment.sock"), ioDiscard{}, &stderr, func(string) (jsonClient, error) {
+			code := run(context.Background(), test.args, socketEnv("/tmp/environment.sock"), ioDiscard{}, &stderr, func(string, string) (jsonClient, error) {
 				factoryCalls++
 				return &recordingClient{status: testStatus()}, nil
 			}, func(context.Context, string) error {
@@ -366,7 +366,7 @@ func TestLegacyAndFutureCommandsFailBeforeClientSetup(t *testing.T) {
 func TestBlankIDFailsBeforeClientSetup(t *testing.T) {
 	factoryCalls := 0
 	var stderr bytes.Buffer
-	code := run(context.Background(), []string{"project", "show", "   ", "--socket", "/tmp/operator.sock"}, nil, ioDiscard{}, &stderr, func(string) (jsonClient, error) {
+	code := run(context.Background(), []string{"project", "show", "   ", "--socket", "/tmp/operator.sock"}, nil, ioDiscard{}, &stderr, func(string, string) (jsonClient, error) {
 		factoryCalls++
 		return &recordingClient{}, nil
 	}, nil)
@@ -380,7 +380,7 @@ func TestBlankAtomicAckIDFailsBeforeClientSetup(t *testing.T) {
 	var stderr bytes.Buffer
 	code := run(context.Background(), []string{
 		"task", "rework", "task-1", "--ack-message", "   ", "--socket", "/tmp/operator.sock",
-	}, nil, ioDiscard{}, &stderr, func(string) (jsonClient, error) {
+	}, nil, ioDiscard{}, &stderr, func(string, string) (jsonClient, error) {
 		factoryCalls++
 		return &recordingClient{}, nil
 	}, nil)
@@ -394,7 +394,7 @@ func TestServeUsesProvidedContextAndConfig(t *testing.T) {
 	ctx := context.WithValue(context.Background(), contextKey("test"), "value")
 	var gotContext context.Context
 	var gotPath string
-	code := run(ctx, []string{"serve", "--config", "  daemon.yaml  "}, nil, ioDiscard{}, ioDiscard{}, func(string) (jsonClient, error) {
+	code := run(ctx, []string{"serve", "--config", "  daemon.yaml  "}, nil, ioDiscard{}, ioDiscard{}, func(string, string) (jsonClient, error) {
 		t.Fatal("serve invoked client factory")
 		return nil, nil
 	}, func(callContext context.Context, path string) error {
@@ -419,7 +419,7 @@ func TestOutputModesAndInvalidOutput(t *testing.T) {
 			args := append([]string{"project", "show", "project-1"}, test.outputFlag...)
 			client := &recordingClient{status: testStatus()}
 			var stdout, stderr bytes.Buffer
-			code := run(context.Background(), args, socketEnv("/tmp/operator.sock"), &stdout, &stderr, func(string) (jsonClient, error) {
+			code := run(context.Background(), args, socketEnv("/tmp/operator.sock"), &stdout, &stderr, func(string, string) (jsonClient, error) {
 				return client, nil
 			}, nil)
 			if code != 0 || !strings.Contains(stdout.String(), test.want) {
@@ -430,7 +430,7 @@ func TestOutputModesAndInvalidOutput(t *testing.T) {
 
 	factoryCalls := 0
 	var stderr bytes.Buffer
-	code := run(context.Background(), []string{"status", "--output", "yaml"}, socketEnv("/tmp/operator.sock"), ioDiscard{}, &stderr, func(string) (jsonClient, error) {
+	code := run(context.Background(), []string{"status", "--output", "yaml"}, socketEnv("/tmp/operator.sock"), ioDiscard{}, &stderr, func(string, string) (jsonClient, error) {
 		factoryCalls++
 		return &recordingClient{}, nil
 	}, nil)
@@ -466,7 +466,7 @@ func TestStatusAndShowCommandsKeepActualTruthProjection(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			client := &recordingClient{status: status}
 			var stdout, stderr bytes.Buffer
-			code := run(context.Background(), test.args, socketEnv("/tmp/operator.sock"), &stdout, &stderr, func(string) (jsonClient, error) {
+			code := run(context.Background(), test.args, socketEnv("/tmp/operator.sock"), &stdout, &stderr, func(string, string) (jsonClient, error) {
 				return client, nil
 			}, nil)
 			if code != 0 {
@@ -483,7 +483,7 @@ func TestStatusAndShowCommandsKeepActualTruthProjection(t *testing.T) {
 
 func TestVersionDoesNotInitializeDaemonOrClient(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), []string{"version"}, nil, &stdout, &stderr, func(string) (jsonClient, error) {
+	code := run(context.Background(), []string{"version"}, nil, &stdout, &stderr, func(string, string) (jsonClient, error) {
 		t.Fatal("version invoked client factory")
 		return nil, nil
 	}, func(context.Context, string) error {

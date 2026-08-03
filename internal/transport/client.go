@@ -24,11 +24,20 @@ func WithBearerToken(token string) ClientOption {
 	}
 }
 
+func WithHeader(name, value string) ClientOption {
+	return func(client *Client) {
+		if name = strings.TrimSpace(name); name != "" && strings.TrimSpace(value) != "" {
+			client.headers[name] = value
+		}
+	}
+}
+
 // Client is an HTTP/JSON client whose transport can dial only one Unix socket.
 type Client struct {
 	httpClient *http.Client
 	transport  *http.Transport
 	token      string
+	headers    map[string]string
 }
 
 func NewUnixClient(socketPath string, options ...ClientOption) (*Client, error) {
@@ -51,6 +60,7 @@ func NewUnixClient(socketPath string, options ...ClientOption) (*Client, error) 
 	client := &Client{
 		httpClient: &http.Client{Transport: httpTransport},
 		transport:  httpTransport,
+		headers:    map[string]string{},
 	}
 	for _, option := range options {
 		if option != nil {
@@ -88,6 +98,9 @@ func (c *Client) JSON(ctx context.Context, method, path string, input, output an
 	}
 	if c.token != "" {
 		request.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	for name, value := range c.headers {
+		request.Header.Set(name, value)
 	}
 	response, err := c.httpClient.Do(request)
 	if err != nil {

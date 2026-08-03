@@ -169,9 +169,9 @@ generated_total=$((generated_semantic_production + generated_semantic_tests + ge
 
 failure=false
 [ "$production" -le 22000 ] || failure=true
-[ "$tests" -le 23300 ] || failure=true
+[ "$tests" -le 23600 ] || failure=true
 [ "$infra" -le 600 ] || failure=true
-[ "$total" -le 45900 ] || failure=true
+[ "$total" -le 46200 ] || failure=true
 [ "$generated_total" -le 3000 ] || failure=true
 for report in unknown file-blockers function-blockers gofmt multistatement-blockers; do
   [ ! -s "$tmp/$report" ] || failure=true

@@ -18,6 +18,7 @@ import (
 )
 
 const socketEnvironment = "COORDPLANE_OPERATOR_SOCKET"
+const credentialEnvironment = "COORDPLANE_CREDENTIAL"
 
 type environment func(string) string
 
@@ -26,12 +27,13 @@ type jsonClient interface {
 	CloseIdleConnections()
 }
 
-type clientFactory func(string) (jsonClient, error)
+type clientFactory func(string, string) (jsonClient, error)
 type daemonRunner func(context.Context, string) error
 
 type clientConfig struct {
-	socket string
-	output string
+	socket     string
+	credential string
+	output     string
 }
 
 type actionRequest struct {
@@ -39,8 +41,12 @@ type actionRequest struct {
 }
 
 func Run(ctx context.Context, args []string, getenv environment, stdout, stderr io.Writer) int {
-	return run(ctx, args, getenv, stdout, stderr, func(socket string) (jsonClient, error) {
-		return transport.NewUnixClient(socket)
+	return run(ctx, args, getenv, stdout, stderr, func(socket, credential string) (jsonClient, error) {
+		options := []transport.ClientOption{}
+		if credential != "" {
+			options = append(options, transport.WithHeader("X-Coordplane-Credential", credential))
+		}
+		return transport.NewUnixClient(socket, options...)
 	}, daemon.Run)
 }
 
@@ -94,6 +100,8 @@ func run(ctx context.Context, args []string, getenv environment, stdout, stderr 
 		err = runRole(ctx, args[1:], getenv, stdout, stderr, clients)
 	case "participant":
 		err = runParticipant(ctx, args[1:], getenv, stdout, stderr, clients)
+	case "credential":
+		err = runCredential(ctx, args[1:], getenv, stdout, stderr, clients)
 	default:
 		err = fmt.Errorf("unknown coordplane command %q", args[0])
 	}
@@ -146,7 +154,7 @@ func runStatus(ctx context.Context, args []string, getenv environment, stdout, s
 func clientFlags(name string, getenv environment, stderr io.Writer) (*flag.FlagSet, *clientConfig) {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	cfg := &clientConfig{socket: strings.TrimSpace(getenv(socketEnvironment)), output: "human"}
+	cfg := &clientConfig{socket: strings.TrimSpace(getenv(socketEnvironment)), credential: strings.TrimSpace(getenv(credentialEnvironment)), output: "human"}
 	flags.StringVar(&cfg.socket, "socket", cfg.socket, "operator Unix socket")
 	flags.StringVar(&cfg.output, "output", cfg.output, "human or json")
 	return flags, cfg
@@ -193,7 +201,7 @@ func request(ctx context.Context, cfg clientConfig, clients clientFactory, metho
 	if err := cfg.validate(); err != nil {
 		return err
 	}
-	client, err := clients(strings.TrimSpace(cfg.socket))
+	client, err := clients(strings.TrimSpace(cfg.socket), strings.TrimSpace(cfg.credential))
 	if err != nil {
 		return err
 	}

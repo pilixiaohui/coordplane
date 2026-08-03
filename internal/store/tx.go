@@ -549,3 +549,68 @@ DELETE FROM participant_project_role WHERE participant_id=? AND project_id=? AND
 	}
 	return nil
 }
+
+func (u *unitOfWork) Credential(id string) (core.Credential, error) {
+	credential, err := scanCredential(u.tx.QueryRowContext(u.ctx, credentialSelect+` WHERE id=?`, id))
+	return credential, mapNotFound("credential", id, err)
+}
+
+func (u *unitOfWork) Credentials(participantID string) ([]core.Credential, error) {
+	rows, err := u.tx.QueryContext(u.ctx, credentialSelect+` WHERE participant_id=? ORDER BY created_at,id`, participantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var credentials []core.Credential
+	for rows.Next() {
+		credential, err := scanCredential(rows)
+		if err != nil {
+			return nil, err
+		}
+		credentials = append(credentials, credential)
+	}
+	return credentials, rows.Err()
+}
+
+func (u *unitOfWork) InsertCredential(credential core.Credential) error {
+	_, err := u.tx.ExecContext(u.ctx, `
+INSERT INTO credentials(id,participant_id,kind,public_key,secret_hash,status,created_at,revoked_at)
+VALUES(?,?,?,?,?,?,?,?)`,
+		credential.ID, credential.ParticipantID, credential.Kind, "", credential.SecretHash,
+		credential.Status, credential.CreatedAt, credential.RevokedAt)
+	return err
+}
+
+func (u *unitOfWork) UpdateCredential(credential core.Credential, expectedStatus core.CredentialStatus) error {
+	result, err := u.tx.ExecContext(u.ctx, `
+UPDATE credentials SET status=?,revoked_at=? WHERE id=? AND status=?`,
+		credential.Status, credential.RevokedAt, credential.ID, expectedStatus)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return core.Conflict(core.CodeVersionConflict, "credential changed", string(expectedStatus), 1)
+	}
+	return nil
+}
+
+func (u *unitOfWork) SetParticipantCredential(participantID, credentialID string) error {
+	result, err := u.tx.ExecContext(u.ctx, `
+UPDATE participants SET credential_id=? WHERE id=?`,
+		credentialID, participantID)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return core.NewError(core.CodeNotFound, "participant was not found", false)
+	}
+	return nil
+}

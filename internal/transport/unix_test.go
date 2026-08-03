@@ -47,7 +47,7 @@ func TestUnixServerAndJSONClientUseTheSocketAndRemoveItOnClose(t *testing.T) {
 	if err := client.JSON(ctx, http.MethodGet, "/v1/status?project_id=prj-socket", nil, &status); err != nil {
 		t.Fatalf("JSON over Unix socket: %v", err)
 	}
-	if len(operations.calls) != 1 || operations.calls[0].name != "status" || operations.calls[0].value != "prj-socket" {
+	if len(operations.calls) != 2 || operations.calls[1].name != "status" || operations.calls[1].value != "prj-socket" {
 		t.Fatalf("operator calls = %+v", operations.calls)
 	}
 
@@ -120,7 +120,7 @@ func TestUnixServerAndClientSupportLongFilesystemPaths(t *testing.T) {
 	if err := client.JSON(ctx, http.MethodGet, "/v1/status?project_id=prj-long", nil, &status); err != nil {
 		t.Fatalf("request over long Unix path: %v", err)
 	}
-	if len(operations.calls) != 1 || operations.calls[0].value != "prj-long" {
+	if len(operations.calls) != 2 || operations.calls[1].value != "prj-long" {
 		t.Fatalf("operator calls = %#v", operations.calls)
 	}
 }

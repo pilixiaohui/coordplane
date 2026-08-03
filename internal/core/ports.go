@@ -85,6 +85,11 @@ type Transaction interface {
 	ParticipantRoles(string) ([]ParticipantRoleBinding, error)
 	InsertParticipantRole(ParticipantRoleBinding) error
 	DeleteParticipantRole(string, string, string) error
+	Credential(string) (Credential, error)
+	Credentials(string) ([]Credential, error)
+	InsertCredential(Credential) error
+	UpdateCredential(Credential, CredentialStatus) error
+	SetParticipantCredential(string, string) error
 
 	AppendEvent(Event) (Event, error)
 }

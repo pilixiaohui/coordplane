@@ -28,6 +28,7 @@ func NewOperatorHandler(operations OperatorOperations) http.Handler {
 	registerProjectAgentRoutes(mux, operations)
 	registerTaskRoutes(mux, operations)
 	registerParticipantRoleRoutes(mux, operations)
+	registerCredentialRoutes(mux, operations)
 
 	mux.HandleFunc("/v1/runs", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
@@ -52,7 +53,22 @@ func NewOperatorHandler(operations OperatorOperations) http.Handler {
 	})))
 	registerMessageEventGCRoutes(mux, operations)
 	mux.HandleFunc("/", notFound)
-	return fenceMutations(operations, mux)
+	return fenceMutations(operations, operatorCredentialFence(operations, mux))
+}
+
+// operatorCredentialFence is the human-identity gate for the operator
+// surface. Once the default human participant holds any credential row, every
+// operator request must present an active credential secret in
+// X-Coordplane-Credential; with no credential rows (fresh install) the legacy
+// socket trust boundary remains in effect.
+func operatorCredentialFence(operations OperatorOperations, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := operations.AuthenticateOperator(r.Context(), r.Header.Get("X-Coordplane-Credential")); err != nil {
+			writeError(w, err)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func registerProjectAgentRoutes(mux *http.ServeMux, operations OperatorOperations) {
@@ -183,6 +199,18 @@ func registerTaskRoutes(mux *http.ServeMux, operations OperatorOperations) {
 	mux.HandleFunc("/v1/tasks/{id}/rework", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.TaskActionInput) (any, error) {
 		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
 		return operations.ReworkTask(ctx.Context, input)
+	})))
+}
+
+func registerCredentialRoutes(mux *http.ServeMux, operations OperatorOperations) {
+	mux.HandleFunc("/v1/credentials", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.AddCredentialInput) (any, error) {
+		return operations.AddCredential(ctx.Context, input)
+	})))
+	mux.HandleFunc("/v1/credentials/rotate", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.AddCredentialInput) (any, error) {
+		return operations.RotateCredential(ctx.Context, input)
+	})))
+	mux.HandleFunc("/v1/credentials/{id}/revoke", requireMethod(http.MethodPost, actionCall(func(ctx requestContext, id, requestID string) (any, error) {
+		return operations.RevokeCredential(ctx.Context, id, requestID)
 	})))
 }
 
