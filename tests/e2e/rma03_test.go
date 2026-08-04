@@ -142,6 +142,9 @@ func TestRealClaudeUnifiedParticipantTwoProjectConvergence(t *testing.T) {
 		t.Fatalf("rma03 restarted review evidence = %q", task.EvidenceType)
 	}
 	requireRepair(t, ctx, coordplane, socket, projectB.ID, false)
+	runGCJSON[core.GCRunResult](t, ctx, coordplane, daemon.logPath,
+		"gc", "run", "--socket", socket, "--confirm", "--request-id", "rma03-gc", "--output", "json")
+	waitForWorkspacesRemoved(t, ctx, dataDir, projectA.ID, taskA.ID, taskB.ID)
 	_ = daemon.Stop()
 	t.Logf("PASS rma03 projects A=%s B=%s C0=%s A=%s B=%s review=%s binaries=%s/%s", projectA.ID, projectB.ID, initialSHA, taskA.HeadSHA, taskB.HeadSHA, review.ID, coordplane, coordlink)
 }
