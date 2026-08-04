@@ -12,6 +12,7 @@ internal/runtime/*_test.go|handwritten_tests|docker_runtime
 internal/daemon/runtime*_test.go|handwritten_tests|docker_runtime
 internal/daemon/components_test.go|handwritten_tests|docker_runtime
 tests/e2e/testdata/real-claude/*|excluded|test_fixture
+tests/e2e/web_test.go|handwritten_frontend|web_frontend
 tests/e2e/*|handwritten_tests|e2e
 tests/testsupport/*|handwritten_tests|e2e
 tests/contract/fixtures/*|excluded|test_fixture
@@ -26,6 +27,7 @@ internal/daemon/testdata/claude-runtime/claude|handwritten_tests|docker_runtime
 cmd/*|handwritten_production|cmd
 internal/operatorcli/*|handwritten_production|cmd
 internal/coordlinkcli/*|handwritten_production|cmd
+internal/webserver/*|handwritten_frontend|web_frontend
 internal/transport/*|handwritten_production|transport
 internal/core/*|handwritten_production|core
 internal/store/*|handwritten_production|store

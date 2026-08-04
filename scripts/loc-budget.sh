@@ -161,6 +161,7 @@ generated_semantic_production=$(awk -F'|' '$1=="generated_semantic_production"{n
 generated_semantic_tests=$(awk -F'|' '$1=="generated_semantic_tests"{n+=$3} END{print n+0}' "$tmp/records")
 generated_semantic_infra=$(awk -F'|' '$1=="generated_semantic_infra"{n+=$3} END{print n+0}' "$tmp/records")
 generated_mechanical_excluded=$(awk -F'|' '$1=="generated_mechanical_excluded"{n+=$3} END{print n+0}' "$tmp/records")
+frontend=$(awk -F'|' '$1=="handwritten_frontend"{n+=$3} END{print n+0}' "$tmp/records")
 production=$((handwritten_production + generated_semantic_production))
 tests=$((handwritten_tests + generated_semantic_tests))
 infra=$((handwritten_infra + generated_semantic_infra))
@@ -168,11 +169,9 @@ total=$((production + tests + infra))
 generated_total=$((generated_semantic_production + generated_semantic_tests + generated_semantic_infra + generated_mechanical_excluded))
 
 failure=false
-[ "$production" -le 22400 ] || failure=true
-[ "$tests" -le 23600 ] || failure=true
-[ "$infra" -le 600 ] || failure=true
-[ "$total" -le 46600 ] || failure=true
-[ "$generated_total" -le 3000 ] || failure=true
+[ "$production" -le 22400 ] || failure=true; [ "$frontend" -le 3000 ] || failure=true
+[ "$tests" -le 23600 ] || failure=true; [ "$infra" -le 600 ] || failure=true
+[ "$total" -le 46600 ] || failure=true; [ "$generated_total" -le 3000 ] || failure=true
 for report in unknown file-blockers function-blockers gofmt multistatement-blockers; do
   [ ! -s "$tmp/$report" ] || failure=true
 done
@@ -185,7 +184,7 @@ awk -F'|' \
   -v revision="$revision" -v base="$base" -v added="$raw_added" -v deleted="$raw_deleted" \
   -v hp="$handwritten_production" -v ht="$handwritten_tests" -v hi="$handwritten_infra" \
   -v gsp="$generated_semantic_production" -v gst="$generated_semantic_tests" -v gsi="$generated_semantic_infra" -v gme="$generated_mechanical_excluded" \
-  -v production="$production" -v tests="$tests" -v infra="$infra" -v total="$total" \
+  -v production="$production" -v frontend="$frontend" -v tests="$tests" -v infra="$infra" -v total="$total" \
   -v generated="$generated_total" -v source_total="$((total + generated_mechanical_excluded))" -v fixture_bytes="$fixture_bytes" \
   -v unknown="$tmp/unknown" -v fw="$tmp/file-warnings" -v fb="$tmp/file-blockers" -v fnw="$tmp/function-warnings" -v fnb="$tmp/function-blockers" -v gofmt_bad="$tmp/gofmt" -v multi="$tmp/multistatement-blockers" -v clean="$clean" -v failed="$failure" '
   function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
@@ -197,9 +196,9 @@ awk -F'|' \
   { module[$1 SUBSEP $2]+=$3 }
   END {
     printf "{\n  \"schema_version\": 1,\n  \"revision\": \"%s\",\n  \"base_revision\": \"%s\",\n", revision, base
-    printf "  \"atomic_buckets\": {\"handwritten_production\":%d,\"handwritten_tests\":%d,\"handwritten_infra\":%d,\"generated_semantic_production\":%d,\"generated_semantic_tests\":%d,\"generated_semantic_infra\":%d,\"generated_mechanical_excluded\":%d},\n", hp,ht,hi,gsp,gst,gsi,gme
+    printf "  \"atomic_buckets\": {\"handwritten_frontend\":%d,\"handwritten_production\":%d,\"handwritten_tests\":%d,\"handwritten_infra\":%d,\"generated_semantic_production\":%d,\"generated_semantic_tests\":%d,\"generated_semantic_infra\":%d,\"generated_mechanical_excluded\":%d},\n", frontend, hp,ht,hi,gsp,gst,gsi,gme
     printf "  \"budgeted\": {\"production\":%d,\"tests\":%d,\"infra\":%d,\"total\":%d},\n", production,tests,infra,total
-    printf "  \"thresholds\": {\"production\":22400,\"tests\":23600,\"infra\":600,\"total\":46600,\"generated_review\":3000},\n"
+    printf "  \"thresholds\": {\"production\":22400,\"tests\":23600,\"infra\":600,\"total\":46600,\"frontend\":3000,\"generated_review\":3000},\n"
     printf "  \"generated_total\": %d,\n  \"first_party_source_total\": %d,\n  \"fixture_bytes\": %d,\n", generated,source_total,fixture_bytes
     printf "  \"modules\": {"; n=asorti(module, keys); for(i=1;i<=n;i++){split(keys[i],p,SUBSEP); if(i>1)printf ","; printf "\"%s/%s\":%d",esc(p[1]),esc(p[2]),module[keys[i]]} printf "},\n"
     printf "  \"diff\": {\"raw_added\":%d,\"raw_deleted\":%d},\n", added,deleted

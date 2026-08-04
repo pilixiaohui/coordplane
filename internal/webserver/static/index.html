@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CoordPlane</title>
+<style>
+  :root {
+    --bg:#0f1419; --panel:#171e27; --panel2:#1d2631; --line:#2a3644;
+    --text:#e6edf3; --muted:#8b98a5; --accent:#58a6ff; --green:#3fb950; --red:#f85149;
+    --yellow:#d29922; --purple:#bc8cff; --blue:#58a6ff; --gray:#8b98a5;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; display:flex; min-height:100vh; }
+  aside { width:190px; background:var(--panel); border-right:1px solid var(--line); padding:16px 10px; flex-shrink:0; }
+  .logo { font-weight:700; font-size:16px; padding:0 8px 14px; border-bottom:1px solid var(--line); margin-bottom:12px; }
+  .logo span { color:var(--accent); }
+  nav a { display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:6px; color:var(--muted); text-decoration:none; margin-bottom:2px; cursor:pointer; }
+  nav a:hover { background:var(--panel2); color:var(--text); }
+  nav a.on { background:var(--panel2); color:var(--text); font-weight:600; }
+  main { flex:1; padding:20px 24px; overflow-y:auto; }
+  h1 { font-size:18px; margin-bottom:14px; }
+  h2 { font-size:15px; margin:18px 0 10px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:16px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
+  .card .num { font-size:26px; font-weight:700; }
+  .card .lbl { color:var(--muted); font-size:12px; margin-top:2px; }
+  table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  th { text-align:left; color:var(--muted); font-weight:600; font-size:12px; padding:8px 12px; border-bottom:1px solid var(--line); background:var(--panel2); }
+  td { padding:8px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
+  tr:last-child td { border-bottom:none; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; font-weight:600; white-space:nowrap; }
+  .st-queued{background:#22303f;color:var(--gray)} .st-running{background:#122a3f;color:var(--blue)}
+  .st-finishing{background:#122a3f;color:var(--blue)} .st-waiting{background:#332b12;color:var(--yellow)}
+  .st-submitted{background:#2b1f3f;color:var(--purple)} .st-completed{background:#12291b;color:var(--green)}
+  .st-failed{background:#3d1a1c;color:var(--red)} .st-cancelled{background:#22303f;color:var(--gray)}
+  .st-active{background:#122a3f;color:var(--blue)} .st-paused{background:#332b12;color:var(--yellow)} .st-archived{background:#22303f;color:var(--gray)}
+  .ev-captured{background:#122a3f;color:var(--blue);border:1px solid var(--blue)}
+  .ev-human{background:#12291b;color:var(--green);border:1px solid var(--green)}
+  .mono { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; }
+  .muted { color:var(--muted); }
+  .board { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }
+  .col { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px; min-height:120px; }
+  .col h3 { font-size:12px; color:var(--muted); margin-bottom:8px; }
+  .tcard { background:var(--panel2); border:1px solid var(--line); border-radius:6px; padding:8px 10px; margin-bottom:8px; cursor:pointer; }
+  .tcard:hover { border-color:var(--accent); }
+  .tcard .title { font-weight:600; font-size:13px; }
+  .tcard .meta { color:var(--muted); font-size:11px; margin-top:4px; display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  .detail { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
+  .detail .row { display:flex; gap:8px; padding:4px 0; }
+  .detail .row .k { color:var(--muted); width:140px; flex-shrink:0; }
+  .actions { margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; }
+  .btn { background:var(--panel2); border:1px solid var(--line); color:var(--text); border-radius:6px; padding:5px 12px; cursor:pointer; font-size:13px; }
+  .btn:hover { border-color:var(--accent); }
+  .btn.primary { background:#122a3f; border-color:var(--accent); color:var(--accent); }
+  .btn.danger { border-color:var(--red); color:var(--red); }
+  .btn:disabled { opacity:.4; cursor:not-allowed; }
+  input,select,textarea { background:var(--panel2); border:1px solid var(--line); color:var(--text); border-radius:6px; padding:6px 10px; font-size:13px; }
+  .form-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; max-width:680px; }
+  .form-grid label { grid-column:1/-1; color:var(--muted); font-size:12px; margin-top:6px; }
+  .toast { position:fixed; bottom:20px; right:20px; background:#122a3f; border:1px solid var(--accent); color:var(--text); padding:10px 16px; border-radius:8px; display:none; max-width:420px; z-index:9; }
+  .toast.show { display:block; }
+  .login { max-width:420px; margin:80px auto; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:28px; }
+  .login h1 { margin-bottom:16px; }
+  .login .err { color:var(--red); margin-top:8px; min-height:1.2em; }
+  .progress { display:inline-block; width:110px; height:6px; background:var(--panel2); border-radius:3px; overflow:hidden; vertical-align:middle; }
+  .progress i { display:block; height:100%; background:var(--accent); }
+  .tl { border-left:2px solid var(--line); padding-left:12px; margin-left:6px; }
+  .tl div { padding:3px 0; }
+  .tl .t { color:var(--muted); font-size:11px; margin-right:6px; }
+  .banner { background:#3d1a1c; border:1px solid var(--red); color:var(--text); border-radius:8px; padding:10px 14px; margin-bottom:14px; }
+</style>
+</head>
+<body>
+<aside>
+  <div class="logo">Coord<span>Plane</span></div>
+  <nav id="nav">
+    <a data-v="dash" class="on">◈ Dashboard</a>
+    <a data-v="agents">♟ Agents</a>
+    <a data-v="tasks">☰ Tasks</a>
+    <a data-v="runs">⏱ Runs</a>
+    <a data-v="messages">✉ Messages</a>
+    <a data-v="roles">♛ Roles</a>
+    <a data-v="creds">🔑 Credentials</a>
+    <a data-v="events">≣ Events</a>
+  </nav>
+</aside>
+<main id="main"></main>
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>

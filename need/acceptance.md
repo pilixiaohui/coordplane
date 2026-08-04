@@ -665,6 +665,8 @@ Owner已批准保留上述完整产品范围和本节非空、非纯注释物理
 | Build/test infra | `250 / 400 / 600` | `250 / 400 / 600` | `0 / 0 / 0` |
 | Budgeted total | `23,050 / 28,400 / 34,250` | `41,250 / 43,400 / 46,600` | `+18,200 / +15,000 / +12,350` |
 
+**前端独立预算(Owner 已批准,2026-08-04)**:web 前端 SPA、`internal/webserver/*` 服务层与 web e2e(`tests/e2e/web_test.go`)计入独立的 `handwritten_frontend` 桶,发布阈值 `3,000` 物理行,不与后端核心 production/tests/infra/total 共享;后端预算包络不变。
+
 Production和Tests新增空间先以透明、未分配的重基线reserve列入下表，保留原模块/测试边界审查值以持续暴露重复和owner漂移。第一版候选按12.6节报告实际模块分布；reserve不是忽略模块超限或弱化合同的授权。
 
 ### 12.2 Budgeted maintained production预算

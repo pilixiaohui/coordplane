@@ -183,6 +183,7 @@ Manager、Developer、Reviewer、Integrator 只是 Agent 指令或显示标签�
 
 - 第一版以一个production one-shot CLI adapter为基线；scripted adapter只属于测试。第二个provider adapter必须单独增加预算，不能挤占Core、Runtime或Git恢复逻辑。
 - Owner已批准统一参与者框架(v0.2-delta)需求范围对应的重基线：Budgeted maintained production SLOC目标/软阈值/发布阈值为`20,000 / 21,000 / 22,400`；tests为`21,000 / 22,000 / 23,600`；build/test infrastructure仍为`250 / 400 / 600`；三类合计为`41,250 / 43,400 / 46,600`。总量合格不能覆盖production超限。
+- 前端(web 面 SPA 与 web e2e)单独配置预算,不与后端核心功能共享:`handwritten_frontend` 上限 `3,000` 物理行(非空非纯注释口径,JS/CSS 沿用同一计数器);前端 Go 服务层(`internal/webserver/*`)亦计入 frontend,不计入 production。后端 production/tests/infra/total 预算不受前端影响。
 - 上述envelope替换旧`10,500 / 12,550 / 14,650`、`12,300 / 15,450 / 19,000`和总计`23,050 / 28,400 / 34,250`，只改变预算，不删除或降级任何Core、Runtime、Git、CLI或真实多Agent边界合同。
 - 第一版候选必须在clean revision生成LOC JSON，并完成`acceptance.md`定义的真实双Agent和四Agent可靠性场景。固定硬件性能baseline、reference manifest和长时间soak不属于第一版完成条件；真实live证据能否复用按受影响文件的精确diff判断，不能因纯文档变更重复消耗provider调用。
 - LOC低于预算不代表完成；所有状态、隔离、recovery、Git CAS和真实Docker/Git验收仍必须通过。

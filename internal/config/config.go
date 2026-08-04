@@ -29,6 +29,7 @@ func ClaudeProviderEnvCatalog() []string { return strings.Split(claudeProviderEn
 type Config struct {
 	DataDir         string          `yaml:"data_dir"`
 	OperatorSocket  string          `yaml:"operator_socket"`
+	WebAddr         string          `yaml:"web_addr"`
 	MaxParallelRuns int             `yaml:"max_parallel_runs"`
 	Retention       RetentionConfig `yaml:"retention"`
 	Runtime         RuntimeConfig   `yaml:"runtime"`
@@ -63,6 +64,7 @@ type RuntimeConfig struct {
 type fileConfig struct {
 	DataDir         string              `yaml:"data_dir"`
 	OperatorSocket  string              `yaml:"operator_socket"`
+	WebAddr         string              `yaml:"web_addr"`
 	MaxParallelRuns int                 `yaml:"max_parallel_runs"`
 	Retention       fileRetentionConfig `yaml:"retention"`
 	Runtime         fileRuntimeConfig   `yaml:"runtime"`
@@ -142,6 +144,7 @@ func Load(path string) (Config, error) {
 	cfg := Config{
 		DataDir:         raw.DataDir,
 		OperatorSocket:  raw.OperatorSocket,
+		WebAddr:         strings.TrimSpace(raw.WebAddr),
 		MaxParallelRuns: raw.MaxParallelRuns,
 		Retention: RetentionConfig{
 			CompletedWorkspace: time.Duration(*raw.Retention.CompletedWorkspace),
