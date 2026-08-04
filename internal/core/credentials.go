@@ -22,13 +22,13 @@ const (
 )
 
 type Credential struct {
-	ID            string
-	ParticipantID string
-	Kind          CredentialKind
-	SecretHash    string
-	Status        CredentialStatus
-	CreatedAt     string
-	RevokedAt     string
+	ID            string           `json:"id"`
+	ParticipantID string           `json:"participant_id"`
+	Kind          CredentialKind   `json:"kind"`
+	SecretHash    string           `json:"secret_hash"`
+	Status        CredentialStatus `json:"status"`
+	CreatedAt     string           `json:"created_at"`
+	RevokedAt     string           `json:"revoked_at,omitempty"`
 }
 
 // AddCredentialInput issues a credential for a participant. Only one active

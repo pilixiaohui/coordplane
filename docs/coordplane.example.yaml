@@ -1,0 +1,46 @@
+# CoordPlane 示例配置 —— 部署到使用全流程见 docs/quickstart.md(本文件同目录)
+# 复制为 coordplane.yaml 后按需修改。
+
+# 数据目录(所有运行时状态:SQLite、control repos、workspaces、agent homes、日志)
+data_dir: /var/lib/coordplane
+
+# operator Unix socket(CLI 用;必须位于 data_dir 内)
+operator_socket: /var/lib/coordplane/operator.sock
+
+# Web 前端监听地址(默认关闭;仅建议绑本机回环;浏览器打开 http://127.0.0.1:8080)
+web_addr: 127.0.0.1:8080
+
+# 最大并行 Run 数
+max_parallel_runs: 2
+
+retention:
+  # 已完成 workspace 保留时长(0 = 立即可回收)
+  completed_workspace: 24h
+  # 终态 task ref 保留时长
+  terminal_task_ref: 24h
+  # Run 日志保留时长
+  run_log: 24h
+
+runtime:
+  # Docker 网络(bridge / host)
+  docker_network: bridge
+  # 以下三项默认在 data_dir 下,可显式覆盖
+  workspace_root: /var/lib/coordplane/workspaces
+  agent_home_root: /var/lib/coordplane/agent-homes
+  log_root: /var/lib/coordplane/logs
+  # CLI Agent 运行镜像(须含 claude 可执行文件与 git;真实 Claude 镜像构建见
+  # tests/e2e/testdata/real-claude/build.sh)
+  default_image: node:22-bookworm
+  # 注入 Agent 容器的 provider 环境变量 allowlist(真实 Claude gate 用)
+  provider_env_allowlist: []
+  # Run 超时与关闭宽限
+  run_timeout: 12m
+  shutdown_grace: 5s
+
+git:
+  # Git capture 辅助镜像(与 default_image 相同即可)
+  capture_helper_image: node:22-bookworm
+  capture_timeout: 2m
+  maximum_bundle_bytes: 67108864
+  maximum_objects: 250000
+  maximum_handoff_bytes: 268435456

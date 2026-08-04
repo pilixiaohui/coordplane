@@ -48,6 +48,7 @@ go.mod|handwritten_infra|infra
 */Dockerfile|handwritten_infra|infra
 Dockerfile|handwritten_infra|infra
 README.md|excluded|documentation
+docs/*|excluded|documentation
 need/*|excluded|documentation
 go.sum|excluded|dependency_lock
 loc-budget*.json|excluded|generated_report

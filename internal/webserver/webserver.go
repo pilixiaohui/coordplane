@@ -11,8 +11,19 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"syscall"
 	"time"
 )
+
+// listenConfig reuses the listener address across restarts (TIME_WAIT
+// connections from a previous run must not block the next bind).
+var listenConfig = net.ListenConfig{
+	Control: func(network, address string, connection syscall.RawConn) error {
+		return connection.Control(func(fd uintptr) {
+			_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+		})
+	},
+}
 
 //go:embed static
 var staticFiles embed.FS
@@ -33,7 +44,7 @@ func Handler(operator http.Handler) (http.Handler, error) {
 // Serve runs the composed handler on addr until ctx is cancelled, then shuts
 // down gracefully.
 func Serve(ctx context.Context, addr string, handler http.Handler) error {
-	listener, err := net.Listen("tcp", addr)
+	listener, err := listenConfig.Listen(context.Background(), "tcp", addr)
 	if err != nil {
 		return err
 	}
