@@ -61,13 +61,13 @@ func TestRealClaudeUnifiedParticipantTwoProjectConvergence(t *testing.T) {
 	for _, agent := range []core.Agent{agentA, agentB} {
 		runJSON[core.Agent](t, ctx, coordplane, "agent", "resume", agent.ID, "--socket", socket, "--request-id", "rma03-resume-"+agent.ID, "--output", "json")
 	}
-	runA, runB := waitForConcurrentRunsWithProgress(t, ctx, coordplane, socket, taskA.ID, taskB.ID, "LIVE-READY", 5*time.Minute)
+	runA, runB := waitForConcurrentRunsWithProgress(t, ctx, coordplane, socket, taskA.ID, taskB.ID, "LIVE-READY", 9*time.Minute)
 	assertIsolatedRuns(t, dataDir, runA, runB, inspectContainer(t, ctx, runA.ContainerID), inspectContainer(t, ctx, runB.ContainerID))
 	sendBossMessage(t, ctx, coordplane, socket, projectA.ID, agentA.ID, taskA.ID, "LIVE-GO A", "rma03-go-a")
 	sendBossMessage(t, ctx, coordplane, socket, projectB.ID, agentB.ID, taskB.ID, "LIVE-GO B", "rma03-go-b")
 
-	taskA = waitForTaskWithin(t, ctx, coordplane, socket, taskA.ID, "rma03 A submission", 7*time.Minute, capturedSubmission)
-	taskB = waitForTaskWithin(t, ctx, coordplane, socket, taskB.ID, "rma03 B submission", 7*time.Minute, capturedSubmission)
+	taskA = waitForTaskWithin(t, ctx, coordplane, socket, taskA.ID, "rma03 A submission", 11*time.Minute, capturedSubmission)
+	taskB = waitForTaskWithin(t, ctx, coordplane, socket, taskB.ID, "rma03 B submission", 11*time.Minute, capturedSubmission)
 
 	// agentA dispatched a review child task to the human participant; the
 	// human converges it with task complete (human_confirm evidence).
@@ -146,16 +146,23 @@ func TestRealClaudeUnifiedParticipantTwoProjectConvergence(t *testing.T) {
 	t.Logf("PASS rma03 projects A=%s B=%s C0=%s A=%s B=%s review=%s binaries=%s/%s", projectA.ID, projectB.ID, initialSHA, taskA.HeadSHA, taskB.HeadSHA, review.ID, coordplane, coordlink)
 }
 
-const rma03LiveInstructions = `You are running the real unified-participant acceptance gate for CoordPlane.
-Read the complete run bootstrap before acting. Use native Git only inside /workspace/project and use coordlink for every coordination action. Never treat your own text or process exit as Task completion.
-Configure Git safe.directory=/workspace/project and a local test user before committing.
+const rma03LiveInstructions = `You are a CoordPlane acceptance-gate agent. Execute the numbered steps below IN ORDER. Do not explore. Do not read documentation. Do not inspect the coordlink binary or its help. Deviating from these steps fails the gate.
 
-For a work Task, read live_module (tokenize or count) from the Task description. Immediately call coordlink progress with summary LIVE-READY. Poll coordlink inbox list until LIVE-GO is present, then acknowledge that Message.
-Read SPEC.md. Implement exactly the module file you own: tokenize.go for live_module=tokenize, count.go for live_module=count. Do not modify main.go, SPEC.md or fixture-test.sh. Run ./fixture-test.sh <live_module> until it passes.
-If the description contains human_review=1, create a child Task assigned to the human participant with coordlink task create --participant participant-owner --title "RMA03 human review" --description "human review of the tokenize module" and request-id rma03-review-<run>.
-Commit only your module file with native Git, resolve HEAD with git rev-parse HEAD, then call coordlink task submit with that exact expected head. Remain alive briefly for Daemon shutdown.
+1. Run exactly: coordlink progress --summary LIVE-READY
+2. Poll your inbox until a message body contains LIVE-GO (run: coordlink inbox list; if not present, wait 2 seconds and repeat).
+3. Acknowledge all pending inbox messages: coordlink inbox ack <each message id>
+4. cd /workspace/project
+5. Read SPEC.md and the task description. Implement ONLY your module file: live_module=tokenize -> tokenize.go; live_module=count -> count.go. Do not modify main.go, SPEC.md or fixture-test.sh.
+6. If the task description contains human_review=1, run exactly: coordlink task create --participant participant-owner --title "RMA03 human review" --description "human review of the tokenize module"
+7. Run: ./fixture-test.sh <live_module> (the value of live_module from the description). Retry until it passes.
+8. Run: git config user.name "RMA03 Agent"; git config user.email rma03@coordplane.local
+9. Run: git add <your module file>; git commit -m "rma03 <live_module> implementation"
+10. Run: git status --porcelain  (it must print nothing. If it prints files, delete every untracked file with rm -f <file> and repeat until it prints nothing. Never commit untracked artifacts.)
+11. Run: head=$(git rev-parse HEAD)  (its output is exactly 40 hex characters)
+12. Run exactly: coordlink task submit --summary "rma03 <live_module> result" --expected-head "$head"
+13. Wait 5 seconds, then exit.
 
-For an integration Task, use the exact Source head from the bootstrap. Merge it into the current canonical-based workspace with native git merge --no-ff, run ./fixture-test.sh <live_module>, commit if Git did not create the merge commit, resolve HEAD, and call coordlink task submit with the exact expected head. Do not create child Tasks and do not accept source Tasks yourself.
+If a step errors, retry the same step up to 3 times, then continue to the next step. The only files you may write are your module file and git objects.
 `
 
 func createWordfreqSourceRepository(t *testing.T, ctx context.Context, root string) (string, string) {

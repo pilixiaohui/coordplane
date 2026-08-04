@@ -2,22 +2,22 @@
 set -eu
 
 mode=${1:-full}
-go build -o wordfreq .
+go build -o /tmp/wordfreq .
 case "$mode" in
 tokenize)
-	out=$(printf 'Hello world hello.\n' | ./wordfreq tokenize)
+	out=$(printf 'Hello world hello.\n' | /tmp/wordfreq tokenize)
 	[ "$(printf '%s\n' "$out" | wc -l)" -eq 3 ]
 	printf '%s\n' "$out" | grep -qx hello
 	printf '%s\n' "$out" | grep -qx world
 	;;
 count)
-	out=$(printf 'hello world hello\n' | ./wordfreq count)
+	out=$(printf 'hello world hello\n' | /tmp/wordfreq count)
 	[ "$(printf '%s\n' "$out" | wc -l)" -eq 2 ]
 	printf '%s\n' "$out" | grep -qx 'hello 2'
 	printf '%s\n' "$out" | grep -qx 'world 1'
 	;;
 full)
-	out=$(printf 'Hello world hello.\n' | ./wordfreq)
+	out=$(printf 'Hello world hello.\n' | /tmp/wordfreq)
 	[ "$(printf '%s\n' "$out" | wc -l)" -eq 2 ]
 	printf '%s\n' "$out" | grep -qx 'hello 2'
 	printf '%s\n' "$out" | grep -qx 'world 1'
