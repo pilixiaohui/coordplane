@@ -37,7 +37,7 @@ func TestRealClaudeUnifiedParticipantTwoProjectConvergence(t *testing.T) {
 	registerLiveHomeCleanup(t, image, dataDir)
 	instructions := filepath.Join(root, "rma03-instructions.md")
 	testsupport.WriteFile(t, instructions, []byte(rma03LiveInstructions), 0o600)
-	configPath := testsupport.WriteFile(t, filepath.Join(root, "coordplane-rma03.yaml"), testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: 2, CompletedWorkspace: "24h", TerminalTaskRef: "24h", RunLog: "24h", DockerNetwork: network, DefaultImage: image, ProviderEnv: providerEnv, Tail: "  run_timeout: 12m\n  shutdown_grace: 5s\ngit:\n  capture_helper_image: " + image + "\n  capture_timeout: 30s\n  maximum_bundle_bytes: 67108864\n  maximum_objects: 250000\n  maximum_handoff_bytes: 268435456\n"}), 0o600)
+	configPath := testsupport.WriteFile(t, filepath.Join(root, "coordplane-rma03.yaml"), testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: socket, MaxParallelRuns: 2, CompletedWorkspace: "0", TerminalTaskRef: "24h", RunLog: "24h", DockerNetwork: network, DefaultImage: image, ProviderEnv: providerEnv, Tail: "  run_timeout: 12m\n  shutdown_grace: 5s\ngit:\n  capture_helper_image: " + image + "\n  capture_timeout: 30s\n  maximum_bundle_bytes: 67108864\n  maximum_objects: 250000\n  maximum_handoff_bytes: 268435456\n"}), 0o600)
 
 	daemon := startDaemon(t, coordplane, configPath, socket)
 	trackFailure := registerLiveFailureDiagnostics(t, coordplane, socket, dataDir, providerEnv, func() error { return daemon.Stop() })
