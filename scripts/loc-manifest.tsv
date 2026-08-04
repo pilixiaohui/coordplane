@@ -11,6 +11,7 @@ internal/daemon/git_capture_helper*_test.go|handwritten_tests|git_component
 internal/runtime/*_test.go|handwritten_tests|docker_runtime
 internal/daemon/runtime*_test.go|handwritten_tests|docker_runtime
 internal/daemon/components_test.go|handwritten_tests|docker_runtime
+tests/e2e/testdata/real-claude/*|excluded|test_fixture
 tests/e2e/*|handwritten_tests|e2e
 tests/testsupport/*|handwritten_tests|e2e
 tests/contract/fixtures/*|excluded|test_fixture

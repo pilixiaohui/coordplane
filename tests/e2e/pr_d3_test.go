@@ -35,16 +35,16 @@ func TestPRD3CredentialRotationAndRevocationLifecycle(t *testing.T) {
 	const first = "prd3-first-secret-0123456789"
 	const second = "prd3-second-secret-0123456789"
 	runJSON[core.Credential](t, ctx, coordplane, "credential", "add", "--socket", socket, "--participant", "participant-owner", "--secret", first, "--request-id", "prd3-add", "--output", "json")
-	credentialCLI(t, ctx, coordplane, socket, "", "project", "list").expectFailure()
-	credentialCLI(t, ctx, coordplane, socket, "wrong-secret-0123456789", "project", "list").expectFailure()
-	credentialCLI(t, ctx, coordplane, socket, first, "project", "list").expectOK()
+	credentialCLI(t, ctx, coordplane, socket, "", "project", "list").expect(false)
+	credentialCLI(t, ctx, coordplane, socket, "wrong-secret-0123456789", "project", "list").expect(false)
+	credentialCLI(t, ctx, coordplane, socket, first, "project", "list").expect(true)
 
 	runJSON[core.Credential](t, ctx, coordplane, "credential", "rotate", "--socket", socket, "--participant", "participant-owner", "--secret", second, "--request-id", "prd3-rotate", "--output", "json")
-	credentialCLI(t, ctx, coordplane, socket, first, "project", "list").expectFailure()
-	credentialCLI(t, ctx, coordplane, socket, second, "project", "list").expectOK()
+	credentialCLI(t, ctx, coordplane, socket, first, "project", "list").expect(false)
+	credentialCLI(t, ctx, coordplane, socket, second, "project", "list").expect(true)
 
 	runJSON[core.Credential](t, ctx, coordplane, "credential", "revoke", "participant-owner", "--socket", socket, "--request-id", "prd3-revoke", "--output", "json")
-	credentialCLI(t, ctx, coordplane, socket, second, "project", "list").expectFailure()
+	credentialCLI(t, ctx, coordplane, socket, second, "project", "list").expect(false)
 
 	if err := daemon.Stop(); err != nil {
 		t.Fatalf("stop daemon before restart: %v\n%s", err, readLog(daemon.logPath))
@@ -60,7 +60,7 @@ func TestPRD3CredentialRotationAndRevocationLifecycle(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	credentialCLI(t, ctx, coordplane, socket, second, "project", "list").expectFailure()
+	credentialCLI(t, ctx, coordplane, socket, second, "project", "list").expect(false)
 }
 
 // credentialCLI runs one operator command with COORDPLANE_CREDENTIAL set.
@@ -77,16 +77,12 @@ type credentialCommand struct {
 	err error
 }
 
-func (c *credentialCommand) expectOK() {
+func (c *credentialCommand) expect(ok bool) {
 	c.t.Helper()
-	if c.err != nil {
+	if ok && c.err != nil {
 		c.t.Fatalf("credential-gated command failed: %v\n%s", c.err, c.raw)
 	}
-}
-
-func (c *credentialCommand) expectFailure() {
-	c.t.Helper()
-	if c.err == nil {
+	if !ok && c.err == nil {
 		c.t.Fatalf("credential-gated command unexpectedly succeeded: %s", c.raw)
 	}
 }

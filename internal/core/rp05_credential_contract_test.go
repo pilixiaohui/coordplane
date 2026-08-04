@@ -12,6 +12,13 @@ import (
 
 // RP-05: human credentials are stored hashed only; a revoked credential
 // rejects the next request; rotation invalidates the old secret immediately.
+func requireDenied(t *testing.T, err error) {
+	t.Helper()
+	if !core.IsCode(err, core.CodeScopeDenied) {
+		t.Fatalf("credential gate error = %v, want SCOPE_DENIED", err)
+	}
+}
+
 func TestRP05CredentialLifecycleHashesAndRevokes(t *testing.T) {
 	h := newHarness(t)
 	if err := h.service.AuthenticateOperator(context.Background(), ""); err != nil {
@@ -30,7 +37,6 @@ func TestRP05CredentialLifecycleHashesAndRevokes(t *testing.T) {
 	var secretHash string
 	db, err := sql.Open("sqlite", "file:"+h.path+"?_pragma=busy_timeout(5000)")
 	requireNoError(t, err)
-	defer db.Close()
 	if err := db.QueryRowContext(context.Background(), `SELECT secret_hash FROM credentials WHERE id=?`, added.ID).Scan(&secretHash); err != nil {
 		t.Fatal(err)
 	}
@@ -39,12 +45,8 @@ func TestRP05CredentialLifecycleHashesAndRevokes(t *testing.T) {
 	}
 
 	// Wrong or missing secrets are rejected; the correct one passes.
-	if err := h.service.AuthenticateOperator(context.Background(), ""); !core.IsCode(err, core.CodeScopeDenied) {
-		t.Fatalf("missing secret error = %v", err)
-	}
-	if err := h.service.AuthenticateOperator(context.Background(), "wrong-secret-0123456789"); !core.IsCode(err, core.CodeScopeDenied) {
-		t.Fatalf("wrong secret error = %v", err)
-	}
+	requireDenied(t, h.service.AuthenticateOperator(context.Background(), ""))
+	requireDenied(t, h.service.AuthenticateOperator(context.Background(), "wrong-secret-0123456789"))
 	requireNoError(t, h.service.AuthenticateOperator(context.Background(), "first-secret-0123456789"))
 
 	// A second active credential cannot be added while one is active.
@@ -64,9 +66,7 @@ func TestRP05CredentialLifecycleHashesAndRevokes(t *testing.T) {
 	if rotated.ID == added.ID {
 		t.Fatal("rotation reused the old credential id")
 	}
-	if err := h.service.AuthenticateOperator(context.Background(), "first-secret-0123456789"); !core.IsCode(err, core.CodeScopeDenied) {
-		t.Fatalf("rotated-out secret error = %v", err)
-	}
+	requireDenied(t, h.service.AuthenticateOperator(context.Background(), "first-secret-0123456789"))
 	requireNoError(t, h.service.AuthenticateOperator(context.Background(), "second-secret-0123456789"))
 
 	// Revocation: every subsequent request is rejected, even with the correct
@@ -74,7 +74,5 @@ func TestRP05CredentialLifecycleHashesAndRevokes(t *testing.T) {
 	if _, err := h.service.RevokeCredential(context.Background(), core.DefaultHumanParticipantID, "rp05-revoke"); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.service.AuthenticateOperator(context.Background(), "second-secret-0123456789"); !core.IsCode(err, core.CodeScopeDenied) {
-		t.Fatalf("revoked secret error = %v", err)
-	}
+	requireDenied(t, h.service.AuthenticateOperator(context.Background(), "second-secret-0123456789"))
 }

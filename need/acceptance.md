@@ -547,6 +547,18 @@ Boundary：真实Git ref/reachability + workspace filesystem。
 
 真实CLI gate需要provider凭据或网络时可以在普通CI标记SKIP，但任何SKIP结果只能声明“自动测试通过，live未验收”，不能声明产品完成。
 
+### 10.3 真实 live gate 运行流程(已实测通过)
+
+`scripts/e2e-real-cli.sh` 要求显式不可变镜像(sha256 digest)+ `ANTHROPIC_AUTH_TOKEN`(经 provider env allowlist 注入容器)。两步运行流程：
+
+1. 构建不可变真实 Claude 镜像(固定 Claude Code 2.1.126 + Go 1.22.5 + glibc 基座):
+   `digest=$(./tests/e2e/testdata/real-claude/build.sh)`(输出 `sha256:...`;无网络时 SKIP 77);
+2. 运行完整 live gate:
+   `E2E_RUNTIME_IMAGE="$digest" E2E_DOCKER_NETWORK=host|bridge ./scripts/e2e-real-cli.sh`
+   (网络能直连 provider 时用 bridge;需经本机代理时用 host)。
+
+覆盖:RMA-01 adapter smoke、RMA-02 双 Agent 收敛、RMA-03 统一参与者双项目真实协作(人类 owner/developer 双角色、agent→human review 派发与 human_confirm 证据、凭据认证、Daemon 重启)。SKIP 语义同上。
+
 ## 11. 第一版真实多 Agent 可靠性验收
 
 ### 11.1 目标和边界
