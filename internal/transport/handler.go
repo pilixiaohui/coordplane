@@ -345,7 +345,21 @@ func registerMessageEventGCRoutes(mux *http.ServeMux, operations OperatorOperati
 	// 因此这里用"已见最大事件 ID"做增量过滤:每轮拉最新一页(DESC),
 	// 只输出 id 大于已见值的部分,再推进已见值。
 	mux.HandleFunc("/v1/events/stream", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
-		projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
+		query := r.URL.Query()
+		projectID := strings.TrimSpace(query.Get("project_id"))
+		// after:断线续传起点(前端重连时携带已见最大事件 ID);
+		// types:逗号分隔的 AG-UI 词汇过滤(空 = 全部)。
+		after, err := queryInt(query.Get("after"), "after")
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		typeFilter := make(map[string]bool)
+		for _, t := range strings.Split(query.Get("types"), ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				typeFilter[t] = true
+			}
+		}
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			writeError(w, errors.New("streaming unsupported"))
@@ -354,7 +368,7 @@ func registerMessageEventGCRoutes(mux *http.ServeMux, operations OperatorOperati
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		var lastSeen int64
+		lastSeen := int64(after)
 		for {
 			page, err := operations.ListEvents(r.Context(), core.EventFilter{ProjectID: projectID, Limit: 100})
 			if err != nil {
@@ -375,6 +389,9 @@ func registerMessageEventGCRoutes(mux *http.ServeMux, operations OperatorOperati
 				}
 				payload, ok := aguiEventPayload(event)
 				if !ok {
+					continue
+				}
+				if len(typeFilter) > 0 && !typeFilter[payload["type"].(string)] {
 					continue
 				}
 				data, err := json.Marshal(payload)

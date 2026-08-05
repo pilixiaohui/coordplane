@@ -21,6 +21,7 @@ func aguiEventPayload(event core.Event) (map[string]any, bool) {
 	switch event.Kind {
 	case "run.created", "run.active":
 		return map[string]any{
+			"id":      event.ID,
 			"type":    "run_start",
 			"run_id":  event.RunID,
 			"task_id": entityIDFor(event, "task"),
@@ -29,6 +30,7 @@ func aguiEventPayload(event core.Event) (map[string]any, bool) {
 		}, true
 	case "message.created", "message.delivered":
 		return map[string]any{
+			"id":        event.ID,
 			"type":      "text_message",
 			"message_id": event.EntityID,
 			"task_id":   entityIDFor(event, "task"),
@@ -37,6 +39,7 @@ func aguiEventPayload(event core.Event) (map[string]any, bool) {
 		}, true
 	case "task.progress":
 		return map[string]any{
+			"id":       event.ID,
 			"type":     "tool_call",
 			"task_id":  event.EntityID,
 			"run_id":   event.RunID,
@@ -45,6 +48,7 @@ func aguiEventPayload(event core.Event) (map[string]any, bool) {
 		}, true
 	case "run.exited", "run.failed", "run.interrupted", "run.timed_out", "run.cancelled", "task.failed":
 		return map[string]any{
+			"id":      event.ID,
 			"type":    "run_complete",
 			"run_id":  event.RunID,
 			"task_id": entityIDFor(event, "task"),

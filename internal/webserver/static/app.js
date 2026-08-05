@@ -120,45 +120,82 @@ function render() {
 // AG-UI 实时事件流:fetch + ReadableStream 消费 SSE(/v1/events/stream),
 // 事件词汇为 run_start / text_message / tool_call / run_complete。
 // EventSource 不支持自定义凭据头,故用 fetch 流式读取。
+// 支持:类型过滤(服务端 types 参数)、断线自动重连(after=已见最大事件 ID 续传)、暂停/清空。
 let aguiStreamToken = 0;
+let aguiLastId = 0;
+let aguiFilter = "";
+let aguiPaused = false;
+
+const AGUI_LABEL = { run_start: "启动", text_message: "消息", tool_call: "调用", run_complete: "结束" };
+const AGUI_CLS = { run_start: "agui-run", text_message: "agui-msg", tool_call: "agui-tool", run_complete: "agui-end" };
+
 async function startAguiStream() {
   const token = ++aguiStreamToken;
   const box = $("agui-stream");
+  const status = $("agui-status");
   if (!box) return;
   box.innerHTML = '<div class="muted">连接中…</div>';
-  try {
-    const resp = await fetch("/v1/events/stream", {
-      headers: { "X-Coordplane-Credential": sessionStorage.getItem(KEY) || "" },
-    });
-    if (!resp.ok || !resp.body) { box.innerHTML = '<div class="muted">流不可用</div>'; return; }
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let idx;
-      while ((idx = buf.indexOf("\n\n")) >= 0) {
-        const block = buf.slice(0, idx);
-        buf = buf.slice(idx + 2);
-        const dline = block.split("\n").find(l => l.startsWith("data: "));
-        if (!dline) continue;
-        try {
-          const ev = JSON.parse(dline.slice(6));
-          if (aguiStreamToken !== token) return;
-          const row = document.createElement("div");
-          row.className = "agui-row";
-          row.textContent = `[${esc(ev.at || "")}] ${esc(ev.type)} ${esc(ev.run_id || ev.task_id || ev.message_id || "")}${ev.summary ? " — " + esc(ev.summary) : ""}`;
-          box.prepend(row);
-          while (box.childElementCount > 120) box.removeChild(box.lastChild);
-        } catch (e) { /* 忽略坏块 */ }
+  const connect = async (attempt) => {
+    if (aguiPaused || aguiStreamToken !== token) return;
+    const url = "/v1/events/stream?after=" + aguiLastId + (aguiFilter ? "&types=" + encodeURIComponent(aguiFilter) : "");
+    try {
+      const resp = await fetch(url, {
+        headers: { "X-Coordplane-Credential": sessionStorage.getItem(KEY) || "" },
+      });
+      if (!resp.ok || !resp.body) {
+        status.textContent = "流不可用(" + resp.status + ")";
+        scheduleReconnect(token, attempt);
+        return;
       }
+      status.textContent = "已连接" + (aguiLastId > 0 ? " · 续传" : "");
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const block = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          const dline = block.split("\n").find(l => l.startsWith("data: "));
+          if (!dline) continue;
+          try {
+            const ev = JSON.parse(dline.slice(6));
+            if (aguiStreamToken !== token || aguiPaused) return;
+            if (typeof ev.id === "number" && ev.id > aguiLastId) aguiLastId = ev.id;
+            const row = document.createElement("div");
+            row.className = "agui-row " + (AGUI_CLS[ev.type] || "");
+            const label = AGUI_LABEL[ev.type] || ev.type;
+            row.innerHTML = `<span class="pill agui-badge">${esc(label)}</span> <span class="mono">${esc(ev.run_id || ev.task_id || ev.message_id || "")}</span><span class="muted"> ${esc(ev.summary ? "— " + ev.summary : "")}</span>`;
+            box.prepend(row);
+            while (box.childElementCount > 120) box.removeChild(box.lastChild);
+          } catch (e) { /* 忽略坏块 */ }
+        }
+      }
+    } catch (e) {
+      if (aguiStreamToken !== token) return;
+      status.textContent = "已断开,重连中…";
+      scheduleReconnect(token, attempt);
     }
-  } catch (e) {
-    if (aguiStreamToken === token) box.innerHTML = '<div class="muted">流已断开</div>';
-  }
+  };
+  await connect(0);
 }
+
+function scheduleReconnect(token, attempt) {
+  if (aguiPaused || aguiStreamToken !== token) return;
+  setTimeout(() => { if (aguiStreamToken === token && !aguiPaused) startAguiStream(); }, 3000);
+}
+
+function aguiSetFilter(v) { aguiFilter = v; aguiStreamToken++; aguiLastId = 0; startAguiStream(); }
+function aguiTogglePause() {
+  aguiPaused = !aguiPaused;
+  const btn = $("agui-pause");
+  if (btn) btn.textContent = aguiPaused ? "继续" : "暂停";
+  if (!aguiPaused) { aguiStreamToken++; startAguiStream(); }
+}
+function aguiClear() { const box = $("agui-stream"); if (box) box.innerHTML = ""; }
 
 const views = {
   dash() {
@@ -252,6 +289,18 @@ const views = {
   events() {
     return `<h1>Events</h1>
     <h2 style="margin-top:18px">实时流 <span class="muted">(AG-UI 词汇: run_start / text_message / tool_call / run_complete)</span></h2>
+    <div class="agui-tools">
+      <select id="agui-filter" onchange="aguiSetFilter(this.value)">
+        <option value="">全部类型</option>
+        <option value="run_start">run_start</option>
+        <option value="text_message">text_message</option>
+        <option value="tool_call">tool_call</option>
+        <option value="run_complete">run_complete</option>
+      </select>
+      <button class="btn" id="agui-pause" onclick="aguiTogglePause()">暂停</button>
+      <button class="btn" onclick="aguiClear()">清空</button>
+      <span class="muted" id="agui-status">连接中…</span>
+    </div>
     <div id="agui-stream" class="agui-stream"><div class="muted">连接中…</div></div>
     <h2 style="margin-top:18px">历史</h2>
     <table><tr><th>时间</th><th>事件</th><th>实体</th><th>actor</th><th>备注</th></tr>
