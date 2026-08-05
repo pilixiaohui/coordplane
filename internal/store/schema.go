@@ -1,756 +1,386 @@
 package store
 
-const coreSchemaSQL = `
-CREATE TABLE IF NOT EXISTS agents (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  role TEXT NOT NULL,
-  runtime_kind TEXT NOT NULL,
-  cli_backend TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
+const schemaVersion = 4
+const schemaName = "coordplane_v4_human_task_lifecycle"
+const participantRolesMigrationName = "coordplane_v3_participant_roles"
+const initialSchemaName = "coordplane_v1_six_objects"
+const isolationSpecMigrationName = "coordplane_v2_run_isolation_spec"
+const isolationSpecMigrationSQL = `ALTER TABLE runs ADD COLUMN isolation_spec_version INTEGER NOT NULL DEFAULT 1 CHECK (isolation_spec_version IN (1,2))`
 
-CREATE TABLE IF NOT EXISTS work_contracts (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  title TEXT NOT NULL,
-  objective TEXT NOT NULL,
-  issuer_agent_id TEXT,
-  issuer_contract_id TEXT,
-  target_kind TEXT NOT NULL,
-  target_id TEXT NOT NULL,
-  status TEXT NOT NULL,
-  completion_requirements_json TEXT NOT NULL DEFAULT '{}',
-  acceptance_policy_json TEXT NOT NULL DEFAULT '{}',
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS assignments (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  contract_id TEXT NOT NULL,
-  assignee_agent_id TEXT,
-  assignee_role TEXT,
-  state TEXT NOT NULL,
-  priority INTEGER NOT NULL DEFAULT 0,
-  reason TEXT NOT NULL,
-  session_route_id TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY(contract_id) REFERENCES work_contracts(id)
-);
-
-CREATE TABLE IF NOT EXISTS leases (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  assignment_id TEXT NOT NULL,
-  agent_id TEXT NOT NULL,
-  runtime_id TEXT,
-  session_route_id TEXT,
-  state TEXT NOT NULL,
-  expires_at TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY(assignment_id) REFERENCES assignments(id)
-);
-
-CREATE TABLE IF NOT EXISTS attempts (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  lease_id TEXT NOT NULL,
-  cli_backend TEXT NOT NULL,
-  runtime_kind TEXT NOT NULL,
-  session_native_id TEXT,
-  start_reason TEXT NOT NULL,
-  status TEXT NOT NULL,
-  transcript_ref TEXT,
-  started_at TEXT NOT NULL,
-  ended_at TEXT,
-  FOREIGN KEY(lease_id) REFERENCES leases(id)
-);
-
-CREATE TABLE IF NOT EXISTS session_routes (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  agent_id TEXT NOT NULL,
-  runtime_id TEXT,
-  cli_backend TEXT NOT NULL,
-  session_native_id TEXT NOT NULL,
-  route_json TEXT NOT NULL DEFAULT '{}',
-  state TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS threads (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  scope TEXT NOT NULL,
-  subject TEXT NOT NULL,
-  created_by TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  thread_id TEXT NOT NULL,
-  sender_agent_id TEXT NOT NULL,
-  body TEXT NOT NULL,
-  references_json TEXT NOT NULL DEFAULT '[]',
-  intent TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY(thread_id) REFERENCES threads(id)
-);
-
-CREATE TABLE IF NOT EXISTS mailbox_items (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  recipient_agent_id TEXT,
-  recipient_role TEXT,
-  reason TEXT NOT NULL,
-  thread_id TEXT,
-  message_id TEXT,
-  contract_id TEXT,
-  session_route_id TEXT,
-  state TEXT NOT NULL,
-  followup_ref TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS evidence (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  kind TEXT NOT NULL,
-  contract_id TEXT NOT NULL,
-  produced_by TEXT NOT NULL,
-  content_ref TEXT,
-  inline_content TEXT,
-  summary TEXT NOT NULL,
-  verdict TEXT,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY(contract_id) REFERENCES work_contracts(id)
-);
-
-CREATE TABLE IF NOT EXISTS delivery_attempts (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  mailbox_item_id TEXT NOT NULL,
-  route_id TEXT,
-  signal_json TEXT NOT NULL DEFAULT '{}',
-  state TEXT NOT NULL,
-  last_error TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY(mailbox_item_id) REFERENCES mailbox_items(id)
-);
-
-CREATE TABLE IF NOT EXISTS capability_calls (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  trace_id TEXT NOT NULL,
-  capability_name TEXT NOT NULL,
-  subject_kind TEXT NOT NULL,
-  subject_id TEXT NOT NULL,
-  scope_json TEXT NOT NULL DEFAULT '{}',
-  status TEXT NOT NULL,
-  idempotency_key TEXT,
-  created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS artifacts (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  owner_agent_id TEXT NOT NULL,
-  object_ref TEXT NOT NULL,
-  checksum TEXT NOT NULL,
-  size_bytes INTEGER NOT NULL,
-  content_type TEXT NOT NULL,
-  metadata_json TEXT NOT NULL DEFAULT '{}',
-  created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS transcripts (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  attempt_id TEXT NOT NULL,
-  object_ref TEXT NOT NULL,
-  checksum TEXT NOT NULL,
-  size_bytes INTEGER NOT NULL,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY(attempt_id) REFERENCES attempts(id)
-);
-
-CREATE TABLE IF NOT EXISTS queue_items (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  queue_name TEXT NOT NULL,
-  kind TEXT NOT NULL,
-  payload_ref TEXT NOT NULL,
-  state TEXT NOT NULL CHECK (state IN ('queued', 'leased', 'done', 'failed', 'dead')),
-  lease_owner TEXT,
-  lease_expires_at TEXT,
-  attempt_count INTEGER NOT NULL DEFAULT 0,
-  next_run_at TEXT NOT NULL,
-  last_error TEXT,
-  idempotency_key TEXT,
-  priority INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS queue_items_idempotency_idx
-  ON queue_items(queue_name, idempotency_key)
-  WHERE idempotency_key IS NOT NULL AND idempotency_key <> '';
-
-CREATE INDEX IF NOT EXISTS queue_items_claim_idx
-  ON queue_items(queue_name, state, next_run_at, priority);
-
-CREATE TABLE IF NOT EXISTS events (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  trace_id TEXT,
-  subject_kind TEXT,
-  subject_id TEXT,
-  agent_id TEXT,
-  runtime_id TEXT,
-  capability_name TEXT,
-  event_type TEXT NOT NULL,
-  aggregate_type TEXT NOT NULL,
-  aggregate_id TEXT NOT NULL,
-  payload_json TEXT NOT NULL DEFAULT '{}',
-  occurred_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS events_trace_idx ON events(trace_id, occurred_at);
-CREATE INDEX IF NOT EXISTS events_aggregate_idx ON events(aggregate_type, aggregate_id, occurred_at);
-`
-
-const teamConfigSkillSchemaSQL = `
-CREATE TABLE IF NOT EXISTS team_config_versions (
-  team_id TEXT NOT NULL,
-  version INTEGER NOT NULL,
-  active INTEGER NOT NULL DEFAULT 1,
-  raw_yaml TEXT NOT NULL,
-  config_json TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  PRIMARY KEY(team_id, version)
-);
-
-CREATE TABLE IF NOT EXISTS team_config_agents (
-  team_id TEXT NOT NULL,
-  version INTEGER NOT NULL,
-  agent_id TEXT NOT NULL,
-  role_prompt_ref TEXT,
-  role_prompt TEXT NOT NULL DEFAULT '',
-  runtime_profile TEXT NOT NULL,
-  cli_backend TEXT NOT NULL,
-  skills_json TEXT NOT NULL DEFAULT '[]',
-  capabilities_json TEXT NOT NULL DEFAULT '[]',
-  created_at TEXT NOT NULL,
-  PRIMARY KEY(team_id, version, agent_id),
-  FOREIGN KEY(team_id, version) REFERENCES team_config_versions(team_id, version)
-);
-
-CREATE TABLE IF NOT EXISTS skill_packages (
+const schemaSQL = `
+CREATE TABLE schema_migrations (
+  version INTEGER PRIMARY KEY,
   name TEXT NOT NULL,
-  version INTEGER NOT NULL,
-  summary TEXT NOT NULL,
-  content TEXT NOT NULL,
-  capability_refs_json TEXT NOT NULL DEFAULT '[]',
-  enabled INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL,
-  PRIMARY KEY(name, version)
+  applied_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS team_config_agents_lookup_idx
-  ON team_config_agents(team_id, version, agent_id);
-CREATE INDEX IF NOT EXISTS skill_packages_name_idx
-  ON skill_packages(name, enabled, version);
-`
-
-const sessionLifecycleSchemaSQL = `
-CREATE TABLE IF NOT EXISTS prepare_leases (
+CREATE TABLE projects (
   id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  lease_id TEXT NOT NULL,
-  attempt_id TEXT,
-  agent_id TEXT NOT NULL,
-  owner TEXT NOT NULL,
-  state TEXT NOT NULL CHECK (state IN ('active', 'released', 'expired')),
-  expires_at TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY(lease_id) REFERENCES leases(id)
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS prepare_leases_active_lease_idx
-  ON prepare_leases(lease_id)
-  WHERE state = 'active';
-
-CREATE TABLE IF NOT EXISTS active_guards (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  resource_kind TEXT NOT NULL,
-  resource_ref TEXT NOT NULL,
-  attempt_id TEXT NOT NULL,
-  lease_id TEXT NOT NULL,
-  session_route_id TEXT,
-  state TEXT NOT NULL CHECK (state IN ('active', 'released')),
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY(attempt_id) REFERENCES attempts(id),
-  FOREIGN KEY(lease_id) REFERENCES leases(id)
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS active_guards_resource_idx
-  ON active_guards(resource_kind, resource_ref)
-  WHERE state = 'active';
-
-CREATE INDEX IF NOT EXISTS active_guards_attempt_idx
-  ON active_guards(attempt_id, state);
-`
-
-const objectStoreSchemaSQL = `
-CREATE TABLE IF NOT EXISTS object_blobs (
-  object_ref TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  owner_agent_id TEXT,
-  checksum TEXT NOT NULL,
-  size_bytes INTEGER NOT NULL,
-  content_type TEXT NOT NULL,
-  content BLOB NOT NULL,
-  created_at TEXT NOT NULL
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS object_blobs_checksum_idx
-  ON object_blobs(checksum);
-
-CREATE INDEX IF NOT EXISTS object_blobs_owner_idx
-  ON object_blobs(owner_agent_id, created_at);
-`
-
-const controlledGitSchemaSQL = `
-CREATE TABLE IF NOT EXISTS git_repositories (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  source_path TEXT NOT NULL,
-  canonical_branch TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('active', 'disabled', 'error')),
+  name TEXT NOT NULL UNIQUE,
+  source TEXT NOT NULL,
+  source_ref TEXT NOT NULL,
+  initial_sha TEXT NOT NULL,
+  control_repo_path TEXT NOT NULL UNIQUE,
+  canonical_ref TEXT NOT NULL,
+  canonical_sha TEXT NOT NULL,
+  integration_agent_id TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL CHECK (status IN ('creating','active','error','archived')),
+  pending_action TEXT NOT NULL DEFAULT '' CHECK (pending_action IN ('','initialize','verify')),
+  pending_action_id TEXT NOT NULL DEFAULT '',
+  pending_started_at TEXT NOT NULL DEFAULT '',
+  last_error TEXT NOT NULL DEFAULT '',
+  version INTEGER NOT NULL CHECK (version >= 1),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS git_repositories_source_idx
-  ON git_repositories(source_path, canonical_branch);
-
-CREATE TABLE IF NOT EXISTS git_workspaces (
+CREATE TABLE agents (
   id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  repo_id TEXT NOT NULL,
-  agent_id TEXT NOT NULL,
-  runtime_id TEXT,
-  contract_id TEXT,
-  path TEXT NOT NULL,
-  base_ref TEXT NOT NULL,
-  head_ref TEXT NOT NULL,
-  dirty INTEGER NOT NULL DEFAULT 0,
-  state TEXT NOT NULL CHECK (state IN ('preparing', 'ready', 'locked', 'error', 'archived')),
+  display_name TEXT NOT NULL,
+  adapter_id TEXT NOT NULL,
+  image TEXT NOT NULL,
+  instructions_file TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('active','paused','archived')),
+  version INTEGER NOT NULL CHECK (version >= 1),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE tasks (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  kind TEXT NOT NULL CHECK (kind IN ('conversation','work','integration')),
+  parent_task_id TEXT NOT NULL DEFAULT '',
+  retry_of_task_id TEXT NOT NULL DEFAULT '',
+  created_by_kind TEXT NOT NULL CHECK (created_by_kind IN ('boss','agent','system')),
+  created_by_id TEXT NOT NULL DEFAULT '',
+  assignee_agent_id TEXT NOT NULL REFERENCES agents(id),
+  title TEXT NOT NULL,
+  description TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL CHECK (status IN ('queued','running','finishing','waiting','submitted','completed','failed','cancelled')),
+  current_run_id TEXT NOT NULL DEFAULT '',
+  generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+  next_run_at TEXT NOT NULL,
+  retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+  max_retries INTEGER NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
+  wait_reason TEXT NOT NULL DEFAULT '',
+  result_summary TEXT NOT NULL DEFAULT '',
+  failure_reason TEXT NOT NULL DEFAULT '',
+  base_sha TEXT NOT NULL DEFAULT '',
+  head_sha TEXT NOT NULL DEFAULT '',
+  head_run_id TEXT NOT NULL DEFAULT '',
+  task_ref TEXT NOT NULL DEFAULT '',
+  accepted_by_kind TEXT NOT NULL DEFAULT '',
+  accepted_by_id TEXT NOT NULL DEFAULT '',
+  accepted_at TEXT NOT NULL DEFAULT '',
+  accepted_integration_agent_id TEXT NOT NULL DEFAULT '',
+  final_canonical_sha TEXT NOT NULL DEFAULT '',
+  integration_task_id TEXT NOT NULL DEFAULT '',
+  source_task_id TEXT NOT NULL DEFAULT '',
+  source_run_id TEXT NOT NULL DEFAULT '',
+  source_task_ref TEXT NOT NULL DEFAULT '',
+  source_head_sha TEXT NOT NULL DEFAULT '',
+	  source_ref_released_at TEXT NOT NULL DEFAULT '',
+  source_accept_version INTEGER NOT NULL DEFAULT 0,
+  observed_canonical_sha TEXT NOT NULL DEFAULT '',
+  pending_action TEXT NOT NULL DEFAULT '' CHECK (pending_action IN ('','capture','advance')),
+  pending_action_id TEXT NOT NULL DEFAULT '',
+  pending_action_version INTEGER NOT NULL DEFAULT 0,
+  pending_action_run_id TEXT NOT NULL DEFAULT '',
+  pending_expected_sha TEXT NOT NULL DEFAULT '',
+  pending_target_sha TEXT NOT NULL DEFAULT '',
+  pending_started_at TEXT NOT NULL DEFAULT '',
+  version INTEGER NOT NULL CHECK (version >= 1),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  FOREIGN KEY(repo_id) REFERENCES git_repositories(id)
+  submitted_at TEXT NOT NULL DEFAULT '',
+  completed_at TEXT NOT NULL DEFAULT '',
+  closed_at TEXT NOT NULL DEFAULT ''
 );
 
-CREATE INDEX IF NOT EXISTS git_workspaces_agent_idx
-  ON git_workspaces(agent_id, repo_id, state);
-
-CREATE TABLE IF NOT EXISTS git_operations (
+CREATE TABLE runs (
   id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  operation_type TEXT NOT NULL,
-  actor_agent_id TEXT NOT NULL,
-  workspace_id TEXT,
-  repo_id TEXT NOT NULL,
-  idempotency_key TEXT,
-  before_ref TEXT NOT NULL DEFAULT '',
-  after_ref TEXT NOT NULL DEFAULT '',
-  stdout TEXT NOT NULL DEFAULT '',
-  stderr TEXT NOT NULL DEFAULT '',
-  exit_code INTEGER NOT NULL DEFAULT 0,
-  state TEXT NOT NULL CHECK (state IN ('pending', 'running', 'succeeded', 'rejected', 'failed')),
-  feedback_json TEXT NOT NULL DEFAULT '{}',
-  created_at TEXT NOT NULL,
-  completed_at TEXT,
-  FOREIGN KEY(workspace_id) REFERENCES git_workspaces(id),
-  FOREIGN KEY(repo_id) REFERENCES git_repositories(id)
-);
-
-CREATE INDEX IF NOT EXISTS git_operations_workspace_idx
-  ON git_operations(workspace_id, created_at);
-
-CREATE TABLE IF NOT EXISTS git_locks (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  scope_kind TEXT NOT NULL CHECK (scope_kind IN ('workspace', 'repo')),
-  scope_id TEXT NOT NULL,
-  operation_id TEXT NOT NULL,
-  owner_agent_id TEXT NOT NULL,
-  state TEXT NOT NULL CHECK (state IN ('active', 'released')),
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  expires_at TEXT NOT NULL,
-  FOREIGN KEY(operation_id) REFERENCES git_operations(id)
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS git_locks_active_scope_idx
-  ON git_locks(scope_kind, scope_id)
-  WHERE state = 'active';
-
-CREATE INDEX IF NOT EXISTS git_locks_operation_idx
-  ON git_locks(operation_id, state);
-
-CREATE TABLE IF NOT EXISTS changesets (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  workspace_id TEXT NOT NULL,
-  repo_id TEXT NOT NULL,
-  contract_id TEXT,
-  base_ref TEXT NOT NULL,
-  head_ref TEXT NOT NULL,
-  commit_ids_json TEXT NOT NULL DEFAULT '[]',
-  summary TEXT NOT NULL,
-  evidence_refs_json TEXT NOT NULL DEFAULT '[]',
-  state TEXT NOT NULL CHECK (state IN ('draft', 'submitted', 'abandoned')),
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY(workspace_id) REFERENCES git_workspaces(id),
-  FOREIGN KEY(repo_id) REFERENCES git_repositories(id)
-);
-
-CREATE INDEX IF NOT EXISTS changesets_workspace_idx
-  ON changesets(workspace_id, state, created_at);
-`
-
-const controlledGitV2SchemaSQL = `
-CREATE TABLE IF NOT EXISTS git_merge_attempts (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  changeset_id TEXT NOT NULL,
-  repo_id TEXT NOT NULL,
-  workspace_id TEXT NOT NULL,
-  target_ref TEXT NOT NULL,
-  integration_path TEXT NOT NULL DEFAULT '',
-  base_before TEXT NOT NULL,
-  result_ref TEXT NOT NULL DEFAULT '',
-  state TEXT NOT NULL CHECK (state IN ('clean', 'conflicted', 'resolved', 'applied', 'aborted', 'failed')),
-  conflict_set_id TEXT,
-  operation_id TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY(changeset_id) REFERENCES changesets(id),
-  FOREIGN KEY(repo_id) REFERENCES git_repositories(id),
-  FOREIGN KEY(workspace_id) REFERENCES git_workspaces(id),
-  FOREIGN KEY(operation_id) REFERENCES git_operations(id)
-);
-
-CREATE INDEX IF NOT EXISTS git_merge_attempts_changeset_idx
-  ON git_merge_attempts(changeset_id, state, created_at);
-
-CREATE TABLE IF NOT EXISTS git_conflict_sets (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  merge_attempt_id TEXT NOT NULL,
-  files_json TEXT NOT NULL DEFAULT '[]',
-  summary TEXT NOT NULL,
-  state TEXT NOT NULL CHECK (state IN ('open', 'resolved', 'abandoned')),
-  resolved_by TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY(merge_attempt_id) REFERENCES git_merge_attempts(id)
-);
-
-CREATE INDEX IF NOT EXISTS git_conflict_sets_attempt_idx
-  ON git_conflict_sets(merge_attempt_id, state);
-
-CREATE TABLE IF NOT EXISTS git_rollback_points (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  operation_id TEXT NOT NULL,
-  repo_id TEXT NOT NULL,
-  workspace_id TEXT,
-  target_ref TEXT NOT NULL,
-  before_ref TEXT NOT NULL,
-  after_ref TEXT NOT NULL,
-  state TEXT NOT NULL CHECK (state IN ('available', 'used', 'expired')),
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY(operation_id) REFERENCES git_operations(id),
-  FOREIGN KEY(repo_id) REFERENCES git_repositories(id),
-  FOREIGN KEY(workspace_id) REFERENCES git_workspaces(id)
-);
-
-CREATE INDEX IF NOT EXISTS git_rollback_points_operation_idx
-  ON git_rollback_points(operation_id, state);
-`
-
-const runtimeEvidenceSchemaSQL = `
-CREATE TABLE IF NOT EXISTS runtime_instances (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  runtime_id TEXT NOT NULL UNIQUE,
-  runtime_profile TEXT NOT NULL,
-  runtime_kind TEXT NOT NULL,
-  agent_id TEXT NOT NULL,
-  attempt_id TEXT NOT NULL,
-  lease_id TEXT NOT NULL,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  agent_id TEXT NOT NULL REFERENCES agents(id),
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  resumed_from_run_id TEXT NOT NULL DEFAULT '',
+  adapter_id TEXT NOT NULL,
+  image TEXT NOT NULL,
+  instructions_hash TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL CHECK (state IN ('starting','active','exited','failed','interrupted','cancelled','timed_out')),
+  workspace_path TEXT NOT NULL DEFAULT '',
   container_id TEXT NOT NULL DEFAULT '',
-  container_name TEXT NOT NULL DEFAULT '',
-  image TEXT NOT NULL DEFAULT '',
-  network TEXT NOT NULL DEFAULT '',
-  state TEXT NOT NULL CHECK (state IN ('preparing', 'ready', 'failed', 'stopped')),
-  workspace_path TEXT NOT NULL,
-  home_path TEXT NOT NULL,
-  host_workspace_ref TEXT NOT NULL DEFAULT '',
-  host_home_ref TEXT NOT NULL DEFAULT '',
-  coordlink_path TEXT NOT NULL DEFAULT '',
-  checks_json TEXT NOT NULL DEFAULT '{}',
-  env_keys_json TEXT NOT NULL DEFAULT '[]',
-  last_error TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY(attempt_id) REFERENCES attempts(id),
-  FOREIGN KEY(lease_id) REFERENCES leases(id)
-);
-
-CREATE INDEX IF NOT EXISTS runtime_instances_attempt_idx
-  ON runtime_instances(attempt_id, state);
-
-CREATE INDEX IF NOT EXISTS runtime_instances_agent_idx
-  ON runtime_instances(agent_id, runtime_kind, state);
-`
-
-const cliSessionSchemaSQL = `
-CREATE TABLE IF NOT EXISTS cli_sessions (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  attempt_id TEXT NOT NULL,
-  runtime_id TEXT NOT NULL,
-  agent_id TEXT NOT NULL,
-  cli_backend TEXT NOT NULL,
-  profile_name TEXT NOT NULL,
-  session_native_id TEXT NOT NULL,
-  container_id TEXT NOT NULL DEFAULT '',
-  container_name TEXT NOT NULL DEFAULT '',
-  process_ref TEXT NOT NULL DEFAULT '',
-  state TEXT NOT NULL CHECK (state IN ('starting', 'running', 'resumed', 'exited', 'failed', 'finished')),
-  start_reason TEXT NOT NULL,
-  resume_of TEXT NOT NULL DEFAULT '',
+  native_session_id TEXT NOT NULL DEFAULT '',
+  log_path TEXT NOT NULL DEFAULT '',
+  token_hash TEXT NOT NULL UNIQUE,
+  token_revoked_at TEXT NOT NULL DEFAULT '',
+  requested_outcome TEXT NOT NULL DEFAULT '' CHECK (requested_outcome IN ('','wait','submit','fail')),
+  requested_summary TEXT NOT NULL DEFAULT '',
+  expected_head TEXT NOT NULL DEFAULT '',
+  requested_at TEXT NOT NULL DEFAULT '',
+  stop_requested_at TEXT NOT NULL DEFAULT '',
+  stop_reason TEXT NOT NULL DEFAULT '',
+  stop_operation_id TEXT NOT NULL DEFAULT '',
+  heartbeat_at TEXT NOT NULL DEFAULT '',
   exit_code INTEGER,
+  terminal_reason TEXT NOT NULL DEFAULT '',
   last_error TEXT NOT NULL DEFAULT '',
-  transcript_ref TEXT NOT NULL DEFAULT '',
-  command_json TEXT NOT NULL DEFAULT '[]',
-  env_keys_json TEXT NOT NULL DEFAULT '[]',
-  started_at TEXT NOT NULL,
-  ended_at TEXT,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY(attempt_id) REFERENCES attempts(id)
-);
-
-CREATE INDEX IF NOT EXISTS cli_sessions_attempt_idx
-  ON cli_sessions(attempt_id, state, started_at);
-
-CREATE INDEX IF NOT EXISTS cli_sessions_native_idx
-  ON cli_sessions(cli_backend, session_native_id);
-`
-
-const commandRunSchemaSQL = `
-CREATE TABLE IF NOT EXISTS command_runs (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  agent_id TEXT NOT NULL,
-  lease_id TEXT NOT NULL,
-  assignment_id TEXT NOT NULL,
-  contract_id TEXT NOT NULL,
-  attempt_id TEXT NOT NULL,
-  session_route_id TEXT NOT NULL,
-  runtime_id TEXT NOT NULL,
-  container_id TEXT NOT NULL DEFAULT '',
-  container_name TEXT NOT NULL DEFAULT '',
-  cwd TEXT NOT NULL,
-  argv_json TEXT NOT NULL DEFAULT '[]',
-  env_keys_json TEXT NOT NULL DEFAULT '[]',
-  status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'timed_out')),
-  exit_code INTEGER,
-  stdout_ref TEXT NOT NULL DEFAULT '',
-  stderr_ref TEXT NOT NULL DEFAULT '',
-  stdout_bytes INTEGER NOT NULL DEFAULT 0,
-  stderr_bytes INTEGER NOT NULL DEFAULT 0,
-  stdout_truncated INTEGER NOT NULL DEFAULT 0,
-  stderr_truncated INTEGER NOT NULL DEFAULT 0,
-  timeout_seconds INTEGER NOT NULL DEFAULT 0,
-  duration_ms INTEGER NOT NULL DEFAULT 0,
-  evidence_id TEXT NOT NULL DEFAULT '',
-  last_error TEXT NOT NULL DEFAULT '',
-  idempotency_key TEXT,
+  cleanup_state TEXT NOT NULL CHECK (cleanup_state IN ('not_needed','pending','removed','blocked')),
+  launch_nonce TEXT NOT NULL DEFAULT '',
+  launch_operation_id TEXT NOT NULL DEFAULT '',
+  launch_phase TEXT NOT NULL DEFAULT 'intent' CHECK (launch_phase IN ('intent','created','start_issued','process_observed')),
+  home_path TEXT NOT NULL DEFAULT '',
+  container_name TEXT NOT NULL,
+  deadline_at TEXT NOT NULL DEFAULT '',
+  last_observed_at TEXT NOT NULL DEFAULT '',
+  launch_mode TEXT NOT NULL CHECK (launch_mode IN ('start','resume')),
+  resume_native_session_id TEXT NOT NULL DEFAULT '',
+  runtime_error_code TEXT NOT NULL DEFAULT '',
+  cleanup_operation_id TEXT NOT NULL DEFAULT '',
+  version INTEGER NOT NULL CHECK (version >= 1),
   created_at TEXT NOT NULL,
-  started_at TEXT NOT NULL,
-  ended_at TEXT,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY(lease_id) REFERENCES leases(id),
-  FOREIGN KEY(attempt_id) REFERENCES attempts(id),
-  FOREIGN KEY(session_route_id) REFERENCES session_routes(id),
-  FOREIGN KEY(contract_id) REFERENCES work_contracts(id)
+  started_at TEXT NOT NULL DEFAULT '',
+  ended_at TEXT NOT NULL DEFAULT ''
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS command_runs_idempotency_idx
-  ON command_runs(agent_id, attempt_id, idempotency_key)
-  WHERE idempotency_key IS NOT NULL AND idempotency_key <> '';
-
-CREATE INDEX IF NOT EXISTS command_runs_attempt_idx
-  ON command_runs(attempt_id, created_at);
-
-CREATE INDEX IF NOT EXISTS command_runs_contract_idx
-  ON command_runs(contract_id, created_at);
-`
-
-const runtimeTokenSchemaSQL = `
-CREATE TABLE IF NOT EXISTS runtime_tokens (
-  token_hash TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  agent_id TEXT NOT NULL,
-  runtime_id TEXT NOT NULL,
-  attempt_id TEXT NOT NULL,
-  lease_id TEXT NOT NULL,
-  state TEXT NOT NULL CHECK (state IN ('active', 'revoked')),
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY(attempt_id) REFERENCES attempts(id),
-  FOREIGN KEY(lease_id) REFERENCES leases(id)
-);
-
-CREATE INDEX IF NOT EXISTS runtime_tokens_attempt_idx
-  ON runtime_tokens(attempt_id, state, updated_at);
-
-CREATE INDEX IF NOT EXISTS runtime_tokens_runtime_idx
-  ON runtime_tokens(runtime_id, state, updated_at);
-`
-
-const validationAssessmentSchemaSQL = `
-CREATE TABLE IF NOT EXISTS validation_assessments (
+CREATE TABLE messages (
   id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  verifier_agent_id TEXT NOT NULL,
-  lease_id TEXT NOT NULL,
-  assignment_id TEXT NOT NULL,
-  contract_id TEXT NOT NULL,
-  attempt_id TEXT NOT NULL,
-  session_route_id TEXT NOT NULL,
-  runtime_id TEXT NOT NULL,
-  assessed_contract_id TEXT NOT NULL,
-  verdict TEXT NOT NULL CHECK (verdict IN ('pass', 'fail', 'blocked')),
-  reason TEXT NOT NULL,
-  summary TEXT NOT NULL,
-  checked_refs_json TEXT NOT NULL DEFAULT '[]',
-  ref_snapshot_json TEXT NOT NULL DEFAULT '[]',
-  evidence_id TEXT NOT NULL,
-  idempotency_key TEXT,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  related_task_id TEXT NOT NULL DEFAULT '',
+  sender_kind TEXT NOT NULL CHECK (sender_kind IN ('boss','agent','system')),
+  sender_id TEXT NOT NULL DEFAULT '',
+  recipient_kind TEXT NOT NULL CHECK (recipient_kind IN ('boss','agent')),
+  recipient_id TEXT NOT NULL DEFAULT '',
+  reply_to_message_id TEXT NOT NULL DEFAULT '',
+  system_code TEXT NOT NULL DEFAULT '',
+  body TEXT NOT NULL,
+  wake INTEGER NOT NULL CHECK (wake IN (0,1)),
+  state TEXT NOT NULL CHECK (state IN ('pending','delivered','acknowledged','cancelled')),
+  delivered_run_id TEXT NOT NULL DEFAULT '',
+  delivery_count INTEGER NOT NULL DEFAULT 0 CHECK (delivery_count >= 0),
+  max_deliveries INTEGER NOT NULL DEFAULT 0 CHECK (max_deliveries >= 0),
+  next_delivery_at TEXT NOT NULL,
+  last_delivery_error TEXT NOT NULL DEFAULT '',
+  idempotency_key TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version >= 1),
   created_at TEXT NOT NULL,
-  FOREIGN KEY(lease_id) REFERENCES leases(id),
-  FOREIGN KEY(contract_id) REFERENCES work_contracts(id),
-  FOREIGN KEY(attempt_id) REFERENCES attempts(id),
-  FOREIGN KEY(session_route_id) REFERENCES session_routes(id),
-  FOREIGN KEY(evidence_id) REFERENCES evidence(id)
+  delivered_at TEXT NOT NULL DEFAULT '',
+  acknowledged_at TEXT NOT NULL DEFAULT ''
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS validation_assessments_idempotency_idx
-  ON validation_assessments(verifier_agent_id, attempt_id, idempotency_key)
-  WHERE idempotency_key IS NOT NULL AND idempotency_key <> '';
-
-CREATE INDEX IF NOT EXISTS validation_assessments_contract_idx
-  ON validation_assessments(contract_id, created_at);
-
-CREATE INDEX IF NOT EXISTS validation_assessments_assessed_contract_idx
-  ON validation_assessments(assessed_contract_id, created_at);
-`
-
-const releaseAcceptanceSchemaSQL = `
-CREATE TABLE IF NOT EXISTS release_acceptances (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  root_contract_id TEXT NOT NULL,
-  team_id TEXT NOT NULL,
-  team_version INTEGER NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('passed', 'failed', 'blocked')),
-  run_label TEXT NOT NULL DEFAULT '',
-  predicate_results_json TEXT NOT NULL DEFAULT '[]',
-  evidence_refs_json TEXT NOT NULL DEFAULT '[]',
-  inspect_summary_json TEXT NOT NULL DEFAULT '{}',
-  event_cursor_json TEXT NOT NULL DEFAULT '{}',
-  failure_summary TEXT NOT NULL DEFAULT '',
-  created_by TEXT NOT NULL,
+CREATE TABLE events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL DEFAULT '',
+  entity_type TEXT NOT NULL CHECK (entity_type IN ('project','agent','task','run','message','daemon')),
+  entity_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  actor_kind TEXT NOT NULL CHECK (actor_kind IN ('boss','agent','daemon','system')),
+  actor_id TEXT NOT NULL DEFAULT '',
+  run_id TEXT NOT NULL DEFAULT '',
+  request_id TEXT NOT NULL DEFAULT '',
+  operation_id TEXT NOT NULL DEFAULT '',
+  payload_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload_json)),
   created_at TEXT NOT NULL
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS release_acceptances_run_idx
-  ON release_acceptances(root_contract_id, team_id, team_version, run_label);
-
-CREATE INDEX IF NOT EXISTS release_acceptances_root_idx
-  ON release_acceptances(root_contract_id, created_at);
-`
-
-const contractTeamScopeSchemaSQL = `
-CREATE TABLE IF NOT EXISTS contract_team_scopes (
-  contract_id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  team_id TEXT NOT NULL,
-  team_version INTEGER NOT NULL,
-  source TEXT NOT NULL,
+CREATE TABLE request_dedupes (
+  actor_scope TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  result_json BLOB NOT NULL,
   created_at TEXT NOT NULL,
-  FOREIGN KEY(contract_id) REFERENCES work_contracts(id),
-  FOREIGN KEY(team_id, team_version) REFERENCES team_config_versions(team_id, version)
+  PRIMARY KEY (actor_scope, operation, idempotency_key)
 );
 
-CREATE INDEX IF NOT EXISTS contract_team_scopes_team_idx
-  ON contract_team_scopes(team_id, team_version);
+CREATE UNIQUE INDEX tasks_one_open_conversation
+  ON tasks(project_id, assignee_agent_id)
+  WHERE kind = 'conversation' AND status NOT IN ('completed','cancelled');
+CREATE UNIQUE INDEX tasks_current_run_unique
+  ON tasks(current_run_id) WHERE current_run_id <> '';
+CREATE UNIQUE INDEX tasks_one_open_integration_source
+  ON tasks(project_id,source_task_ref)
+  WHERE kind='integration' AND source_task_ref<>'' AND status NOT IN ('completed','cancelled');
+CREATE INDEX tasks_schedule
+  ON tasks(status, next_run_at, priority DESC, created_at, id);
+CREATE INDEX tasks_assignee_status
+  ON tasks(assignee_agent_id, status);
+CREATE UNIQUE INDEX runs_one_live_per_agent
+  ON runs(agent_id) WHERE state IN ('starting','active');
+CREATE UNIQUE INDEX runs_one_live_per_task
+  ON runs(task_id) WHERE state IN ('starting','active');
+CREATE INDEX runs_task_created ON runs(task_id, created_at, id);
+CREATE INDEX messages_delivery ON messages(recipient_kind, recipient_id, state, next_delivery_at);
+CREATE INDEX messages_order ON messages(task_id, created_at, id);
+CREATE INDEX events_project_order ON events(project_id, id);
+CREATE INDEX events_entity_order ON events(entity_type, entity_id, id);
 `
 
-const agentCommunicationEnvelopeSchemaSQL = `
-CREATE TABLE IF NOT EXISTS agent_communication_envelopes (
+// participantRolesMigrationSQL adds the unified participant framework tables:
+// participants (human and CLI agent identities), configurable roles, per-project
+// role bindings, and human credentials. Rows are seeded in Go by Store.Migrate
+// so capability names stay sourced from the core registry.
+const participantRolesMigrationSQL = `
+ALTER TABLE events RENAME TO events_legacy;
+CREATE TABLE events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL DEFAULT '',
+  entity_type TEXT NOT NULL CHECK (entity_type IN ('project','agent','task','run','message','daemon','participant','role')),
+  entity_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  actor_kind TEXT NOT NULL CHECK (actor_kind IN ('boss','agent','daemon','system')),
+  actor_id TEXT NOT NULL DEFAULT '',
+  run_id TEXT NOT NULL DEFAULT '',
+  request_id TEXT NOT NULL DEFAULT '',
+  operation_id TEXT NOT NULL DEFAULT '',
+  payload_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload_json)),
+  created_at TEXT NOT NULL
+);
+INSERT INTO events SELECT id,project_id,entity_type,entity_id,kind,actor_kind,actor_id,run_id,request_id,operation_id,payload_json,created_at FROM events_legacy;
+DROP TABLE events_legacy;
+CREATE INDEX events_project_order ON events(project_id, id);
+CREATE INDEX events_entity_order ON events(entity_type, entity_id, id);
+
+CREATE TABLE participants (
   id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL DEFAULT 'default',
-  kind TEXT NOT NULL CHECK (kind IN ('message', 'task', 'result', 'repair', 'budget_attention', 'followup')),
-  sender_agent_id TEXT NOT NULL,
-  recipient_agent_id TEXT,
-  recipient_role TEXT,
-  thread_id TEXT,
-  message_id TEXT,
-  contract_id TEXT,
-  parent_envelope_id TEXT,
-  summary TEXT NOT NULL DEFAULT '',
-  body_inline TEXT,
-  body_ref TEXT,
-  trigger_turn INTEGER NOT NULL DEFAULT 1,
-  metadata_json TEXT NOT NULL DEFAULT '{}',
+  kind TEXT NOT NULL CHECK (kind IN ('human','cli_agent')),
+  display_name TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('active','paused','archived')),
+  credential_id TEXT NOT NULL DEFAULT '',
+  adapter_id TEXT NOT NULL DEFAULT '',
+  image TEXT NOT NULL DEFAULT '',
+  instructions_file TEXT NOT NULL DEFAULT '',
+  version INTEGER NOT NULL CHECK (version >= 1),
   created_at TEXT NOT NULL,
-  FOREIGN KEY(thread_id) REFERENCES threads(id),
-  FOREIGN KEY(message_id) REFERENCES messages(id),
-  FOREIGN KEY(contract_id) REFERENCES work_contracts(id),
-  FOREIGN KEY(parent_envelope_id) REFERENCES agent_communication_envelopes(id)
+  updated_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS agent_communication_envelopes_recipient_idx
-  ON agent_communication_envelopes(recipient_agent_id, kind, created_at);
+CREATE TABLE roles (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT NOT NULL DEFAULT '',
+  capabilities TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(capabilities)),
+  version INTEGER NOT NULL CHECK (version >= 1),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 
-CREATE INDEX IF NOT EXISTS agent_communication_envelopes_contract_idx
-  ON agent_communication_envelopes(contract_id, kind, created_at);
+CREATE TABLE participant_project_role (
+  participant_id TEXT NOT NULL REFERENCES participants(id),
+  project_id TEXT NOT NULL,
+  role_id TEXT NOT NULL REFERENCES roles(id),
+  version INTEGER NOT NULL CHECK (version >= 1),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (participant_id, project_id, role_id)
+);
 
-ALTER TABLE mailbox_items ADD COLUMN envelope_id TEXT;
+CREATE TABLE credentials (
+  id TEXT PRIMARY KEY,
+  participant_id TEXT NOT NULL REFERENCES participants(id),
+  kind TEXT NOT NULL CHECK (kind IN ('ssh_key','operator_token')),
+  public_key TEXT NOT NULL DEFAULT '',
+  secret_hash TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL CHECK (status IN ('active','revoked')),
+  created_at TEXT NOT NULL,
+  revoked_at TEXT NOT NULL DEFAULT ''
+);
 
-ALTER TABLE mailbox_items ADD COLUMN trigger_turn INTEGER NOT NULL DEFAULT 1;
+CREATE INDEX participant_project_role_project
+  ON participant_project_role(project_id, participant_id);
+CREATE INDEX credentials_participant
+  ON credentials(participant_id, status);
+`
 
-CREATE INDEX IF NOT EXISTS mailbox_items_envelope_idx
-  ON mailbox_items(envelope_id);
+// humanTaskLifecycleMigrationSQL generalizes task/message references to the
+// unified participant framework: tasks carry the assignee participant and an
+// evidence grade, messages carry the recipient participant, existing agents
+// get participant rows, and historical rows are backfilled.
+//
+// The tasks table is rebuilt so assignee_agent_id loses its mandatory agent
+// foreign key: a human-assigned task has assignee_agent_id=” and
+// assignee_participant_id set, while agent-assigned tasks mirror the agent id
+// into assignee_participant_id. The rebuild runs with foreign_keys=OFF (see
+// applyHumanTaskLifecycleMigration) and recreates every tasks index; the open
+// conversation uniqueness moves to the participant column so a project can
+// hold one open conversation per participant (human or agent).
+const humanTaskLifecycleMigrationSQL = `
+CREATE TABLE tasks_v4 (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  kind TEXT NOT NULL CHECK (kind IN ('conversation','work','integration')),
+  parent_task_id TEXT NOT NULL DEFAULT '',
+  retry_of_task_id TEXT NOT NULL DEFAULT '',
+  created_by_kind TEXT NOT NULL CHECK (created_by_kind IN ('boss','agent','system')),
+  created_by_id TEXT NOT NULL DEFAULT '',
+  assignee_agent_id TEXT NOT NULL DEFAULT '',
+  assignee_participant_id TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL,
+  description TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL CHECK (status IN ('queued','running','finishing','waiting','submitted','completed','failed','cancelled')),
+  current_run_id TEXT NOT NULL DEFAULT '',
+  generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+  next_run_at TEXT NOT NULL,
+  retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+  max_retries INTEGER NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
+  wait_reason TEXT NOT NULL DEFAULT '',
+  result_summary TEXT NOT NULL DEFAULT '',
+  failure_reason TEXT NOT NULL DEFAULT '',
+  base_sha TEXT NOT NULL DEFAULT '',
+  head_sha TEXT NOT NULL DEFAULT '',
+  head_run_id TEXT NOT NULL DEFAULT '',
+  task_ref TEXT NOT NULL DEFAULT '',
+  accepted_by_kind TEXT NOT NULL DEFAULT '',
+  accepted_by_id TEXT NOT NULL DEFAULT '',
+  accepted_at TEXT NOT NULL DEFAULT '',
+  accepted_integration_agent_id TEXT NOT NULL DEFAULT '',
+  final_canonical_sha TEXT NOT NULL DEFAULT '',
+  integration_task_id TEXT NOT NULL DEFAULT '',
+  source_task_id TEXT NOT NULL DEFAULT '',
+  source_run_id TEXT NOT NULL DEFAULT '',
+  source_task_ref TEXT NOT NULL DEFAULT '',
+  source_head_sha TEXT NOT NULL DEFAULT '',
+  source_ref_released_at TEXT NOT NULL DEFAULT '',
+  source_accept_version INTEGER NOT NULL DEFAULT 0,
+  observed_canonical_sha TEXT NOT NULL DEFAULT '',
+  pending_action TEXT NOT NULL DEFAULT '' CHECK (pending_action IN ('','capture','advance')),
+  pending_action_id TEXT NOT NULL DEFAULT '',
+  pending_action_version INTEGER NOT NULL DEFAULT 0,
+  pending_action_run_id TEXT NOT NULL DEFAULT '',
+  pending_expected_sha TEXT NOT NULL DEFAULT '',
+  pending_target_sha TEXT NOT NULL DEFAULT '',
+  pending_started_at TEXT NOT NULL DEFAULT '',
+  evidence_type TEXT NOT NULL DEFAULT '' CHECK (evidence_type IN ('','captured','human_confirm')),
+  version INTEGER NOT NULL CHECK (version >= 1),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  submitted_at TEXT NOT NULL DEFAULT '',
+  completed_at TEXT NOT NULL DEFAULT '',
+  closed_at TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO tasks_v4(id,project_id,kind,parent_task_id,retry_of_task_id,created_by_kind,created_by_id,assignee_agent_id,title,description,priority,status,current_run_id,generation,next_run_at,retry_count,max_retries,wait_reason,result_summary,failure_reason,base_sha,head_sha,head_run_id,task_ref,accepted_by_kind,accepted_by_id,accepted_at,accepted_integration_agent_id,final_canonical_sha,integration_task_id,source_task_id,source_run_id,source_task_ref,source_head_sha,source_ref_released_at,source_accept_version,observed_canonical_sha,pending_action,pending_action_id,pending_action_version,pending_action_run_id,pending_expected_sha,pending_target_sha,pending_started_at,version,created_at,updated_at,submitted_at,completed_at,closed_at,assignee_participant_id,evidence_type)
+SELECT id,project_id,kind,parent_task_id,retry_of_task_id,created_by_kind,created_by_id,assignee_agent_id,title,description,priority,status,current_run_id,generation,next_run_at,retry_count,max_retries,wait_reason,result_summary,failure_reason,base_sha,head_sha,head_run_id,task_ref,accepted_by_kind,accepted_by_id,accepted_at,accepted_integration_agent_id,final_canonical_sha,integration_task_id,source_task_id,source_run_id,source_task_ref,source_head_sha,source_ref_released_at,source_accept_version,observed_canonical_sha,pending_action,pending_action_id,pending_action_version,pending_action_run_id,pending_expected_sha,pending_target_sha,pending_started_at,version,created_at,updated_at,submitted_at,completed_at,closed_at,assignee_agent_id,'' FROM tasks;
+DROP TABLE tasks;
+ALTER TABLE tasks_v4 RENAME TO tasks;
+CREATE UNIQUE INDEX tasks_one_open_conversation
+  ON tasks(project_id, assignee_participant_id)
+  WHERE kind = 'conversation' AND status NOT IN ('completed','cancelled');
+CREATE UNIQUE INDEX tasks_current_run_unique
+  ON tasks(current_run_id) WHERE current_run_id <> '';
+CREATE UNIQUE INDEX tasks_one_open_integration_source
+  ON tasks(project_id,source_task_ref)
+  WHERE kind='integration' AND source_task_ref<>'' AND status NOT IN ('completed','cancelled');
+CREATE INDEX tasks_schedule
+  ON tasks(status, next_run_at, priority DESC, created_at, id);
+CREATE INDEX tasks_assignee_status
+  ON tasks(assignee_agent_id, status);
+ALTER TABLE messages ADD COLUMN recipient_participant_id TEXT NOT NULL DEFAULT '';
+UPDATE tasks SET assignee_participant_id = assignee_agent_id WHERE assignee_agent_id <> '';
+UPDATE messages SET recipient_participant_id = CASE WHEN recipient_kind = 'boss' THEN 'participant-owner' ELSE recipient_id END;
+INSERT INTO participants(id,kind,display_name,status,adapter_id,image,instructions_file,version,created_at,updated_at)
+SELECT id,'cli_agent',display_name,status,adapter_id,image,instructions_file,1,created_at,updated_at FROM agents
+WHERE NOT EXISTS (SELECT 1 FROM participants WHERE participants.id = agents.id);
 `

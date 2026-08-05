@@ -1,236 +1,226 @@
-package runtime_test
+//go:build docker
+
+package runtime
 
 import (
+	"bufio"
 	"context"
-	"database/sql"
+	"errors"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	gostdlib "runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
-
-	"coordplane/internal/claudeenv"
-	cpruntime "coordplane/internal/runtime"
-	"coordplane/internal/secrets"
-	"coordplane/internal/store"
-
-	_ "modernc.org/sqlite"
 )
 
-func TestDockerRuntimeGateRequiresExplicitEnvironment(t *testing.T) {
-	if os.Getenv("COORDPLANE_DOCKER_GATE") != "1" {
-		t.Skip("set COORDPLANE_DOCKER_GATE=1 with COORDPLANE_COORDLINK_PATH and COORDPLANE_BACKEND_URL to run the real Docker runtime gate")
-	}
-	coordlinkPath := os.Getenv("COORDPLANE_COORDLINK_PATH")
-	backendURL := os.Getenv("COORDPLANE_BACKEND_URL")
-	if coordlinkPath == "" || backendURL == "" {
-		t.Skip("real Docker gate requires COORDPLANE_COORDLINK_PATH and COORDPLANE_BACKEND_URL")
-	}
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skipf("docker CLI unavailable: %v", err)
-	}
-	image := os.Getenv("COORDPLANE_DOCKER_IMAGE")
-	if image == "" {
-		image = "alpine:3.20"
-	}
-	network := os.Getenv("COORDPLANE_DOCKER_NETWORK")
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+func TestDockerExecutorRealLifecycleAndOwnershipFence(t *testing.T) {
+	executor, err := NewDockerExecutorFromEnvironment()
+	requireNoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	db, cleanup := newIntegrationDB(t)
-	defer cleanup()
-	defer cleanupRuntimeContainers(t, db)
-	runtimeRoot := filepath.Join(t.TempDir(), "docker-runtime")
-	backend := cpruntime.NewDockerRuntime(cpruntime.DockerRuntimeConfig{
-		DB:            db,
-		ProfileName:   "docker-gate",
-		TeamID:        "docker-gate",
-		Image:         image,
-		Network:       network,
-		RuntimeRoot:   runtimeRoot,
-		CoordlinkPath: coordlinkPath,
-		DBPath:        filepath.Join(t.TempDir(), "coordplane.db"),
-		Ready:         true,
-	})
-	prepared, err := backend.Prepare(ctx, cpruntime.PrepareRequest{
-		AgentID:        "developer",
-		AttemptID:      "att_docker_gate",
-		AssignmentID:   "asn_docker_gate",
-		LeaseID:        "lease_docker_gate",
-		ContractID:     "ctr_docker_gate",
-		TeamID:         "docker-gate",
-		RuntimeProfile: "docker-gate",
-		CLIBackend:     "fake",
-		BackendURL:     backendURL,
-		WorkspaceName:  "docker-gate-workspace",
-	})
-	if err != nil {
-		t.Fatalf("prepare docker runtime: %v", err)
+	if err := executor.Ping(ctx); err != nil {
+		t.Skipf("SKIP(Docker unavailable): %v", err)
 	}
-	if prepared.ContainerName != "" {
-		t.Cleanup(func() {
-			_ = exec.Command("docker", "rm", "-f", prepared.ContainerName).Run()
+	image := buildDockerFixtureImage(t, ctx)
+	home := t.TempDir()
+	ref := RuntimeRef{
+		ContainerName: "coordplane-test-" + strconv.FormatInt(time.Now().UnixNano(), 36),
+		ProjectID:     "project-docker", TaskID: "task-docker", AgentID: "agent-docker",
+		RunID: "run-docker", Generation: 7, LaunchNonce: "nonce-docker",
+	}
+	spec := ContainerSpec{
+		Ref: ref, Image: image,
+		Command: CommandSpec{
+			Executable: "/runtime-fixture", Args: []string{"hold"},
+			Env: map[string]string{"HOME": "/home/agent", "PROVIDER_TOKEN": "provider-secret"},
+		},
+		SensitiveEnvKeys: []string{"PROVIDER_TOKEN"},
+		WorkingDir:       "/home/agent", User: "65532:" + strconv.Itoa(os.Getgid()),
+		GroupAdd: []string{strconv.Itoa(os.Getgid())}, Network: "none", ReadOnlyRoot: true,
+		Mounts: []Mount{{Source: home, Target: "/home/agent"}},
+		Limits: ResourceLimits{PIDs: 32, MemoryBytes: 128 << 20, NanoCPUs: 500_000_000, TmpfsBytes: 8 << 20},
+	}
+	created, err := executor.Create(ctx, spec)
+	requireNoError(t, err)
+	t.Cleanup(func() {
+		cleanup, stop := context.WithTimeout(context.Background(), 15*time.Second)
+		defer stop()
+		_, _ = executor.Stop(cleanup, created, 0)
+		_, _ = executor.Remove(cleanup, created)
+	})
+	adopted, err := executor.Create(ctx, spec)
+	if err != nil || adopted.ContainerID != created.ContainerID {
+		t.Fatalf("idempotent create = %#v err=%v, first=%#v", adopted, err, created)
+	}
+	attached, err := executor.Attach(ctx, created)
+	if err != nil || attached.ContainerID != created.ContainerID {
+		t.Fatalf("attach = %#v err=%v", attached, err)
+	}
+	started, err := executor.Start(ctx, created)
+	requireNoError(t, err)
+	state, err := executor.Inspect(ctx, started)
+	requireNoError(t, err)
+	if !state.Running || state.Status != StatusRunning || state.PID <= 0 || state.AutoRemove ||
+		state.RestartPolicy != "no" || state.Privileged || !state.ReadonlyRootfs || state.PublishedPorts != 0 ||
+		!contains(state.CapDrop, "ALL") || !contains(state.SecurityOpt, "no-new-privileges") || !state.Init {
+		t.Fatalf("insecure or non-live container state = %#v", state)
+	}
+	if err := ValidateAdoption(spec, state); err != nil {
+		t.Fatalf("live container does not match its creation contract: %v", err)
+	}
+	logs, err := executor.Logs(ctx, started, true)
+	requireNoError(t, err)
+	line, readErr := bufio.NewReader(logs).ReadString('\n')
+	closeErr := logs.Close()
+	if readErr != nil || closeErr != nil || !strings.Contains(line, "runtime-ready") {
+		t.Fatalf("logs=%q read=%v close=%v", line, readErr, closeErr)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*RuntimeRef)
+	}{
+		{name: "launch nonce", mutate: func(ref *RuntimeRef) { ref.LaunchNonce = "wrong-nonce" }},
+		{name: "generation", mutate: func(ref *RuntimeRef) { ref.Generation++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			wrong := started
+			test.mutate(&wrong)
+			if _, err := executor.Stop(ctx, wrong, 0); !errors.Is(err, ErrOwnership) {
+				t.Fatalf("mismatched Stop error = %v", err)
+			}
+			assertContainerStillRunning(t, ctx, executor, started)
+			if _, err := executor.Remove(ctx, wrong); !errors.Is(err, ErrOwnership) {
+				t.Fatalf("mismatched Remove error = %v", err)
+			}
+			assertContainerStillRunning(t, ctx, executor, started)
 		})
 	}
-	if prepared.Workspace != cpruntime.ContainerWorkspacePath ||
-		prepared.HomeDir != cpruntime.ContainerHomePath ||
-		prepared.Env["COORDPLANE_TOKEN"] == "" ||
-		prepared.ContainerID == "" {
-		t.Fatalf("prepared docker runtime = %+v", prepared)
+	if _, err := executor.Stop(ctx, started, time.Second); err != nil {
+		t.Fatal(err)
 	}
-	for _, name := range []string{"workspace_writable", "home_writable", "git_workspace_writable", "cli_user_consistent"} {
-		if !prepared.Checks[name] {
-			t.Fatalf("prepared docker checks = %#v, want %s", prepared.Checks, name)
-		}
+	exit, err := executor.Wait(ctx, started)
+	if err != nil || exit.ExitCode == 0 {
+		t.Fatalf("stopped exit = %#v err=%v", exit, err)
+	}
+	if _, err := executor.Remove(ctx, started); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := executor.Remove(ctx, started)
+	if err != nil || !removed.AlreadyAbsent {
+		t.Fatalf("idempotent remove = %#v err=%v", removed, err)
 	}
 }
 
-func TestDockerExecClientStdinGatePassesInputToContainerProcess(t *testing.T) {
-	if os.Getenv("COORDPLANE_DOCKER_STDIN_GATE") != "1" {
-		t.Skip("set COORDPLANE_DOCKER_STDIN_GATE=1 to verify docker exec -i passes stdin into a real container process")
-	}
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skipf("docker CLI unavailable: %v", err)
-	}
-	image := os.Getenv("COORDPLANE_DOCKER_IMAGE")
-	if image == "" {
-		image = "alpine:3.20"
-	}
-	name := cpruntime.DockerSafeName("coordplane-stdin-gate-" + time.Now().UTC().Format("150405.000000000"))
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+func TestDockerExecutorRejectsMaliciousSameLabelContainer(t *testing.T) {
+	executor, err := NewDockerExecutorFromEnvironment()
+	requireNoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	_ = exec.CommandContext(ctx, "docker", "rm", "-f", name).Run()
-	raw, err := exec.CommandContext(ctx, "docker", "run", "-d", "--name", name, image, "sleep", "60").CombinedOutput()
-	if err != nil {
-		t.Fatalf("docker run stdin gate: %v: %s", err, raw)
+	if err := executor.Ping(ctx); err != nil {
+		t.Skipf("SKIP(Docker unavailable): %v", err)
+	}
+	image := buildDockerFixtureImage(t, ctx)
+	spec := validTestSpec(t.TempDir())
+	spec.Image = image
+	spec.Ref = RuntimeRef{
+		ContainerName: "coordplane-drift-" + strconv.FormatInt(time.Now().UnixNano(), 36),
+		ProjectID:     "project-drift", TaskID: "task-drift", AgentID: "agent-drift",
+		RunID: "run-drift", Generation: 11, LaunchNonce: "nonce-drift",
+	}
+	requireNoError(t, validateContainerSpec(&spec))
+	payload := dockerCreateRequest(spec)
+	payload.User = "0:0"
+	payload.HostConfig.Privileged = true
+	payload.HostConfig.ReadonlyRootfs = false
+	extra := dockerMount{Type: "bind", Source: spec.Mounts[0].Source, Target: "/forbidden"}
+	extra.BindOptions.Propagation = "rprivate"
+	payload.HostConfig.Mounts = append(payload.HostConfig.Mounts, extra)
+	query := url.Values{"name": []string{spec.Ref.ContainerName}}
+	response, err := executor.call(ctx, http.MethodPost, "/"+dockerAPIVersion+"/containers/create?"+query.Encode(), payload, nil)
+	requireNoError(t, err)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		t.Fatal(dockerResponseError(response, "create malicious fixture"))
+	}
+	var created struct {
+		ID string `json:"Id"`
+	}
+	requireNoError(t, decodeResponse(response.Body, &created))
+	ref := spec.Ref
+	ref.ContainerID = created.ID
+	t.Cleanup(func() {
+		cleanup, stop := context.WithTimeout(context.Background(), 15*time.Second)
+		defer stop()
+		_, _ = executor.Remove(cleanup, ref)
+	})
+	if _, err := executor.Create(ctx, spec); !errors.Is(err, ErrOwnership) {
+		t.Fatalf("same-label insecure container adoption error = %v", err)
+	}
+	after, err := executor.Inspect(ctx, ref)
+	if err != nil || after.Status != StatusCreated || after.Running {
+		t.Fatalf("rejected insecure container was changed: state=%#v err=%v", after, err)
+	}
+}
+
+func assertContainerStillRunning(t *testing.T, ctx context.Context, executor *DockerExecutor, ref RuntimeRef) {
+	t.Helper()
+	state, err := executor.Inspect(ctx, ref)
+	if err != nil || !state.Running || state.Status != StatusRunning {
+		t.Fatalf("rejected ownership operation changed container: state=%#v err=%v", state, err)
+	}
+}
+
+func buildDockerFixtureImage(t *testing.T, ctx context.Context) string {
+	t.Helper()
+	_, sourceFile, _, ok := gostdlib.Caller(0)
+	if !ok {
+		t.Fatal("resolve Docker fixture source path")
+	}
+	packageRoot := filepath.Dir(sourceFile)
+	repositoryRoot := filepath.Clean(filepath.Join(packageRoot, "..", ".."))
+	contextRoot := t.TempDir()
+	binaryPath := filepath.Join(contextRoot, "runtime-fixture")
+	buildBinary := exec.CommandContext(
+		ctx, "go", "build", "-buildvcs=false", "-o", binaryPath,
+		"./internal/runtime/testdata/docker-fixture",
+	)
+	buildBinary.Dir = repositoryRoot
+	buildBinary.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if output, err := buildBinary.CombinedOutput(); err != nil {
+		t.Fatalf("build static Docker fixture: %v\n%s", err, output)
+	}
+	image := "coordplane-runtime-test:" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	dockerConfig := filepath.Join(contextRoot, "docker-config")
+	requireNoError(t, os.Mkdir(dockerConfig, 0o700))
+	dockerfile := filepath.Join(packageRoot, "testdata", "docker-fixture", "Dockerfile")
+	buildImage := exec.CommandContext(
+		ctx, "docker", "build", "--network=none", "--pull=false", "-q",
+		"-t", image, "-f", dockerfile, contextRoot,
+	)
+	buildImage.Env = append(os.Environ(), "DOCKER_CONFIG="+dockerConfig)
+	if output, err := buildImage.CombinedOutput(); err != nil {
+		t.Fatalf("build hermetic Docker fixture: %v\n%s", err, output)
 	}
 	t.Cleanup(func() {
-		_ = exec.Command("docker", "rm", "-f", name).Run()
+		cleanup, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		remove := exec.CommandContext(cleanup, "docker", "image", "rm", "-f", image)
+		remove.Env = append(os.Environ(), "DOCKER_CONFIG="+dockerConfig)
+		_ = remove.Run()
 	})
-	result, err := cpruntime.DockerExecClient{}.Exec(ctx, cpruntime.ContainerExecSpec{
-		ContainerName: name,
-		Workdir:       "/",
-		HomeDir:       "/",
-		Command:       []string{"sh", "-lc", "cat"},
-		Stdin:         "coordplane-stdin-gate\n",
-		Timeout:       10 * time.Second,
-	})
-	if err != nil || result.ExitCode != 0 {
-		t.Fatalf("docker exec stdin gate failed: result=%+v err=%v stderr=%s", result, err, result.Stderr)
-	}
-	if string(result.Stdout) != "coordplane-stdin-gate\n" {
-		t.Fatalf("docker exec stdout = %q, want stdin echoed by container process", result.Stdout)
-	}
+	return image
 }
 
-func TestDockerClaudeAuthProbeGateRequiresExplicitEnvironment(t *testing.T) {
-	if os.Getenv("COORDPLANE_DOCKER_CLAUDE_AUTH_GATE") != "1" {
-		t.Skip("set COORDPLANE_DOCKER_CLAUDE_AUTH_GATE=1 to verify real Docker/Claude non-interactive auth probe behavior")
-	}
-	coordlinkPath := os.Getenv("COORDPLANE_COORDLINK_PATH")
-	backendURL := os.Getenv("COORDPLANE_BACKEND_URL")
-	if coordlinkPath == "" || backendURL == "" {
-		t.Skip("real Docker Claude auth gate requires COORDPLANE_COORDLINK_PATH and COORDPLANE_BACKEND_URL")
-	}
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skipf("docker CLI unavailable: %v", err)
-	}
-	image := os.Getenv("COORDPLANE_REAL_CLI_IMAGE")
-	if image == "" {
-		image = os.Getenv("COORDPLANE_DOCKER_IMAGE")
-	}
-	if image == "" {
-		t.Fatal("COORDPLANE_REAL_CLI_IMAGE or COORDPLANE_DOCKER_IMAGE is required for the Claude auth gate")
-	}
-	claudeBin := os.Getenv("COORDPLANE_CLAUDE_BIN")
-	if claudeBin == "" {
-		claudeBin = "/usr/local/bin/claude"
-	}
-	authKeys := splitCSV(os.Getenv("COORDPLANE_CLAUDE_ENV"))
-	if len(authKeys) == 0 {
-		authKeys = claudeenv.RuntimeKeys
-	}
-	expectPass := os.Getenv("COORDPLANE_CLAUDE_AUTH_EXPECT_PASS") == "1"
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-	db, cleanup := newIntegrationDB(t)
-	defer cleanup()
-	runtimeRoot := filepath.Join(t.TempDir(), "docker-runtime")
-	var provider secrets.Provider
-	if len(authKeys) > 0 {
-		provider = secrets.NewEnvProvider(authKeys)
-	}
-	backend := cpruntime.NewDockerRuntime(cpruntime.DockerRuntimeConfig{
-		DB:             db,
-		ProfileName:    "docker-claude-auth-gate",
-		TeamID:         "docker-claude-auth-gate",
-		Image:          image,
-		Network:        os.Getenv("COORDPLANE_DOCKER_NETWORK"),
-		RuntimeRoot:    runtimeRoot,
-		CoordlinkPath:  coordlinkPath,
-		DBPath:         filepath.Join(t.TempDir(), "coordplane.db"),
-		ClaudeBinary:   claudeBin,
-		Ready:          true,
-		SecretProvider: provider,
-	})
-	prepared, err := backend.Prepare(ctx, cpruntime.PrepareRequest{
-		AgentID:        "developer",
-		AttemptID:      "att_docker_claude_auth_gate",
-		AssignmentID:   "asn_docker_claude_auth_gate",
-		LeaseID:        "lease_docker_claude_auth_gate",
-		ContractID:     "ctr_docker_claude_auth_gate",
-		TeamID:         "docker-claude-auth-gate",
-		RuntimeProfile: "docker-claude-auth-gate",
-		CLIBackend:     "claude",
-		BackendURL:     backendURL,
-		WorkspaceName:  "docker-claude-auth-gate-workspace",
-	})
-	if prepared.ContainerName != "" {
-		t.Cleanup(func() {
-			_ = exec.Command("docker", "rm", "-f", prepared.ContainerName).Run()
-		})
-	}
-	if expectPass {
-		if err != nil {
-			t.Fatalf("prepare with configured Claude auth failed: %v", err)
-		}
-		if !prepared.Checks["claude_auth_probe_passed"] {
-			t.Fatalf("prepared checks = %#v, want claude auth probe passed", prepared.Checks)
-		}
-		return
-	}
-	if err == nil {
-		t.Fatalf("prepare without expected Claude auth succeeded with checks %#v; set COORDPLANE_CLAUDE_AUTH_EXPECT_PASS=1 for a passing auth gate", prepared.Checks)
-	}
-	if !strings.Contains(err.Error(), "CLAUDE_AUTH") && !strings.Contains(err.Error(), "CLAUDE_NOT_FOUND") {
-		t.Fatalf("prepare error = %v, want typed Claude auth/probe failure", err)
-	}
-}
-
-func newIntegrationDB(t *testing.T) (*sql.DB, func()) {
-	t.Helper()
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	db.SetMaxOpenConns(1)
-	st := store.New(db)
-	if _, err := st.Migrate(context.Background()); err != nil {
-		_ = db.Close()
-		t.Fatalf("migrate: %v", err)
-	}
-	return db, func() {
-		_ = db.Close()
-	}
-}
-
-func splitCSV(value string) []string {
-	var out []string
-	for _, part := range strings.Split(value, ",") {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			out = append(out, part)
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
 		}
 	}
-	return out
+	return false
 }

@@ -1,387 +1,406 @@
-package coordlinkcli_test
+package coordlinkcli
 
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"reflect"
-	"runtime"
-	"sort"
 	"strings"
+	"syscall"
 	"testing"
 
-	"coordplane/internal/backend"
-	"coordplane/internal/coordlinkcli"
+	"coordplane/internal/core"
+	"coordplane/internal/transport"
 )
 
-func TestCoordlinkCLIUsesBackendTypedResponsesAndDurableCallAudit(t *testing.T) {
-	ctx := context.Background()
-	dir := t.TempDir()
-	app, err := backend.Open(ctx, backend.Config{
-		DBPath:         filepath.Join(dir, "coordplane.db"),
-		ListenAddr:     "127.0.0.1:0",
-		TeamConfigPath: writeTeamConfig(t, dir),
-	})
-	if err != nil {
-		t.Fatalf("open backend: %v", err)
+func TestScopedClientReadsTokenFile(t *testing.T) {
+	root := t.TempDir()
+	socket := filepath.Join(root, "api.sock")
+	operations := &runOperations{wantToken: "file-token"}
+	startCLIServer(t, root, socket, transport.NewRunHandler(operations))
+	tokenFile := filepath.Join(root, "token")
+	if err := os.WriteFile(tokenFile, []byte("file-token\n"), 0o440); err != nil {
+		t.Fatal(err)
 	}
-	defer app.Close()
-	server := httptest.NewServer(app.Handler)
-	defer server.Close()
-
-	env := mapEnv(map[string]string{
-		"COORDPLANE_BACKEND_URL": server.URL,
-		"COORDPLANE_AGENT_ID":    "builder",
-		"COORDPLANE_RUNTIME_ID":  "runtime_test",
-		"COORDPLANE_TOKEN":       "agent-token-test",
-	})
-
-	list := runCLI(t, env, "capability", "list")
-	if list.code != 0 {
-		t.Fatalf("capability list exit = %d stderr=%s stdout=%s", list.code, list.stderr, list.stdout)
-	}
-	listEnvelope := decodeEnvelope(t, list.stdout)
-	if listEnvelope["status"] != "accepted" {
-		t.Fatalf("capability list = %#v, want accepted", listEnvelope)
-	}
-	if names := capabilityNames(t, listEnvelope); strings.Join(names, ",") != "contract.current" {
-		t.Fatalf("capability names = %v, want only contract.current", names)
-	}
-
-	current := runCLI(t, env, "call", "contract.current")
-	if current.code != 1 {
-		t.Fatalf("contract.current exit = %d stderr=%s stdout=%s", current.code, current.stderr, current.stdout)
-	}
-	currentEnvelope := decodeEnvelope(t, current.stdout)
-	if currentEnvelope["status"] != "error" || currentEnvelope["error_code"] != "CONTRACT_CURRENT_FAILED" {
-		t.Fatalf("contract.current envelope = %#v, want backend typed error", currentEnvelope)
-	}
-
-	skillList := runCLI(t, env, "skill", "list")
-	if skillList.code != 0 {
-		t.Fatalf("skill list exit = %d stderr=%s stdout=%s", skillList.code, skillList.stderr, skillList.stdout)
-	}
-	skillListEnvelope := decodeEnvelope(t, skillList.stdout)
-	if skillListEnvelope["status"] != "accepted" || !strings.Contains(skillList.stdout, "coordplane-service") {
-		t.Fatalf("skill list envelope = %#v stdout=%s, want coordplane-service", skillListEnvelope, skillList.stdout)
-	}
-
-	skillRead := runCLI(t, env, "skill", "read", "coordplane-service")
-	if skillRead.code != 0 {
-		t.Fatalf("skill read exit = %d stderr=%s stdout=%s", skillRead.code, skillRead.stderr, skillRead.stdout)
-	}
-	skillReadEnvelope := decodeEnvelope(t, skillRead.stdout)
-	if skillReadEnvelope["status"] != "accepted" || !strings.Contains(skillRead.stdout, "contract.current") {
-		t.Fatalf("skill read envelope = %#v stdout=%s, want content from backend", skillReadEnvelope, skillRead.stdout)
-	}
-
-	unauthorized := runCLI(t, env, "call", "object.read", "--input", `{"object_ref":"obj_sha256_missing"}`)
-	if unauthorized.code != 2 {
-		t.Fatalf("unauthorized exit = %d stderr=%s stdout=%s", unauthorized.code, unauthorized.stderr, unauthorized.stdout)
-	}
-	unauthorizedEnvelope := decodeEnvelope(t, unauthorized.stdout)
-	if unauthorizedEnvelope["status"] != "rejected" || unauthorizedEnvelope["error_code"] != "UNAUTHORIZED_CAPABILITY_CALL" {
-		t.Fatalf("unauthorized envelope = %#v, want typed rejected preserved", unauthorizedEnvelope)
-	}
-
-	if calls := countRows(t, ctx, app.DB, "capability_calls"); calls != 3 {
-		t.Fatalf("capability_calls = %d, want capability.list + two calls", calls)
-	}
-	inspect := getInspect(t, server.URL)
-	counts, ok := inspect["counts"].(map[string]any)
-	if !ok {
-		t.Fatalf("inspect counts = %#v, want object", inspect["counts"])
-	}
-	if got := int64(counts["capability_calls"].(float64)); got != 3 {
-		t.Fatalf("inspect capability_calls = %d, want 3", got)
-	}
-}
-
-func TestCoordlinkCLIThreeAgentFixtureScopesCapabilitiesAndSkills(t *testing.T) {
-	ctx := context.Background()
-	dir := t.TempDir()
-	app, err := backend.Open(ctx, backend.Config{
-		DBPath:         filepath.Join(dir, "coordplane.db"),
-		ListenAddr:     "127.0.0.1:0",
-		TeamConfigPath: threeAgentFixturePath(t),
-	})
-	if err != nil {
-		t.Fatalf("open backend with three-agent fixture: %v", err)
-	}
-	defer app.Close()
-	server := httptest.NewServer(app.Handler)
-	defer server.Close()
-
-	for _, agentID := range []string{"coordinator", "developer", "verifier"} {
-		env := mapEnv(map[string]string{
-			"COORDPLANE_BACKEND_URL": server.URL,
-			"COORDPLANE_AGENT_ID":    agentID,
-			"COORDPLANE_RUNTIME_ID":  "runtime_" + agentID,
-			"COORDPLANE_TOKEN":       "agent-token-test",
-		})
-		list := runCLI(t, env, "capability", "list")
-		if list.code != 0 {
-			t.Fatalf("%s capability list exit = %d stderr=%s stdout=%s", agentID, list.code, list.stderr, list.stdout)
-		}
-		assertNamesEqual(t, capabilityNames(t, decodeEnvelope(t, list.stdout)), threeAgentExpectedCapabilities[agentID])
-
-		skills := runCLI(t, env, "skill", "list")
-		if skills.code != 0 {
-			t.Fatalf("%s skill list exit = %d stderr=%s stdout=%s", agentID, skills.code, skills.stderr, skills.stdout)
-		}
-		assertNamesEqual(t, skillNames(t, decodeEnvelope(t, skills.stdout)), threeAgentExpectedSkills[agentID])
-	}
-
-	developerEnv := mapEnv(map[string]string{
-		"COORDPLANE_BACKEND_URL": server.URL,
-		"COORDPLANE_AGENT_ID":    "developer",
-	})
-	controlledGit := runCLI(t, developerEnv, "skill", "read", "controlled-git")
-	if controlledGit.code != 0 {
-		t.Fatalf("developer skill read exit = %d stderr=%s stdout=%s", controlledGit.code, controlledGit.stderr, controlledGit.stdout)
-	}
-	controlledGitEnvelope := decodeEnvelope(t, controlledGit.stdout)
-	if controlledGitEnvelope["status"] != "accepted" || !strings.Contains(controlledGit.stdout, "git.commit") {
-		t.Fatalf("developer controlled-git read = %#v stdout=%s, want accepted content", controlledGitEnvelope, controlledGit.stdout)
-	}
-
-	verifierEnv := mapEnv(map[string]string{
-		"COORDPLANE_BACKEND_URL": server.URL,
-		"COORDPLANE_AGENT_ID":    "verifier",
-	})
-	deniedSkill := runCLI(t, verifierEnv, "skill", "read", "controlled-git")
-	if deniedSkill.code != 2 {
-		t.Fatalf("verifier skill read exit = %d stderr=%s stdout=%s", deniedSkill.code, deniedSkill.stderr, deniedSkill.stdout)
-	}
-	deniedSkillEnvelope := decodeEnvelope(t, deniedSkill.stdout)
-	if deniedSkillEnvelope["status"] != "rejected" || deniedSkillEnvelope["error_code"] != "SKILL_READ_REJECTED" {
-		t.Fatalf("verifier controlled-git read = %#v, want typed rejected", deniedSkillEnvelope)
-	}
-	if _, ok := deniedSkillEnvelope["data"]; ok {
-		t.Fatalf("verifier unauthorized skill read leaked data: %#v", deniedSkillEnvelope)
-	}
-
-	deniedCapability := runCLI(t, verifierEnv, "call", "git.commit", "--input", `{"message":"not allowed","paths":["feature.txt"]}`)
-	if deniedCapability.code != 2 {
-		t.Fatalf("verifier git.commit exit = %d stderr=%s stdout=%s", deniedCapability.code, deniedCapability.stderr, deniedCapability.stdout)
-	}
-	deniedCapabilityEnvelope := decodeEnvelope(t, deniedCapability.stdout)
-	if deniedCapabilityEnvelope["status"] != "rejected" || deniedCapabilityEnvelope["error_code"] != "UNAUTHORIZED_CAPABILITY_CALL" {
-		t.Fatalf("verifier git.commit = %#v, want unauthorized typed rejected", deniedCapabilityEnvelope)
-	}
-	if _, ok := deniedCapabilityEnvelope["data"]; ok {
-		t.Fatalf("verifier unauthorized capability call leaked data: %#v", deniedCapabilityEnvelope)
-	}
-	if calls := countRows(t, ctx, app.DB, "capability_calls"); calls != 4 {
-		t.Fatalf("capability_calls = %d, want three capability.list audits plus rejected git.commit", calls)
-	}
-}
-
-type cliResult struct {
-	code   int
-	stdout string
-	stderr string
-}
-
-func runCLI(t *testing.T, env func(string) string, args ...string) cliResult {
-	t.Helper()
+	getenv := scopedEnvironment(socket, tokenFile)
 	var stdout, stderr bytes.Buffer
-	code := coordlinkcli.Run(context.Background(), args, env, strings.NewReader(""), &stdout, &stderr)
-	return cliResult{code: code, stdout: stdout.String(), stderr: stderr.String()}
-}
-
-func mapEnv(values map[string]string) func(string) string {
-	return func(key string) string {
-		return values[key]
+	code := Run(context.Background(), []string{
+		"progress", "--summary", "from file", "--request-id", "token-file-progress", "--output", "json",
+	}, getenv, nil, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	if operations.progressCalls != 1 {
+		t.Fatalf("progress calls = %d, want 1", operations.progressCalls)
 	}
 }
 
-func writeTeamConfig(t *testing.T, dir string) string {
+func TestRetryingClientRetriesOnlyTransientErrorsWithStableRequestID(t *testing.T) {
+	transient := []error{
+		fmt.Errorf("dial: %w", syscall.ECONNREFUSED),
+		core.NewError(core.CodeRunStarting, "starting", true),
+		core.NewError(core.CodeRuntimeUnavailable, "recovering", true),
+	}
+	next := &retryScriptClient{errors: transient}
+	client := &retryingClient{next: next, maxAttempts: 4}
+	input := core.ProgressInput{Summary: "working", RequestID: "stable-request"}
+	var output core.Event
+	if err := client.JSON(context.Background(), http.MethodPost, "/v1/progress", input, &output); err != nil {
+		t.Fatal(err)
+	}
+	if next.calls != 4 {
+		t.Fatalf("calls = %d, want 4", next.calls)
+	}
+	for index, requestID := range next.requestIDs {
+		if requestID != input.RequestID {
+			t.Fatalf("attempt %d request ID = %q, want %q", index, requestID, input.RequestID)
+		}
+	}
+
+	denied := &retryScriptClient{errors: []error{core.NewError(core.CodeScopeDenied, "denied", false)}}
+	client = &retryingClient{next: denied, maxAttempts: 3}
+	if err := client.JSON(context.Background(), http.MethodPost, "/v1/progress", input, &output); !core.IsCode(err, core.CodeScopeDenied) {
+		t.Fatalf("scope error = %v, want %s", err, core.CodeScopeDenied)
+	}
+	if denied.calls != 1 {
+		t.Fatalf("scope denial retried %d times", denied.calls)
+	}
+
+	exhausted := &retryScriptClient{errors: []error{
+		fmt.Errorf("dial 1: %w", syscall.ENOENT),
+		fmt.Errorf("dial 2: %w", syscall.ENOENT),
+		fmt.Errorf("dial 3: %w", syscall.ENOENT),
+	}}
+	client = &retryingClient{next: exhausted, maxAttempts: 3}
+	if err := client.JSON(context.Background(), http.MethodPost, "/v1/progress", input, &output); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("exhausted error = %v, want ENOENT", err)
+	}
+	if exhausted.calls != 3 {
+		t.Fatalf("exhausted calls = %d, want 3", exhausted.calls)
+	}
+}
+
+type retryScriptClient struct {
+	errors     []error
+	calls      int
+	requestIDs []string
+}
+
+func (c *retryScriptClient) JSON(_ context.Context, _ string, _ string, input, output any) error {
+	c.calls++
+	if progress, ok := input.(core.ProgressInput); ok {
+		c.requestIDs = append(c.requestIDs, progress.RequestID)
+	}
+	if c.calls <= len(c.errors) && c.errors[c.calls-1] != nil {
+		return c.errors[c.calls-1]
+	}
+	if event, ok := output.(*core.Event); ok {
+		*event = core.Event{Kind: "task.progress"}
+	}
+	return nil
+}
+
+func (c *retryScriptClient) CloseIdleConnections() {}
+
+func TestLegacyCommandsAreRejectedBeforeSocketLookup(t *testing.T) {
+	for _, args := range [][]string{{"capability", "list"}, {"skill", "list"}, {"call", "anything"}} {
+		var stdout, stderr bytes.Buffer
+		code := Run(context.Background(), args, func(string) string { return "" }, nil, &stdout, &stderr)
+		if code == 0 || !bytes.Contains(stderr.Bytes(), []byte("unknown coordlink command")) {
+			t.Fatalf("args=%v code=%d stderr=%s", args, code, stderr.String())
+		}
+		if bytes.Contains(stderr.Bytes(), []byte(socketEnvironment+" is required")) {
+			t.Fatalf("legacy command attempted socket setup: %s", stderr.String())
+		}
+	}
+}
+
+func TestProgressUsesPerRunSocketAndBearerToken(t *testing.T) {
+	root := t.TempDir()
+	socket := filepath.Join(root, "api.sock")
+	operations := &runOperations{wantToken: "run-token"}
+	startCLIServer(t, root, socket, transport.NewRunHandler(operations))
+	tokenFile := writeRunTokenFile(t, "run-token")
+	getenv := scopedEnvironment(socket, tokenFile)
+	var stdout, stderr bytes.Buffer
+	code := Run(context.Background(), []string{"progress", "--summary", "must-not-commit", "--request-id", "req-invalid", "--output", "xml"}, getenv, nil, &stdout, &stderr)
+	if code == 0 || !bytes.Contains(stderr.Bytes(), []byte("--output must be human or json")) {
+		t.Fatalf("invalid output code=%d stderr=%s", code, stderr.String())
+	}
+	if operations.progressCalls != 0 {
+		t.Fatalf("invalid output performed %d progress mutations", operations.progressCalls)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run(context.Background(), []string{"progress", "--summary", "working", "--request-id", "req-1", "--output", "json"}, getenv, nil, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	if operations.summary != "working" || operations.requestID != "req-1" {
+		t.Fatalf("progress input = %q/%q", operations.summary, operations.requestID)
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte(`"kind":"task.progress"`)) {
+		t.Fatalf("stdout=%s", stdout.String())
+	}
+}
+
+func TestP2CommandsUseOnlyTheFixedPerRunSurface(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		method     string
+		path       string
+		bodyValues map[string]any
+	}{
+		{name: "task current", args: []string{"task", "current", "--output", "json"}, method: http.MethodGet, path: "/v1/task/current"},
+		{name: "task show", args: []string{"task", "show", "task/child", "--output", "json"}, method: http.MethodGet, path: "/v1/task/task%2Fchild"},
+		{
+			name:   "task create",
+			args:   []string{"task", "create", "--agent", "agent-b", "--title", "review", "--description", "inspect", "--priority", "7", "--max-retries", "2", "--source-task", "task-source", "--request-id", "req-create", "--ack-message", "msg-1", "--ack-message", "msg-2", "--output", "json"},
+			method: http.MethodPost,
+			path:   "/v1/task/create",
+			bodyValues: map[string]any{
+				"assignee_agent_id": "agent-b", "title": "review", "description": "inspect",
+				"priority": float64(7), "max_retries": float64(2), "source_task_id": "task-source", "request_id": "req-create", "ack_message_ids": []any{"msg-1", "msg-2"},
+			},
+		},
+		{
+			name:       "task wait",
+			args:       []string{"task", "wait", "--reason", "children running", "--request-id", "req-wait", "--ack-message", "msg-3", "--output", "json"},
+			method:     http.MethodPost,
+			path:       "/v1/task/outcome",
+			bodyValues: map[string]any{"outcome": "wait", "reason": "children running", "request_id": "req-wait", "ack_message_ids": []any{"msg-3"}},
+		},
+		{
+			name:       "task submit",
+			args:       []string{"task", "submit", "--summary", "ready", "--expected-head", "abc123", "--request-id", "req-submit", "--ack-message", "msg-4", "--output", "json"},
+			method:     http.MethodPost,
+			path:       "/v1/task/outcome",
+			bodyValues: map[string]any{"outcome": "submit", "summary": "ready", "expected_head": "abc123", "request_id": "req-submit", "ack_message_ids": []any{"msg-4"}},
+		},
+		{
+			name:       "task fail",
+			args:       []string{"task", "fail", "--reason", "cannot proceed", "--request-id", "req-fail", "--ack-message", "msg-5", "--output", "json"},
+			method:     http.MethodPost,
+			path:       "/v1/task/outcome",
+			bodyValues: map[string]any{"outcome": "fail", "reason": "cannot proceed", "request_id": "req-fail", "ack_message_ids": []any{"msg-5"}},
+		},
+		{
+			name:       "task accept",
+			args:       []string{"task", "accept", "task/child", "--integration-agent", "agent-i", "--request-id", "req-accept", "--ack-message", "msg-accept", "--output", "json"},
+			method:     http.MethodPost,
+			path:       "/v1/task/task%2Fchild/accept",
+			bodyValues: map[string]any{"integration_agent_id": "agent-i", "request_id": "req-accept", "ack_message_ids": []any{"msg-accept"}},
+		},
+		{
+			name:       "task rework",
+			args:       []string{"task", "rework", "task/child", "--reason", "needs changes", "--request-id", "req-rework", "--ack-message", "msg-rework", "--output", "json"},
+			method:     http.MethodPost,
+			path:       "/v1/task/task%2Fchild/rework",
+			bodyValues: map[string]any{"reason": "needs changes", "request_id": "req-rework", "ack_message_ids": []any{"msg-rework"}},
+		},
+		{name: "inbox list", args: []string{"inbox", "list", "--output", "json"}, method: http.MethodGet, path: "/v1/inbox"},
+		{name: "inbox read", args: []string{"inbox", "read", "msg/read", "--output", "json"}, method: http.MethodGet, path: "/v1/inbox/msg%2Fread"},
+		{
+			name:       "inbox ack",
+			args:       []string{"inbox", "ack", "--ack-message", "msg-6", "--ack-message", "msg-7", "--request-id", "req-ack", "--output", "json"},
+			method:     http.MethodPost,
+			path:       "/v1/inbox/ack",
+			bodyValues: map[string]any{"message_ids": []any{"msg-6", "msg-7"}, "request_id": "req-ack"},
+		},
+		{
+			name:       "message to boss",
+			args:       []string{"message", "send", "--to-boss", "--task", "task-parent", "--body", "result", "--reply-to", "msg-8", "--request-id", "req-boss", "--ack-message", "msg-8", "--output", "json"},
+			method:     http.MethodPost,
+			path:       "/v1/message",
+			bodyValues: map[string]any{"recipient_kind": "boss", "task_id": "task-parent", "body": "result", "reply_to_message_id": "msg-8", "request_id": "req-boss", "ack_message_ids": []any{"msg-8"}},
+		},
+		{
+			name:       "message to agent",
+			args:       []string{"message", "send", "--to-agent", "agent-c", "--task", "task-child", "--wake", "--body", "question", "--request-id", "req-agent", "--output", "json"},
+			method:     http.MethodPost,
+			path:       "/v1/message",
+			bodyValues: map[string]any{"recipient_kind": "agent", "recipient_id": "agent-c", "task_id": "task-child", "wake": true, "body": "question", "request_id": "req-agent"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := runRecordedCommand(t, test.args)
+			if request.method != test.method || request.path != test.path {
+				t.Fatalf("request = %s %s, want %s %s", request.method, request.path, test.method, test.path)
+			}
+			if request.authorization != "Bearer run-token" {
+				t.Fatalf("Authorization = %q, want scoped bearer", request.authorization)
+			}
+			for key, want := range test.bodyValues {
+				if got := request.body[key]; !jsonValuesEqual(got, want) {
+					t.Errorf("body[%q] = %#v, want %#v; body=%#v", key, got, want, request.body)
+				}
+			}
+		})
+	}
+}
+
+func TestMessageSendRejectsAmbiguousRecipientBeforeMutation(t *testing.T) {
+	tokenFile := writeRunTokenFile(t, "run-token")
+	for _, args := range [][]string{
+		{"message", "send", "--body", "missing recipient"},
+		{"message", "send", "--to-boss", "--to-agent", "agent-b", "--body", "ambiguous"},
+	} {
+		var stdout, stderr bytes.Buffer
+		code := Run(context.Background(), args, scopedEnvironment(filepath.Join(t.TempDir(), "missing.sock"), tokenFile), nil, &stdout, &stderr)
+		if code == 0 || !strings.Contains(stderr.String(), "exactly one of --to-boss or --to-agent") {
+			t.Fatalf("args=%v code=%d stderr=%s", args, code, stderr.String())
+		}
+	}
+}
+
+type recordedRequest struct {
+	method        string
+	path          string
+	authorization string
+	body          map[string]any
+}
+
+func runRecordedCommand(t *testing.T, args []string) recordedRequest {
 	t.Helper()
-	path := filepath.Join(dir, "team.yaml")
-	raw := []byte(`team_id: coordlink-test
-version: 1
-runtime_profiles:
-  external-local:
-    kind: external
-agents:
-  - id: builder
-    runtime_profile: external-local
-    cli_backend: fake
-    skills:
-      - coordplane-service
-    capabilities:
-      - contract.current
-`)
-	if err := os.WriteFile(path, raw, 0o644); err != nil {
-		t.Fatalf("write TeamConfig: %v", err)
+	root := t.TempDir()
+	socket := filepath.Join(root, "api.sock")
+	requests := make(chan recordedRequest, 1)
+	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		record := recordedRequest{method: request.Method, path: request.URL.EscapedPath(), authorization: request.Header.Get("Authorization")}
+		if request.Body != nil {
+			defer request.Body.Close()
+			if raw, err := io.ReadAll(request.Body); err != nil {
+				t.Errorf("read request body: %v", err)
+			} else if len(bytes.TrimSpace(raw)) > 0 {
+				if err := json.Unmarshal(raw, &record.body); err != nil {
+					t.Errorf("decode request body %q: %v", raw, err)
+				}
+			}
+		}
+		requests <- record
+		writer.Header().Set("Content-Type", "application/json")
+		data := `{}`
+		if request.URL.Path == "/v1/inbox" || request.URL.Path == "/v1/inbox/ack" {
+			data = `[]`
+		}
+		_, _ = io.WriteString(writer, `{"ok":true,"data":`+data+`,"error":null}`)
+	})
+	startCLIServer(t, root, socket, handler)
+	tokenFile := writeRunTokenFile(t, "run-token")
+	getenv := scopedEnvironment(socket, tokenFile)
+	var stdout, stderr bytes.Buffer
+	if code := Run(context.Background(), args, getenv, nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("Run(%v) code=%d stderr=%s", args, code, stderr.String())
+	}
+	return <-requests
+}
+
+func scopedEnvironment(socket, tokenFile string) func(string) string {
+	return func(name string) string {
+		switch name {
+		case socketEnvironment:
+			return socket
+		case tokenFileEnvironment:
+			return tokenFile
+		default:
+			return ""
+		}
+	}
+}
+
+func startCLIServer(t *testing.T, root, socket string, handler http.Handler) {
+	t.Helper()
+	server, err := transport.NewUnixServer(root, socket, handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- server.Serve() }()
+	t.Cleanup(func() {
+		_ = server.Close()
+		<-done
+	})
+}
+
+func writeRunTokenFile(t *testing.T, token string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(path, []byte(token+"\n"), 0o440); err != nil {
+		t.Fatal(err)
 	}
 	return path
 }
 
-func threeAgentFixturePath(t *testing.T) string {
-	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("resolve test path: runtime caller unavailable")
-	}
-	return filepath.Join(filepath.Dir(file), "..", "..", "team_config", "fixtures", "cp_accept_001_three_agent.yaml")
+func jsonValuesEqual(left, right any) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
 }
 
-func decodeEnvelope(t *testing.T, raw string) map[string]any {
-	t.Helper()
-	var out map[string]any
-	if err := json.Unmarshal([]byte(raw), &out); err != nil {
-		t.Fatalf("decode envelope: %v; raw=%s", err, raw)
-	}
-	return out
+type runOperations struct {
+	wantToken     string
+	summary       string
+	requestID     string
+	progressCalls int
 }
 
-func capabilityNames(t *testing.T, envelope map[string]any) []string {
-	t.Helper()
-	rawData, ok := envelope["data"].([]any)
-	if !ok {
-		t.Fatalf("data = %#v, want array", envelope["data"])
-	}
-	var names []string
-	for _, raw := range rawData {
-		definition, ok := raw.(map[string]any)
-		if !ok {
-			t.Fatalf("definition = %#v, want object", raw)
-		}
-		name, ok := definition["name"].(string)
-		if !ok {
-			t.Fatalf("name = %#v, want string", definition["name"])
-		}
-		names = append(names, name)
-	}
-	return names
+func (o *runOperations) RequireReady() error { return nil }
+
+func (o *runOperations) CurrentTask(context.Context, string) (core.CurrentTaskResult, error) {
+	return core.CurrentTaskResult{}, nil
 }
 
-func skillNames(t *testing.T, envelope map[string]any) []string {
-	t.Helper()
-	rawData, ok := envelope["data"].([]any)
-	if !ok {
-		t.Fatalf("data = %#v, want array", envelope["data"])
-	}
-	var names []string
-	for _, raw := range rawData {
-		summary, ok := raw.(map[string]any)
-		if !ok {
-			t.Fatalf("summary = %#v, want object", raw)
-		}
-		name, ok := summary["name"].(string)
-		if !ok {
-			t.Fatalf("name = %#v, want string", summary["name"])
-		}
-		names = append(names, name)
-	}
-	return names
+func (o *runOperations) TaskForRun(context.Context, string, string) (core.Task, error) {
+	return core.Task{}, nil
 }
 
-func assertNamesEqual(t *testing.T, got, want []string) {
-	t.Helper()
-	gotCopy := append([]string(nil), got...)
-	wantCopy := append([]string(nil), want...)
-	sort.Strings(gotCopy)
-	sort.Strings(wantCopy)
-	if !reflect.DeepEqual(gotCopy, wantCopy) {
-		t.Fatalf("names = %v, want %v", gotCopy, wantCopy)
-	}
+func (o *runOperations) CreateChildTask(context.Context, core.CreateChildTaskInput) (core.Task, error) {
+	return core.Task{}, nil
 }
 
-var threeAgentExpectedCapabilities = map[string][]string{
-	"coordinator": {
-		"assignment.next",
-		"assignment.watch",
-		"communication.read",
-		"contract.add",
-		"contract.complete",
-		"contract.context",
-		"contract.current",
-		"contract.wait",
-		"mailbox.get",
-		"mailbox.list",
-		"mailbox.resolve",
-		"message.send",
-		"object.inspect",
-		"object.read",
-		"report.submit",
-	},
-	"developer": {
-		"assignment.next",
-		"assignment.watch",
-		"changeset.abandon",
-		"changeset.submit",
-		"communication.read",
-		"contract.complete",
-		"contract.context",
-		"contract.current",
-		"git.abort",
-		"git.commit",
-		"git.conflicts",
-		"git.diff",
-		"git.log",
-		"git.merge_apply",
-		"git.merge_preview",
-		"git.recover",
-		"git.resolve",
-		"git.rollback",
-		"git.status",
-		"object.inspect",
-		"object.read",
-		"report.submit",
-		"workspace.prepare",
-		"workspace.status",
-		"workspace.sync",
-	},
-	"verifier": {
-		"assignment.next",
-		"assignment.watch",
-		"communication.read",
-		"contract.complete",
-		"contract.context",
-		"contract.current",
-		"mailbox.get",
-		"mailbox.list",
-		"mailbox.resolve",
-		"object.inspect",
-		"object.read",
-		"report.submit",
-		"validation.assessment",
-	},
+func (o *runOperations) RequestOutcome(context.Context, core.OutcomeInput) (core.OutcomeResult, error) {
+	return core.OutcomeResult{}, nil
 }
 
-var threeAgentExpectedSkills = map[string][]string{
-	"coordinator": {"contract-delegation", "coordplane-service"},
-	"developer":   {"controlled-git", "coordplane-service"},
-	"verifier":    {"coordplane-service"},
+func (o *runOperations) RequestAccept(context.Context, core.AcceptInput) (core.Task, error) {
+	return core.Task{}, nil
 }
 
-func countRows(t *testing.T, ctx context.Context, db *sql.DB, table string) int64 {
-	t.Helper()
-	var count int64
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+table).Scan(&count); err != nil {
-		t.Fatalf("count %s: %v", table, err)
-	}
-	return count
+func (o *runOperations) ReworkTask(context.Context, core.TaskActionInput) (core.Task, error) {
+	return core.Task{}, nil
 }
 
-func getInspect(t *testing.T, backendURL string) map[string]any {
-	t.Helper()
-	httpResp, httpErr := http.Get(backendURL + "/inspect")
-	if httpErr != nil {
-		t.Fatalf("GET inspect: %v", httpErr)
-	}
-	defer httpResp.Body.Close()
-	var out map[string]any
-	if err := json.NewDecoder(httpResp.Body).Decode(&out); err != nil {
-		t.Fatalf("decode inspect: %v", err)
-	}
-	return out
+func (o *runOperations) Inbox(context.Context, string) ([]core.Message, error) {
+	return nil, nil
 }
+
+func (o *runOperations) InboxMessage(context.Context, string, string) (core.Message, error) {
+	return core.Message{}, nil
+}
+
+func (o *runOperations) AcknowledgeAgentMessages(context.Context, core.AcknowledgeMessagesInput) ([]core.Message, error) {
+	return nil, nil
+}
+
+func (o *runOperations) SendAgentMessage(context.Context, core.SendMessageInput) (core.Message, error) {
+	return core.Message{}, nil
+}
+
+func (o *runOperations) Progress(_ context.Context, input core.ProgressInput) (core.Event, error) {
+	o.progressCalls++
+	if input.Token != o.wantToken {
+		return core.Event{}, core.NewError(core.CodeScopeDenied, "bad token", false)
+	}
+	o.summary, o.requestID = input.Summary, input.RequestID
+	return core.Event{ID: 1, Kind: "task.progress", EntityID: "task-1"}, nil
+}
+
+var _ transport.RunOperations = (*runOperations)(nil)

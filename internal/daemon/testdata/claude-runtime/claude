@@ -1,0 +1,57 @@
+#!/bin/sh
+set -eu
+
+resuming=false
+[ "${1:-}" = "-p" ] && [ "${2:-}" = "--bare" ] && [ "${3:-}" = "--verbose" ]
+[ "${4:-}" = "--output-format" ] && [ "${5:-}" = "stream-json" ]
+[ "${6:-}" = "--dangerously-skip-permissions" ]
+shift 6
+if [ "${1:-}" = "--resume" ]; then
+    resuming=true
+    [ -n "${2:-}" ]
+    shift 2
+fi
+[ "${1:-}" = "--" ] && [ "$#" -eq 2 ]
+
+echo '{"type":"system","subtype":"init","session_id":"scripted-session-p3"}'
+bootstrap=/run/coordplane/bootstrap
+if grep -q "crash matrix" "$bootstrap"; then
+    sleep 0.3
+fi
+/usr/local/bin/coordlink progress --summary "provider process is live" --request-id scripted-progress --output json >/dev/null
+
+if grep -q "resume error" "$bootstrap"; then
+    if [ "$resuming" = true ]; then
+      echo '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"scripted resume failure"}'
+      exit 2
+    fi
+    if [ ! -f /home/agent/.resume-fallback-started ]; then
+      : > /home/agent/.resume-fallback-started
+      exit 0
+    fi
+    /usr/local/bin/coordlink task wait --reason "fresh fallback established" --request-id scripted-wait --output json >/dev/null
+    sleep 30
+elif grep -q "outcome then hold" "$bootstrap"; then
+    /usr/local/bin/coordlink task wait --reason "durable before restart" --request-id scripted-outcome-before-restart --output json >/dev/null
+    sleep 30
+elif grep -q "verify all launch messages" "$bootstrap"; then
+    count=$(grep -c '^- \[' "$bootstrap")
+    [ "$count" -gt 20 ]
+    grep -q '\[body omitted: aggregate limit\]' "$bootstrap"
+    echo "$count" > /workspace/project/bootstrap-message-count
+    sleep 2
+    set -- task wait --reason "all bootstrap message IDs observed" --request-id scripted-bootstrap-wait
+    for id in $(sed -n 's/^- \[\([^]]*\)\].*/\1/p' "$bootstrap"); do
+      set -- "$@" --ack-message "$id"
+    done
+    /usr/local/bin/coordlink "$@" --output json >/dev/null
+    sleep 30
+elif grep -q "exit after active for crash matrix" "$bootstrap"; then
+    sleep 1
+elif grep -q "hold until stopped" "$bootstrap"; then
+    echo "dirty runtime state" > /workspace/project/dirty-runtime.txt
+    sleep 30
+fi
+
+echo '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
+echo '{"type":"assistant","message":"done completed"}'

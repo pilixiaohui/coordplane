@@ -1,822 +1,263 @@
-package runtime_test
+package runtime
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"coordplane/internal/claudeenv"
-	"coordplane/internal/coordination"
-	cpruntime "coordplane/internal/runtime"
-	"coordplane/internal/secrets"
-	"coordplane/internal/skills"
-	"coordplane/internal/store"
-	"coordplane/internal/teamconfig"
-
-	_ "modernc.org/sqlite"
+	"coordplane/tests/testsupport"
 )
 
-func TestRuntimeEnvAllowlistRejectsForbiddenKeys(t *testing.T) {
-	env, err := cpruntime.BuildRuntimeEnv(cpruntime.EnvironmentInput{
-		BackendURL:    "http://coordplane.test",
-		AgentID:       "developer",
-		RuntimeID:     "rt_docker_test",
-		AttemptID:     "att_test",
-		AssignmentID:  "asn_test",
-		LeaseID:       "lease_test",
-		Workspace:     cpruntime.ContainerWorkspacePath,
-		CLIBackend:    "fake",
-		TeamID:        "team-test",
-		WorkspaceName: "workspace-test",
-	})
+var requireNoError = testsupport.RequireNoError
+
+func requireRedactedOwnershipError(t *testing.T, err error) {
+	t.Helper()
+	if !errors.Is(err, ErrOwnership) {
+		t.Fatal("drift did not return the generic ownership error")
+	}
+	for _, forbidden := range []string{"PROVIDER_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "provider-secret", "rotated-provider-secret", environmentValueDigest("provider-secret"), environmentValueDigest("rotated-provider-secret")} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Fatal("ownership error exposed sensitive environment detail")
+		}
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func TestDockerExecutorPreservesCallerCancellation(t *testing.T) {
+	executor := &DockerExecutor{client: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		<-request.Context().Done()
+		return nil, request.Context().Err()
+	})}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := executor.Ping(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled Docker request error = %v, want context.Canceled", err)
+	}
+	if errors.Is(err, ErrUnavailable) {
+		t.Fatalf("caller cancellation was misclassified as Docker unavailable: %v", err)
+	}
+}
+
+func TestContainerSpecRejectsRootAndSymlinkMounts(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	link := filepath.Join(root, "link")
+	requireNoError(t, os.Mkdir(real, 0o700))
+	requireNoError(t, os.Symlink(real, link))
+	spec := validTestSpec(real)
+	spec.User = "0:0"
+	if err := validateContainerSpec(&spec); err == nil {
+		t.Fatal("root container user was accepted")
+	}
+	spec = validTestSpec(link)
+	if err := validateContainerSpec(&spec); err == nil {
+		t.Fatal("symlink mount source was accepted")
+	}
+}
+
+func TestInspectFactRequiresEveryOwnershipFence(t *testing.T) {
+	ref := testRef()
+	payload := dockerInspect{ID: "container-id", Name: "/" + ref.ContainerName}
+	payload.Config.Labels = labelsFor(ref)
+	payload.Config.Image = "agent:test"
+	payload.Config.Entrypoint = []string{"/runtime-fixture"}
+	payload.Config.Cmd = []string{"hold"}
+	payload.Config.Env = []string{"HOME=/home/agent", "PROVIDER_TOKEN=inspect-secret"}
+	payload.State.Status = "created"
+	payload.HostConfig.RestartPolicy.Name = "no"
+	init := true
+	payload.HostConfig.Init = &init
+	payload.HostConfig.Tmpfs = map[string]string{"/tmp": "rw,nosuid,nodev,size=8388608"}
+	state, err := inspectFact(payload, ref)
 	if err != nil {
-		t.Fatalf("build env: %v", err)
+		t.Fatalf("matching ownership rejected: %v", err)
 	}
-	if err := cpruntime.ValidateRuntimeEnv(env); err != nil {
-		t.Fatalf("valid env rejected: %v", err)
+	if !equalStrings(state.Entrypoint, payload.Config.Entrypoint) ||
+		!equalStrings(state.CommandArgs, payload.Config.Cmd) || !state.Init ||
+		state.Tmpfs["/tmp"] != payload.HostConfig.Tmpfs["/tmp"] {
+		t.Fatalf("inspect omitted adoption facts: %#v", state)
 	}
-	for _, key := range []string{"PATH", "COORDPLANE_DB_PATH", "COORDPLANE_RUNTIME_ROOT"} {
-		t.Run(key, func(t *testing.T) {
-			unsafe := cloneStringMap(env)
-			unsafe[key] = "forbidden"
-			if err := cpruntime.ValidateRuntimeEnv(unsafe); err == nil {
-				t.Fatalf("ValidateRuntimeEnv accepted forbidden key %s", key)
+	if rendered := fmt.Sprintf("%#v", state); strings.Contains(rendered, "inspect-secret") {
+		t.Fatalf("inspect fact leaked environment plaintext: %s", rendered)
+	}
+	for label, value := range labelsFor(ref) {
+		t.Run(label, func(t *testing.T) {
+			changed := payload
+			changed.Config.Labels = labelsFor(ref)
+			changed.Config.Labels[label] = value + "-wrong"
+			if _, err := inspectFact(changed, ref); !errors.Is(err, ErrOwnership) {
+				t.Fatalf("mismatched %s error = %v", label, err)
 			}
 		})
 	}
 }
 
-func TestRuntimeEnvAllowlistAcceptsOnlyConfiguredClaudeCLIEnv(t *testing.T) {
-	env, err := cpruntime.BuildRuntimeEnv(cpruntime.EnvironmentInput{
-		BackendURL:    "http://coordplane.test",
-		AgentID:       "developer",
-		RuntimeID:     "rt_docker_test",
-		AttemptID:     "att_test",
-		AssignmentID:  "asn_test",
-		LeaseID:       "lease_test",
-		Workspace:     cpruntime.ContainerWorkspacePath,
-		CLIBackend:    "claude",
-		TeamID:        "team-test",
-		WorkspaceName: "workspace-test",
-	})
-	if err != nil {
-		t.Fatalf("build env: %v", err)
-	}
-	for _, key := range claudeenv.RuntimeKeys {
-		withClaudeEnv := cloneStringMap(env)
-		withClaudeEnv[key] = "configured"
-		if err := cpruntime.ValidateRuntimeEnv(withClaudeEnv); err != nil {
-			t.Fatalf("ValidateRuntimeEnv rejected configured Claude CLI env %s: %v", key, err)
-		}
-	}
-	for _, key := range []string{"ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "CLAUDE_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"} {
-		withLegacyEnv := cloneStringMap(env)
-		withLegacyEnv[key] = "legacy"
-		if err := cpruntime.ValidateRuntimeEnv(withLegacyEnv); err == nil {
-			t.Fatalf("ValidateRuntimeEnv accepted legacy Claude env key %s", key)
-		}
-	}
-}
-
-func TestDockerSafeNameIsDeterministicAndDockerCompatible(t *testing.T) {
-	got := cpruntime.DockerSafeName("CoordPlane/Team A:Developer#01")
-	if got != "coordplane-team-a-developer-01" {
-		t.Fatalf("safe name = %q, want docker-compatible normalized name", got)
-	}
-}
-
-func TestRunnerStartsDockerRuntimeWithDurableEvidenceAndScopedEnv(t *testing.T) {
-	ctx := context.Background()
-	h := newDockerRuntimeHarness(t, nil)
-	add := addContract(t, ctx, h.coordination, "developer")
-
-	session, err := h.runner.StartNext(ctx, "developer")
-	if err != nil {
-		t.Fatalf("start docker runtime: %v", err)
-	}
-	specs := h.docker.Specs()
-	if len(specs) != 1 {
-		t.Fatalf("docker specs = %d, want 1", len(specs))
-	}
-	spec := specs[0]
-	if spec.Env["COORDPLANE_AGENT_ID"] != "developer" ||
-		spec.Env["COORDPLANE_LEASE_ID"] != session.LeaseID ||
-		spec.Env["COORDPLANE_ATTEMPT_ID"] != session.AttemptID ||
-		spec.Env["COORDPLANE_WORKSPACE"] != cpruntime.ContainerWorkspacePath ||
-		spec.Env["COORDPLANE_RUNTIME_ID"] == "" ||
-		spec.Env["COORDPLANE_TOKEN"] == "" {
-		t.Fatalf("docker env = %#v, want scoped runtime identity", spec.Env)
-	}
-	if strings.Contains(mustJSON(t, spec.Env), "DB_PATH") || strings.Contains(mustJSON(t, spec.Env), "RUNTIME_ROOT") {
-		t.Fatalf("docker env leaked forbidden host setting: %#v", spec.Env)
-	}
-	assertMount(t, spec.Mounts, cpruntime.ContainerWorkspacePath, false)
-	assertMount(t, spec.Mounts, cpruntime.ContainerHomePath, false)
-	assertMount(t, spec.Mounts, cpruntime.ContainerCoordlinkPath, true)
-	if spec.User == "" {
-		t.Fatalf("docker spec user is empty, want numeric execution user for bind-mounted workspace ownership")
-	}
-
-	starts := h.fake.Starts()
-	if len(starts) != 1 {
-		t.Fatalf("fake starts = %d, want 1", len(starts))
-	}
-	start := starts[0]
-	if start.RuntimeID != spec.Env["COORDPLANE_RUNTIME_ID"] ||
-		start.Workspace != cpruntime.ContainerWorkspacePath ||
-		start.HomeDir != cpruntime.ContainerHomePath ||
-		start.Env["COORDPLANE_TOKEN"] != spec.Env["COORDPLANE_TOKEN"] {
-		t.Fatalf("adapter start = %+v, want docker-prepared route/env", start)
-	}
-	attempt := attemptRow(t, ctx, h.db, session.AttemptID)
-	if attempt.RuntimeKind != "docker" || attempt.Status != "running" {
-		t.Fatalf("attempt = %+v, want running docker attempt", attempt)
-	}
-	route := routeRow(t, ctx, h.db, session.Route.ID)
-	if route.RuntimeID != spec.Env["COORDPLANE_RUNTIME_ID"] ||
-		route.Workdir != cpruntime.ContainerWorkspacePath ||
-		route.HomeDir != cpruntime.ContainerHomePath {
-		t.Fatalf("route = %+v, want container-visible docker paths", route)
-	}
-	if got := assignmentRoute(t, ctx, h.db, add.AssignmentID); got != session.Route.ID {
-		t.Fatalf("assignment route = %s, want %s", got, session.Route.ID)
-	}
-
-	instance := runtimeInstanceForAttempt(t, ctx, h.db, session.AttemptID)
-	if instance.RuntimeKind != "docker" || instance.RuntimeProfile != "docker-default" ||
-		instance.AgentID != "developer" || instance.State != "ready" ||
-		instance.ContainerID != "container-"+spec.ContainerName ||
-		instance.WorkspacePath != cpruntime.ContainerWorkspacePath ||
-		instance.HomePath != cpruntime.ContainerHomePath {
-		t.Fatalf("runtime instance = %+v, want ready docker evidence", instance)
-	}
-	if !instance.Checks["coordlink_present"] ||
-		!instance.Checks["backend_reachable"] ||
-		!instance.Checks["forbidden_env_absent"] ||
-		!instance.Checks["forbidden_mount_absent"] ||
-		!instance.Checks["workspace_writable"] ||
-		!instance.Checks["home_writable"] ||
-		!instance.Checks["git_workspace_writable"] ||
-		!instance.Checks["cli_user_consistent"] {
-		t.Fatalf("runtime checks = %#v, want pass evidence", instance.Checks)
-	}
-	if strings.Contains(mustJSON(t, instance), spec.Env["COORDPLANE_TOKEN"]) {
-		t.Fatalf("runtime inspect instance leaked token value: %+v", instance)
-	}
-	events := countRowsWhere(t, ctx, h.db, "events", "aggregate_type = 'runtime_instance'")
-	if events < 4 {
-		t.Fatalf("runtime instance events = %d, want prepare/env/container/ready evidence", events)
-	}
-}
-
-func TestDockerRuntimePrepareFailureFailsClosedWithoutAdapterStart(t *testing.T) {
-	ctx := context.Background()
-	h := newDockerRuntimeHarness(t, errors.New("docker daemon unavailable"))
-	add := addContract(t, ctx, h.coordination, "developer")
-
-	if _, err := h.runner.StartNext(ctx, "developer"); err == nil {
-		t.Fatal("StartNext succeeded with docker prepare failure")
-	}
-	if starts := h.fake.Starts(); len(starts) != 0 {
-		t.Fatalf("fake adapter starts = %+v, want none after prepare failure", starts)
-	}
-	if got := countRowsWhere(t, ctx, h.db, "attempts", "status = 'running'"); got != 0 {
-		t.Fatalf("running attempts = %d, want 0", got)
-	}
-	if got := countRowsWhere(t, ctx, h.db, "attempts", "status = 'failed'"); got != 1 {
-		t.Fatalf("failed attempts = %d, want 1", got)
-	}
-	if got := countActiveLeases(t, ctx, h.db, add.AssignmentID); got != 0 {
-		t.Fatalf("active leases after docker failure = %d, want 0", got)
-	}
-	if got := assignmentState(t, ctx, h.db, add.AssignmentID); got != "queued" {
-		t.Fatalf("assignment state = %s, want queued after fail-closed prepare", got)
-	}
-	var state, lastError string
-	if err := h.db.QueryRowContext(ctx, `
-SELECT state, last_error
-FROM runtime_instances
-WHERE runtime_kind = 'docker'`).Scan(&state, &lastError); err != nil {
-		t.Fatalf("query runtime instance: %v", err)
-	}
-	if state != "failed" || !strings.Contains(lastError, "docker daemon unavailable") {
-		t.Fatalf("runtime instance state/error = %s/%s, want failed prepare evidence", state, lastError)
-	}
-	if got := countRowsWhere(t, ctx, h.db, "events", "event_type = 'runtime.prepare_failed'"); got != 1 {
-		t.Fatalf("runtime.prepare_failed events = %d, want 1", got)
-	}
-}
-
-func TestDockerRuntimeMissingWritableCheckFailsClosedWithoutAdapterStart(t *testing.T) {
-	ctx := context.Background()
-	h := newDockerRuntimeHarnessWithClient(t, &recordingDockerClient{
-		checks: map[string]bool{
-			"backend_reachable":      true,
-			"workspace_writable":     true,
-			"home_writable":          true,
-			"git_workspace_writable": true,
-			"cli_user_consistent":    false,
-		},
-	})
-	addContract(t, ctx, h.coordination, "developer")
-
-	if _, err := h.runner.StartNext(ctx, "developer"); err == nil || !strings.Contains(err.Error(), "cli_user_consistent") {
-		t.Fatalf("StartNext error = %v, want fail-closed missing cli_user_consistent check", err)
-	}
-	if starts := h.fake.Starts(); len(starts) != 0 {
-		t.Fatalf("fake adapter starts = %+v, want none after incomplete docker checks", starts)
-	}
-	instance := onlyRuntimeInstance(t, ctx, h.db)
-	if instance.State != "failed" || !strings.Contains(instance.LastError, "cli_user_consistent") {
-		t.Fatalf("runtime instance = %+v, want failed missing check evidence", instance)
-	}
-}
-
-func TestDockerRuntimeInjectsClaudeAuthEnvAndStoresOnlyRedactedEvidence(t *testing.T) {
-	ctx := context.Background()
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	db.SetMaxOpenConns(1)
-	t.Cleanup(func() { _ = db.Close() })
-	st := store.New(db)
-	if _, err := st.Migrate(ctx); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	coordlinkPath := filepath.Join(t.TempDir(), "coordlink")
-	if err := os.WriteFile(coordlinkPath, []byte("fake coordlink"), 0o755); err != nil {
-		t.Fatalf("write coordlink fixture: %v", err)
-	}
-	docker := &recordingDockerClient{}
-	probe := &recordingClaudeAuthProbe{}
-	backend := cpruntime.NewDockerRuntime(cpruntime.DockerRuntimeConfig{
-		DB:            db,
-		ProfileName:   "docker-claude",
-		TeamID:        "runtime-docker-auth-test",
-		Image:         "alpine:3.20",
-		RuntimeRoot:   filepath.Join(t.TempDir(), "docker-runtime"),
-		CoordlinkPath: coordlinkPath,
-		DBPath:        filepath.Join(t.TempDir(), "coordplane.db"),
-		ClaudeBinary:  "/usr/local/bin/claude",
-		Ready:         true,
-		Docker:        docker,
-		AuthProbe:     probe,
-		SecretProvider: &secrets.EnvProvider{
-			Keys: claudeenv.RuntimeKeys,
-			Lookup: func(key string) (string, bool) {
-				switch key {
-				case "ANTHROPIC_AUTH_TOKEN":
-					return "runtime-auth-token-secret", true
-				case "ANTHROPIC_BASE_URL":
-					return "https://anthropic-runtime.test", true
-				case "ANTHROPIC_MODEL":
-					return "claude-runtime-model", true
-				case "ANTHROPIC_DEFAULT_OPUS_MODEL":
-					return "claude-opus-runtime", true
-				case "ANTHROPIC_DEFAULT_SONNET_MODEL":
-					return "claude-sonnet-runtime", true
-				case "ANTHROPIC_DEFAULT_HAIKU_MODEL":
-					return "claude-haiku-runtime", true
-				case "CLAUDE_CODE_SUBAGENT_MODEL":
-					return "claude-subagent-runtime", true
-				case "CLAUDE_CODE_EFFORT_LEVEL":
-					return "high", true
-				}
-				return "", false
-			},
-		},
-	})
-	prepared, err := backend.Prepare(ctx, cpruntime.PrepareRequest{
-		AgentID:        "developer",
-		AttemptID:      "att_auth",
-		AssignmentID:   "asg_auth",
-		LeaseID:        "lease_auth",
-		ContractID:     "ctr_auth",
-		TeamID:         "runtime-docker-auth-test",
-		RuntimeProfile: "docker-claude",
-		CLIBackend:     "claude",
-		BackendURL:     "http://coordplane.test",
-		WorkspaceName:  "test-workspace",
-	})
-	if err != nil {
-		t.Fatalf("prepare claude docker runtime: %v", err)
-	}
-	if !prepared.Checks["claude_auth_probe_passed"] || !prepared.Checks["claude_auth_source_secret_provider_env"] {
-		t.Fatalf("prepared checks = %#v, want passed secret-provider auth probe", prepared.Checks)
-	}
-	if len(docker.specs) != 1 || len(probe.specs) != 1 {
-		t.Fatalf("docker specs = %d probe specs = %d, want one each", len(docker.specs), len(probe.specs))
-	}
-	for _, key := range claudeenv.RuntimeKeys {
-		if docker.specs[0].Env[key] == "" {
-			t.Fatalf("docker spec env missing configured Claude CLI env %s: %#v", key, docker.specs[0].Env)
-		}
-		if probe.specs[0].Env[key] != docker.specs[0].Env[key] {
-			t.Fatalf("probe env[%s] = %q, want docker runtime value %q", key, probe.specs[0].Env[key], docker.specs[0].Env[key])
-		}
-	}
-	assertMount(t, docker.specs[0].Mounts, cpruntime.ContainerHomePath, false)
-	for _, mount := range docker.specs[0].Mounts {
-		if strings.Contains(mount.Source, ".claude") || strings.Contains(mount.Source, "/.config") {
-			t.Fatalf("docker mount leaked host credential path: %+v", mount)
-		}
-	}
-	instance := onlyRuntimeInstance(t, ctx, db)
-	rawInstance := mustJSON(t, instance)
-	if strings.Contains(rawInstance, "runtime-auth-token-secret") {
-		t.Fatalf("runtime inspect leaked auth secret: %s", rawInstance)
-	}
-	for _, key := range claudeenv.RuntimeKeys {
-		if !containsString(instance.EnvKeys, key) {
-			t.Fatalf("runtime env keys = %v, want key name %s only", instance.EnvKeys, key)
-		}
-	}
-	rawEvents := eventPayloadsJSON(t, ctx, db)
-	if strings.Contains(rawEvents, "runtime-auth-token-secret") {
-		t.Fatalf("runtime events leaked auth secret: %s", rawEvents)
-	}
-	for _, eventType := range []string{"runtime.auth_material_injected", "runtime.auth_probe_started", "runtime.auth_probe_passed"} {
-		if got := countRowsWhere(t, ctx, db, "events", "event_type = '"+eventType+"'"); got != 1 {
-			t.Fatalf("%s events = %d, want 1", eventType, got)
-		}
-	}
-}
-
-func TestDockerRuntimeMissingClaudeAuthProbeFailsClosed(t *testing.T) {
-	ctx := context.Background()
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	db.SetMaxOpenConns(1)
-	t.Cleanup(func() { _ = db.Close() })
-	st := store.New(db)
-	if _, err := st.Migrate(ctx); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	coordlinkPath := filepath.Join(t.TempDir(), "coordlink")
-	if err := os.WriteFile(coordlinkPath, []byte("fake coordlink"), 0o755); err != nil {
-		t.Fatalf("write coordlink fixture: %v", err)
-	}
-	probe := &recordingClaudeAuthProbe{
-		result: cpruntime.ClaudeAuthProbeResult{
-			Checks: map[string]bool{
-				"claude_present":             true,
-				"claude_auth_probe_redacted": true,
-			},
-			ErrorCode: "CLAUDE_AUTH_REQUIRED",
-		},
-		err: errors.New("CLAUDE_AUTH_REQUIRED: claude non-interactive auth is unavailable"),
-	}
-	backend := cpruntime.NewDockerRuntime(cpruntime.DockerRuntimeConfig{
-		DB:            db,
-		ProfileName:   "docker-claude",
-		TeamID:        "runtime-docker-auth-test",
-		Image:         "alpine:3.20",
-		RuntimeRoot:   filepath.Join(t.TempDir(), "docker-runtime"),
-		CoordlinkPath: coordlinkPath,
-		DBPath:        filepath.Join(t.TempDir(), "coordplane.db"),
-		ClaudeBinary:  "/usr/local/bin/claude",
-		Ready:         true,
-		Docker:        &recordingDockerClient{},
-		AuthProbe:     probe,
-	})
-	_, err = backend.Prepare(ctx, cpruntime.PrepareRequest{
-		AgentID:        "developer",
-		AttemptID:      "att_auth_missing",
-		AssignmentID:   "asg_auth_missing",
-		LeaseID:        "lease_auth_missing",
-		ContractID:     "ctr_auth_missing",
-		TeamID:         "runtime-docker-auth-test",
-		RuntimeProfile: "docker-claude",
-		CLIBackend:     "claude",
-		BackendURL:     "http://coordplane.test",
-		WorkspaceName:  "test-workspace",
-	})
-	if err == nil || !strings.Contains(err.Error(), "CLAUDE_AUTH_REQUIRED") {
-		t.Fatalf("prepare error = %v, want typed auth failure", err)
-	}
-	instance := onlyRuntimeInstance(t, ctx, db)
-	if instance.State != "failed" || !strings.Contains(instance.LastError, "CLAUDE_AUTH_REQUIRED") {
-		t.Fatalf("runtime instance = %+v, want failed auth evidence", instance)
-	}
-	if instance.Checks["claude_auth_probe_passed"] {
-		t.Fatalf("runtime checks = %#v, want auth probe not passed", instance.Checks)
-	}
-	if got := countRowsWhere(t, ctx, db, "events", "event_type = 'runtime.auth_probe_failed'"); got != 1 {
-		t.Fatalf("runtime.auth_probe_failed events = %d, want 1", got)
-	}
-}
-
-func TestDockerCLIClientPrepareContainerUsesPrivateEnvFileWithoutArgvSecrets(t *testing.T) {
-	dir := t.TempDir()
-	callsPath := filepath.Join(dir, "calls.txt")
-	envPathsPath := filepath.Join(dir, "env-paths.txt")
-	envModesPath := filepath.Join(dir, "env-modes.txt")
-	envCopiesPath := filepath.Join(dir, "env-copies.txt")
-	dockerPath := filepath.Join(dir, "docker")
-	script := fmt.Sprintf(`#!/bin/sh
-printf 'CALL\n' >> %s
-printf '%%s\n' "$@" >> %s
-prev=''
-for arg in "$@"; do
-  if [ "$prev" = "--env-file" ]; then
-    printf '%%s\n' "$arg" >> %s
-    stat -c '%%a' "$arg" >> %s
-    cat "$arg" >> %s
-    printf '\n---\n' >> %s
-  fi
-  prev="$arg"
-done
-case "$1" in
-  rm)
-    exit 0
-    ;;
-  run)
-    printf 'container-secret-boundary\n'
-    exit 0
-    ;;
-  exec)
-    exit 0
-    ;;
-esac
-exit 0
-`, callsPath, callsPath, envPathsPath, envModesPath, envCopiesPath, envCopiesPath)
-	if err := os.WriteFile(dockerPath, []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake docker binary: %v", err)
-	}
-	result, err := (cpruntime.DockerCLIClient{Binary: dockerPath}).PrepareContainer(context.Background(), cpruntime.DockerContainerSpec{
-		ContainerName: "coordplane-secret-boundary",
-		Image:         "alpine:3.20",
-		Env: map[string]string{
-			"COORDPLANE_AGENT_ID":    "developer",
-			"COORDPLANE_TOKEN":       "COORDPLANE_TOKEN_RUN_SENTINEL",
-			"ANTHROPIC_AUTH_TOKEN":   "ANTHROPIC_AUTH_TOKEN_RUN_SENTINEL",
-			"COORDPLANE_BACKEND_URL": "http://coordplane.test",
-		},
-		Mounts: []cpruntime.DockerMount{
-			{Source: filepath.Join(dir, "workspace"), Target: cpruntime.ContainerWorkspacePath},
-			{Source: filepath.Join(dir, "home"), Target: cpruntime.ContainerHomePath},
-		},
-	})
-	if err != nil {
-		t.Fatalf("prepare container: %v", err)
-	}
-	if result.ContainerID != "container-secret-boundary" || !result.Checks["backend_reachable"] {
-		t.Fatalf("prepare result = %+v, want backend-reachable container evidence", result)
-	}
-	callsRaw, err := os.ReadFile(callsPath)
-	if err != nil {
-		t.Fatalf("read fake docker calls: %v", err)
-	}
-	if !strings.Contains(string(callsRaw), "--env-file") {
-		t.Fatalf("docker calls = %s, want --env-file", callsRaw)
-	}
-	for _, forbidden := range []string{"COORDPLANE_TOKEN_RUN_SENTINEL", "ANTHROPIC_AUTH_TOKEN_RUN_SENTINEL"} {
-		if strings.Contains(string(callsRaw), forbidden) {
-			t.Fatalf("docker host argv leaked %q: %s", forbidden, callsRaw)
-		}
-	}
-	envCopies, err := os.ReadFile(envCopiesPath)
-	if err != nil {
-		t.Fatalf("read copied env-files: %v", err)
-	}
-	for _, want := range []string{"COORDPLANE_TOKEN=COORDPLANE_TOKEN_RUN_SENTINEL", "ANTHROPIC_AUTH_TOKEN=ANTHROPIC_AUTH_TOKEN_RUN_SENTINEL"} {
-		if !strings.Contains(string(envCopies), want) {
-			t.Fatalf("env-file copies = %q, missing %q", envCopies, want)
-		}
-	}
-	modesRaw, err := os.ReadFile(envModesPath)
-	if err != nil {
-		t.Fatalf("read env-file modes: %v", err)
-	}
-	for _, mode := range strings.Fields(string(modesRaw)) {
-		if mode != "600" {
-			t.Fatalf("env-file modes = %q, want every file mode 600", modesRaw)
-		}
-	}
-	pathsRaw, err := os.ReadFile(envPathsPath)
-	if err != nil {
-		t.Fatalf("read env-file paths: %v", err)
-	}
-	for _, path := range strings.Fields(string(pathsRaw)) {
-		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("env-file path %q still exists or stat failed unexpectedly: %v", path, err)
-		}
-	}
-}
-
-func TestDockerCLIClientPrepareContainerCleansEnvFileWhenRunFails(t *testing.T) {
-	dir := t.TempDir()
-	envPathsPath := filepath.Join(dir, "env-paths.txt")
-	dockerPath := filepath.Join(dir, "docker")
-	script := fmt.Sprintf(`#!/bin/sh
-prev=''
-for arg in "$@"; do
-  if [ "$prev" = "--env-file" ]; then
-    printf '%%s\n' "$arg" >> %s
-  fi
-  prev="$arg"
-done
-case "$1" in
-  rm)
-    exit 0
-    ;;
-  run)
-    printf 'run failed\n' >&2
-    exit 42
-    ;;
-esac
-exit 0
-`, envPathsPath)
-	if err := os.WriteFile(dockerPath, []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake docker binary: %v", err)
-	}
-	_, err := (cpruntime.DockerCLIClient{Binary: dockerPath}).PrepareContainer(context.Background(), cpruntime.DockerContainerSpec{
-		ContainerName: "coordplane-secret-boundary",
-		Image:         "alpine:3.20",
-		Env:           map[string]string{"COORDPLANE_TOKEN": "COORDPLANE_TOKEN_RUN_FAILURE_SENTINEL"},
-	})
-	if err == nil || !strings.Contains(err.Error(), "docker run failed") {
-		t.Fatalf("prepare container error = %v, want docker run failed", err)
-	}
-	pathsRaw, err := os.ReadFile(envPathsPath)
-	if err != nil {
-		t.Fatalf("read env-file paths: %v", err)
-	}
-	for _, path := range strings.Fields(string(pathsRaw)) {
-		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("env-file path %q still exists or stat failed unexpectedly: %v", path, err)
-		}
-	}
-}
-
-type dockerRuntimeHarness struct {
-	db           *sql.DB
-	store        *store.Store
-	coordination *coordination.Service
-	runner       *cpruntime.Runner
-	fake         *cpruntime.FakeCLIAdapter
-	docker       *recordingDockerClient
-}
-
-func newDockerRuntimeHarness(t *testing.T, dockerErr error) dockerRuntimeHarness {
-	t.Helper()
-	return newDockerRuntimeHarnessWithClient(t, &recordingDockerClient{err: dockerErr})
-}
-
-func newDockerRuntimeHarnessWithClient(t *testing.T, docker *recordingDockerClient) dockerRuntimeHarness {
-	t.Helper()
-	ctx := context.Background()
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	db.SetMaxOpenConns(1)
-	t.Cleanup(func() {
-		_ = db.Close()
-	})
-	st := store.New(db)
-	if _, err := st.Migrate(ctx); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	skillRegistry := skills.NewRegistry(st)
-	if err := skillRegistry.RegisterBuiltins(ctx); err != nil {
-		t.Fatalf("register builtin skills: %v", err)
-	}
-	coordSvc := coordination.NewService(st)
-	coordlinkPath := filepath.Join(t.TempDir(), "coordlink")
-	if err := os.WriteFile(coordlinkPath, []byte("fake coordlink"), 0o755); err != nil {
-		t.Fatalf("write coordlink fixture: %v", err)
-	}
-	dockerRuntime := cpruntime.NewDockerRuntime(cpruntime.DockerRuntimeConfig{
-		DB:            db,
-		ProfileName:   "docker-default",
-		TeamID:        "runtime-docker-test",
-		Image:         "alpine:3.20",
-		RuntimeRoot:   filepath.Join(t.TempDir(), "docker-runtime"),
-		CoordlinkPath: coordlinkPath,
-		DBPath:        filepath.Join(t.TempDir(), "coordplane.db"),
-		Ready:         true,
-		Docker:        docker,
-	})
-	fake := cpruntime.NewFakeCLIAdapter()
-	runner, err := cpruntime.NewRunner(cpruntime.RunnerConfig{
-		Store:           st,
-		Coordination:    coordSvc,
-		TeamConfig:      dockerRuntimeTeamConfig(),
-		Skills:          skillRegistry,
-		RuntimeBackends: map[string]cpruntime.RuntimeBackend{"docker-default": dockerRuntime},
-		Adapter:         fake,
-		BackendURL:      "http://coordplane.test",
-		WorkspaceName:   "test-workspace",
-	})
-	if err != nil {
-		t.Fatalf("new docker runner: %v", err)
-	}
-	return dockerRuntimeHarness{
-		db:           db,
-		store:        st,
-		coordination: coordSvc,
-		runner:       runner,
-		fake:         fake,
-		docker:       docker,
-	}
-}
-
-func dockerRuntimeTeamConfig() teamconfig.Config {
-	return teamconfig.Config{
-		TeamID:  "runtime-docker-test",
-		Version: 1,
-		RuntimeProfiles: map[string]teamconfig.RuntimeProfile{
-			"docker-default": {Kind: "docker", Image: "alpine:3.20", WorkspaceMode: "isolated"},
-		},
-		Agents: []teamconfig.AgentConfig{
-			{
-				ID:             "developer",
-				RolePrompt:     "developer role",
-				RuntimeProfile: "docker-default",
-				CLIBackend:     "fake",
-				Skills:         []string{"coordplane-service"},
-				Capabilities:   step5Capabilities(),
-			},
-		},
-	}
-}
-
-type recordingDockerClient struct {
-	err    error
-	checks map[string]bool
-	specs  []cpruntime.DockerContainerSpec
-}
-
-func (c *recordingDockerClient) PrepareContainer(ctx context.Context, spec cpruntime.DockerContainerSpec) (cpruntime.DockerContainerResult, error) {
-	select {
-	case <-ctx.Done():
-		return cpruntime.DockerContainerResult{}, ctx.Err()
-	default:
-	}
-	c.specs = append(c.specs, cloneDockerSpec(spec))
-	if c.err != nil {
-		return cpruntime.DockerContainerResult{}, c.err
-	}
-	checks := map[string]bool{
-		"backend_reachable":      true,
-		"workspace_writable":     true,
-		"home_writable":          true,
-		"git_workspace_writable": true,
-		"cli_user_consistent":    true,
-	}
-	for key, value := range c.checks {
-		checks[key] = value
-	}
-	return cpruntime.DockerContainerResult{
-		ContainerID: "container-" + spec.ContainerName,
-		Checks:      checks,
-	}, nil
-}
-
-func (c *recordingDockerClient) Specs() []cpruntime.DockerContainerSpec {
-	out := make([]cpruntime.DockerContainerSpec, len(c.specs))
-	for i, spec := range c.specs {
-		out[i] = cloneDockerSpec(spec)
-	}
-	return out
-}
-
-type recordingClaudeAuthProbe struct {
-	result cpruntime.ClaudeAuthProbeResult
-	err    error
-	specs  []cpruntime.ClaudeAuthProbeSpec
-}
-
-func (p *recordingClaudeAuthProbe) ProbeClaudeAuth(ctx context.Context, spec cpruntime.ClaudeAuthProbeSpec) (cpruntime.ClaudeAuthProbeResult, error) {
-	select {
-	case <-ctx.Done():
-		return cpruntime.ClaudeAuthProbeResult{}, ctx.Err()
-	default:
-	}
-	p.specs = append(p.specs, cloneClaudeAuthProbeSpec(spec))
-	if p.result.Checks == nil && p.err == nil {
-		return cpruntime.ClaudeAuthProbeResult{Checks: map[string]bool{
-			"claude_present":                         true,
-			"claude_auth_configured":                 true,
-			"claude_auth_probe_passed":               true,
-			"claude_auth_probe_redacted":             true,
-			"home_private":                           true,
-			"home_persistent":                        true,
-			"claude_auth_source_secret_provider_env": spec.AuthSource == "secret_provider_env",
-			"claude_auth_source_preseeded_home":      spec.AuthSource != "secret_provider_env",
-		}}, nil
-	}
-	return p.result, p.err
-}
-
-func cloneClaudeAuthProbeSpec(spec cpruntime.ClaudeAuthProbeSpec) cpruntime.ClaudeAuthProbeSpec {
-	cloned := spec
-	cloned.Env = cloneStringMap(spec.Env)
-	return cloned
-}
-
-func cloneDockerSpec(spec cpruntime.DockerContainerSpec) cpruntime.DockerContainerSpec {
-	cloned := spec
-	cloned.Labels = cloneStringMap(spec.Labels)
-	cloned.Env = cloneStringMap(spec.Env)
-	cloned.Mounts = append([]cpruntime.DockerMount(nil), spec.Mounts...)
-	return cloned
-}
-
-func onlyRuntimeInstance(t *testing.T, ctx context.Context, db *sql.DB) cpruntime.RuntimeInstance {
-	t.Helper()
-	instances, err := cpruntime.ListRuntimeInstances(ctx, db)
-	if err != nil {
-		t.Fatalf("list runtime instances: %v", err)
-	}
-	if len(instances) != 1 {
-		t.Fatalf("runtime instances = %+v, want exactly one", instances)
-	}
-	return instances[0]
-}
-
-func assertMount(t *testing.T, mounts []cpruntime.DockerMount, target string, readOnly bool) {
-	t.Helper()
-	for _, mount := range mounts {
-		if mount.Target == target {
-			if mount.Source == "" || mount.ReadOnly != readOnly {
-				t.Fatalf("mount %s = %+v, want source and readOnly=%v", target, mount, readOnly)
+func TestValidateOwnershipRequiresCompleteDurableIdentity(t *testing.T) {
+	expected := testRef()
+	expected.ContainerID = "container-id"
+	valid := func() RuntimeRef { return expected }
+	tests := map[string]func(*RuntimeRef){
+		"container ID":   func(ref *RuntimeRef) { ref.ContainerID = "other-container" },
+		"container name": func(ref *RuntimeRef) { ref.ContainerName = "other-name" },
+		"project":        func(ref *RuntimeRef) { ref.ProjectID = "other-project" },
+		"task":           func(ref *RuntimeRef) { ref.TaskID = "other-task" },
+		"agent":          func(ref *RuntimeRef) { ref.AgentID = "other-agent" },
+		"run":            func(ref *RuntimeRef) { ref.RunID = "other-run" },
+		"generation":     func(ref *RuntimeRef) { ref.Generation++ },
+		"launch nonce":   func(ref *RuntimeRef) { ref.LaunchNonce = "other-nonce" },
+	}
+	if err := ValidateOwnership(expected, valid()); err != nil {
+		t.Fatalf("matching runtime ownership rejected: %v", err)
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			actual := valid()
+			mutate(&actual)
+			if err := ValidateOwnership(expected, actual); !errors.Is(err, ErrOwnership) {
+				t.Fatalf("ownership drift error = %v", err)
 			}
+		})
+	}
+	expected.ContainerID = ""
+	if err := ValidateOwnership(expected, valid()); err != nil {
+		t.Fatalf("create-before-ID-persistence adoption rejected: %v", err)
+	}
+}
+
+func TestValidateAdoptionRejectsIsolationDrift(t *testing.T) {
+	source := t.TempDir()
+	spec := validTestSpec(source)
+	valid := func() LiveState {
+		environment, err := inspectEnvironment([]string{
+			"HOME=/home/agent",
+			"COORDPLANE_RUN_SOCKET=/run/coordplane/api.sock",
+			"PROVIDER_TOKEN=provider-secret",
+			"IMAGE_DEFAULT=allowed",
+		})
+		requireNoError(t, err)
+		return LiveState{
+			Ref: spec.Ref, Image: spec.Image,
+			Entrypoint: []string{spec.Command.Executable}, CommandArgs: append([]string(nil), spec.Command.Args...),
+			Environment: environment, WorkingDir: spec.WorkingDir, User: spec.User,
+			GroupAdd: append([]string(nil), spec.GroupAdd...), Network: spec.Network,
+			RestartPolicy: "no", ReadonlyRootfs: true, CapDrop: []string{"ALL"},
+			SecurityOpt: []string{"no-new-privileges"}, PIDsLimit: spec.Limits.PIDs,
+			MemoryBytes: spec.Limits.MemoryBytes, NanoCPUs: spec.Limits.NanoCPUs,
+			Init: true, Tmpfs: map[string]string{"/tmp": "nodev,size=8388608,rw,nosuid"},
+			Mounts: []MountFact{{
+				Type: "bind", Source: source, Destination: "/home/agent", ReadWrite: true, Propagation: "rprivate",
+			}},
+		}
+	}
+	if err := ValidateAdoption(spec, valid()); err != nil {
+		t.Fatalf("matching isolation rejected: %v", err)
+	}
+	withoutSecret := validTestSpec(source)
+	delete(withoutSecret.Command.Env, "PROVIDER_TOKEN")
+	requireRedactedOwnershipError(t, ValidateAdoption(withoutSecret, valid()))
+	tests := map[string]func(*LiveState){
+		"image":             func(state *LiveState) { state.Image = "other:image" },
+		"entrypoint":        func(state *LiveState) { state.Entrypoint = []string{"/bin/sh"} },
+		"command arguments": func(state *LiveState) { state.CommandArgs = []string{"other"} },
+		"fixed environment": func(state *LiveState) { setEnvironmentDigest(state, "HOME", "/root") },
+		"rotated sensitive environment": func(state *LiveState) {
+			setEnvironmentDigest(state, "PROVIDER_TOKEN", "rotated-provider-secret")
+		},
+		"missing environment": func(state *LiveState) { removeEnvironmentFact(state, "PROVIDER_TOKEN") },
+		"duplicate environment": func(state *LiveState) {
+			state.Environment = append(state.Environment, state.Environment[0])
+		},
+		"working directory": func(state *LiveState) { state.WorkingDir = "/tmp" },
+		"root user":         func(state *LiveState) { state.User = "0:0" },
+		"wrong user":        func(state *LiveState) { state.User = "65531:65532" },
+		"wrong network":     func(state *LiveState) { state.Network = "host" },
+		"auto remove":       func(state *LiveState) { state.AutoRemove = true },
+		"restart":           func(state *LiveState) { state.RestartPolicy = "always" },
+		"privileged":        func(state *LiveState) { state.Privileged = true },
+		"cap add":           func(state *LiveState) { state.CapAdd = []string{"SYS_ADMIN"} },
+		"cap drop":          func(state *LiveState) { state.CapDrop = nil },
+		"extra cap drop":    func(state *LiveState) { state.CapDrop = append(state.CapDrop, "NET_RAW") },
+		"writable root":     func(state *LiveState) { state.ReadonlyRootfs = false },
+		"new privileges":    func(state *LiveState) { state.SecurityOpt = nil },
+		"extra security option": func(state *LiveState) {
+			state.SecurityOpt = append(state.SecurityOpt, "seccomp=unconfined")
+		},
+		"published port":      func(state *LiveState) { state.PublishedPorts = 1 },
+		"PID limit":           func(state *LiveState) { state.PIDsLimit++ },
+		"memory limit":        func(state *LiveState) { state.MemoryBytes++ },
+		"CPU limit":           func(state *LiveState) { state.NanoCPUs++ },
+		"init process":        func(state *LiveState) { state.Init = false },
+		"tmpfs missing":       func(state *LiveState) { state.Tmpfs = nil },
+		"tmpfs extra path":    func(state *LiveState) { state.Tmpfs["/var/tmp"] = "rw" },
+		"tmpfs size":          func(state *LiveState) { state.Tmpfs["/tmp"] = "rw,nosuid,nodev,size=1" },
+		"tmpfs options":       func(state *LiveState) { state.Tmpfs["/tmp"] = "rw,nosuid,size=8388608" },
+		"tmpfs duplicate":     func(state *LiveState) { state.Tmpfs["/tmp"] = "rw,rw,nosuid,nodev,size=8388608" },
+		"extra mount":         func(state *LiveState) { state.Mounts = append(state.Mounts, state.Mounts[0]) },
+		"mount source":        func(state *LiveState) { state.Mounts[0].Source = filepath.Dir(source) },
+		"mount target":        func(state *LiveState) { state.Mounts[0].Destination = "/workspace" },
+		"mount access":        func(state *LiveState) { state.Mounts[0].ReadWrite = false },
+		"mount type":          func(state *LiveState) { state.Mounts[0].Type = "volume" },
+		"mount propagation":   func(state *LiveState) { state.Mounts[0].Propagation = "rshared" },
+		"supplementary group": func(state *LiveState) { state.GroupAdd = append(state.GroupAdd, "1234") },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			state := valid()
+			mutate(&state)
+			requireRedactedOwnershipError(t, ValidateAdoption(spec, state))
+		})
+	}
+}
+
+func validTestSpec(source string) ContainerSpec {
+	return ContainerSpec{
+		Ref: testRef(), Image: "alpine:3.20",
+		Command: CommandSpec{
+			Executable: "/runtime-fixture", Args: []string{"hold"},
+			Env: map[string]string{
+				"HOME": "/home/agent", "COORDPLANE_RUN_SOCKET": "/run/coordplane/api.sock",
+				"PROVIDER_TOKEN": "provider-secret",
+			},
+		},
+		SensitiveEnvKeys: []string{"PROVIDER_TOKEN"}, WorkingDir: "/home/agent",
+		User: "65532:65532", GroupAdd: []string{"65532"}, Network: "none",
+		Mounts: []Mount{{Source: source, Target: "/home/agent"}}, ReadOnlyRoot: true,
+		Limits: ResourceLimits{PIDs: 32, MemoryBytes: 128 << 20, NanoCPUs: 500_000_000, TmpfsBytes: 8 << 20},
+	}
+}
+
+func setEnvironmentDigest(state *LiveState, name, value string) {
+	for index := range state.Environment {
+		if state.Environment[index].Name == name {
+			state.Environment[index].ValueDigest = environmentValueDigest(value)
 			return
 		}
 	}
-	t.Fatalf("mount target %s missing from %+v", target, mounts)
 }
 
-func runtimeInstanceForAttempt(t *testing.T, ctx context.Context, db *sql.DB, attemptID string) cpruntime.RuntimeInstance {
-	t.Helper()
-	instances, err := cpruntime.ListRuntimeInstances(ctx, db)
-	if err != nil {
-		t.Fatalf("list runtime instances: %v", err)
-	}
-	for _, instance := range instances {
-		if instance.AttemptID == attemptID {
-			return instance
+func removeEnvironmentFact(state *LiveState, name string) {
+	for index := range state.Environment {
+		if state.Environment[index].Name == name {
+			state.Environment = append(state.Environment[:index], state.Environment[index+1:]...)
+			return
 		}
 	}
-	t.Fatalf("runtime instance for attempt %s not found in %+v", attemptID, instances)
-	return cpruntime.RuntimeInstance{}
 }
 
-func mustJSON(t *testing.T, value any) string {
-	t.Helper()
-	raw, err := json.Marshal(value)
-	if err != nil {
-		t.Fatalf("marshal JSON: %v", err)
+func testRef() RuntimeRef {
+	return RuntimeRef{
+		ContainerName: "coordplane-run-run-a", ProjectID: "project-a", TaskID: "task-a",
+		AgentID: "agent-a", RunID: "run-a", Generation: 3, LaunchNonce: "nonce-a",
 	}
-	return string(raw)
-}
-
-func cloneStringMap(in map[string]string) map[string]string {
-	out := make(map[string]string, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
-	return out
-}
-
-func containsString(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
-}
-
-func eventPayloadsJSON(t *testing.T, ctx context.Context, db *sql.DB) string {
-	t.Helper()
-	rows, err := db.QueryContext(ctx, `SELECT payload_json FROM events ORDER BY occurred_at, id`)
-	if err != nil {
-		t.Fatalf("query events: %v", err)
-	}
-	defer rows.Close()
-	var b strings.Builder
-	for rows.Next() {
-		var payload string
-		if err := rows.Scan(&payload); err != nil {
-			t.Fatalf("scan event payload: %v", err)
-		}
-		b.WriteString(payload)
-		b.WriteByte('\n')
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate event payloads: %v", err)
-	}
-	return b.String()
 }

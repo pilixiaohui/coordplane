@@ -1,0 +1,859 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"coordplane/internal/adapter"
+	"coordplane/internal/core"
+	containerruntime "coordplane/internal/runtime"
+)
+
+const (
+	runtimeShutdownOverhead = 25 * time.Second
+	runtimeShutdownPoll     = 50 * time.Millisecond
+	runtimeShutdownReason   = "daemon_shutdown"
+)
+
+type runtimeWorker struct {
+	name string
+	run  func(context.Context, *runtimeController)
+}
+
+var runtimeWorkers = []runtimeWorker{
+	{name: "scheduler", run: runScheduler},
+	{name: "supervisor", run: runSupervisor},
+	{name: "reconciler", run: runReconciler},
+	{name: "gc", run: runRuntimeGC},
+}
+
+func runScheduler(ctx context.Context, controller *runtimeController) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !controller.schedulerHealthy() {
+				continue
+			}
+			claim, operation, ok, err := controller.claimNext(ctx)
+			if err != nil {
+				controller.setSchedulerDegraded(err.Error())
+				continue
+			}
+			controller.clearSchedulerDegraded()
+			if !ok {
+				continue
+			}
+			_ = controller.launchOwned(ctx, claim, operation)
+		}
+	}
+}
+
+func runSupervisor(ctx context.Context, controller *runtimeController) {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			controller.mu.Lock()
+			monitors := make([]*runMonitor, 0, len(controller.monitors))
+			for _, monitor := range controller.monitors {
+				monitors = append(monitors, monitor)
+			}
+			controller.mu.Unlock()
+			for _, monitor := range monitors {
+				run, err := controller.service.Run(ctx, monitor.runID)
+				if err == nil && monitor.control != nil && (run.RequestedOutcome != "" || run.StopRequestedAt != "") {
+					select {
+					case monitor.control.outcome <- struct{}{}:
+					default:
+					}
+				}
+			}
+		}
+	}
+}
+
+func runReconciler(ctx context.Context, controller *runtimeController) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := controller.Reconcile(ctx); err != nil {
+				controller.setDegraded(err.Error())
+			}
+		}
+	}
+}
+
+func runRuntimeGC(ctx context.Context, controller *runtimeController) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			controller.cleanupTerminalRuns(ctx)
+			logBefore := time.Now().UTC().Add(-controller.config.Retention.RunLog).Format("2006-01-02T15:04:05.000000000Z")
+			if err := controller.cleanupRunLogs(ctx, logBefore); err != nil {
+				controller.setDegraded(err.Error())
+				continue
+			}
+			workspaceBefore := time.Now().UTC().Add(-controller.config.Retention.CompletedWorkspace).Format("2006-01-02T15:04:05.000000000Z")
+			if err := controller.service.ReconcileWorkspaceGC(ctx, workspaceBefore); err != nil {
+				controller.setDegraded(err.Error())
+				continue
+			}
+			closedBefore := time.Now().UTC().Add(-controller.config.Retention.TerminalTaskRef).Format("2006-01-02T15:04:05.000000000Z")
+			if err := controller.service.ReconcileGitGC(ctx, closedBefore); err != nil {
+				controller.setDegraded(err.Error())
+			}
+		}
+	}
+}
+
+func (c *runtimeController) Reconcile(ctx context.Context) error {
+	// Git intent recovery is independent of Docker availability and must
+	// converge before any new scheduler admission.
+	if err := c.service.ReconcileGit(ctx); err != nil {
+		return fmt.Errorf("reconcile Git intents: %w", err)
+	}
+	if err := c.executor.Ping(ctx); err != nil {
+		if errors.Is(err, containerruntime.ErrUnavailable) {
+			c.setDegraded(err.Error())
+			return nil
+		}
+		return err
+	}
+	c.claimMu.Lock()
+	liveRuns, err := c.service.LiveRuns(ctx)
+	c.claimMu.Unlock()
+	if err != nil {
+		return err
+	}
+	for _, run := range liveRuns {
+		operation := c.acquireRunOperation(run.ID)
+		if operation == nil {
+			continue
+		}
+		operationErr := func() error {
+			defer c.releaseRunOperation(run.ID, operation)
+			return c.reconcileOwnedRun(ctx, run)
+		}()
+		if operationErr != nil {
+			wrapped := fmt.Errorf("reconcile Run %s: %w", run.ID, operationErr)
+			c.setDegraded(wrapped.Error())
+			if errors.Is(operationErr, containerruntime.ErrUnavailable) || errors.Is(operationErr, containerruntime.ErrOwnership) {
+				return nil
+			}
+			return wrapped
+		}
+	}
+	c.cleanupTerminalRuns(ctx)
+	if err := c.detectOrphans(ctx); err != nil {
+		c.setDegraded(err.Error())
+		return nil
+	}
+	c.clearDegraded()
+	return nil
+}
+
+func (c *runtimeController) reconcileOwnedRun(ctx context.Context, snapshot core.Run) error {
+	run, err := c.service.Run(ctx, snapshot.ID)
+	if err != nil {
+		return err
+	}
+	if core.IsRunTerminal(run.State) {
+		return nil
+	}
+	if run.LaunchNonce == "" {
+		if _, err := c.service.RecordRuntimeRunTerminal(ctx, core.RunTerminalInput{
+			RunID: run.ID, Generation: run.Generation, LaunchOperationID: run.LaunchOperationID,
+			State: core.RunFailed, TerminalReason: "starting Run has no launch nonce",
+			RuntimeErrorCode: "LAUNCH_INTENT_INCOMPLETE", RequestID: runtimeRequest(run, "reconcile-unprepared"),
+			OperationID: run.LaunchOperationID,
+		}); err != nil {
+			return fmt.Errorf("reconcile unprepared Run %s: %w", run.ID, err)
+		}
+		return nil
+	}
+	return c.reconcileRun(ctx, run)
+}
+
+func (c *runtimeController) claimNext(ctx context.Context) (core.Claim, *runOperation, bool, error) {
+	c.claimMu.Lock()
+	defer c.claimMu.Unlock()
+	c.mu.Lock()
+	shuttingDown := c.shuttingDown
+	c.mu.Unlock()
+	if shuttingDown {
+		return core.Claim{}, nil, false, nil
+	}
+	claim, ok, err := c.service.ClaimNext(ctx, "")
+	if err != nil || !ok {
+		return claim, nil, ok, err
+	}
+	operation := c.acquireRunOperation(claim.Run.ID)
+	if operation == nil {
+		return core.Claim{}, nil, false, errors.New("claimed Run already has a runtime owner")
+	}
+	return claim, operation, true, nil
+}
+
+func (c *runtimeController) reconcileRun(ctx context.Context, run core.Run) error {
+	ref := runtimeRef(run)
+	state, err := c.executor.Inspect(ctx, ref)
+	if errors.Is(err, containerruntime.ErrNotFound) {
+		updated, task, hasIntent, intentErr := c.reconcileDurableIntent(ctx, run)
+		if intentErr != nil {
+			return intentErr
+		}
+		if hasIntent {
+			run = updated
+			terminalState, reason := reconcileIntentTerminal(run, task)
+			return c.finishMissingReconciledRun(ctx, run, ref, terminalState, reason)
+		}
+		terminalState := core.RunFailed
+		reason := "container was not created"
+		if run.LaunchPhase == core.LaunchStartIssued || run.LaunchPhase == core.LaunchProcessObserved || run.State == core.RunActive {
+			terminalState = core.RunInterrupted
+			reason = "owned container is missing after start was issued"
+		}
+		return c.finishMissingReconciledRun(ctx, run, ref, terminalState, reason)
+	}
+	if err != nil {
+		return err
+	}
+	ref = state.Ref
+	if run.ContainerID == "" {
+		created, recordErr := c.service.RecordContainerCreated(ctx, runtimeFactInput(run, ref, "reconcile-created"))
+		if recordErr != nil {
+			return recordErr
+		}
+		run = created
+	}
+	if err := c.validateAdoptedContainer(ctx, run, state); err != nil {
+		return err
+	}
+	entry, ok := c.adapters.Lookup(run.AdapterID)
+	if !ok {
+		return fmt.Errorf("adapter %q is not registered", run.AdapterID)
+	}
+	updated, _, hasIntent, err := c.reconcileDurableIntent(ctx, run)
+	if err != nil {
+		return err
+	}
+	if hasIntent {
+		return c.stopReconciledRun(ctx, updated, ref, state, entry)
+	}
+	control, err := c.rebuildControl(ctx, run)
+	if err != nil {
+		return err
+	}
+	switch state.Status {
+	case containerruntime.StatusExited:
+		monitor := c.newMonitor(run, ref, entry, control)
+		result := <-monitor.wait
+		return c.finishObservedRun(run, monitor, result)
+	case containerruntime.StatusCreated:
+		if run.LaunchPhase == core.LaunchCreated {
+			started, recordErr := c.service.RecordRunStartIssued(ctx, runtimeFactInput(run, ref, "reconcile-start"))
+			if recordErr != nil {
+				return recordErr
+			}
+			run = started
+		}
+		if run.LaunchPhase != core.LaunchStartIssued {
+			return errors.New("created container has an incompatible durable launch phase")
+		}
+		if _, err := c.executor.Attach(ctx, ref); err != nil {
+			return err
+		}
+		if _, err := c.executor.Start(ctx, ref); err != nil {
+			return err
+		}
+		return c.adoptRunning(ctx, run, ref, entry, control)
+	case containerruntime.StatusRunning:
+		return c.adoptRunning(ctx, run, ref, entry, control)
+	default:
+		return errors.New("Docker returned an unsupported container state")
+	}
+}
+
+func (c *runtimeController) reconcileDurableIntent(ctx context.Context, run core.Run) (core.Run, core.Task, bool, error) {
+	projection, err := c.service.Task(ctx, run.TaskID)
+	if err != nil {
+		return core.Run{}, core.Task{}, false, err
+	}
+	task := projection.Task
+	hasIntent := run.StopRequestedAt != "" || run.RequestedOutcome != "" ||
+		task.Status == core.TaskCancelled || deadlineReached(run.DeadlineAt)
+	if !hasIntent || run.StopRequestedAt != "" {
+		return run, task, hasIntent, nil
+	}
+
+	reason := "task outcome recorded"
+	switch {
+	case task.Status == core.TaskCancelled:
+		reason = "Task cancelled"
+	case deadlineReached(run.DeadlineAt):
+		reason = "deadline exceeded"
+	}
+	operation, err := randomRuntimeID("reconcile-stop")
+	if err != nil {
+		return core.Run{}, core.Task{}, false, err
+	}
+	updated, err := c.service.RequestRuntimeStop(ctx, core.RunStopInput{
+		RunID: run.ID, Reason: reason, OperationID: operation,
+		RequestID: runtimeRequest(run, "reconcile-stop"),
+	})
+	if err != nil {
+		return core.Run{}, core.Task{}, false, err
+	}
+	return updated, task, true, nil
+}
+
+func reconcileIntentTerminal(run core.Run, task core.Task) (core.RunState, string) {
+	switch {
+	case task.Status == core.TaskCancelled:
+		return core.RunCancelled, "Task cancelled"
+	case run.StopReason == "deadline exceeded":
+		return core.RunTimedOut, "Run deadline exceeded"
+	default:
+		reason := run.StopReason
+		if reason == "" {
+			reason = "durable stop intent observed during reconciliation"
+		}
+		return core.RunInterrupted, reason
+	}
+}
+
+func (c *runtimeController) finishMissingReconciledRun(
+	ctx context.Context,
+	run core.Run,
+	ref containerruntime.RuntimeRef,
+	state core.RunState,
+	reason string,
+) error {
+	operation := run.LaunchOperationID
+	if run.StopOperationID != "" {
+		operation = run.StopOperationID
+	}
+	terminal, err := c.service.RecordRuntimeRunTerminal(ctx, core.RunTerminalInput{
+		RunID: run.ID, Generation: run.Generation, LaunchNonce: run.LaunchNonce,
+		LaunchOperationID: run.LaunchOperationID, ContainerID: run.ContainerID,
+		State: state, TerminalReason: reason,
+		RuntimeErrorCode: "CONTAINER_NOT_FOUND", RequestID: runtimeRequest(run, "reconcile-not-found"),
+		OperationID: operation,
+	})
+	if err != nil {
+		return err
+	}
+	return c.cleanupRun(ctx, terminal.Run, ref, nil, nil)
+}
+
+func (c *runtimeController) stopReconciledRun(
+	ctx context.Context,
+	run core.Run,
+	ref containerruntime.RuntimeRef,
+	state containerruntime.LiveState,
+	entry adapter.CLI,
+) error {
+	if state.Status == containerruntime.StatusCreated {
+		grace := c.shutdownGrace()
+		stopCtx, cancel := context.WithTimeout(context.Background(), grace+10*time.Second)
+		_, stopErr := c.executor.Stop(stopCtx, ref, grace)
+		cancel()
+		if stopErr != nil {
+			return stopErr
+		}
+		projection, err := c.service.Task(ctx, run.TaskID)
+		if err != nil {
+			return err
+		}
+		terminalState, reason := reconcileIntentTerminal(run, projection.Task)
+		operation := run.StopOperationID
+		if operation == "" {
+			operation = run.LaunchOperationID
+		}
+		terminal, err := c.service.RecordRuntimeRunTerminal(ctx, core.RunTerminalInput{
+			RunID: run.ID, Generation: run.Generation, LaunchNonce: run.LaunchNonce,
+			LaunchOperationID: run.LaunchOperationID, ContainerID: run.ContainerID,
+			State: terminalState, TerminalReason: reason,
+			RequestID: runtimeRequest(run, "reconcile-terminal"), OperationID: operation,
+		})
+		if err != nil {
+			return err
+		}
+		return c.cleanupRun(ctx, terminal.Run, ref, nil, nil)
+	}
+
+	monitor := c.newMonitor(run, ref, entry, nil)
+	if err := c.registerMonitor(monitor); err != nil {
+		_ = monitor.cancelAndCollectLogs(2 * time.Second)
+		return err
+	}
+	defer c.unregisterMonitor(monitor)
+	if state.Status == containerruntime.StatusRunning {
+		grace := c.shutdownGrace()
+		stopCtx, cancel := context.WithTimeout(context.Background(), grace+10*time.Second)
+		_, stopErr := c.executor.Stop(stopCtx, ref, grace)
+		cancel()
+		if stopErr != nil {
+			_ = monitor.cancelAndCollectLogs(2 * time.Second)
+			return stopErr
+		}
+	}
+	select {
+	case result := <-monitor.wait:
+		return c.finishObservedRun(run, monitor, result)
+	case <-time.After(c.shutdownGrace() + 10*time.Second):
+		_ = monitor.cancelAndCollectLogs(2 * time.Second)
+		return errors.New("timed out waiting for reconciled container to stop")
+	}
+}
+
+func (c *runtimeController) adoptRunning(
+	ctx context.Context,
+	run core.Run,
+	ref containerruntime.RuntimeRef,
+	entry adapter.CLI,
+	control *runControl,
+) error {
+	monitor := c.newMonitor(run, ref, entry, control)
+	if err := c.registerMonitor(monitor); err != nil {
+		_ = monitor.cancelAndCollectLogs(2 * time.Second)
+		return err
+	}
+	if run.State == core.RunStarting {
+		if run.LaunchPhase != core.LaunchStartIssued {
+			c.unregisterMonitor(monitor)
+			_ = monitor.cancelAndCollectLogs(2 * time.Second)
+			return errors.New("running container lacks start_issued durable phase")
+		}
+		if _, err := c.service.ObserveProcessAndActivateRun(ctx, runtimeFactInput(run, ref, "reconcile-active")); err != nil {
+			c.unregisterMonitor(monitor)
+			_ = monitor.cancelAndCollectLogs(2 * time.Second)
+			return err
+		}
+	}
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.supervise(monitor)
+	}()
+	return nil
+}
+
+func (c *runtimeController) rebuildControl(ctx context.Context, run core.Run) (*runControl, error) {
+	c.mu.Lock()
+	if existing := c.controls[run.ID]; existing != nil {
+		c.mu.Unlock()
+		return existing, nil
+	}
+	c.mu.Unlock()
+	path := filepath.Join(c.controlRoot, run.ID)
+	if err := validateRunControl(ctx, c.controlRoot, run, c.service.AuthorizeRunScope); err != nil {
+		return nil, err
+	}
+	control, err := c.openRunControl(run, path)
+	if err != nil {
+		return nil, err
+	}
+	c.registerControl(run.ID, control)
+	return control, nil
+}
+
+func (c *runtimeController) cleanupTerminalRuns(ctx context.Context) {
+	runs, err := c.service.RunsNeedingCleanup(ctx)
+	if err != nil {
+		return
+	}
+	for _, run := range runs {
+		operation := c.acquireRunOperation(run.ID)
+		if operation == nil {
+			continue
+		}
+		func() {
+			defer c.releaseRunOperation(run.ID, operation)
+			_ = c.cleanupRun(ctx, run, runtimeRef(run), nil, nil)
+		}()
+	}
+}
+
+// isDaemonHelperRef reports whether a managed container is one of the daemon's
+// own short-lived Git helper containers (git-capture/git-inspect, created in
+// git_capture_helper.go). Helper refs carry a deterministic fingerprint: name
+// coordplane-git-(capture|inspect)-<24-hex digest>, AgentID git-helper,
+// generation 1, and the same 24-hex digest as LaunchNonce; their RunID is an
+// operation digest with no Run row by design. Without this exclusion
+// detectOrphans would fail-closed on them and flap the daemon degraded during
+// every capture/inspect window (COD-64, live #11). The match is deliberately
+// narrow so the fail-closed property is preserved: run containers
+// (coordplane-run-*, real Agent and Run IDs) never match, so a running
+// container without a Run row still requires manual quarantine.
+func isDaemonHelperRef(ref containerruntime.RuntimeRef) bool {
+	digest, ok := helperRefDigest(ref.ContainerName)
+	if !ok {
+		return false
+	}
+	return ref.AgentID == "git-helper" && ref.Generation == 1 && ref.LaunchNonce == digest
+}
+
+// helperRefDigest returns the 24-hex operation digest suffix of a known helper
+// container name, or ok=false for any other name shape. The digest is
+// hex.EncodeToString(digest[:12]) from git_capture_helper.go — a 12-byte
+// SHA-256 prefix, 24 hex characters.
+func helperRefDigest(name string) (string, bool) {
+	for _, prefix := range []string{"coordplane-git-capture-", "coordplane-git-inspect-"} {
+		rest, found := strings.CutPrefix(name, prefix)
+		if !found || len(rest) != 24 {
+			continue
+		}
+		for _, r := range rest {
+			if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+				return "", false
+			}
+		}
+		return rest, true
+	}
+	return "", false
+}
+
+func (c *runtimeController) detectOrphans(ctx context.Context) error {
+	states, err := c.executor.Managed(ctx)
+	if err != nil {
+		return err
+	}
+	liveAgents := make(map[string]string)
+	for _, state := range states {
+		if isDaemonHelperRef(state.Ref) {
+			// daemon 自身短生命周期 helper 容器:无 Run row 是设计行为,不是 orphan。
+			// 排除面为确定性 helper 指纹(见 isDaemonHelperRef),coordplane-run-* 运行
+			// 容器不匹配,无 Run row 仍 fail-closed 隔离(COD-52 同源安全属性不放松)。
+			continue
+		}
+		run, runErr := c.service.Run(ctx, state.Ref.RunID)
+		if core.IsCode(runErr, core.CodeNotFound) {
+			return fmt.Errorf("managed orphan container %s requires manual quarantine", state.Ref.ContainerName)
+		}
+		if runErr != nil {
+			return runErr
+		}
+		if err := containerruntime.ValidateOwnership(runtimeRef(run), state.Ref); err != nil {
+			return err
+		}
+		if state.Running {
+			if previous := liveAgents[run.AgentID]; previous != "" && previous != run.ID {
+				return fmt.Errorf("Agent %s has multiple live owned containers", run.AgentID)
+			}
+			liveAgents[run.AgentID] = run.ID
+		}
+	}
+	return nil
+}
+
+func (c *runtimeController) Shutdown(ctx context.Context) error {
+	c.stopRuntimeAdmission()
+	ctx, cancel := c.boundedRuntimeShutdownContext(ctx)
+	defer cancel()
+	c.mu.Lock()
+	c.shutdownCtx = ctx
+	c.mu.Unlock()
+
+	graceErr := c.waitForNaturalShutdown(ctx)
+	intentErr := c.persistShutdownIntents(ctx)
+	c.cancelRuntimeWorkers()
+	workerErr := c.waitForRuntimeWorkers(ctx)
+	convergeErr := c.convergeShutdownRuns(ctx)
+
+	c.mu.Lock()
+	controls := make(map[string]*runControl, len(c.controls))
+	for id, control := range c.controls {
+		controls[id] = control
+	}
+	c.mu.Unlock()
+	var controlErr error
+	for id, control := range controls {
+		controlErr = errors.Join(controlErr, c.closeControlContext(ctx, id, control))
+	}
+	return errors.Join(graceErr, intentErr, workerErr, convergeErr, controlErr)
+}
+
+func (c *runtimeController) stopRuntimeAdmission() {
+	// claimMu closes the gap between the scheduler's admission check and the
+	// transaction that creates a Run.
+	c.claimMu.Lock()
+	c.mu.Lock()
+	c.shuttingDown = true
+	c.mu.Unlock()
+	c.claimMu.Unlock()
+}
+
+func (c *runtimeController) boundedRuntimeShutdownContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if _, ok := parent.Deadline(); ok {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, c.shutdownGrace()+runtimeShutdownOverhead)
+}
+
+func (c *runtimeController) runtimeNaturalShutdownGrace(ctx context.Context) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return c.shutdownGrace()
+	}
+	remaining := time.Until(deadline) - runtimeShutdownOverhead
+	if remaining <= 0 {
+		return 0
+	}
+	grace := c.shutdownGrace()
+	if grace > remaining {
+		grace = remaining
+	}
+	return grace
+}
+
+func (c *runtimeController) waitForNaturalShutdown(ctx context.Context) error {
+	grace := c.runtimeNaturalShutdownGrace(ctx)
+	if grace <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	ticker := time.NewTicker(runtimeShutdownPoll)
+	defer ticker.Stop()
+	for {
+		liveRuns, err := c.service.LiveRuns(ctx)
+		if err != nil {
+			return err
+		}
+		if len(liveRuns) == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+func (c *runtimeController) persistShutdownIntents(ctx context.Context) error {
+	liveRuns, err := c.service.LiveRuns(ctx)
+	if err != nil {
+		return err
+	}
+	var result error
+	for _, snapshot := range liveRuns {
+		run, readErr := c.service.Run(ctx, snapshot.ID)
+		if readErr != nil {
+			result = errors.Join(result, fmt.Errorf("read shutdown Run %s: %w", snapshot.ID, readErr))
+			continue
+		}
+		if core.IsRunTerminal(run.State) || run.StopRequestedAt != "" {
+			continue
+		}
+		if run.RequestedOutcome == "" {
+			updated, _, hasIntent, intentErr := c.reconcileDurableIntent(ctx, run)
+			if intentErr != nil {
+				result = errors.Join(result, fmt.Errorf("persist existing stop intent for Run %s: %w", run.ID, intentErr))
+				continue
+			}
+			if hasIntent || updated.StopRequestedAt != "" {
+				continue
+			}
+		}
+		operation, operationErr := randomRuntimeID("shutdown")
+		if operationErr != nil {
+			result = errors.Join(result, operationErr)
+			continue
+		}
+		_, stopErr := c.service.RequestRuntimeStop(ctx, core.RunStopInput{
+			RunID: run.ID, Reason: runtimeShutdownReason, OperationID: operation,
+			RequestID: runtimeRequest(run, "shutdown"),
+		})
+		if stopErr != nil {
+			latest, latestErr := c.service.Run(ctx, run.ID)
+			if latestErr == nil && (core.IsRunTerminal(latest.State) || latest.StopRequestedAt != "") {
+				continue
+			}
+			result = errors.Join(result, fmt.Errorf("persist shutdown stop for Run %s: %w", run.ID, stopErr))
+		}
+	}
+	return result
+}
+
+func (c *runtimeController) cancelRuntimeWorkers() {
+	c.mu.Lock()
+	if c.cancel == nil {
+		c.ctx, c.cancel = context.WithCancel(context.Background())
+	}
+	cancel := c.cancel
+	monitors := make([]*runMonitor, 0, len(c.monitors))
+	for _, monitor := range c.monitors {
+		monitors = append(monitors, monitor)
+	}
+	c.mu.Unlock()
+	cancel()
+	// Reconciliation may create monitors before Start installs c.ctx. Cancel
+	// their own Wait contexts as well so shutdown can always join them.
+	for _, monitor := range monitors {
+		if monitor.waitCancel != nil {
+			monitor.waitCancel()
+		}
+	}
+}
+
+func (c *runtimeController) convergeShutdownRuns(ctx context.Context) error {
+	liveRuns, err := c.service.LiveRuns(ctx)
+	if err != nil {
+		return err
+	}
+	if len(liveRuns) == 0 {
+		return nil
+	}
+	limit := c.config.MaxParallelRuns
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > len(liveRuns) {
+		limit = len(liveRuns)
+	}
+	jobs := make(chan core.Run)
+	results := make(chan error, len(liveRuns))
+	for range limit {
+		go func() {
+			for snapshot := range jobs {
+				results <- c.convergeShutdownRun(ctx, snapshot)
+			}
+		}()
+	}
+	for _, snapshot := range liveRuns {
+		jobs <- snapshot
+	}
+	close(jobs)
+	var result error
+	for range liveRuns {
+		result = errors.Join(result, <-results)
+	}
+	return result
+}
+
+func (c *runtimeController) convergeShutdownRun(ctx context.Context, snapshot core.Run) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	operation := c.acquireRunOperation(snapshot.ID)
+	if operation == nil {
+		return fmt.Errorf("shutdown Run %s still has a runtime owner", snapshot.ID)
+	}
+	defer c.releaseRunOperation(snapshot.ID, operation)
+	run, err := c.service.Run(ctx, snapshot.ID)
+	if err != nil {
+		return err
+	}
+	if core.IsRunTerminal(run.State) {
+		return nil
+	}
+	return c.shutdownRun(ctx, run)
+}
+
+func (c *runtimeController) waitForRuntimeWorkers(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *runtimeController) shutdownRun(ctx context.Context, run core.Run) error {
+	if run.StopRequestedAt == "" {
+		operation, err := randomRuntimeID("shutdown")
+		if err != nil {
+			return err
+		}
+		updated, err := c.service.RequestRuntimeStop(ctx, core.RunStopInput{
+			RunID: run.ID, Reason: runtimeShutdownReason, OperationID: operation,
+			RequestID: runtimeRequest(run, "shutdown"),
+		})
+		if err != nil {
+			return err
+		}
+		run = updated
+	}
+	if run.LaunchNonce == "" {
+		operation := run.StopOperationID
+		if operation == "" {
+			operation = run.LaunchOperationID
+		}
+		terminal, err := c.service.RecordRuntimeRunTerminal(ctx, core.RunTerminalInput{
+			RunID: run.ID, Generation: run.Generation, LaunchOperationID: run.LaunchOperationID,
+			State: core.RunFailed, TerminalReason: "daemon shutdown before runtime launch was prepared",
+			RuntimeErrorCode: "DAEMON_SHUTDOWN", RequestID: runtimeRequest(run, "shutdown-terminal"),
+			OperationID: operation,
+		})
+		if err != nil {
+			return err
+		}
+		return c.cleanupRun(ctx, terminal.Run, runtimeRef(terminal.Run), nil, nil)
+	}
+	ref := runtimeRef(run)
+	grace := c.shutdownGrace()
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining < grace {
+			grace = max(time.Duration(0), remaining)
+		}
+	}
+	_, stopErr := c.executor.Stop(ctx, ref, grace)
+	if stopErr != nil && !errors.Is(stopErr, containerruntime.ErrNotFound) {
+		return stopErr
+	}
+	exit, waitErr := c.executor.Wait(ctx, ref)
+	entry, ok := c.adapters.Lookup(run.AdapterID)
+	if !ok {
+		return fmt.Errorf("shutdown Run %s adapter %q is not registered", run.ID, run.AdapterID)
+	}
+	c.mu.Lock()
+	control := c.controls[run.ID]
+	c.mu.Unlock()
+	monitor := &runMonitor{
+		runID: run.ID, ref: ref, entry: entry, control: control,
+		redact: c.runtimeRedaction(run), logs: make(chan error, 1),
+	}
+	monitor.logs <- c.streamLogs(ctx, run, ref, entry, monitor)
+	return c.finishObservedRunContext(ctx, run, monitor, waitResult{fact: exit, err: waitErr})
+}
+
+func (c *runtimeController) Close() error {
+	if c == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return c.Shutdown(ctx)
+}
