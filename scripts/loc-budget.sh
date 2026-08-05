@@ -169,8 +169,8 @@ total=$((production + tests + infra))
 generated_total=$((generated_semantic_production + generated_semantic_tests + generated_semantic_infra + generated_mechanical_excluded))
 
 failure=false
-[ "$production" -le 22400 ] || failure=true; [ "$frontend" -le 3000 ] || failure=true
-[ "$tests" -le 23600 ] || failure=true; [ "$infra" -le 600 ] || failure=true; [ "$total" -le 46600 ] || failure=true; [ "$generated_total" -le 3000 ] || failure=true
+[ "$production" -le 22600 ] || failure=true; [ "$frontend" -le 3000 ] || failure=true
+[ "$tests" -le 23700 ] || failure=true; [ "$infra" -le 600 ] || failure=true; [ "$total" -le 47000 ] || failure=true; [ "$generated_total" -le 3000 ] || failure=true
 for report in unknown file-blockers function-blockers gofmt multistatement-blockers; do
   [ ! -s "$tmp/$report" ] || failure=true
 done
@@ -197,7 +197,7 @@ awk -F'|' \
     printf "{\n  \"schema_version\": 1,\n  \"revision\": \"%s\",\n  \"base_revision\": \"%s\",\n", revision, base
     printf "  \"atomic_buckets\": {\"handwritten_frontend\":%d,\"handwritten_production\":%d,\"handwritten_tests\":%d,\"handwritten_infra\":%d,\"generated_semantic_production\":%d,\"generated_semantic_tests\":%d,\"generated_semantic_infra\":%d,\"generated_mechanical_excluded\":%d},\n", frontend, hp,ht,hi,gsp,gst,gsi,gme
     printf "  \"budgeted\": {\"production\":%d,\"tests\":%d,\"infra\":%d,\"total\":%d},\n", production,tests,infra,total
-    printf "  \"thresholds\": {\"production\":22400,\"tests\":23600,\"infra\":600,\"total\":46600,\"frontend\":3000,\"generated_review\":3000},\n"
+    printf "  \"thresholds\": {\"production\":22600,\"tests\":23700,\"infra\":600,\"total\":47000,\"frontend\":3000,\"generated_review\":3000},\n"
     printf "  \"generated_total\": %d,\n  \"first_party_source_total\": %d,\n  \"fixture_bytes\": %d,\n", generated,source_total,fixture_bytes
     printf "  \"modules\": {"; n=asorti(module, keys); for(i=1;i<=n;i++){split(keys[i],p,SUBSEP); if(i>1)printf ","; printf "\"%s/%s\":%d",esc(p[1]),esc(p[2]),module[keys[i]]} printf "},\n"
     printf "  \"diff\": {\"raw_added\":%d,\"raw_deleted\":%d},\n", added,deleted

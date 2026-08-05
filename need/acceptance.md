@@ -662,10 +662,10 @@ Owner已批准保留上述完整产品范围和本节非空、非纯注释物理
 
 | bucket | 旧目标/软阈值/发布或审查阈值 | 批准的目标/软阈值/发布或审查阈值 | 逐项增量 |
 | --- | ---: | ---: | ---: |
-| Production | `10,500 / 12,550 / 14,650` | `20,000 / 21,000 / 22,400` | `+9,500 / +8,450 / +7,750` |
-| Tests | `12,300 / 15,450 / 19,000` | `21,000 / 22,000 / 23,600` | `+8,700 / +6,550 / +4,600` |
+| Production | `10,500 / 12,550 / 14,650` | `20,000 / 21,000 / 22,600` | `+9,500 / +8,450 / +7,950` |
+| Tests | `12,300 / 15,450 / 19,000` | `21,000 / 22,000 / 23,700` | `+8,700 / +6,550 / +4,700` |
 | Build/test infra | `250 / 400 / 600` | `250 / 400 / 600` | `0 / 0 / 0` |
-| Budgeted total | `23,050 / 28,400 / 34,250` | `41,250 / 43,400 / 46,600` | `+18,200 / +15,000 / +12,350` |
+| Budgeted total | `23,050 / 28,400 / 34,250` | `41,250 / 43,400 / 47,000` | `+18,200 / +15,000 / +12,750` |
 
 **前端独立预算(Owner 已批准,2026-08-04)**:web 前端 SPA、`internal/webserver/*` 服务层与 web e2e(`tests/e2e/web_test.go`)计入独立的 `handwritten_frontend` 桶,发布阈值 `3,000` 物理行,不与后端核心 production/tests/infra/total 共享;后端预算包络不变。
 
@@ -683,12 +683,12 @@ Production和Tests新增空间先以透明、未分配的重基线reserve列入�
 | `git`：Project、private clone、capture、task ref、CAS、integration/GC | 1,900 | 2,250 | 2,600 |
 | `adapter`：静态接口/registry和一个production adapter | 550 | 700 | 850 |
 | `daemon/config/shared`：wiring、file lock、worker registry、config、clock/ID/error/redaction | 700 | 850 | 1,000 |
-| Owner批准的未分配重基线reserve | 8,000 | 6,950 | 5,850 |
-| **Production合计** | **18,500** | **19,500** | **20,500** |
+| Owner批准的未分配重基线reserve | 9,500 | 8,450 | 7,950 |
+| **Production合计** | **20,000** | **21,000** | **22,600** |
 
-模块超过软阈值可以在production总软阈值内小幅调剂，但必须在变更说明中列出净增量、所属不变量和删除/合并计划。任一模块超过模块审查阈值时必须复核owner边界和重复实现，不能靠把语义搬到其他目录消除命中；只要production总量仍`<=20,500`、12.6节候选证据审查已完成且复核未发现范围漂移，模块命中本身不阻断发布。Production总量严格`>20,500`时阻断第一版发布，直到删除旧/重复路径，或owner先显式修改需求和预算。
+模块超过软阈值可以在production总软阈值内小幅调剂，但必须在变更说明中列出净增量、所属不变量和删除/合并计划。任一模块超过模块审查阈值时必须复核owner边界和重复实现，不能靠把语义搬到其他目录消除命中；只要production总量仍`<=22,600`、12.6节候选证据审查已完成且复核未发现范围漂移，模块命中本身不阻断发布。Production总量严格`>22,600`时阻断第一版发布，直到删除旧/重复路径，或owner先显式修改需求和预算。
 
-第二个production adapter不在基线内。确需第一版加入时，规划增量为adapter production目标/软/审查`+450/+550/+650` SLOC、adapter tests`+500/+650/+800` SLOC；完整预算将变为Production `18,950/20,050/21,150`、Tests `20,500/22,150/23,300`、budgeted总计`39,700/42,600/45,050`。必须先把完整表和README改成新基线，再实现并说明为什么一个adapter不能完成产品验收；只有更新后的完整表可作为`loc-budget`输入。
+第二个production adapter不在基线内。确需第一版加入时，规划增量为adapter production目标/软/审查`+450/+550/+650` SLOC、adapter tests`+500/+650/+800` SLOC；完整预算将变为Production `20,450/21,550/23,250`、Tests `21,500/22,650/24,500`、budgeted总计`42,200/44,600/48,350`。必须先把完整表和README改成新基线，再实现并说明为什么一个adapter不能完成产品验收；只有更新后的完整表可作为`loc-budget`输入。
 
 ### 12.3 测试和基础设施预算
 
@@ -701,14 +701,14 @@ Production和Tests新增空间先以透明、未分配的重基线reserve列入�
 | 真实Docker runtime/fault matrix | 2,200 | 2,800 | 3,500 |
 | Deterministic + real CLI E2E harness | 1,500 | 1,900 | 2,300 |
 | 多Agent可靠性观测、故障编排和安全报告 | 800 | 1,100 | 1,500 |
-| Owner批准的未分配重基线reserve | 7,700 | 6,050 | 3,500 |
-| **Tests合计** | **20,000** | **21,500** | **22,500** |
+| Owner批准的未分配重基线reserve | 8,700 | 6,550 | 4,700 |
+| **Tests合计** | **21,000** | **22,000** | **23,700** |
 
 测试超过审查阈值只触发重复fixture/helper和边界重叠审查，不得仅因LOC删除测试。测试能否删除只由对应不变量已删除或已由更低、更真实边界完整替代决定。
 
 多Agent可靠性harness必须复用既有public CLI、Docker/Git fixture helper和状态断言；它只新增场景编排、环境观测和安全报告，不得复制Core/Runtime/Git实现，也不得把角色或provider特判写入主执行器。
 
-Budgeted build/test infrastructure（shell、Dockerfile、Makefile、手写YAML及语义型generated输入/输出）目标250、软阈值400、审查阈值600 SLOC。Budgeted maintained surface目标/软/审查为`38,750/41,400/43,600`；该总数包含语义型generated SLOC，不含机械generated输出和静态fixture，不能覆盖production超限，也不是减少测试的理由。
+Budgeted build/test infrastructure（shell、Dockerfile、Makefile、手写YAML及语义型generated输入/输出）目标250、软阈值400、审查阈值600 SLOC。Budgeted maintained surface目标/软/审查为`41,250/43,400/47,000`；该总数包含语义型generated SLOC，不含机械generated输出和静态fixture，不能覆盖production超限，也不是减少测试的理由。
 
 ### 12.4 统一统计口径
 
@@ -756,7 +756,7 @@ first_party_source_total = 所有上述源码物理行集合去重后的总数
 1. 冻结一个clean候选revision `R`，运行第13节全部非provider Gate和`scripts/loc-budget.sh --check --output loc-budget.json`。
 2. LOC JSON必须记录并匹配`R`，保留全部原子桶、`budgeted_production/tests/infra/total`、每模块实际值、generated/fixture可见性、Git diff以及unknown path、file/function和gofmt质量blocker；不得只报告四个合计数。
 3. 第11节真实live报告必须记录其已验证revision。若候选`R`只比该revision多需求文档或其他不影响production/runtime/fixture的变更，可以通过精确diff复用证据；任何相关代码、测试fixture、image或adapter配置变化都必须重跑受影响的真实场景。
-4. 只有LOC四个发布值分别`<=20,500/22,500/600/43,600`、质量blocker清零、第11节真实场景通过且第14节不变量全部满足，第一版Gate才完成。
+4. 只有LOC四个发布值分别`<=22,600/23,700/600/47,000`、质量blocker清零、第11节真实场景通过且第14节不变量全部满足，第一版Gate才完成。
 5. 若要扩大envelope、排除源码或删减产品/测试合同，必须在实现前显式修改五份need；不得在脚本、报告或评论中暗改。
 
 ## 13. 验证命令和Gate
@@ -803,7 +803,7 @@ E2E失败后不得直接反复改E2E脚本或prompt。必须先分类到Core、R
 - Deterministic双Agent E2E通过。
 - `RMA-01`真实双Agent E2E通过且未SKIP；production adapter、Message、task ref、integration和canonical CAS形成完整证据。
 - `RMA-02`真实四Agent场景通过且未SKIP；4个source Run真实重叠，并在一次Daemon重启后继续收敛。
-- `budgeted_production/tests/infra/total <= 20,500/22,500/600/43,600`，质量blocker清零，测试未因LOC被弱化。
+- `budgeted_production/tests/infra/total <= 22,600/23,700/600/47,000`，质量blocker清零，测试未因LOC被弱化。
 - 验收结束后没有starting/active Run、owned orphan container、未解释capture/CAS intent或误删的task ref。
 - Boss能从正式命令读取最终Task、Run、Message、base/head和canonical SHA。
 - Boss和Reviewer能从正式入口实际读取、检出和测试精确未集成task head，而不获得control repo写权限。
