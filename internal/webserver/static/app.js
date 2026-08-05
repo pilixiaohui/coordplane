@@ -114,6 +114,50 @@ function render() {
   if (view === "task") { m.innerHTML = renderTaskDetail(); return; }
   if (view === "agent") { m.innerHTML = renderAgentDetail(); return; }
   m.innerHTML = views[view]();
+  if (view === "events") startAguiStream();
+}
+
+// AG-UI 实时事件流:fetch + ReadableStream 消费 SSE(/v1/events/stream),
+// 事件词汇为 run_start / text_message / tool_call / run_complete。
+// EventSource 不支持自定义凭据头,故用 fetch 流式读取。
+let aguiStreamToken = 0;
+async function startAguiStream() {
+  const token = ++aguiStreamToken;
+  const box = $("agui-stream");
+  if (!box) return;
+  box.innerHTML = '<div class="muted">连接中…</div>';
+  try {
+    const resp = await fetch("/v1/events/stream", {
+      headers: { "X-Coordplane-Credential": sessionStorage.getItem(KEY) || "" },
+    });
+    if (!resp.ok || !resp.body) { box.innerHTML = '<div class="muted">流不可用</div>'; return; }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const block = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const dline = block.split("\n").find(l => l.startsWith("data: "));
+        if (!dline) continue;
+        try {
+          const ev = JSON.parse(dline.slice(6));
+          if (aguiStreamToken !== token) return;
+          const row = document.createElement("div");
+          row.className = "agui-row";
+          row.textContent = `[${esc(ev.at || "")}] ${esc(ev.type)} ${esc(ev.run_id || ev.task_id || ev.message_id || "")}${ev.summary ? " — " + esc(ev.summary) : ""}`;
+          box.prepend(row);
+          while (box.childElementCount > 120) box.removeChild(box.lastChild);
+        } catch (e) { /* 忽略坏块 */ }
+      }
+    }
+  } catch (e) {
+    if (aguiStreamToken === token) box.innerHTML = '<div class="muted">流已断开</div>';
+  }
 }
 
 const views = {
@@ -207,6 +251,9 @@ const views = {
   },
   events() {
     return `<h1>Events</h1>
+    <h2 style="margin-top:18px">实时流 <span class="muted">(AG-UI 词汇: run_start / text_message / tool_call / run_complete)</span></h2>
+    <div id="agui-stream" class="agui-stream"><div class="muted">连接中…</div></div>
+    <h2 style="margin-top:18px">历史</h2>
     <table><tr><th>时间</th><th>事件</th><th>实体</th><th>actor</th><th>备注</th></tr>
     ${eventsCache.map(e => `<tr><td class="mono">${esc(e.created_at)}</td><td>${esc(e.kind)}</td><td class="mono">${esc(e.entity_id)}</td><td>${esc(e.actor_kind)}:${esc(e.actor_id)}</td><td class="muted">${esc((e.payload_json || "").slice(0, 80))}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">无</td></tr>'}
     </table>`;

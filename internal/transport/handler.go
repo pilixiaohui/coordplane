@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"coordplane/internal/core"
 )
@@ -334,6 +335,50 @@ func registerMessageEventGCRoutes(mux *http.ServeMux, operations OperatorOperati
 			Limit:      limit,
 		})
 		writeResult(w, result, err)
+	}))
+	// /v1/events/stream 提供 SSE 实时事件流,事件词汇按 AG-UI 映射
+	// (docs/protocols.md §4):run.created/active -> run_start,
+	// message.created/delivered -> text_message, task.progress -> tool_call,
+	// run.exited|failed|interrupted|timed_out 与 task.failed -> run_complete。
+	// 实现为服务端增量轮询投影(1s 间隔 + 15s 心跳),不改变后端事件模型。
+	mux.HandleFunc("/v1/events/stream", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			writeError(w, errors.New("streaming unsupported"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		cursor := ""
+		for {
+			page, err := operations.ListEvents(r.Context(), core.EventFilter{ProjectID: projectID, Cursor: cursor, Limit: 50})
+			if err != nil {
+				writeError(w, err)
+				return
+			}
+			for _, event := range page.Items {
+				if payload, ok := aguiEventPayload(event); ok {
+					data, err := json.Marshal(payload)
+					if err != nil {
+						continue
+					}
+					fmt.Fprintf(w, "event: %s\ndata: %s\n\n", payload["type"], data)
+					flusher.Flush()
+				}
+			}
+			if page.NextCursor != "" && page.NextCursor != cursor {
+				cursor = page.NextCursor
+			}
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(1 * time.Second):
+				fmt.Fprint(w, ": heartbeat\n\n")
+				flusher.Flush()
+			}
+		}
 	}))
 	mux.HandleFunc("/v1/gc/preview", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
 		result, err := operations.GCPreview(r.Context())
