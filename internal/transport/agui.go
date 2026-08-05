@@ -21,30 +21,30 @@ func aguiEventPayload(event core.Event) (map[string]any, bool) {
 	switch event.Kind {
 	case "run.created", "run.active":
 		return map[string]any{
-			"id":      event.ID,
-			"type":    "run_start",
-			"run_id":  event.RunID,
-			"task_id": entityIDFor(event, "task"),
+			"id":       event.ID,
+			"type":     "run_start",
+			"run_id":   event.RunID,
+			"task_id":  entityIDFor(event, "task"),
 			"agent_id": event.ActorID,
-			"at":      at,
+			"at":       at,
 		}, true
 	case "message.created", "message.delivered":
 		return map[string]any{
-			"id":        event.ID,
-			"type":      "text_message",
+			"id":         event.ID,
+			"type":       "text_message",
 			"message_id": event.EntityID,
-			"task_id":   entityIDFor(event, "task"),
-			"run_id":    event.RunID,
-			"at":        at,
+			"task_id":    entityIDFor(event, "task"),
+			"run_id":     event.RunID,
+			"at":         at,
 		}, true
 	case "task.progress":
 		return map[string]any{
-			"id":       event.ID,
-			"type":     "tool_call",
-			"task_id":  event.EntityID,
-			"run_id":   event.RunID,
-			"summary":  summaryOf(event),
-			"at":       at,
+			"id":      event.ID,
+			"type":    "tool_call",
+			"task_id": event.EntityID,
+			"run_id":  event.RunID,
+			"summary": summaryOf(event),
+			"at":      at,
 		}, true
 	case "run.exited", "run.failed", "run.interrupted", "run.timed_out", "run.cancelled", "task.failed":
 		return map[string]any{
