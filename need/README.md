@@ -140,8 +140,20 @@ Manager、Developer、Reviewer、Integrator 只是 Agent 指令或显示标签�
 - 分布式队列、远程 runner 集群、Kubernetes、HA、多 Daemon 并行写同一 data directory。
 - Web UI、复杂 Dashboard、Autopilot、定时任务、模型成本平台、长期语义记忆或向量数据库。
 - CoordPlane 内置 LLM、阅读自然语言后自动拆任务、自动选择角色、自动验收代码或自动解决冲突。
+- 内部 agent↔agent 点对点直连（A2A 或其他任何直连协议）；多 Agent 协作只经 Daemon 的 Task/Message 机制。
+- AGNTCY/ANP 等跨组织发现/身份/传输基础设施；第一版是单 Daemon、本地优先，不需要 agent 目录/去中心化身份/加密传输网络。
 
 未来若增加上述能力，必须先修改本需求基线，并作为可删除的独立适配层加入；不得在第一版主流程中预埋半成品接口。
+
+### 6.1 行业标准协议定位（演进合同）
+
+本小节固化第一版边界内对行业标准协议的定位，防止实现漂移。详细设计见 `docs/protocols.md`；对象/状态/Run 事实仍只由 `core.md`/`runtime.md` 定义，本小节不新增任何持久对象或状态。
+
+1. **ACP（Agent Client Protocol，协调者 ↔ CLI agent）是 adapter 层的演进目标，不是第一版合同**。第一版 adapter 仍是静态注册的 provider 私有协议（Claude CLI）；当 ACP 达到 1.0 稳定且目标 agent（Claude Code）提供原生或成熟 bridge 支持后，应当实现 ACP client adapter 替换私有事件解析。`runtime.md` §7.1 的 adapter 接口（BuildStartCommand/BuildResumeCommand/BuildInjectInput/ParseEvent/ResumeCompatible）与 ACP 方法（session/new、session/prompt、session/cancel、session/update、session/request_permission）的映射见 `docs/protocols.md`。**第一版不得**预埋 ACP 半成品接口或按协议名写主循环特判；adapter 注册列表保持静态。
+2. **A2A（Agent2Agent，agent↔agent）只作为未来对外互操作出口**。Boss 面未来可把 Project/Task 暴露为 A2A 端点 + 静态 AgentCard（能力/技能/安全声明，`/.well-known/agent-card.json`），用于与其他 agent 平台互派任务；但**内部多 Agent 协作必须保持 Daemon 单一协调，禁止 agent↔agent 点对点直连**（见 §6 非目标）。A2A 出口属于未来能力，必须先修改本需求基线。
+3. **AG-UI（agent↔UI）作为 Web 前端事件流参考**。实时展示 Run 进度/工具调用时应当映射 AG-UI 事件词汇（RunStart/TextMessage/ToolCall/RunComplete 等，SSE + JSON Patch），不得为前端自造第二套事件协议。
+4. **MCP（Model Context Protocol）不建设平台**。见 §6 非目标（通用 tool adapter、MCP server、plugin 平台）；agent 在容器内自行连接 MCP server 属 agent 自身行为，CoordPlane 不提供平台化支持。
+5. **AGNTCY/ANP 等发现/身份/传输基础设施不进第一版**。单 Daemon、本地优先定位不匹配；仅当未来演进为多 Daemon 或对外可发现 agent 时再评估。
 
 ## 7. 设计原则
 

@@ -654,3 +654,11 @@ reconcile 未完成前，查询可以只读开放，但不得 claim Task 或启�
 - Task/Message 表直接承担调度/递送队列，不建设通用 QueueItem。
 - 每次状态变化与 Event 同事务；每个外部动作都有 intent 和 reconciliation。
 - Daemon 不理解任务正文、角色名、代码或验收语义。
+
+## 14. 未来能力与标准协议边界
+
+行业标准协议的总体定位见 `README.md` §6.1，Runtime 侧 ACP 演进合同见 `runtime.md` §7.4。本文件的对象与状态机**不因协议演进而改变**；本节只声明未来能力的边界，不新增任何持久对象、状态或命令。
+
+- **A2A（Agent2Agent）对外出口是未来能力**。若未来把 Project/Task 暴露为 A2A 端点 + 静态 AgentCard（能力/技能/安全声明），必须满足：① 对外 `tasks/send`、`tasks/get`、`tasks/cancel` 全部映射到本文件的 Task/Message 语义（submitted 对应 queued、working 对应 running、completed/failed/canceled 对应同名终态、INPUT_REQUIRED 对应 waiting），不创建第二套任务对象或状态机；② 对外身份/凭据校验独立于内部 Run token/generation fence，不得复用或暴露内部 token；③ 对外委派进来的任务与内部 Task 同表同规则（scope、幂等、Event 同事务）。该能力必须先修改本需求基线再实现。
+- **内部协作禁止任何直连协议**。多 Agent 协作只经 Daemon 的 Task/Message 机制（见 §13 不变量）；A2A 或其他 agent↔agent 点对点直连不得进入容器网络或 Run 会话。
+- **Boss 控制面不引入新协议**。`coordplane`/`coordlink`/内部 HTTP transport 调用同一 operation 函数的约束（§8）不因协议演进而放宽。

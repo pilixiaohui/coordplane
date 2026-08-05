@@ -234,6 +234,26 @@ Message 已被处理                 <- Message acknowledged
 - 新 Message 到达已退出 one-shot session 时，必须创建新 Resume Run。
 - 第一版production adapter应使用one-shot执行模型。未来注册live adapter时，必须同时支持Inject或明确可由Executor关闭当前turn；`live && !supports_inject`且不会自行退出的组合必须在注册时拒绝。
 
+### 7.4 ACP 演进合同（Agent Client Protocol）
+
+ACP 是"协调者 ↔ 命令行 agent"的行业标准协议（JSON-RPC 2.0 over stdio；session/new、session/prompt、session/cancel、session/update 流式事件、session/request_permission）。定位与总体决策见 `README.md` §6.1；本节是 Runtime 侧的演进合同。
+
+- **第一版 adapter 合同不变**：adapter 仍按 §7.1 静态注册、解析 provider 私有协议；不得因 ACP 预埋半成品接口，不得在主循环按协议名写特判。
+- **ACP client adapter 是演进目标**：当 ACP 达 1.0 稳定、且目标 agent（Claude Code）提供原生或成熟 bridge 支持时，应当新增静态注册的 ACP client adapter。其与现有接口的映射固定为：
+
+| adapter 接口 | ACP 方法/事件 | 说明 |
+| --- | --- | --- |
+| BuildStartCommand | session/new | 启动 ACP server（agent CLI 包装）并新建 session |
+| bootstrap 输入 | session/prompt | 一次性投影作为首轮 prompt |
+| BuildResumeCommand | session/load | 用 native session ID 恢复 |
+| BuildInjectInput | session/prompt（进行中） | 运行中输入，仍受 Run token/generation 校验 |
+| ParseEvent | session/update 事件流 | 解析标准化事件，替代私有 JSONL |
+| ResumeCompatible | 协议版本 + agent 能力声明 | 兼容性判断来源 |
+
+- **ACP client adapter 必须保持本文件全部 Runtime 合同**：one-shot 执行模型、三类事实分离、resume 即新 Run、token/generation fence、Docker 生命周期统一由 Executor 拥有、适配器不得直接改 Task/Message/Git。
+- **采用前置条件**（全部满足才可实现替换）：ACP 1.0 发布；Claude Code 原生支持或经审核的 bridge 稳定；ACP conformance 测试（session 生命周期、流式事件、cancel、resume）纳入本仓库验收；provider 计费/凭据路径与现有 allowlist 兼容。
+- 新增或删除 adapter 仍只改动注册列表与实现；删除私有 adapter 时同步删除其 fixture 与正向测试，保留防止旧路径回归的负向 guard。
+
 ## 8. Run 启动流程
 
 Core claim 事务创建 state=starting 的 Run 后，Runtime 按注册步骤执行：

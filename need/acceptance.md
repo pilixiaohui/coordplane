@@ -154,6 +154,8 @@ events
 | INV-15 | 第一版没有动态registry、TeamConfig DSL、验收引擎、artifact平台或per-tool审计 |
 | INV-16 | 四Agent负载下控制面不成为瓶颈，Daemon崩溃后在有界时间恢复且无重复/泄漏 |
 | INV-17 | 第一版production维护面保持在已声明SLOC预算内，超预算不能靠隐藏/压缩路径规避 |
+| INV-18 | 第一版不引入行业协议半成品接口：adapter 保持静态注册的 provider 私有协议（README.md §6.1）；ACP client adapter 只按 runtime.md §7.4 的采用前置条件实现，不按协议名写主循环特判 |
+| INV-19 | 内部多 Agent 协作只经 Daemon 的 Task/Message 机制；任何 agent↔agent 直连协议（含 A2A）不得出现在容器网络/Run 会话或生产入口（core.md §14） |
 
 ## 6. Core 合同场景
 
