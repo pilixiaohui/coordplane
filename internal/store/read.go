@@ -10,6 +10,22 @@ import (
 	"coordplane/internal/core"
 )
 
+// projectScopeSuffix returns a SQL suffix that restricts a query to one
+// project when projectID is non-empty; an empty scope counts globally.
+func projectScopeSuffix(projectID, column string) string {
+	if strings.TrimSpace(projectID) == "" {
+		return ""
+	}
+	return " AND " + column + "=?"
+}
+
+func projectScopeArgs(projectID string) []any {
+	if strings.TrimSpace(projectID) == "" {
+		return nil
+	}
+	return []any{strings.TrimSpace(projectID)}
+}
+
 type historyCursor struct {
 	CreatedAt string `json:"created_at"`
 	ID        string `json:"id"`
@@ -433,6 +449,12 @@ func (s *Store) StatusProjection(ctx context.Context, projectID string) (core.St
 
 	projection.Tasks, err = statusTaskViews(ctx, tx, tasks, runs)
 	if err != nil {
+		return core.StatusProjection{}, err
+	}
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM messages WHERE recipient_kind='boss' AND state='pending'`+projectScopeSuffix(projectID, "project_id"),
+		projectScopeArgs(projectID)...,
+	).Scan(&projection.PendingBossMessages); err != nil {
 		return core.StatusProjection{}, err
 	}
 	if err := tx.Commit(); err != nil {

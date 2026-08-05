@@ -252,9 +252,10 @@ type Snapshot struct {
 // StatusProjection is the bounded SQLite view used to build Status. It keeps
 // current operational state separate from the paginated history surfaces.
 type StatusProjection struct {
-	Snapshot  Snapshot   `json:"snapshot"`
-	Tasks     []TaskView `json:"tasks,omitempty"`
-	Truncated bool       `json:"-"`
+	Snapshot            Snapshot   `json:"snapshot"`
+	Tasks               []TaskView `json:"tasks,omitempty"`
+	PendingBossMessages int        `json:"pending_boss_messages"`
+	Truncated           bool       `json:"-"`
 }
 
 type TaskProjection struct {
@@ -299,13 +300,14 @@ type EventPage struct {
 }
 
 type Status struct {
-	DaemonReady      bool           `json:"daemon_ready"`
-	Reason           string         `json:"reason,omitempty"`
-	Runtime          *RuntimeStatus `json:"runtime,omitempty"`
-	SummaryTruncated bool           `json:"summary_truncated,omitempty"`
-	Snapshot         Snapshot       `json:"snapshot"`
-	ActualRefs       []GitState     `json:"actual_refs,omitempty"`
-	Tasks            []TaskView     `json:"tasks,omitempty"`
+	DaemonReady         bool           `json:"daemon_ready"`
+	Reason              string         `json:"reason,omitempty"`
+	Runtime             *RuntimeStatus `json:"runtime,omitempty"`
+	SummaryTruncated    bool           `json:"summary_truncated,omitempty"`
+	PendingBossMessages int            `json:"pending_boss_messages,omitempty"`
+	Snapshot            Snapshot       `json:"snapshot"`
+	ActualRefs          []GitState     `json:"actual_refs,omitempty"`
+	Tasks               []TaskView     `json:"tasks,omitempty"`
 }
 
 type RuntimeStatus struct {

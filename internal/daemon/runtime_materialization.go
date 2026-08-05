@@ -86,6 +86,10 @@ func buildBootstrap(
 			body.WriteString("The convenience ref may move; the source SHA above is authoritative.\n")
 		}
 		_ = workspacePath
+	} else {
+		body.WriteString("This is a conversation Run: the project workspace is NOT mounted (no /workspace/project) and no project code is available.\n")
+		body.WriteString("Do not attempt to read, modify, build, or commit project code here, and do not run git commands expecting the project repository.\n")
+		body.WriteString("To do code work, create or request a work/review Task (coordlink task create, or a message to the Boss).\n")
 	}
 	if len(launch.Messages) > 0 {
 		body.WriteString("Pending messages:\n")
@@ -111,7 +115,11 @@ func buildBootstrap(
 			)
 		}
 	}
-	body.WriteString("Use native Git commands in the private workspace. Use coordlink task wait, submit, or fail for an explicit outcome. CLI exit or text such as done does not complete the Task.\n")
+	if launch.Task.Kind == core.TaskConversation {
+		body.WriteString("Reply to the pending messages above. Use coordlink task wait when you are done for now; CLI exit or text such as done does not complete the Task.\n")
+	} else {
+		body.WriteString("Use native Git commands in the private workspace. Use coordlink task wait, submit, or fail for an explicit outcome. CLI exit or text such as done does not complete the Task.\n")
+	}
 	return body.String()
 }
 

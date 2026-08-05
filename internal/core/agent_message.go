@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"strings"
+	"time"
 )
 
 func (s *Service) SendAgentMessage(ctx context.Context, input SendMessageInput) (Message, error) {
@@ -253,7 +254,11 @@ func (s *Service) wakeDeliveryTask(
 	}
 	expectedVersion := task.Version
 	task.Status = TaskQueued
-	task.NextRunAt = now
+	// conversationWakeMergeWindow batches wake messages that arrive close
+	// together into one Run: a queued task is not requeued again, so
+	// messages arriving within the window are all carried by the same
+	// bootstrap instead of spawning one container Run per message.
+	task.NextRunAt = addSeconds(now, conversationWakeMergeWindow)
 	task.Version++
 	task.UpdatedAt = now
 	if err := tx.UpdateTask(*task, expectedVersion, TaskWaiting); err != nil {
@@ -261,4 +266,17 @@ func (s *Service) wakeDeliveryTask(
 	}
 	_, err := tx.AppendEvent(event(task.ProjectID, "task", task.ID, "task.requeued", actorKind, actorID, runID, requestID, "", eventPayload(map[string]any{"reason": reason}), now))
 	return err
+}
+
+// conversationWakeMergeWindow delays a conversation wake by this many
+// seconds so that a burst of messages triggers a single Run instead of one
+// Run per message. Work/integration tasks are not affected.
+const conversationWakeMergeWindow = 10
+
+func addSeconds(now string, seconds int) string {
+	instant, err := time.Parse(time.RFC3339Nano, now)
+	if err != nil {
+		return now
+	}
+	return instant.Add(time.Duration(seconds) * time.Second).UTC().Format("2006-01-02T15:04:05.000000000Z")
 }

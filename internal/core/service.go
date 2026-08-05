@@ -124,7 +124,7 @@ func (s *Service) Status(ctx context.Context, projectID string) (Status, error) 
 	if err != nil {
 		return Status{}, err
 	}
-	status := Status{Snapshot: projection.Snapshot, Tasks: projection.Tasks, SummaryTruncated: projection.Truncated}
+	status := Status{Snapshot: projection.Snapshot, Tasks: projection.Tasks, PendingBossMessages: projection.PendingBossMessages, SummaryTruncated: projection.Truncated}
 	s.readyMu.RLock()
 	status.DaemonReady = s.ready
 	if s.runtimeStatus != nil {
