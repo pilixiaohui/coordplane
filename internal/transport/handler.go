@@ -341,6 +341,9 @@ func registerMessageEventGCRoutes(mux *http.ServeMux, operations OperatorOperati
 	// message.created/delivered -> text_message, task.progress -> tool_call,
 	// run.exited|failed|interrupted|timed_out 与 task.failed -> run_complete。
 	// 实现为服务端增量轮询投影(1s 间隔 + 15s 心跳),不改变后端事件模型。
+	// 注意:ListEvents 游标是 before 语义(向旧翻页),不适合增量轮询,
+	// 因此这里用"已见最大事件 ID"做增量过滤:每轮拉最新一页(DESC),
+	// 只输出 id 大于已见值的部分,再推进已见值。
 	mux.HandleFunc("/v1/events/stream", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
 		projectID := strings.TrimSpace(r.URL.Query().Get("project_id"))
 		flusher, ok := w.(http.Flusher)
@@ -351,25 +354,35 @@ func registerMessageEventGCRoutes(mux *http.ServeMux, operations OperatorOperati
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		cursor := ""
+		var lastSeen int64
 		for {
-			page, err := operations.ListEvents(r.Context(), core.EventFilter{ProjectID: projectID, Cursor: cursor, Limit: 50})
+			page, err := operations.ListEvents(r.Context(), core.EventFilter{ProjectID: projectID, Limit: 100})
 			if err != nil {
 				writeError(w, err)
 				return
 			}
+			// page.Items 按 id DESC(新->旧);收集新事件后按时间正序输出。
+			var fresh []core.Event
 			for _, event := range page.Items {
-				if payload, ok := aguiEventPayload(event); ok {
-					data, err := json.Marshal(payload)
-					if err != nil {
-						continue
-					}
-					fmt.Fprintf(w, "event: %s\ndata: %s\n\n", payload["type"], data)
-					flusher.Flush()
+				if event.ID > lastSeen {
+					fresh = append(fresh, event)
 				}
 			}
-			if page.NextCursor != "" && page.NextCursor != cursor {
-				cursor = page.NextCursor
+			for i := len(fresh) - 1; i >= 0; i-- {
+				event := fresh[i]
+				if event.ID > lastSeen {
+					lastSeen = event.ID
+				}
+				payload, ok := aguiEventPayload(event)
+				if !ok {
+					continue
+				}
+				data, err := json.Marshal(payload)
+				if err != nil {
+					continue
+				}
+				fmt.Fprintf(w, "event: %s\ndata: %s\n\n", payload["type"], data)
+				flusher.Flush()
 			}
 			select {
 			case <-r.Context().Done():
