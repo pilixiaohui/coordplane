@@ -419,7 +419,7 @@ func TestRT05ReconcileAdoptsRunningContainerAndRebuildsRunSocket(t *testing.T) {
 	}
 	terminal := waitForRun(t, fixture, claim.Task.ID, func(run core.Run, task core.Task) bool {
 		return run.ID == active.ID && run.State == core.RunInterrupted &&
-			run.CleanupState == core.CleanupRemoved && task.Status == core.TaskFailed
+			run.CleanupState == core.CleanupRemoved && task.Status == core.TaskQueued
 	})
 	if _, err := fixture.executor.Inspect(fixture.ctx, runtimeRef(terminal)); !errors.Is(err, containerruntime.ErrNotFound) {
 		t.Fatalf("adopted container survived terminal cleanup: %v", err)
