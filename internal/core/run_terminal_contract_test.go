@@ -9,7 +9,7 @@ import (
 	"coordplane/internal/core"
 )
 
-func TestRuntimeTerminalProjectsCanonicalRetryForStartingAndActiveRuns(t *testing.T) {
+func TestRuntimeTerminalInterruptRequeuesTaskForResumeForStartingAndActiveRuns(t *testing.T) {
 	tests := []struct {
 		name     string
 		activate bool
@@ -34,20 +34,22 @@ func TestRuntimeTerminalProjectsCanonicalRetryForStartingAndActiveRuns(t *testin
 				t.Fatal(err)
 			}
 
-			assertRetryProjection(t, h, project.ID, claim.Task.ID, claim.Run.ID, core.TaskFailed, 0)
-			assertInterruptEvents(t, h, project.ID, requestID, "task.failed")
+			// An interruption is a resume point, not a failure: the task returns
+			// to the queue so the next launch resumes the session.
+			assertRetryProjection(t, h, project.ID, claim.Task.ID, claim.Run.ID, core.RunInterrupted, core.TaskQueued, 0)
+			assertRetryEvents(t, h, project.ID, requestID, "run.interrupted", "task.requeued")
 		})
 	}
 }
 
-func TestRuntimeTerminalUsesRetryBudgetAndBackoffExactlyOnce(t *testing.T) {
+func TestRuntimeTerminalInterruptAtRetryLimitStillRequeuesForResume(t *testing.T) {
 	h := newHarness(t)
-	project, first := createClaimedWorkRun(t, h, "one-retry", 1)
+	project, first := createClaimedWorkRun(t, h, "resume-always", 1)
 	first.Run = prepareRuntimeRun(t, h, first, t.TempDir(), "first")
 	firstTerminal, err := recordInterruptedRun(h, first.Run, "start lost", "first-interrupt")
 	requireNoError(t, err)
-	assertRetryProjection(t, h, project.ID, first.Task.ID, first.Run.ID, core.TaskQueued, 1)
-	assertInterruptEvents(t, h, project.ID, "first-interrupt", "task.requeued")
+	assertRetryProjection(t, h, project.ID, first.Task.ID, first.Run.ID, core.RunInterrupted, core.TaskQueued, 0)
+	assertRetryEvents(t, h, project.ID, "first-interrupt", "run.interrupted", "task.requeued")
 	recordCleanupRemoved(t, h, firstTerminal.Run, "first-cleanup")
 
 	h.clock.Advance(time.Second)
@@ -59,13 +61,53 @@ func TestRuntimeTerminalUsesRetryBudgetAndBackoffExactlyOnce(t *testing.T) {
 	if _, err := recordInterruptedRun(h, second.Run, "process lost", "second-interrupt"); err != nil {
 		t.Fatal(err)
 	}
-	assertRetryProjection(t, h, project.ID, first.Task.ID, second.Run.ID, core.TaskFailed, 1)
-	assertInterruptEvents(t, h, project.ID, "second-interrupt", "task.failed")
+	// At retryCount == maxRetries the interrupt is still a resume point: the
+	// retry budget is not consumed by interruption at all, the task returns to
+	// the queue so the next launch resumes the session.
+	assertRetryProjection(t, h, project.ID, first.Task.ID, second.Run.ID, core.RunInterrupted, core.TaskQueued, 0)
+	assertRetryEvents(t, h, project.ID, "second-interrupt", "run.interrupted", "task.requeued")
+
+	events, err := h.database.Events(context.Background(), core.EventFilter{ProjectID: project.ID})
+	requireNoError(t, err)
+	if countEvent(events, "task.requeued") != 2 || countEvent(events, "task.failed") != 0 ||
+		countEvent(events, "run.interrupted") != 2 {
+		t.Fatalf("interrupt resume events = %#v", events)
+	}
+}
+
+func TestRuntimeTerminalUsesRetryBudgetAndBackoffExactlyOnce(t *testing.T) {
+	h := newHarness(t)
+	project, first := createClaimedWorkRun(t, h, "one-retry", 1)
+	first.Run = prepareRuntimeRun(t, h, first, t.TempDir(), "first")
+	firstTerminal, err := recordRunTerminal(h, context.Background(), core.RunTerminalInput{
+		RunID: first.Run.ID, State: core.RunExited, ExitCode: intPointer(1),
+		TerminalReason: "no task outcome", RequestID: "first-exit",
+	})
+	requireNoError(t, err)
+	assertRetryProjection(t, h, project.ID, first.Task.ID, first.Run.ID, core.RunExited, core.TaskQueued, 1)
+	assertRetryEvents(t, h, project.ID, "first-exit", "run.exited", "task.requeued")
+	recordCleanupRemoved(t, h, firstTerminal.Run, "first-cleanup")
+
+	h.clock.Advance(time.Second)
+	second, ok, err := h.service.ClaimNext(context.Background(), project.ID)
+	if err != nil || !ok {
+		t.Fatalf("second claim: ok=%v err=%v", ok, err)
+	}
+	second.Run = prepareAndActivateRuntimeRun(t, h, second, t.TempDir(), "second")
+	if _, err := recordRunTerminal(h, context.Background(), core.RunTerminalInput{
+		RunID: second.Run.ID, State: core.RunExited, ExitCode: intPointer(1),
+		TerminalReason: "no task outcome again", RequestID: "second-exit",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// An exit without an outcome exhausts the retry budget exactly once.
+	assertRetryProjection(t, h, project.ID, first.Task.ID, second.Run.ID, core.RunExited, core.TaskFailed, 1)
+	assertRetryEvents(t, h, project.ID, "second-exit", "run.exited", "task.failed")
 
 	events, err := h.database.Events(context.Background(), core.EventFilter{ProjectID: project.ID})
 	requireNoError(t, err)
 	if countEvent(events, "task.requeued") != 1 || countEvent(events, "task.failed") != 1 ||
-		countEvent(events, "run.interrupted") != 2 {
+		countEvent(events, "run.exited") != 2 {
 		t.Fatalf("retry terminal events = %#v", events)
 	}
 }
@@ -139,7 +181,7 @@ func recordCleanupRemoved(t *testing.T, h *harness, run core.Run, requestID stri
 	}
 }
 
-func assertRetryProjection(t *testing.T, h *harness, projectID, taskID, runID string, status core.TaskStatus, retryCount int) {
+func assertRetryProjection(t *testing.T, h *harness, projectID, taskID, runID string, runState core.RunState, status core.TaskStatus, retryCount int) {
 	t.Helper()
 	snapshot, err := h.database.Snapshot(context.Background(), projectID)
 	requireNoError(t, err)
@@ -148,15 +190,15 @@ func assertRetryProjection(t *testing.T, h *harness, projectID, taskID, runID st
 	if task.Status != status || task.RetryCount != retryCount || task.CurrentRunID != "" {
 		t.Fatalf("retry task = %#v, want status=%s count=%d and no current run", task, status, retryCount)
 	}
-	if run.State != core.RunInterrupted || run.TokenRevokedAt == "" || run.EndedAt == "" {
-		t.Fatalf("interrupted run = %#v", run)
+	if run.State != runState || run.TokenRevokedAt == "" || run.EndedAt == "" {
+		t.Fatalf("terminal run = %#v", run)
 	}
 	if status == core.TaskQueued && task.NextRunAt <= run.EndedAt {
 		t.Fatalf("retry has no backoff: next_run_at=%s ended_at=%s", task.NextRunAt, run.EndedAt)
 	}
 }
 
-func assertInterruptEvents(t *testing.T, h *harness, projectID, requestID, taskKind string) {
+func assertRetryEvents(t *testing.T, h *harness, projectID, requestID, runKind, taskKind string) {
 	t.Helper()
 	events, err := h.database.Events(context.Background(), core.EventFilter{ProjectID: projectID})
 	requireNoError(t, err)
@@ -166,8 +208,8 @@ func assertInterruptEvents(t *testing.T, h *harness, projectID, requestID, taskK
 			kinds[event.Kind]++
 		}
 	}
-	if kinds["run.interrupted"] != 1 || kinds[taskKind] != 1 || len(kinds) != 2 {
-		t.Fatalf("interrupt request %s Events = %#v", requestID, kinds)
+	if kinds[runKind] != 1 || kinds[taskKind] != 1 || len(kinds) != 2 {
+		t.Fatalf("retry request %s Events = %#v", requestID, kinds)
 	}
 }
 

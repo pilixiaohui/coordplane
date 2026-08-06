@@ -300,7 +300,7 @@ func (c *runtimeController) reconcileDurableIntent(ctx context.Context, run core
 	}
 	task := projection.Task
 	hasIntent := run.StopRequestedAt != "" || run.RequestedOutcome != "" ||
-		task.Status == core.TaskCancelled || deadlineReached(run.DeadlineAt)
+		task.Status == core.TaskCancelled || deadlineReached(run.DeadlineAt) || c.runStalled(run)
 	if !hasIntent || run.StopRequestedAt != "" {
 		return run, task, hasIntent, nil
 	}
@@ -311,6 +311,8 @@ func (c *runtimeController) reconcileDurableIntent(ctx context.Context, run core
 		reason = "Task cancelled"
 	case deadlineReached(run.DeadlineAt):
 		reason = "deadline exceeded"
+	case c.runStalled(run):
+		reason = "stalled"
 	}
 	operation, err := randomRuntimeID("reconcile-stop")
 	if err != nil {
@@ -330,8 +332,8 @@ func reconcileIntentTerminal(run core.Run, task core.Task) (core.RunState, strin
 	switch {
 	case task.Status == core.TaskCancelled:
 		return core.RunCancelled, "Task cancelled"
-	case run.StopReason == "deadline exceeded":
-		return core.RunTimedOut, "Run deadline exceeded"
+	case run.StopReason == "deadline exceeded" || run.StopReason == "stalled":
+		return core.RunTimedOut, "Run " + run.StopReason
 	default:
 		reason := run.StopReason
 		if reason == "" {

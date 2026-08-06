@@ -109,6 +109,12 @@ func (s *Service) ClaimNext(ctx context.Context, projectID string) (Claim, bool,
 
 func (s *Service) projectRuntimeFailure(tx Transaction, task *Task, run Run, requestID, now string) error {
 	decision := runtimeRetryDecision(task.RetryCount, task.MaxRetries)
+	if run.State == RunTimedOut || run.State == RunInterrupted {
+		// Timeout and interruption are resume points, not terminal failures:
+		// the run returns to the queue so the next launch resumes the session
+		// instead of spending the retry budget or failing the task.
+		decision = taskRetryDecision{status: TaskQueued, retryCount: task.RetryCount}
+	}
 	if decision.status != task.Status {
 		if err := ValidateTaskTransition(task.Kind, task.Status, decision.status); err != nil {
 			return err

@@ -7,7 +7,7 @@ import (
 
 func (s *Service) CreateChildTask(ctx context.Context, input CreateChildTaskInput) (Task, error) {
 	request, err := s.normalizeWorkTask(input.AssigneeAgentID, input.AssigneeParticipantID, input.Title, input.Description,
-		input.SourceTaskID, input.Priority, input.MaxRetries, input.AckMessageIDs, input.RequestID)
+		input.SourceTaskID, input.Priority, input.MaxRetries, input.BudgetSeconds, input.AckMessageIDs, input.RequestID)
 	if err != nil {
 		return Task{}, err
 	}
@@ -15,8 +15,9 @@ func (s *Service) CreateChildTask(ctx context.Context, input CreateChildTaskInpu
 	hash, err := inputFingerprint(struct {
 		AgentID, Title, Description, SourceTaskID, AckIDs string
 		Priority, MaxRetries                              int
+		BudgetSeconds                                     int64
 	}{request.agentID, request.title, request.description, request.sourceTaskID,
-		strings.Join(request.ackIDs, "\x00"), request.priority, request.maxRetries})
+		strings.Join(request.ackIDs, "\x00"), request.priority, request.maxRetries, request.budgetSeconds})
 	if err != nil {
 		return Task{}, err
 	}

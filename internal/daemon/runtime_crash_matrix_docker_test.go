@@ -636,7 +636,7 @@ func assertRT05Converged(
 			t.Fatalf("pre-active outcome N/A admitted durable outcome: Run %#v Task %#v", run, task)
 		}
 	case "stop":
-		if run.State != core.RunInterrupted || run.StopRequestedAt == "" || task.Status != core.TaskFailed {
+		if run.State != core.RunInterrupted || run.StopRequestedAt == "" || task.Status != core.TaskQueued {
 			t.Fatalf("stop recovery = Run %#v Task %#v", run, task)
 		}
 	case "cancel":
@@ -644,7 +644,7 @@ func assertRT05Converged(
 			t.Fatalf("cancel recovery = Run %#v Task %#v", run, task)
 		}
 	case "timeout":
-		if run.State != core.RunTimedOut || run.StopRequestedAt == "" || task.Status != core.TaskFailed {
+		if run.State != core.RunTimedOut || run.StopRequestedAt == "" || task.Status != core.TaskQueued {
 			t.Fatalf("timeout recovery = Run %#v Task %#v", run, task)
 		}
 	}

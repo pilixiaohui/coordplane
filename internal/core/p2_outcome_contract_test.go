@@ -2,6 +2,7 @@ package core_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"coordplane/internal/core"
@@ -197,4 +198,67 @@ func createActiveWorkClaim(t *testing.T, h *harness, project core.Project, agent
 		t.Fatal(err)
 	}
 	return claim
+}
+
+func TestP2SubmitExpandsShortHashPrefix(t *testing.T) {
+	h := newHarness(t)
+	agent := h.addAgent(t, "short-prefix-agent")
+	project := h.addProject(t, "short-prefix-project", "")
+	claim := createActiveWorkClaim(t, h, project, agent, "short-prefix")
+	const fullSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	requested, err := h.service.RequestOutcome(context.Background(), core.OutcomeInput{
+		Token: claim.Token, Outcome: core.OutcomeSubmit, Summary: "capture this",
+		ExpectedHead: "aaaa", RequestID: "short-prefix-outcome",
+	})
+	requireNoError(t, err)
+	if requested.Run.ExpectedHead != fullSHA || requested.Task.PendingExpectedSHA != fullSHA {
+		t.Fatalf("short prefix did not expand durably: run.ExpectedHead=%q task.PendingExpectedSHA=%q",
+			requested.Run.ExpectedHead, requested.Task.PendingExpectedSHA)
+	}
+	if requested.Task.Status != core.TaskFinishing || requested.Task.PendingAction != "capture" ||
+		requested.Task.PendingActionRunID != claim.Run.ID {
+		t.Fatalf("submit projection = %#v", requested.Task)
+	}
+	terminalActiveRun(t, h, claim.Run.ID, "short-prefix-terminal")
+	requireNoError(t, h.service.ReconcileGit(context.Background()))
+	task, err := h.database.Task(context.Background(), claim.Task.ID)
+	requireNoError(t, err)
+	if task.Status != core.TaskSubmitted {
+		t.Fatalf("capture did not finish submit: %#v", task)
+	}
+}
+
+func TestP2SubmitShortPrefixFailureIsRetryable(t *testing.T) {
+	h := newHarness(t)
+	agent := h.addAgent(t, "short-prefix-fail-agent")
+	project := h.addProject(t, "short-prefix-fail-project", "")
+	claim := createActiveWorkClaim(t, h, project, agent, "short-prefix-fail")
+	before := durableSignature(t, h.database, project.ID)
+	_, err := h.service.RequestOutcome(context.Background(), core.OutcomeInput{
+		Token: claim.Token, Outcome: core.OutcomeSubmit, Summary: "bad head",
+		ExpectedHead: "bogus", RequestID: "short-prefix-fail-outcome",
+	})
+	if !core.IsCode(err, core.CodeInvalidArgument) {
+		t.Fatalf("unresolvable prefix error = %v", err)
+	}
+	if !strings.Contains(err.Error(), "expand expected_head in workspace") ||
+		!strings.Contains(err.Error(), "does not resolve to a commit") {
+		t.Fatalf("error does not surface readable cause: %v", err)
+	}
+	h.requireDurableSignature(t, project.ID, before)
+	task, err := h.database.Task(context.Background(), claim.Task.ID)
+	requireNoError(t, err)
+	if task.Status != core.TaskRunning || task.PendingAction != "" {
+		t.Fatalf("failed submit changed task: %#v", task)
+	}
+	// Corrected resubmit under the same request ID proves the idempotency key was not poisoned.
+	fixed, err := h.service.RequestOutcome(context.Background(), core.OutcomeInput{
+		Token: claim.Token, Outcome: core.OutcomeSubmit, Summary: "fixed head",
+		ExpectedHead: "aaaa", RequestID: "short-prefix-fail-outcome",
+	})
+	requireNoError(t, err)
+	if fixed.Task.Status != core.TaskFinishing || fixed.Task.PendingAction != "capture" ||
+		fixed.Run.ExpectedHead != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("corrected submit projection = %#v", fixed)
+	}
 }

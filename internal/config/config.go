@@ -58,6 +58,7 @@ type RuntimeConfig struct {
 	DefaultImage         string        `yaml:"default_image"`
 	ProviderEnvAllowlist []string      `yaml:"provider_env_allowlist"`
 	RunTimeout           time.Duration `yaml:"-"`
+	StallTimeout         time.Duration `yaml:"-"`
 	ShutdownGrace        time.Duration `yaml:"-"`
 }
 
@@ -93,6 +94,7 @@ type fileRuntimeConfig struct {
 	DefaultImage         string        `yaml:"default_image"`
 	ProviderEnvAllowlist []string      `yaml:"provider_env_allowlist"`
 	RunTimeout           *yamlDuration `yaml:"run_timeout,omitempty"`
+	StallTimeout         *yamlDuration `yaml:"stall_timeout,omitempty"`
 	ShutdownGrace        *yamlDuration `yaml:"shutdown_grace,omitempty"`
 }
 
@@ -166,6 +168,9 @@ func Load(path string) (Config, error) {
 	}
 	if raw.Runtime.RunTimeout != nil {
 		cfg.Runtime.RunTimeout = time.Duration(*raw.Runtime.RunTimeout)
+	}
+	if raw.Runtime.StallTimeout != nil {
+		cfg.Runtime.StallTimeout = time.Duration(*raw.Runtime.StallTimeout)
 	}
 	if raw.Runtime.ShutdownGrace != nil {
 		cfg.Runtime.ShutdownGrace = time.Duration(*raw.Runtime.ShutdownGrace)
@@ -255,6 +260,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Runtime.RunTimeout < 0 {
 		return errors.New("validate config: runtime.run_timeout must be a positive duration or 0")
+	}
+	if c.Runtime.StallTimeout < 0 {
+		return errors.New("validate config: runtime.stall_timeout must be a positive duration or 0")
 	}
 	if c.Runtime.ShutdownGrace <= 0 {
 		return errors.New("validate config: runtime.shutdown_grace must be a positive duration")

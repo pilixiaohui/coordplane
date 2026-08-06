@@ -296,10 +296,7 @@ func (c *runtimeController) launchOwned(ctx context.Context, claim core.Claim, o
 	controlPath := filepath.Join(c.controlRoot, launch.Run.ID)
 
 	mode, resumedFrom, resumeSession := c.selectLaunchMode(ctx, launch, entry, workspacePath)
-	deadline := ""
-	if c.config.Runtime.RunTimeout > 0 {
-		deadline = time.Now().UTC().Add(c.config.Runtime.RunTimeout).Format(time.RFC3339Nano)
-	}
+	deadline := runDeadlineAt(launch.Task.BudgetSeconds, c.config.Runtime.RunTimeout, time.Now())
 	nonce, err := randomRuntimeID("nonce")
 	if err != nil {
 		return err

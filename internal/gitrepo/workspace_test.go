@@ -434,3 +434,36 @@ func gitObjectExists(t *testing.T, repoPath, sha string) bool {
 	cmd.Env = gitEnvironment()
 	return cmd.Run() == nil
 }
+
+func TestGT06ExpandHeadResolvesShortPrefixInWorkspace(t *testing.T) {
+	ctx := context.Background()
+	_, manager, project, _, initial := newWorkspaceFixture(t)
+	spec := WorkspaceSpec{ProjectID: project.ID, TaskID: "task-expand", BaseSHA: initial}
+	fact, err := manager.Materialize(ctx, spec)
+	requireNoError(t, err)
+
+	gitOutput(t, fact.Path, "config", "user.email", "expand@coordplane.local")
+	gitOutput(t, fact.Path, "config", "user.name", "Expand")
+	head := commitFile(t, fact.Path, "result.txt", "done\n", "task result")
+	if len(head) != 40 {
+		t.Fatalf("commitFile returned %q", head)
+	}
+
+	full, err := manager.ExpandHead(ctx, spec, fact.Path, head[:8])
+	requireNoError(t, err)
+	if full != head {
+		t.Fatalf("ExpandHead(%.8s) = %q, want %q", head, full, head)
+	}
+
+	for _, bad := range []struct {
+		ref  string
+		want string
+	}{
+		{ref: "", want: "expected head is empty"},
+		{ref: "zzzzzz", want: "does not resolve to a commit"},
+	} {
+		if _, err := manager.ExpandHead(ctx, spec, fact.Path, bad.ref); err == nil || !strings.Contains(err.Error(), bad.want) {
+			t.Fatalf("ExpandHead(%q) error = %v, want containing %q", bad.ref, err, bad.want)
+		}
+	}
+}

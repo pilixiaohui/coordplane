@@ -946,6 +946,19 @@ func (g *fakeGit) Capture(_ context.Context, intent core.GitCaptureIntent) (core
 	}, nil
 }
 
+func (g *fakeGit) ExpandHead(_ context.Context, intent core.GitExpandHeadIntent) (string, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	ref := intent.ExpectedHead
+	if _, err := hex.DecodeString(ref); err == nil && len(ref) == 40 {
+		return ref, nil
+	}
+	if ref != "" && strings.HasPrefix(g.sha, ref) {
+		return g.sha, nil
+	}
+	return "", fmt.Errorf("expected head %q does not resolve to a commit in the workspace", ref)
+}
+
 func (g *fakeGit) CleanupCapture(context.Context, core.GitCaptureIntent) error { return nil }
 
 func (g *fakeGit) Advance(_ context.Context, intent core.GitAdvanceIntent) (core.GitAdvanceFact, error) {

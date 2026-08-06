@@ -189,6 +189,7 @@ type AgentHomeStateFact struct {
 // not need to implement result mutation behavior.
 type TaskGit interface {
 	Capture(context.Context, GitCaptureIntent) (GitCaptureFact, error)
+	ExpandHead(context.Context, GitExpandHeadIntent) (string, error)
 	CleanupCapture(context.Context, GitCaptureIntent) error
 	Advance(context.Context, GitAdvanceIntent) (GitAdvanceFact, error)
 	ResolveTaskRef(context.Context, GitTaskRefIntent) (string, error)
@@ -218,6 +219,20 @@ type GitCaptureIntent struct {
 	ExpectedHead  string
 	Source        *GitSource
 	OperationID   string
+}
+
+// GitExpandHeadIntent resolves a caller-supplied short hash prefix (or other
+// ref) to a full commit object ID in the Run's private workspace. WorkspacePath
+// is daemon-internal and is validated by the executor against the deterministic
+// Task path before any Git command runs inside it.
+type GitExpandHeadIntent struct {
+	ProjectID     string
+	TaskID        string
+	RunID         string
+	WorkspacePath string
+	BaseSHA       string
+	ExpectedHead  string
+	Source        *GitSource
 }
 
 type GitCaptureFact struct {

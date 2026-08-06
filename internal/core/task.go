@@ -17,7 +17,7 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (Task, 
 		return Task{}, err
 	}
 	request, err := s.normalizeWorkTask(input.AssigneeAgentID, input.AssigneeParticipantID, input.Title, input.Description,
-		input.SourceTaskID, input.Priority, input.MaxRetries, input.AckMessageIDs, input.RequestID)
+		input.SourceTaskID, input.Priority, input.MaxRetries, input.BudgetSeconds, input.AckMessageIDs, input.RequestID)
 	if err != nil {
 		return Task{}, err
 	}
@@ -25,8 +25,10 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (Task, 
 	inputHash, err := inputFingerprint(struct {
 		ProjectID, AgentID, Kind, Title, Description, SourceTaskID, RetryOfTaskID, AckIDs string
 		Priority, MaxRetries                                                              int
+		BudgetSeconds                                                                     int64
 	}{projectID, request.agentID, string(input.Kind), request.title, request.description,
-		request.sourceTaskID, request.retryOfTaskID, strings.Join(request.ackIDs, "\x00"), request.priority, request.maxRetries})
+		request.sourceTaskID, request.retryOfTaskID, strings.Join(request.ackIDs, "\x00"), request.priority, request.maxRetries,
+		request.budgetSeconds})
 	if err != nil {
 		return Task{}, err
 	}
