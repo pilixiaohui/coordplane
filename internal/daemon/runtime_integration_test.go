@@ -262,21 +262,22 @@ func TestRT04RunStopInterruptsOnlyTheRunAndPreservesDirtyWorkspace(t *testing.T)
 	}
 	terminal := waitForRun(t, fixture, task.ID, func(run core.Run, task core.Task) bool {
 		return run.ID == active.ID && run.State == core.RunInterrupted &&
-			run.CleanupState == core.CleanupRemoved && task.Status == core.TaskFailed
+			run.CleanupState == core.CleanupRemoved && task.Status == core.TaskQueued
 	})
 	persistedTask, err := fixture.components.store.Task(fixture.ctx, task.ID)
 	requireNoError(t, err)
 	if terminal.StopOperationID == "" || terminal.TokenRevokedAt == "" ||
 		persistedTask.Status == core.TaskCancelled || persistedTask.Status == core.TaskCompleted ||
+		persistedTask.Status == core.TaskFailed ||
 		!strings.HasPrefix(persistedTask.FailureReason, "RUN_INTERRUPTED") {
-		t.Fatalf("run stop changed Task semantics: Run=%#v Task=%#v", terminal, persistedTask)
+		t.Fatalf("run stop did not requeue task for resume: Run=%#v Task=%#v", terminal, persistedTask)
 	}
 	if _, err := os.Stat(dirty); err != nil {
 		t.Fatalf("run stop reset, cleaned, or deleted dirty workspace: %v", err)
 	}
 }
 
-func TestRT04DeadlineTimesOutRunWithoutCompletingTaskOrCleaningWorkspace(t *testing.T) {
+func TestRT04DeadlineTimesOutRunAndRequeuesTaskForResume(t *testing.T) {
 	fixture := newP3DockerFixtureWithRunTimeout(t, 3*time.Second)
 	agent := fixture.addAgent(t, "Timeout Agent")
 	project := fixture.addProject(t, agent.ID)
@@ -291,13 +292,14 @@ func TestRT04DeadlineTimesOutRunWithoutCompletingTaskOrCleaningWorkspace(t *test
 	dirty := filepath.Join(active.WorkspacePath, "dirty-runtime.txt")
 	waitForFile(t, fixture.ctx, dirty)
 	terminal := waitForRun(t, fixture, task.ID, func(run core.Run, task core.Task) bool {
-		return run.State == core.RunTimedOut && run.CleanupState == core.CleanupRemoved && task.Status == core.TaskFailed
+		return run.State == core.RunTimedOut && run.CleanupState == core.CleanupRemoved && task.Status == core.TaskQueued
 	})
 	persistedTask, err := fixture.components.store.Task(fixture.ctx, task.ID)
 	requireNoError(t, err)
 	if terminal.StopRequestedAt == "" || terminal.StopOperationID == "" || terminal.TokenRevokedAt == "" ||
-		persistedTask.Status == core.TaskCompleted || !strings.HasPrefix(persistedTask.FailureReason, "RUN_TIMED_OUT") {
-		t.Fatalf("timeout did not preserve durable intent/projection: Run=%#v Task=%#v", terminal, persistedTask)
+		persistedTask.Status == core.TaskCompleted || persistedTask.Status == core.TaskFailed ||
+		!strings.HasPrefix(persistedTask.FailureReason, "RUN_TIMED_OUT") {
+		t.Fatalf("timeout did not requeue task for resume: Run=%#v Task=%#v", terminal, persistedTask)
 	}
 	if _, err := os.Stat(dirty); err != nil {
 		t.Fatalf("timeout reset, cleaned, or deleted dirty workspace: %v", err)
@@ -417,7 +419,7 @@ func TestRT05ReconcileAdoptsRunningContainerAndRebuildsRunSocket(t *testing.T) {
 	}
 	terminal := waitForRun(t, fixture, claim.Task.ID, func(run core.Run, task core.Task) bool {
 		return run.ID == active.ID && run.State == core.RunInterrupted &&
-			run.CleanupState == core.CleanupRemoved && task.Status == core.TaskFailed
+			run.CleanupState == core.CleanupRemoved && task.Status == core.TaskQueued
 	})
 	if _, err := fixture.executor.Inspect(fixture.ctx, runtimeRef(terminal)); !errors.Is(err, containerruntime.ErrNotFound) {
 		t.Fatalf("adopted container survived terminal cleanup: %v", err)

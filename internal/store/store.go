@@ -223,6 +223,16 @@ func (s *Store) Migrate(ctx context.Context) (MigrationResult, error) {
 		if err := s.applyHumanTaskLifecycleMigration(ctx); err != nil {
 			return MigrationResult{}, err
 		}
+		result.Applied = append(result.Applied, 4)
+		version = 4
+	}
+	if version == 4 {
+		if err := s.validateCanonicalDatabase(ctx, 4); err != nil {
+			return MigrationResult{}, err
+		}
+		if err := s.applyTaskBudgetMigration(ctx); err != nil {
+			return MigrationResult{}, err
+		}
 		result.Applied = append(result.Applied, schemaVersion)
 	}
 	if err := s.validateCanonicalDatabase(ctx, schemaVersion); err != nil {
@@ -311,7 +321,7 @@ func (s *Store) applyHumanTaskLifecycleMigration(ctx context.Context) error {
 		}
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, schemaVersion, schemaName, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, 4, schemaName, now); err != nil {
 		return core.WrapError(core.CodeInternal, "record human task lifecycle migration", false, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -337,12 +347,26 @@ func (s *Store) applyHumanTaskLifecycleMigration(ctx context.Context) error {
 	return nil
 }
 
+func (s *Store) applyTaskBudgetMigration(ctx context.Context) error {
+	// The task self-declared budget column is additive: the v4 rebuild finished
+	// tasks_v4 without it, so existing v4 databases and fresh databases both
+	// reach the same final schema by applying this ALTER.
+	if _, err := s.db.ExecContext(ctx, budgetSecondsMigrationSQL); err != nil {
+		return core.WrapError(core.CodeInternal, "apply task budget seconds schema migration", false, err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, 5, budgetSecondsMigrationName, now); err != nil {
+		return core.WrapError(core.CodeInternal, "record task budget seconds migration", false, err)
+	}
+	return nil
+}
+
 func (s *Store) migrationVersion(ctx context.Context) (int, error) {
 	var version int
 	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil {
 		return 0, legacySchemaError("read SQLite migration version", err)
 	}
-	if version != 1 && version != 2 && version != 3 && version != schemaVersion {
+	if version != 1 && version != 2 && version != 3 && version != 4 && version != schemaVersion {
 		return 0, legacySchemaError("legacy database migration history requires backup and a new data_dir", nil)
 	}
 	return version, nil

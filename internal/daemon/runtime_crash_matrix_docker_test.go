@@ -632,11 +632,22 @@ func assertRT05Converged(
 			t.Fatalf("outcome recovery = Run %#v Task %#v", run, task)
 		}
 	case "outcome_NA":
-		if run.RequestedOutcome != "" || run.RequestedAt != "" || task.Status != core.TaskFailed {
+		// The pre-active outcome must not be durably admitted. The task end
+		// state depends on how the crash recovered: a run that failed to start
+		// (container never created) fails the task, while an interrupted run
+		// returns to the queue as a resume point.
+		if run.RequestedOutcome != "" || run.RequestedAt != "" {
 			t.Fatalf("pre-active outcome N/A admitted durable outcome: Run %#v Task %#v", run, task)
 		}
+		wantStatus := core.TaskFailed
+		if run.State == core.RunInterrupted {
+			wantStatus = core.TaskQueued
+		}
+		if task.Status != wantStatus {
+			t.Fatalf("pre-active outcome N/A task status = %s, want %s: Run %#v Task %#v", task.Status, wantStatus, run, task)
+		}
 	case "stop":
-		if run.State != core.RunInterrupted || run.StopRequestedAt == "" || task.Status != core.TaskFailed {
+		if run.State != core.RunInterrupted || run.StopRequestedAt == "" || task.Status != core.TaskQueued {
 			t.Fatalf("stop recovery = Run %#v Task %#v", run, task)
 		}
 	case "cancel":
@@ -644,7 +655,7 @@ func assertRT05Converged(
 			t.Fatalf("cancel recovery = Run %#v Task %#v", run, task)
 		}
 	case "timeout":
-		if run.State != core.RunTimedOut || run.StopRequestedAt == "" || task.Status != core.TaskFailed {
+		if run.State != core.RunTimedOut || run.StopRequestedAt == "" || task.Status != core.TaskQueued {
 			t.Fatalf("timeout recovery = Run %#v Task %#v", run, task)
 		}
 	}

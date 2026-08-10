@@ -110,6 +110,7 @@ type Task struct {
 	NextRunAt                  string     `json:"next_run_at"`
 	RetryCount                 int        `json:"retry_count"`
 	MaxRetries                 int        `json:"max_retries"`
+	BudgetSeconds              int64      `json:"budget_seconds,omitempty"`
 	WaitReason                 string     `json:"wait_reason,omitempty"`
 	ResultSummary              string     `json:"result_summary,omitempty"`
 	FailureReason              string     `json:"failure_reason,omitempty"`
@@ -361,6 +362,7 @@ type TaskSummary struct {
 	NextRunAt                  string     `json:"next_run_at"`
 	RetryCount                 int        `json:"retry_count"`
 	MaxRetries                 int        `json:"max_retries"`
+	BudgetSeconds              int64      `json:"budget_seconds,omitempty"`
 	WaitReason                 string     `json:"wait_reason,omitempty"`
 	ResultSummary              string     `json:"result_summary,omitempty"`
 	FailureReason              string     `json:"failure_reason,omitempty"`

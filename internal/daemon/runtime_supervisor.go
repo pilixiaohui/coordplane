@@ -87,7 +87,7 @@ func (c *runtimeController) supervise(monitor *runMonitor) {
 				c.stopOwnedContainer(monitor.ref)
 				continue
 			}
-			if deadlineReached(run.DeadlineAt) {
+			if deadlineReached(run.DeadlineAt) || c.runStalled(run) {
 				c.stopForDurableIntent(monitor)
 				continue
 			}
@@ -254,9 +254,12 @@ func (c *runtimeController) finishObservedRunContext(
 	if taskErr == nil && task.Task.Status == core.TaskCancelled {
 		state = core.RunCancelled
 		reason = "Task cancelled"
-	} else if run.StopReason == "deadline exceeded" {
+	} else if run.StopReason == "deadline exceeded" || run.StopReason == "stalled" {
 		state = core.RunTimedOut
 		reason = "Run deadline exceeded"
+		if run.StopReason == "stalled" {
+			reason = "Run stalled"
+		}
 	} else if run.RequestedOutcome == "" && run.StopRequestedAt != "" {
 		state = core.RunInterrupted
 		reason = run.StopReason
@@ -456,6 +459,47 @@ func deadlineReached(value string) bool {
 	}
 	deadline, err := time.Parse(time.RFC3339Nano, value)
 	return err == nil && !time.Now().UTC().Before(deadline)
+}
+
+// runDeadlineAt returns the absolute deadline for a launch: the task's
+// self-declared budget when set, otherwise the global run_timeout backstop.
+// A zero budget and zero run_timeout mean no deadline (no wall-clock cap).
+func runDeadlineAt(budgetSeconds int64, runTimeout time.Duration, now time.Time) string {
+	budget := time.Duration(0)
+	if budgetSeconds > 0 {
+		budget = time.Duration(budgetSeconds) * time.Second
+	}
+	if runTimeout > 0 && (budget == 0 || runTimeout < budget) {
+		budget = runTimeout
+	}
+	if budget <= 0 {
+		return ""
+	}
+	return now.UTC().Add(budget).Format(time.RFC3339Nano)
+}
+
+// runStalled reports whether the run has stopped making observable progress:
+// no heartbeat or process observation for longer than runtime.stall_timeout.
+// A zero stall_timeout disables stall detection.
+func (c *runtimeController) runStalled(run core.Run) bool {
+	if c.config.Runtime.StallTimeout <= 0 {
+		return false
+	}
+	last := run.HeartbeatAt
+	if last == "" {
+		last = run.LastObservedAt
+	}
+	if last == "" {
+		last = run.StartedAt
+	}
+	if last == "" {
+		return false
+	}
+	observed, err := time.Parse(time.RFC3339Nano, last)
+	if err != nil {
+		return false
+	}
+	return time.Since(observed) > c.config.Runtime.StallTimeout
 }
 
 func (c *runtimeController) contextDone() <-chan struct{} {

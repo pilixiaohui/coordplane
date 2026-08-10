@@ -1470,6 +1470,17 @@ func (g *contractGit) Capture(_ context.Context, intent core.GitCaptureIntent) (
 
 func (g *contractGit) CleanupCapture(context.Context, core.GitCaptureIntent) error { return nil }
 
+func (g *contractGit) ExpandHead(_ context.Context, intent core.GitExpandHeadIntent) (string, error) {
+	ref := intent.ExpectedHead
+	if len(ref) == 40 || len(ref) == 64 {
+		return ref, nil
+	}
+	if ref != "" && strings.HasPrefix(g.sha, ref) {
+		return g.sha, nil
+	}
+	return "", fmt.Errorf("expected head %q does not resolve to a commit in the workspace", ref)
+}
+
 func (g *contractGit) Advance(_ context.Context, intent core.GitAdvanceIntent) (core.GitAdvanceFact, error) {
 	return core.GitAdvanceFact{Outcome: core.GitAdvanceUpdated, ActualSHA: intent.TargetSHA}, nil
 }

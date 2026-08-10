@@ -1,11 +1,13 @@
 package store
 
-const schemaVersion = 4
+const schemaVersion = 5
 const schemaName = "coordplane_v4_human_task_lifecycle"
+const budgetSecondsMigrationName = "coordplane_v5_task_budget_seconds"
 const participantRolesMigrationName = "coordplane_v3_participant_roles"
 const initialSchemaName = "coordplane_v1_six_objects"
 const isolationSpecMigrationName = "coordplane_v2_run_isolation_spec"
 const isolationSpecMigrationSQL = `ALTER TABLE runs ADD COLUMN isolation_spec_version INTEGER NOT NULL DEFAULT 1 CHECK (isolation_spec_version IN (1,2))`
+const budgetSecondsMigrationSQL = `ALTER TABLE tasks ADD COLUMN budget_seconds INTEGER NOT NULL DEFAULT 0 CHECK (budget_seconds >= 0);`
 
 const schemaSQL = `
 CREATE TABLE schema_migrations (
@@ -64,6 +66,7 @@ CREATE TABLE tasks (
   next_run_at TEXT NOT NULL,
   retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
   max_retries INTEGER NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
+  budget_seconds INTEGER NOT NULL DEFAULT 0 CHECK (budget_seconds >= 0),
   wait_reason TEXT NOT NULL DEFAULT '',
   result_summary TEXT NOT NULL DEFAULT '',
   failure_reason TEXT NOT NULL DEFAULT '',

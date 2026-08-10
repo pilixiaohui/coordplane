@@ -650,7 +650,7 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 			task := requireRuntimeValue(service.Task(context.Background(), claim.Task.ID)).Task
 			requireRuntimeCondition(t, persisted.State == core.RunInterrupted && persisted.RuntimeErrorCode == runtimeLogFailureCode &&
 				persisted.NativeSessionID == test.session && persisted.RequestedOutcome == "" && persisted.CleanupState == core.CleanupRemoved && persisted.LastError != "" &&
-				task.Status == core.TaskFailed && task.CurrentRunID == "", "protocol frame did not fail closed: Run=", persisted, " Task=", task)
+				task.Status == core.TaskQueued && task.CurrentRunID == "", "protocol frame did not fail closed: Run=", persisted, " Task=", task)
 			messages := requireRuntimeValue(service.ListMessages(context.Background(), core.MessageFilter{TaskID: claim.Task.ID}))
 			requireRuntimeCondition(t, len(messages.Items) == 1 && messages.Items[0].ID == message.ID && messages.Items[0].State != core.MessageAcknowledged, "protocol frame acknowledged a Message: ", messages.Items)
 		})
