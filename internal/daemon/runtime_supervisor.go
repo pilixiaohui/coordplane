@@ -264,6 +264,9 @@ func (c *runtimeController) finishObservedRunContext(
 		state = core.RunInterrupted
 		reason = run.StopReason
 	}
+	if state == core.RunExited && run.RequestedOutcome == "" {
+		reason = runtimeExitedReason(reason, exitCode, run.LogPath, monitor.redact)
+	}
 	operation := run.LaunchOperationID
 	if run.StopOperationID != "" {
 		operation = run.StopOperationID
@@ -280,6 +283,64 @@ func (c *runtimeController) finishObservedRunContext(
 		return err
 	}
 	return c.cleanupRun(ctx, terminal.Run, monitor.ref, monitor.control, monitor)
+}
+
+// runtimeExitedReason enriches the NO_TASK_OUTCOME terminal reason with the
+// process exit code and the tail of the run log, so a CLI that exits without
+// requesting an outcome leaves a diagnosable failure instead of a bare
+// "CLI process exited". Log content is redacted; the result is bounded to a
+// fraction of MaximumTerminalTextBytes so the durable reason fits its budget.
+func runtimeExitedReason(reason string, exitCode *int, logPath string, redact runtimeRedaction) string {
+	prefix := reason
+	if exitCode != nil {
+		prefix = fmt.Sprintf("CLI process exited (exit %d)", *exitCode)
+	}
+	tail := readLogTail(logPath, 1536)
+	tail = compactLogTail(redact.Text(tail), 20)
+	if tail == "" {
+		return prefix
+	}
+	if len(prefix)+len("; last log activity: ")+len(tail) > 1800 {
+		tail = tail[:1800-len(prefix)-len("; last log activity: ")]
+	}
+	return prefix + "; last log activity: " + tail
+}
+
+func readLogTail(path string, maxBytes int) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() == 0 {
+		return ""
+	}
+	offset := st.Size() - int64(maxBytes)
+	if offset < 0 {
+		offset = 0
+	}
+	buf := make([]byte, st.Size()-offset)
+	if _, err := f.ReadAt(buf, offset); err != nil {
+		return ""
+	}
+	return string(buf)
+}
+
+func compactLogTail(text string, maxLines int) string {
+	lines := strings.Split(text, "\n")
+	var kept []string
+	for i := len(lines) - 1; i >= 0 && len(kept) < maxLines; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	for i, j := 0, len(kept)-1; i < j; i, j = i+1, j-1 {
+		kept[i], kept[j] = kept[j], kept[i]
+	}
+	return strings.Join(kept, "; ")
 }
 
 func (c *runtimeController) failUnpreparedRun(ctx context.Context, run core.Run, code, message string) error {
