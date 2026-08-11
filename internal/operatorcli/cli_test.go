@@ -144,9 +144,9 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 		},
 		{
 			name:   "task create",
-			args:   []string{"task", "create", "--project", "project-1", "--kind", "work", "--agent", "agent-1", "--title", "Implement", "--description", "Do the work", "--priority", "7", "--max-retries", "3", "--source-task", "task-source", "--retry-of", "task-closed", "--ack-message", "message-1", "--request-id", "req-task-create", "--output", "json"},
+			args:   []string{"task", "create", "--project", "project-1", "--kind", "work", "--agent", "agent-1", "--title", "Implement", "--description", "Do the work", "--priority", "7", "--max-retries", "3", "--budget", "3600", "--source-task", "task-source", "--retry-of", "task-closed", "--ack-message", "message-1", "--request-id", "req-task-create", "--output", "json"},
 			method: http.MethodPost, path: "/v1/tasks",
-			input:     core.CreateTaskInput{ProjectID: "project-1", Kind: core.TaskWork, AssigneeAgentID: "agent-1", Title: "Implement", Description: "Do the work", Priority: 7, MaxRetries: 3, SourceTaskID: "task-source", RetryOfTaskID: "task-closed", AckMessageIDs: []string{"message-1"}, RequestID: "req-task-create"},
+			input:     core.CreateTaskInput{ProjectID: "project-1", Kind: core.TaskWork, AssigneeAgentID: "agent-1", Title: "Implement", Description: "Do the work", Priority: 7, MaxRetries: 3, BudgetSeconds: 3600, SourceTaskID: "task-source", RetryOfTaskID: "task-closed", AckMessageIDs: []string{"message-1"}, RequestID: "req-task-create"},
 			outputHas: `"id":"task-1"`,
 		},
 		{

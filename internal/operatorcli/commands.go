@@ -152,6 +152,7 @@ func runTask(ctx context.Context, args []string, getenv environment, stdout, std
 		flags.StringVar(&input.Description, "description", "", "task description")
 		flags.IntVar(&input.Priority, "priority", 0, "task priority")
 		flags.IntVar(&input.MaxRetries, "max-retries", 0, "runtime retry limit")
+		flags.Int64Var(&input.BudgetSeconds, "budget", 0, "self-declared run budget in seconds; 0 = no wall-clock cap")
 		flags.StringVar(&input.SourceTaskID, "source-task", "", "captured source task ID")
 		flags.StringVar(&input.RetryOfTaskID, "retry-of", "", "completed or cancelled task being retried")
 		flags.Var(&acknowledged, "ack-message", "message ID to acknowledge atomically; repeat for multiple messages")

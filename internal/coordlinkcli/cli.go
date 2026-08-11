@@ -193,6 +193,7 @@ func runTask(ctx context.Context, client jsonClient, args []string, stdout, stde
 		flags.StringVar(&input.Description, "description", "", "task description")
 		flags.IntVar(&input.Priority, "priority", 0, "task priority")
 		flags.IntVar(&input.MaxRetries, "max-retries", 0, "runtime retry limit")
+		flags.Int64Var(&input.BudgetSeconds, "budget", 0, "self-declared run budget in seconds; 0 = no wall-clock cap")
 		flags.StringVar(&input.SourceTaskID, "source-task", "", "captured source task ID")
 		flags.StringVar(&input.RequestID, "request-id", "", "idempotency key")
 		flags.Var(&ackMessageIDs, "ack-message", "message ID to acknowledge atomically (repeatable)")
@@ -318,7 +319,7 @@ func runOutcome(ctx context.Context, client jsonClient, outcome core.Outcome, ar
 		flags.StringVar(&input.Reason, "reason", "", "outcome reason")
 	case core.OutcomeSubmit:
 		flags.StringVar(&input.Summary, "summary", "", "result summary")
-		flags.StringVar(&input.ExpectedHead, "expected-head", "", "expected workspace HEAD")
+		flags.StringVar(&input.ExpectedHead, "expected-head", "", "post-commit workspace HEAD (git rev-parse HEAD), not the task base SHA")
 	default:
 		return fmt.Errorf("unsupported task outcome %q", outcome)
 	}
