@@ -106,6 +106,10 @@ func registerProjectAgentRoutes(mux *http.ServeMux, operations OperatorOperation
 	mux.HandleFunc("/v1/projects/{id}/archive", requireMethod(http.MethodPost, actionCall(func(ctx requestContext, id, requestID string) (any, error) {
 		return operations.ArchiveProject(ctx.Context, id, requestID)
 	})))
+	mux.HandleFunc("/v1/projects/{id}/delete", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.ProjectDeleteInput) (any, error) {
+		input.ProjectID = strings.TrimSpace(ctx.PathValue("id"))
+		return nil, operations.DeleteProject(ctx.Context, input)
+	})))
 	addAgent := decodeCall(func(ctx requestContext, input core.AddAgentInput) (any, error) {
 		return operations.AddAgent(ctx.Context, input)
 	})

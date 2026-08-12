@@ -29,6 +29,7 @@ func TestOperatorHandlerHasOnlyTheFixedRouteSurface(t *testing.T) {
 		{name: "show project", method: http.MethodGet, path: "/v1/projects/prj-1", call: "project"},
 		{name: "repair project", method: http.MethodPost, path: "/v1/projects/prj-1/repair", call: "repair_project"},
 		{name: "archive project", method: http.MethodPost, path: "/v1/projects/prj-1/archive", body: `{}`, call: "archive_project"},
+		{name: "delete project", method: http.MethodPost, path: "/v1/projects/prj-1/delete", body: `{}`, call: "delete_project"},
 		{name: "add agent", method: http.MethodPost, path: "/v1/agents", body: `{}`, call: "add_agent"},
 		{name: "list agents", method: http.MethodGet, path: "/v1/agents", call: "list_agents"},
 		{name: "show agent", method: http.MethodGet, path: "/v1/agents/agt-1", call: "agent"},
@@ -325,7 +326,7 @@ func TestRunHandlerReturnsCoreErrorsAndRejectsMalformedJSONBeforeSideEffects(t *
 
 func TestHandlersFenceEveryMutationUntilDaemonReady(t *testing.T) {
 	operatorRoutes := []string{
-		"/v1/projects", "/v1/projects/prj-1/repair", "/v1/projects/prj-1/archive",
+		"/v1/projects", "/v1/projects/prj-1/repair", "/v1/projects/prj-1/archive", "/v1/projects/prj-1/delete",
 		"/v1/agents", "/v1/agents/agt-1/pause", "/v1/agents/agt-1/resume", "/v1/agents/agt-1/archive",
 		"/v1/chat", "/v1/tasks", "/v1/tasks/tsk-1/checkout", "/v1/tasks/tsk-1/close",
 		"/v1/tasks/tsk-1/wake", "/v1/tasks/tsk-1/retry", "/v1/tasks/tsk-1/cancel",
@@ -497,6 +498,10 @@ func (f *operatorFake) RepairProject(_ context.Context, id, requestID string) (c
 
 func (f *operatorFake) ArchiveProject(_ context.Context, id, requestID string) (core.Project, error) {
 	return core.Project{}, f.record("archive_project", actionCall{id: id, requestID: requestID})
+}
+
+func (f *operatorFake) DeleteProject(_ context.Context, input core.ProjectDeleteInput) error {
+	return f.record("delete_project", input)
 }
 
 func (f *operatorFake) AddAgent(_ context.Context, input core.AddAgentInput) (core.Agent, error) {

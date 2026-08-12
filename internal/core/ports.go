@@ -77,6 +77,13 @@ type Transaction interface {
 	DeleteEventsByTask(string) error
 	DeleteTask(string) error
 
+	DeleteMessagesByProject(string) error
+	DeleteRunsByProject(string) ([]Run, error)
+	DeleteTasksByProject(string) error
+	DeleteEventsByProject(string) error
+	DeleteProjectBindings(string) error
+	DeleteProject(string) error
+
 	Role(string) (Role, error)
 	Roles() ([]Role, error)
 	InsertRole(Role) error
@@ -205,6 +212,12 @@ type TaskGit interface {
 	TaskRefState(context.Context, GitDeleteRefIntent) (GitTaskRefStateFact, error)
 	DeleteTaskRefAndPrune(context.Context, GitDeleteRefIntent, func() (bool, error)) (bool, error)
 	DeleteWorkspace(context.Context, GitDeleteWorkspaceIntent, func() (bool, error)) (bool, error)
+}
+
+// ProjectGitDispose is the optional post-delete disk boundary. Core supplies
+// the final durable authorization immediately before deletion.
+type ProjectGitDispose interface {
+	Dispose(context.Context, string) error
 }
 
 type GitSource struct {

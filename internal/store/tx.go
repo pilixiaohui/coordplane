@@ -507,6 +507,56 @@ func (u *unitOfWork) DeleteTask(id string) error {
 	return nil
 }
 
+func (u *unitOfWork) DeleteMessagesByProject(projectID string) error {
+	_, err := u.tx.ExecContext(u.ctx, `DELETE FROM messages WHERE project_id=?`, projectID)
+	return err
+}
+
+func (u *unitOfWork) DeleteRunsByProject(projectID string) ([]core.Run, error) {
+	rows, err := u.tx.QueryContext(u.ctx, runSelect+` WHERE project_id=?`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	runs, err := collectRuns(rows)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := u.tx.ExecContext(u.ctx, `DELETE FROM runs WHERE project_id=?`, projectID); err != nil {
+		return nil, err
+	}
+	return runs, nil
+}
+
+func (u *unitOfWork) DeleteTasksByProject(projectID string) error {
+	_, err := u.tx.ExecContext(u.ctx, `DELETE FROM tasks WHERE project_id=?`, projectID)
+	return err
+}
+
+func (u *unitOfWork) DeleteEventsByProject(projectID string) error {
+	_, err := u.tx.ExecContext(u.ctx, `DELETE FROM events WHERE project_id=?`, projectID)
+	return err
+}
+
+func (u *unitOfWork) DeleteProjectBindings(projectID string) error {
+	_, err := u.tx.ExecContext(u.ctx, `DELETE FROM participant_project_role WHERE project_id=?`, projectID)
+	return err
+}
+
+func (u *unitOfWork) DeleteProject(id string) error {
+	result, err := u.tx.ExecContext(u.ctx, `DELETE FROM projects WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return core.NewError(core.CodeNotFound, "project was not found", false)
+	}
+	return nil
+}
+
 func (u *unitOfWork) RoleBindingCount(roleID string) (int, error) {
 	var count int
 	err := u.tx.QueryRowContext(u.ctx, `SELECT COUNT(*) FROM participant_project_role WHERE role_id=?`, roleID).Scan(&count)

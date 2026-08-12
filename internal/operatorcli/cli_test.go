@@ -61,6 +61,13 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 			input: actionRequest{RequestID: "req-project-archive"}, outputHas: `"id":"project-1"`,
 		},
 		{
+			name:   "project delete",
+			args:   []string{"project", "delete", "project-1", "--reason", "retired", "--request-id", "req-project-delete", "--output", "json"},
+			method: http.MethodPost, path: "/v1/projects/project-1/delete",
+			input:     core.ProjectDeleteInput{Reason: "retired", RequestID: "req-project-delete"},
+			outputHas: `"ok":true`,
+		},
+		{
 			name:   "agent add",
 			args:   []string{"agent", "add", "--id", "agent-1", "--display-name", "Agent One", "--adapter", "claude", "--image", "coordplane:test", "--instructions-file", "/instructions/one.md", "--request-id", "req-agent-add", "--output", "json"},
 			method: http.MethodPost, path: "/v1/agents",

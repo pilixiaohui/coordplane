@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"coordplane/internal/core"
 )
@@ -65,9 +66,34 @@ func runProject(ctx context.Context, args []string, getenv environment, stdout, 
 		return render(stdout, cfg.output, project)
 	case "repair", "archive":
 		return runProjectAction(ctx, args[0], args[1:], getenv, stdout, stderr, clients)
+	case "delete":
+		return runProjectDelete(ctx, args[1:], getenv, stdout, stderr, clients)
 	default:
 		return fmt.Errorf("unknown project subcommand %q", args[0])
 	}
+}
+
+// runProjectDelete permanently removes an archived project. The delete is a
+// void operation (no project body is returned), so it posts the delete input
+// with reason + request ID and reports success.
+func runProjectDelete(ctx context.Context, args []string, getenv environment, stdout, stderr io.Writer, clients clientFactory) error {
+	flags, cfg := clientFlags("project delete", getenv, stderr)
+	var input core.ProjectDeleteInput
+	flags.StringVar(&input.Reason, "reason", "", "deletion reason")
+	flags.StringVar(&input.RequestID, "request-id", "", "idempotency key")
+	id, err := parseID(flags, args)
+	if err != nil {
+		return err
+	}
+	path := "/v1/projects/" + url.PathEscape(id) + "/delete"
+	if err := request(ctx, *cfg, clients, http.MethodPost, path, input, nil); err != nil {
+		return err
+	}
+	if strings.EqualFold(strings.TrimSpace(cfg.output), "json") {
+		return render(stdout, cfg.output, struct{ OK bool `json:"ok"` }{OK: true})
+	}
+	_, err = fmt.Fprintf(stdout, "project %s deleted\n", id)
+	return err
 }
 
 func runProjectAction(ctx context.Context, action string, args []string, getenv environment, stdout, stderr io.Writer, clients clientFactory) error {

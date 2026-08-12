@@ -274,7 +274,7 @@ const views = {
       return `<tr><td><a href="#" onclick="openProject('${p.id}');return false" style="color:var(--accent)">${esc(p.name)}</a></td><td>${pill(p.status)}</td>
       <td>${pt.length} 个任务 <span class="muted">(${pt.filter(t => t.status === "running").length} 运行 / ${pt.filter(t => t.status === "failed").length} 失败)</span></td>
       <td class="mono">${short(p.canonical_sha)}</td><td>${agentName(p.integration_agent_id)}</td><td class="muted">${esc(p.last_error || "")}</td>
-      <td>${p.status === "active" ? `<button class="btn danger" onclick="archiveProject('${p.id}')">归档</button>` : p.status === "error" ? `<button class="btn" onclick="repairProject('${p.id}')">Repair</button>` : ""}</td></tr>`; }).join("")}
+      <td>${p.status === "active" ? `<button class="btn danger" onclick="archiveProject('${p.id}')">归档</button>` : p.status === "error" ? `<button class="btn" onclick="repairProject('${p.id}')">Repair</button>` : p.status === "archived" ? `<button class="btn danger" onclick="deleteProject('${p.id}')">删除</button>` : ""}</td></tr>`; }).join("")}
     </table>`;
   },
   projects() {
@@ -291,7 +291,8 @@ const views = {
     ${filtered.map(p => `<tr><td><a href="#" onclick="openProject('${p.id}');return false" style="color:var(--accent)"><b>${esc(p.name)}</b></a></td>
     <td>${pill(p.status)}</td><td>${tasks.filter(t => t.project_id === p.id).length} 个任务</td><td class="mono">${short(p.canonical_sha)}</td><td>${agentName(p.integration_agent_id)}</td><td class="muted">${esc(p.last_error || "")}</td>
     <td>${p.status === "active" ? `<button class="btn danger" onclick="archiveProject('${p.id}')">归档</button>` : ""}
-    ${p.status === "error" ? `<button class="btn" onclick="repairProject('${p.id}')">Repair</button>` : ""}</td></tr>`).join("") || '<tr><td colspan="7" class="muted">无项目,点右上角新建</td></tr>'}
+    ${p.status === "error" ? `<button class="btn" onclick="repairProject('${p.id}')">Repair</button>` : ""}
+    ${p.status === "archived" ? `<button class="btn danger" onclick="deleteProject('${p.id}')">删除</button>` : ""}</td></tr>`).join("") || '<tr><td colspan="7" class="muted">无项目,点右上角新建</td></tr>'}
     </table>`;
   },
   agents() {
@@ -528,6 +529,12 @@ async function repairProject(id) {
   try { await api("POST", "/v1/projects/" + encodeURIComponent(id) + "/repair", { request_id: rid() }); toast("Repair 已提交"); } catch (e) { toast(e.message, true); }
   if (view === "project") openProject(id); else refreshAll();
 }
+async function deleteProject(id) {
+  if (!confirm("永久删除该已归档项目及其所有任务/Run/消息/事件记录？此操作不可恢复。")) return;
+  const reason = (prompt("删除原因(可选，写入审计事件):", "") || "").trim();
+  try { await api("POST", `/v1/projects/${encodeURIComponent(id)}/delete`, { reason, request_id: rid() }); toast("项目已永久删除"); } catch (e) { toast(e.message, true); }
+  view = "projects"; render(); refreshAll();
+}
 async function openProject(id) {
   view = "project"; detailProject = id; render();
   try { const d = await api("GET", "/v1/projects/" + encodeURIComponent(id)); window._pd = d; render(); }
@@ -556,6 +563,7 @@ function renderProjectDetail() {
       <button class="btn primary" onclick="viewBoard('${d.id}')">查看项目看板</button>
       ${d.status === "active" ? `<button class="btn danger" onclick="archiveProject('${d.id}')">归档</button>` : ""}
       ${d.status === "error" ? `<button class="btn" onclick="repairProject('${d.id}')">Repair</button>` : ""}
+      ${d.status === "archived" ? `<button class="btn danger" onclick="deleteProject('${d.id}')">删除</button>` : ""}
     </div>
   </div>
   <h2>项目任务 (${myTasks.length}) <span class="muted">(已取消 ${myTasks.filter(t => t.status === "cancelled").length})</span></h2>

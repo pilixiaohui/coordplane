@@ -181,6 +181,12 @@ func (s *Store) validateMigrationHistory(ctx context.Context, version int) error
 			name    string
 		}{5, budgetSecondsMigrationName})
 	}
+	if version >= 6 {
+		want = append(want, struct {
+			version int
+			name    string
+		}{6, projectDeleteCapabilityMigrationName})
+	}
 	if len(history) != len(want) {
 		return legacySchemaError("legacy database migration history requires backup and a new data_dir", nil)
 	}

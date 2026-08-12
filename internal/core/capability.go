@@ -28,6 +28,7 @@ const (
 	CapabilityProjectView       Capability = "project.view"
 	CapabilityProjectRepair     Capability = "project.repair"
 	CapabilityProjectArchive    Capability = "project.archive"
+	CapabilityProjectDelete     Capability = "project.delete"
 	CapabilityGCPreview         Capability = "gc.preview"
 	CapabilityGCRun             Capability = "gc.run"
 	CapabilityGCDiscard         Capability = "gc.discard"
@@ -48,6 +49,7 @@ var capabilityRegistry = []Capability{
 	CapabilityMessageSend,
 	CapabilityParticipantManage,
 	CapabilityProjectArchive,
+	CapabilityProjectDelete,
 	CapabilityProjectRepair,
 	CapabilityProjectView,
 	CapabilityRoleBind,

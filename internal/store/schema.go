@@ -1,8 +1,9 @@
 package store
 
-const schemaVersion = 5
+const schemaVersion = 6
 const schemaName = "coordplane_v4_human_task_lifecycle"
 const budgetSecondsMigrationName = "coordplane_v5_task_budget_seconds"
+const projectDeleteCapabilityMigrationName = "coordplane_v6_project_delete_capability"
 const participantRolesMigrationName = "coordplane_v3_participant_roles"
 const initialSchemaName = "coordplane_v1_six_objects"
 const isolationSpecMigrationName = "coordplane_v2_run_isolation_spec"

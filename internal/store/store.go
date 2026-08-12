@@ -233,6 +233,16 @@ func (s *Store) Migrate(ctx context.Context) (MigrationResult, error) {
 		if err := s.applyTaskBudgetMigration(ctx); err != nil {
 			return MigrationResult{}, err
 		}
+		result.Applied = append(result.Applied, 5)
+		version = 5
+	}
+	if version == 5 {
+		if err := s.validateCanonicalDatabase(ctx, 5); err != nil {
+			return MigrationResult{}, err
+		}
+		if err := s.applyProjectDeleteCapabilityMigration(ctx); err != nil {
+			return MigrationResult{}, err
+		}
 		result.Applied = append(result.Applied, schemaVersion)
 	}
 	if err := s.validateCanonicalDatabase(ctx, schemaVersion); err != nil {
@@ -361,12 +371,33 @@ func (s *Store) applyTaskBudgetMigration(ctx context.Context) error {
 	return nil
 }
 
+func (s *Store) applyProjectDeleteCapabilityMigration(ctx context.Context) error {
+	// Data-only migration: the owner role was seeded at migration v3 from the
+	// capability registry of that time, so databases created before
+	// project.delete was added keep a stale capability list and would be denied
+	// scope. Re-serialize the current canonical owner capability set from the
+	// core registry so existing databases match a fresh one.
+	ownerCapabilities, err := json.Marshal(core.CapabilityNames(core.AllCapabilities()))
+	if err != nil {
+		return core.WrapError(core.CodeInternal, "serialize owner role capabilities", false, err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(ctx, `UPDATE roles SET capabilities=?, version=version+1, updated_at=? WHERE id=?`,
+		string(ownerCapabilities), now, core.DefaultOwnerRoleID); err != nil {
+		return core.WrapError(core.CodeInternal, "grant project delete capability to owner role", false, err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, 6, projectDeleteCapabilityMigrationName, now); err != nil {
+		return core.WrapError(core.CodeInternal, "record project delete capability migration", false, err)
+	}
+	return nil
+}
+
 func (s *Store) migrationVersion(ctx context.Context) (int, error) {
 	var version int
 	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil {
 		return 0, legacySchemaError("read SQLite migration version", err)
 	}
-	if version != 1 && version != 2 && version != 3 && version != 4 && version != schemaVersion {
+	if version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != schemaVersion {
 		return 0, legacySchemaError("legacy database migration history requires backup and a new data_dir", nil)
 	}
 	return version, nil

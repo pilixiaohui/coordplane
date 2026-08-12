@@ -22,6 +22,7 @@ type OperatorOperations interface {
 	AddProject(context.Context, core.AddProjectInput) (core.Project, error)
 	RepairProject(context.Context, string, string) (core.Project, error)
 	ArchiveProject(context.Context, string, string) (core.Project, error)
+	DeleteProject(context.Context, core.ProjectDeleteInput) error
 	AddAgent(context.Context, core.AddAgentInput) (core.Agent, error)
 	SetAgentStatus(context.Context, string, core.AgentStatus, string) (core.Agent, error)
 	ArchiveAgent(context.Context, string, string) (core.Agent, error)

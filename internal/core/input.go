@@ -190,6 +190,12 @@ type TaskActionInput struct {
 	RequestID     string   `json:"request_id"`
 }
 
+type ProjectDeleteInput struct {
+	ProjectID string `json:"-"`
+	Reason    string `json:"reason,omitempty"`
+	RequestID string `json:"request_id"`
+}
+
 type RunStopInput struct {
 	RunID       string `json:"run_id"`
 	Reason      string `json:"reason,omitempty"`
