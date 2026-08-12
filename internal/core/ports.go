@@ -72,6 +72,11 @@ type Transaction interface {
 	InsertMessage(Message) error
 	UpdateMessage(Message, int64, MessageState) error
 
+	DeleteRunsByTask(string) ([]Run, error)
+	DeleteMessagesByTask(string) error
+	DeleteEventsByTask(string) error
+	DeleteTask(string) error
+
 	Role(string) (Role, error)
 	Roles() ([]Role, error)
 	InsertRole(Role) error

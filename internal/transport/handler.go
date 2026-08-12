@@ -193,6 +193,10 @@ func registerTaskRoutes(mux *http.ServeMux, operations OperatorOperations) {
 		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
 		return operations.CancelTask(ctx.Context, input)
 	})))
+	mux.HandleFunc("/v1/tasks/{id}/delete", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.TaskActionInput) (any, error) {
+		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
+		return nil, operations.DeleteTask(ctx.Context, input)
+	})))
 	mux.HandleFunc("/v1/tasks/{id}/accept", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.AcceptInput) (any, error) {
 		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
 		return operations.RequestAccept(ctx.Context, input)

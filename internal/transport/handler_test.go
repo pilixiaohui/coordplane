@@ -626,6 +626,10 @@ func (f *operatorFake) CancelTask(_ context.Context, input core.TaskActionInput)
 	return core.Task{}, f.record("cancel_task", input)
 }
 
+func (f *operatorFake) DeleteTask(_ context.Context, input core.TaskActionInput) error {
+	return f.record("delete_task", input)
+}
+
 func (f *operatorFake) RequestAccept(_ context.Context, input core.AcceptInput) (core.Task, error) {
 	return core.Task{}, f.record("accept_task", input)
 }

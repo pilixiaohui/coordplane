@@ -467,6 +467,7 @@ function renderTaskDetail() {
       ${t.status === "failed" ? `<button class="btn" onclick="taskAction('${t.id}','retry')">Retry</button>` : ""}
       ${t.status === "waiting" ? `<button class="btn" onclick="taskAction('${t.id}','wake')">Wake</button>` : ""}
       ${t.status === "waiting" ? `<button class="btn" onclick="closeConversation('${t.id}')">Close 会话</button>` : ""}
+      ${["completed", "cancelled"].includes(t.status) ? `<button class="btn danger" onclick="deleteTask('${t.id}')">Delete</button>` : ""}
     </div>
   </div>
   <div style="margin-top:10px"><button class="btn" onclick="view='tasks';render();refreshAll()">← 返回看板</button></div>`;
@@ -489,6 +490,12 @@ async function taskAction(id, action) {
 async function closeConversation(id) {
   try { await api("POST", `/v1/tasks/${encodeURIComponent(id)}/close`, { request_id: rid() }); toast("会话已关闭"); } catch (e) { toast(e.message, true); }
   refreshAll();
+}
+async function deleteTask(id) {
+  if (!confirm("永久删除该任务及其所有 Run/消息/事件记录？此操作不可恢复。")) return;
+  const reason = (prompt("删除原因(可选，写入审计事件):", "") || "").trim();
+  try { await api("POST", `/v1/tasks/${encodeURIComponent(id)}/delete`, { reason, request_id: rid() }); toast("任务已永久删除"); } catch (e) { toast(e.message, true); }
+  view = "tasks"; render(); refreshAll();
 }
 async function runStop(id) {
   try { await api("POST", "/v1/runs/" + encodeURIComponent(id) + "/stop", { request_id: rid() }); toast("Stop 已请求"); } catch (e) { toast(e.message, true); }

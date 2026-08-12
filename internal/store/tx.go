@@ -465,6 +465,48 @@ func (u *unitOfWork) DeleteRole(id string) error {
 	return nil
 }
 
+// DeleteRunsByTask returns the deleted Runs so callers can release their
+// resources (workspaces, task refs) after the transaction commits.
+func (u *unitOfWork) DeleteRunsByTask(taskID string) ([]core.Run, error) {
+	rows, err := u.tx.QueryContext(u.ctx, runSelect+` WHERE task_id=?`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	runs, err := collectRuns(rows)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := u.tx.ExecContext(u.ctx, `DELETE FROM runs WHERE task_id=?`, taskID); err != nil {
+		return nil, err
+	}
+	return runs, nil
+}
+
+func (u *unitOfWork) DeleteMessagesByTask(taskID string) error {
+	_, err := u.tx.ExecContext(u.ctx, `DELETE FROM messages WHERE task_id=?`, taskID)
+	return err
+}
+
+func (u *unitOfWork) DeleteEventsByTask(taskID string) error {
+	_, err := u.tx.ExecContext(u.ctx, `DELETE FROM events WHERE entity_type='task' AND entity_id=?`, taskID)
+	return err
+}
+
+func (u *unitOfWork) DeleteTask(id string) error {
+	result, err := u.tx.ExecContext(u.ctx, `DELETE FROM tasks WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return core.NewError(core.CodeNotFound, "task was not found", false)
+	}
+	return nil
+}
+
 func (u *unitOfWork) RoleBindingCount(roleID string) (int, error) {
 	var count int
 	err := u.tx.QueryRowContext(u.ctx, `SELECT COUNT(*) FROM participant_project_role WHERE role_id=?`, roleID).Scan(&count)

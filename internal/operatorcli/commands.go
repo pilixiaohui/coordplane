@@ -230,6 +230,8 @@ func runTask(ctx context.Context, args []string, getenv environment, stdout, std
 			return err
 		}
 		return render(stdout, cfg.output, task)
+	case "delete":
+		return runTaskDelete(ctx, args[1:], getenv, stdout, stderr, clients)
 	case "wake", "retry", "cancel", "rework":
 		return runTaskAction(ctx, args[0], args[1:], getenv, stdout, stderr, clients)
 	case "accept":
@@ -275,6 +277,29 @@ func runTaskAccept(ctx context.Context, args []string, getenv environment, stdou
 		return err
 	}
 	return render(stdout, cfg.output, task)
+}
+
+func runTaskDelete(ctx context.Context, args []string, getenv environment, stdout, stderr io.Writer, clients clientFactory) error {
+	flags, cfg := clientFlags("task delete", getenv, stderr)
+	var input core.TaskActionInput
+	var acknowledged stringListFlag
+	flags.StringVar(&input.Reason, "reason", "", "deletion reason")
+	flags.Var(&acknowledged, "ack-message", "message ID to acknowledge atomically; repeat for multiple messages")
+	flags.StringVar(&input.RequestID, "request-id", "", "idempotency key")
+	id, err := parseID(flags, args)
+	if err != nil {
+		return err
+	}
+	input.AckMessageIDs = append([]string(nil), acknowledged...)
+	path := "/v1/tasks/" + url.PathEscape(id) + "/delete"
+	if err := request(ctx, *cfg, clients, http.MethodPost, path, input, nil); err != nil {
+		return err
+	}
+	if strings.EqualFold(strings.TrimSpace(cfg.output), "json") {
+		return render(stdout, cfg.output, struct{ OK bool `json:"ok"` }{OK: true})
+	}
+	_, err = fmt.Fprintf(stdout, "task %s deleted\n", id)
+	return err
 }
 
 func runTaskAction(ctx context.Context, action string, args []string, getenv environment, stdout, stderr io.Writer, clients clientFactory) error {

@@ -35,6 +35,7 @@ type OperatorOperations interface {
 	WakeTask(context.Context, core.TaskActionInput) (core.Task, error)
 	RetryTask(context.Context, core.TaskActionInput) (core.Task, error)
 	CancelTask(context.Context, core.TaskActionInput) (core.Task, error)
+	DeleteTask(context.Context, core.TaskActionInput) error
 	RequestAccept(context.Context, core.AcceptInput) (core.Task, error)
 	ReworkTask(context.Context, core.TaskActionInput) (core.Task, error)
 	RequestRunStop(context.Context, core.RunStopInput) (core.Run, error)
