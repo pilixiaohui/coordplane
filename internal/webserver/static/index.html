@@ -45,7 +45,7 @@
   .agui-badge { font-size:11px; padding:0 6px; border-radius:4px; }
   .agui-run { color:#4a9eff; } .agui-msg { color:#8fdc8f; }
   .agui-tool { color:#ffd479; } .agui-end { color:#ff8a8a; }
-  .board { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }
+  .board { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; }
   .col { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px; min-height:120px; }
   .col h3 { font-size:12px; color:var(--muted); margin-bottom:8px; }
   .tcard { background:var(--panel2); border:1px solid var(--line); border-radius:6px; padding:8px 10px; margin-bottom:8px; cursor:pointer; }
@@ -82,6 +82,7 @@
   <div class="logo">Coord<span>Plane</span></div>
   <nav id="nav">
     <a data-v="dash" class="on">◈ Dashboard</a>
+    <a data-v="projects">📁 Projects</a>
     <a data-v="agents">♟ Agents</a>
     <a data-v="tasks">☰ Tasks</a>
     <a data-v="runs">⏱ Runs</a>
@@ -89,6 +90,7 @@
     <a data-v="roles">♛ Roles</a>
     <a data-v="creds">🔑 Credentials</a>
     <a data-v="events">≣ Events</a>
+    <a data-v="gc">♻ GC</a>
   </nav>
 </aside>
 <main id="main"></main>
