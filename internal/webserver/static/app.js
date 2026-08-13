@@ -23,6 +23,8 @@ let messagesCache = [];
 let eventsCache = [];
 let credsCache = null;
 let gcPreview = null;
+let editMode = "";
+let messagesError = "";
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -63,6 +65,7 @@ async function api(method, path, body) {
   return data ? data.data : null;
 }
 const rid = () => "web-" + Math.random().toString(36).slice(2, 10);
+const leaveEdit = targetView => { editMode = ""; view = targetView; render(); };
 
 function toast(msg, isErr) {
   const t = $("toast");
@@ -133,6 +136,7 @@ function render() {
   document.querySelectorAll("#nav a").forEach(a => a.classList.toggle("on", a.dataset.v === view));
   const m = $("main");
   if (view === "login") return;
+  if (editMode) return;
   if (view === "task") { m.innerHTML = renderTaskDetail(); return; }
   if (view === "agent") { m.innerHTML = renderAgentDetail(); return; }
   if (view === "project") { m.innerHTML = renderProjectDetail(); return; }
@@ -338,6 +342,7 @@ const views = {
   messages() {
     const activeAgents = agents.filter(a => a.status === "active");
     return `<h1>Messages(收件箱)</h1>
+    ${messagesError ? `<div class="banner">消息加载失败：${esc(messagesError)}</div>` : ""}
     <table><tr><th>来自</th><th>内容</th><th>时间</th><th></th></tr>
     ${messagesCache.map(m => `<tr><td>${esc(m.sender_id || "")}</td><td>${esc(m.body)} ${m.state === "pending" || m.state === "delivered" ? '<span class="pill st-running">new</span>' : ""}</td><td class="muted">${esc(m.created_at)}</td>
     <td>${m.state !== "acknowledged" ? `<button class="btn" onclick="ackMsg('${m.id}')">ack</button>` : ""}</td></tr>`).join("") || '<tr><td colspan="4" class="muted">无</td></tr>'}
@@ -424,7 +429,17 @@ function tc(t) {
   return `<div class="tcard" onclick="openTask('${t.id}')"><div class="title">${esc(t.title)}</div><div class="meta">${proj}${agentName(t.assignee_agent_id || t.assignee_participant_id)} · ${pill(t.status)} ${evBadge(t)}</div></div>`;
 }
 
-async function refreshMessages() { try { const d = await api("GET", "/v1/messages?recipient_kind=boss&limit=100"); messagesCache.length = 0; messagesCache.push(...(d.items || [])); } catch (e) { /* 忽略 */ } }
+async function refreshMessages() {
+  try {
+    const d = await api("GET", "/v1/messages?recipient_kind=boss&limit=20");
+    messagesCache.length = 0;
+    messagesCache.push(...(d.items || []));
+    messagesError = "";
+  } catch (e) {
+    messagesError = e.message || String(e);
+    console.error("刷新 Messages 失败:", e);
+  }
+}
 async function refreshRoles() { try { roles = await api("GET", "/v1/roles") || []; } catch (e) { /* 忽略 */ } }
 async function refreshParticipants() { try { participantsCache = await api("GET", "/v1/participants") || []; } catch (e) { /* 忽略 */ } }
 async function refreshEvents() { try { const d = await api("GET", "/v1/events?limit=100"); eventsCache.length = 0; eventsCache.push(...(d.items || [])); } catch (e) { /* 忽略 */ } }
@@ -508,6 +523,7 @@ async function agentAction(id, action) {
 }
 // ---------- 项目 ----------
 function newProjectForm() {
+  editMode = "project";
   $("main").innerHTML = `
   <h1>新建项目</h1>
   <div class="form-grid">
@@ -515,7 +531,7 @@ function newProjectForm() {
     <label>Source(git 地址)</label><input id="p-source" placeholder="https://github.com/.../.git">
     <label>SourceRef</label><input id="p-source-ref" value="main">
     <label>集成 Agent(可空)</label><select id="p-integration">${agents.filter(a => a.status === "active").map(a => `<option value="${a.id}">${esc(a.display_name)}</option>`).join("")}<option value="">(无)</option></select>
-    <div style="grid-column:1/-1;margin-top:8px"><button class="btn primary" onclick="createProject()">创建</button><button class="btn" onclick="view='projects';render()">取消</button></div>
+    <div style="grid-column:1/-1;margin-top:8px"><button class="btn primary" onclick="createProject()">创建</button><button class="btn" onclick="leaveEdit('projects')">取消</button></div>
   </div>`;
 }
 async function createProject() {
@@ -523,6 +539,7 @@ async function createProject() {
   const integ = $("p-integration").value;
   if (integ) body.integration_agent_id = integ;
   try { await api("POST", "/v1/projects", body); toast("项目已创建"); } catch (e) { toast(e.message, true); }
+  editMode = "";
   view = "projects"; refreshAll();
 }
 async function repairProject(id) {
@@ -575,6 +592,7 @@ function renderProjectDetail() {
 }
 // ---------- Agent ----------
 function newAgentForm() {
+  editMode = "agent";
   $("main").innerHTML = `
   <h1>新建 Agent</h1>
   <div class="form-grid">
@@ -582,15 +600,17 @@ function newAgentForm() {
     <label>adapter</label><input id="a-adapter" value="claude">
     <label>image</label><input id="a-image" value="node:22-bookworm">
     <label>instructions 文件(绝对路径)</label><input id="a-instr" value="/instructions/agent.md">
-    <div style="grid-column:1/-1;margin-top:8px"><button class="btn primary" onclick="createAgent()">创建</button><button class="btn" onclick="view='agents';render()">取消</button></div>
+    <div style="grid-column:1/-1;margin-top:8px"><button class="btn primary" onclick="createAgent()">创建</button><button class="btn" onclick="leaveEdit('agents')">取消</button></div>
   </div>`;
 }
 async function createAgent() {
   try { await api("POST", "/v1/agents", { display_name: $("a-name").value.trim(), adapter_id: $("a-adapter").value.trim(), image: $("a-image").value.trim(), instructions_file: $("a-instr").value.trim(), request_id: rid() }); toast("Agent 已创建"); } catch (e) { toast(e.message, true); }
+  editMode = "";
   view = "agents"; refreshAll();
 }
 // ---------- 任务 ----------
 function newTaskForm() {
+  editMode = "task";
   const agentOpts = agents.filter(a => a.status === "active").map(a => `<option value="agent:${a.id}">${esc(a.display_name)}</option>`).join("");
   const humanOpts = participants.filter(p => p.Kind === "human").map(p => `<option value="human:${p.ID}">${esc(p.DisplayName)} (human)</option>`).join("");
   $("main").innerHTML = `
@@ -603,7 +623,7 @@ function newTaskForm() {
     <label>MaxRetries</label><input id="t-retries" type="number" value="0" min="0">
     <label>预算(秒,可空)</label><input id="t-budget" type="number" placeholder="如 600">
     <label>描述</label><textarea id="t-desc" rows="2"></textarea>
-    <div style="grid-column:1/-1;margin-top:8px"><button class="btn primary" onclick="createTask()">创建</button><button class="btn" onclick="view='tasks';render()">取消</button></div>
+    <div style="grid-column:1/-1;margin-top:8px"><button class="btn primary" onclick="createTask()">创建</button><button class="btn" onclick="leaveEdit('tasks')">取消</button></div>
   </div>`;
 }
 async function createTask() {
@@ -614,25 +634,29 @@ async function createTask() {
   if (sel.startsWith("agent:")) body.assignee_agent_id = sel.slice(6);
   else body.assignee_participant_id = sel.slice(6);
   try { await api("POST", "/v1/tasks", body); toast("任务已创建"); } catch (e) { toast(e.message, true); }
+  editMode = "";
   view = "tasks"; refreshAll();
 }
 // ---------- 角色 / 绑定 ----------
 function newRoleForm() {
+  editMode = "role";
   $("main").innerHTML = `
   <h1>新建角色</h1>
   <div class="form-grid">
     <label>名称</label><input id="r-name" placeholder="role-name">
     <label>描述</label><input id="r-desc">
     <label>Capabilities(逗号分隔)</label><input id="r-caps" placeholder="task.create, task.assign, ...">
-    <div style="grid-column:1/-1;margin-top:8px"><button class="btn primary" onclick="createRole()">创建</button><button class="btn" onclick="view='roles';render()">取消</button></div>
+    <div style="grid-column:1/-1;margin-top:8px"><button class="btn primary" onclick="createRole()">创建</button><button class="btn" onclick="leaveEdit('roles')">取消</button></div>
   </div>`;
 }
 async function createRole() {
   const caps = $("r-caps").value.split(",").map(s => s.trim()).filter(Boolean);
   try { await api("POST", "/v1/roles", { Name: $("r-name").value.trim(), Description: $("r-desc").value.trim(), Capabilities: caps, RequestID: rid() }); toast("角色已创建"); } catch (e) { toast(e.message, true); }
+  editMode = "";
   view = "roles"; refreshAll();
 }
 function editRoleForm(id) {
+  editMode = "role-edit";
   const r = roles.find(x => x.ID === id);
   $("main").innerHTML = `
   <h1>编辑角色 <span class="mono">${esc(id)}</span></h1>
@@ -640,12 +664,13 @@ function editRoleForm(id) {
     <label>名称</label><input id="r-name" value="${esc(r.Name)}">
     <label>描述</label><input id="r-desc" value="${esc(r.Description || "")}">
     <label>Capabilities(逗号分隔)</label><input id="r-caps" value="${(r.Capabilities || []).join(", ")}">
-    <div style="grid-column:1/-1;margin-top:8px"><button class="btn primary" onclick="updateRole('${id}')">保存</button><button class="btn" onclick="view='roles';render()">取消</button></div>
+    <div style="grid-column:1/-1;margin-top:8px"><button class="btn primary" onclick="updateRole('${id}')">保存</button><button class="btn" onclick="leaveEdit('roles')">取消</button></div>
   </div>`;
 }
 async function updateRole(id) {
   const caps = $("r-caps").value.split(",").map(s => s.trim()).filter(Boolean);
   try { await api("PUT", "/v1/roles/" + encodeURIComponent(id), { Name: $("r-name").value.trim(), Description: $("r-desc").value.trim(), Capabilities: caps, RequestID: rid() }); toast("角色已更新"); } catch (e) { toast(e.message, true); }
+  editMode = "";
   view = "roles"; refreshAll();
 }
 async function deleteRole(id) {
@@ -654,6 +679,7 @@ async function deleteRole(id) {
   view = "roles"; refreshAll();
 }
 function newBindForm() {
+  editMode = "bind";
   const pOpts = participantsCache.map(p => `<option value="${p.ID}">${esc(p.ID)} (${esc(p.Kind)})</option>`).join("");
   const rOpts = roles.map(r => `<option value="${r.ID}">${esc(r.Name)}</option>`).join("");
   $("main").innerHTML = `
@@ -662,12 +688,13 @@ function newBindForm() {
     <label>Participant</label><select id="b-participant">${pOpts}</select>
     <label>项目作用域(留空=global)</label><select id="b-project"><option value="global">global</option>${projects.filter(p => p.status !== "archived").map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}</select>
     <label>Role</label><select id="b-role">${rOpts}</select>
-    <div style="grid-column:1/-1;margin-top:8px"><button class="btn primary" onclick="bindRole()">绑定</button><button class="btn" onclick="view='roles';render()">取消</button></div>
+    <div style="grid-column:1/-1;margin-top:8px"><button class="btn primary" onclick="bindRole()">绑定</button><button class="btn" onclick="leaveEdit('roles')">取消</button></div>
   </div>`;
 }
 async function bindRole() {
   const body = { ParticipantID: $("b-participant").value, ProjectID: $("b-project").value, RoleID: $("b-role").value, RequestID: rid() };
   try { await api("POST", "/v1/participants/" + encodeURIComponent(body.ParticipantID) + "/roles", body); toast("已绑定"); } catch (e) { toast(e.message, true); }
+  editMode = "";
   view = "roles"; refreshAll();
 }
 async function unbindRole(participantID, projectID, roleID) {
@@ -740,8 +767,8 @@ async function refreshAll() {
     await loadData();
     await Promise.all([refreshMessages(), refreshRoles(), refreshParticipants(), refreshEvents(), refreshCreds()]);
   } catch (e) { if (e.code === "SCOPE_DENIED") { sessionStorage.removeItem(KEY); showLogin("凭据已失效"); } else { toast(e.message, true); } }
-  render();
+  if (!editMode) render();
 }
-$("nav").addEventListener("click", e => { const a = e.target.closest("a"); if (!a) return; view = a.dataset.v; render(); if (view === "events") refreshAll(); });
+$("nav").addEventListener("click", e => { const a = e.target.closest("a"); if (!a) return; editMode = ""; view = a.dataset.v; render(); if (view === "events") refreshAll(); });
 boot();
 setInterval(() => { if (view !== "login") refreshAll(); }, 5000);
