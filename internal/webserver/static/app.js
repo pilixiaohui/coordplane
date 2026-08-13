@@ -445,6 +445,15 @@ function refreshMessagesUI() {
   if (table) table.outerHTML = messagesInboxHTML();
 }
 
+async function ackMsg(id) {
+  try {
+    await api("POST", "/v1/messages/" + encodeURIComponent(id) + "/ack", { request_id: rid() });
+    toast("已 ack");
+  } catch (e) { toast(e.message, true); }
+  await refreshMessages();
+  render();
+}
+
 async function refreshMessages() {
   try {
     const d = await api("GET", "/v1/messages?recipient_kind=boss&limit=20");
