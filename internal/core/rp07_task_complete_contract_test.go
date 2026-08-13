@@ -3,6 +3,7 @@ package core_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"coordplane/internal/core"
 )
@@ -20,6 +21,9 @@ func TestRP07HumanTaskCompleteConvergesWithHumanConfirmEvidence(t *testing.T) {
 		ProjectID: project.ID, AssigneeAgentID: agent.ID, Title: "agent work", RequestID: "rp07-agent",
 	})
 	requireNoError(t, err)
+	if agentTask.Status != core.TaskQueued || agentTask.WaitReason != "" {
+		t.Fatalf("agent task initial state = %#v, want queued without wait_reason", agentTask)
+	}
 	task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
 		ProjectID: project.ID, AssigneeParticipantID: core.DefaultHumanParticipantID,
 		Title: "human review", RequestID: "rp07-create",
@@ -28,10 +32,45 @@ func TestRP07HumanTaskCompleteConvergesWithHumanConfirmEvidence(t *testing.T) {
 	if task.AssigneeAgentID != "" || task.AssigneeParticipantID != core.DefaultHumanParticipantID {
 		t.Fatalf("human assignee = agent %q / participant %q", task.AssigneeAgentID, task.AssigneeParticipantID)
 	}
+	if task.Status != core.TaskWaiting || task.WaitReason != "human_assigned" || task.CurrentRunID != "" {
+		t.Fatalf("human task initial state = %#v, want waiting with wait_reason=human_assigned", task)
+	}
+	if _, err := h.service.WakeTask(context.Background(), core.TaskActionInput{
+		TaskID: task.ID, RequestID: "rp07-wake-human",
+	}); !core.IsCode(err, core.CodeInvalidState) {
+		t.Fatalf("wake on human task error = %v, want INVALID_STATE", err)
+	}
 	if _, err := h.service.CompleteTask(context.Background(), core.CompleteTaskInput{
 		TaskID: agentTask.ID, Summary: "nope", RequestID: "rp07-agent-complete",
 	}); !core.IsCode(err, core.CodeInvalidState) {
 		t.Fatalf("complete on agent task error = %v", err)
+	}
+	queuedHuman, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
+		ProjectID: project.ID, AssigneeParticipantID: core.DefaultHumanParticipantID,
+		Title: "legacy queued human", RequestID: "rp07-queued-human",
+	})
+	requireNoError(t, err)
+	if queuedHuman.Status != core.TaskWaiting {
+		t.Fatalf("queued-human fixture created as %s, want waiting", queuedHuman.Status)
+	}
+	if err := h.database.Transact(context.Background(), func(tx core.Transaction) error {
+		persisted, err := tx.Task(queuedHuman.ID)
+		if err != nil {
+			return err
+		}
+		expectedVersion, expectedStatus := persisted.Version, persisted.Status
+		persisted.Status = core.TaskQueued
+		persisted.WaitReason = ""
+		persisted.Version++
+		persisted.UpdatedAt = time.Date(2026, 7, 12, 1, 2, 4, 0, time.UTC).Format(time.RFC3339Nano)
+		return tx.UpdateTask(persisted, expectedVersion, expectedStatus)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.CompleteTask(context.Background(), core.CompleteTaskInput{
+		TaskID: queuedHuman.ID, Summary: "must not complete from queued", RequestID: "rp07-queued-complete",
+	}); !core.IsCode(err, core.CodeInvalidState) {
+		t.Fatalf("complete queued human task error = %v, want INVALID_STATE", err)
 	}
 	if claim, ok, err := h.service.ClaimNext(context.Background(), project.ID); err != nil || (ok && claim.Task.ID == task.ID) {
 		t.Fatalf("daemon claimed human task: %#v ok=%t err=%v", claim, ok, err)
@@ -46,13 +85,16 @@ func TestRP07HumanTaskCompleteConvergesWithHumanConfirmEvidence(t *testing.T) {
 	})
 	requireNoError(t, err)
 	if completed.Status != core.TaskCompleted || completed.EvidenceType != string(core.EvidenceHumanConfirm) ||
-		completed.HeadSHA != "" || completed.TaskRef != "" || completed.ResultSummary != "reviewed and confirmed" {
+		completed.HeadSHA != "" || completed.HeadRunID != "" || completed.TaskRef != "" ||
+		completed.WaitReason != "" || completed.ClosedAt == "" ||
+		completed.ResultSummary != "reviewed and confirmed" {
 		t.Fatalf("completed = %#v", completed)
 	}
 	detail, err := h.service.Task(context.Background(), task.ID)
 	requireNoError(t, err)
-	if detail.Task.EvidenceType != string(core.EvidenceHumanConfirm) {
-		t.Fatalf("task detail evidence_type = %q", detail.Task.EvidenceType)
+	if detail.Task.EvidenceType != string(core.EvidenceHumanConfirm) || detail.Task.ClosedAt == "" ||
+		detail.Task.WaitReason != "" || detail.Task.HeadSHA != "" {
+		t.Fatalf("task detail after complete = %#v", detail.Task)
 	}
 	if _, err := h.service.CompleteTask(context.Background(), core.CompleteTaskInput{
 		TaskID: task.ID, Summary: "again", RequestID: "rp07-repeat",

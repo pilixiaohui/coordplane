@@ -45,6 +45,14 @@ func TestRP08AgentDispatchesChildTaskToHumanParticipant(t *testing.T) {
 	if child.AssigneeAgentID != "" || child.AssigneeParticipantID != core.DefaultHumanParticipantID || child.ParentTaskID != parent.ID {
 		t.Fatalf("child = agent %q participant %q parent %q", child.AssigneeAgentID, child.AssigneeParticipantID, child.ParentTaskID)
 	}
+	if child.Status != core.TaskWaiting || child.WaitReason != "human_assigned" || child.CurrentRunID != "" {
+		t.Fatalf("human child initial state = %#v, want waiting with wait_reason=human_assigned", child)
+	}
+	if _, err := h.service.WakeTask(context.Background(), core.TaskActionInput{
+		TaskID: child.ID, RequestID: "rp08-wake-human-child",
+	}); !core.IsCode(err, core.CodeInvalidState) {
+		t.Fatalf("wake human child error = %v, want INVALID_STATE", err)
+	}
 	if _, ok, err := h.service.ClaimNext(context.Background(), project.ID); err != nil || ok {
 		t.Fatalf("ClaimNext claimed human child task: ok=%t err=%v", ok, err)
 	}
@@ -52,8 +60,9 @@ func TestRP08AgentDispatchesChildTaskToHumanParticipant(t *testing.T) {
 		TaskID: child.ID, Summary: "review ok", RequestID: "rp08-complete",
 	})
 	requireNoError(t, err)
-	if done.EvidenceType != string(core.EvidenceHumanConfirm) {
-		t.Fatalf("child evidence_type = %q", done.EvidenceType)
+	if done.EvidenceType != string(core.EvidenceHumanConfirm) || done.HeadSHA != "" ||
+		done.HeadRunID != "" || done.TaskRef != "" || done.WaitReason != "" || done.ClosedAt == "" {
+		t.Fatalf("completed human child = %#v", done)
 	}
 	messages, err := h.service.ListMessages(context.Background(), core.MessageFilter{ProjectID: project.ID, RecipientKind: "agent"})
 	requireNoError(t, err)
