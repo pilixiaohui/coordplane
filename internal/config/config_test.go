@@ -26,7 +26,7 @@ func TestLoadAcceptsStrictMinimalConfigAndZeroRetention(t *testing.T) {
 	if cfg.Retention.CompletedWorkspace != 0 || cfg.Retention.TerminalTaskRef != 168*time.Hour || cfg.Retention.RunLog != 0 {
 		t.Fatalf("retention = %+v", cfg.Retention)
 	}
-	if strings.Join(cfg.Runtime.ProviderEnvAllowlist, ",") != "ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL,ANTHROPIC_MODEL,ANTHROPIC_DEFAULT_OPUS_MODEL,ANTHROPIC_DEFAULT_SONNET_MODEL,ANTHROPIC_DEFAULT_HAIKU_MODEL,CLAUDE_CODE_SUBAGENT_MODEL,CLAUDE_CODE_EFFORT_LEVEL" {
+	if strings.Join(cfg.Runtime.ProviderEnvAllowlist, ",") != "ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL,ANTHROPIC_MODEL,ANTHROPIC_DEFAULT_OPUS_MODEL,ANTHROPIC_DEFAULT_SONNET_MODEL,ANTHROPIC_DEFAULT_HAIKU_MODEL,CLAUDE_CODE_SUBAGENT_MODEL,CLAUDE_CODE_EFFORT_LEVEL,OPENAI_API_KEY,OPENAI_BASE_URL" {
 		t.Fatalf("provider allowlist = %#v", cfg.Runtime.ProviderEnvAllowlist)
 	}
 	if cfg.Runtime.RunTimeout != 0 {
@@ -63,9 +63,9 @@ func TestLoadRejectsInvalidConfigWithoutFallback(t *testing.T) {
 		{name: "workspace traversal outside", raw: strings.Replace(valid, filepath.Join(dataDir, "workspaces"), filepath.Join(dataDir, "..", "workspaces"), 1), want: "inside data_dir"},
 		{name: "invalid provider env", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN=value", 1), want: "valid environment variable name"},
 		{name: "duplicate provider env", raw: strings.Replace(valid, "    - ANTHROPIC_AUTH_TOKEN\n", "    - ANTHROPIC_AUTH_TOKEN\n    - ANTHROPIC_AUTH_TOKEN\n", 1), want: "contains duplicate"},
-		{name: "retired API key", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", 1), want: "Claude provider environment catalog"},
-		{name: "proxy credential", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "HTTPS_PROXY", 1), want: "Claude provider environment catalog"},
-		{name: "arbitrary provider env", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "PROVIDER_EXTRA", 1), want: "Claude provider environment catalog"},
+		{name: "retired API key", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", 1), want: "provider environment catalog"},
+		{name: "proxy credential", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "HTTPS_PROXY", 1), want: "provider environment catalog"},
+		{name: "arbitrary provider env", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "PROVIDER_EXTRA", 1), want: "provider environment catalog"},
 		{name: "reserved HOME", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "HOME", 1), want: "reserved environment variable"},
 		{name: "reserved Run socket", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "COORDPLANE_RUN_SOCKET", 1), want: "reserved environment variable"},
 		{name: "reserved token file", raw: strings.Replace(valid, "ANTHROPIC_AUTH_TOKEN", "COORDPLANE_RUN_TOKEN_FILE", 1), want: "reserved environment variable"},
@@ -145,7 +145,7 @@ func TestLoadRejectsRuntimeRootEscapingThroughSymlink(t *testing.T) {
 }
 
 func validConfig(dataDir string) string {
-	return string(testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: filepath.Join(dataDir, "operator.sock"), MaxParallelRuns: 4, CompletedWorkspace: "0", TerminalTaskRef: "168h", RunLog: "0", DockerNetwork: "coordplane", DefaultImage: "coordplane-agent:latest", ProviderEnv: config.ClaudeProviderEnvCatalog()}))
+	return string(testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: filepath.Join(dataDir, "operator.sock"), MaxParallelRuns: 4, CompletedWorkspace: "0", TerminalTaskRef: "168h", RunLog: "0", DockerNetwork: "coordplane", DefaultImage: "coordplane-agent:latest", ProviderEnv: config.ProviderEnvCatalog()}))
 }
 
 func writeConfig(t *testing.T, raw string) string {

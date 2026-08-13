@@ -118,7 +118,7 @@ func TestBootstrapAdvertisesTheImportedSourceConvenienceRef(t *testing.T) {
 }
 
 func TestContainerSpecKeepsTrustedRuntimeEnvironmentOverProviderAllowlist(t *testing.T) {
-	providerEnv := config.ClaudeProviderEnvCatalog()
+	providerEnv := config.ProviderEnvCatalog()
 	for _, name := range append(providerEnv, "ANTHROPIC_API_KEY", "HOME", "COORDPLANE_RUN_SOCKET", "COORDPLANE_RUN_TOKEN_FILE") {
 		t.Setenv(name, "/untrusted/provider-value")
 	}
