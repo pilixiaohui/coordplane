@@ -65,7 +65,7 @@ func TestP3LegacyRuntimeProductsCannotReturn(t *testing.T) {
 func TestP3ProductionAdapterRegistryIsOneStaticOneShotList(t *testing.T) {
 	sources := productionSources(t, "internal/adapter")
 	listName, entries := adapterList(t, sources)
-	if entries != 1 {
+	if entries != 2 {
 		t.Fatalf("compile-time production adapter list %q contains %d entries", listName, entries)
 	}
 	foundProductionUse := false
@@ -131,12 +131,14 @@ func TestP3ProductionAdapterRegistryIsOneStaticOneShotList(t *testing.T) {
 	}
 	registry := adapter.Production()
 	names := registry.Names()
-	if len(names) != 1 || names[0] != "claude" {
-		t.Fatalf("production registry names = %v, want [claude]", names)
+	if len(names) != 2 || names[0] != "claude" || names[1] != "codex" {
+		t.Fatalf("production registry names = %v, want [claude codex]", names)
 	}
-	production, ok := registry.Lookup(names[0])
-	if !ok || production.Metadata().ExecutionModel != adapter.ExecutionOneShot {
-		t.Fatalf("production adapter %q is not one-shot", names[0])
+	for _, name := range names {
+		production, ok := registry.Lookup(name)
+		if !ok || production.Metadata().ExecutionModel != adapter.ExecutionOneShot {
+			t.Fatalf("production adapter %q is not one-shot", name)
+		}
 	}
 	known := stringSet(names...)
 	for _, source := range productionSources(t, "internal/runtime", "internal/daemon") {

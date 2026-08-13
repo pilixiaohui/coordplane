@@ -215,7 +215,7 @@ func TestGT00ProductionBinaryHasNoContractFaultControl(t *testing.T) {
 	}
 }
 
-func TestP3ProductionBinaryRejectsRetiredCodexWithoutDurableWrites(t *testing.T) {
+func TestP3ProductionBinaryAcceptsCodexAdapter(t *testing.T) {
 	root, dataDir, socket, configPath := contractConfigPaths(t, "")
 	daemon := startDaemon(t, configPath, socket)
 	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
@@ -224,22 +224,23 @@ func TestP3ProductionBinaryRejectsRetiredCodexWithoutDurableWrites(t *testing.T)
 	defer database.Close()
 	before := durableSignature(t, database, "")
 
-	command := exec.Command(testBinaries.coordplane,
+	raw := runBinaryJSON(t, testBinaries.coordplane,
 		"agent", "add", "--socket", socket, "--display-name", "Retired Adapter",
 		"--adapter", "codex", "--image", "agent:latest",
 		"--instructions-file", filepath.Join(root, "agent.md"),
-		"--request-id", "retired-adapter", "--output", "json")
-	raw, err := command.CombinedOutput()
-	if err == nil || !bytes.Contains(raw, []byte("adapter_id is not registered")) {
-		t.Fatalf("retired adapter err=%v output=%s", err, raw)
+		"--request-id", "codex-adapter", "--output", "json")
+	var agent core.Agent
+	decodeJSON(t, raw, &agent)
+	if agent.AdapterID != "codex" {
+		t.Fatalf("accepted Codex agent = %#v", agent)
 	}
 	snapshot, err := database.Snapshot(context.Background(), "")
 	requireNoError(t, err)
 	events, err := database.Events(context.Background(), core.EventFilter{EntityType: "agent"})
 	requireNoError(t, err)
 	after := durableSignature(t, database, "")
-	if len(snapshot.Agents) != 0 || len(events) != 0 || after != before {
-		t.Fatalf("retired adapter wrote durable state: agents=%#v events=%#v signature_changed=%t", snapshot.Agents, events, after != before)
+	if len(snapshot.Agents) != 1 || len(events) != 1 || after == before {
+		t.Fatalf("Codex adapter durable state: agents=%#v events=%#v signature_changed=%t", snapshot.Agents, events, after == before)
 	}
 }
 

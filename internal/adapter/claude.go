@@ -11,12 +11,17 @@ const claudeAdapterName = "claude"
 
 const ContainerBootstrapPath = "/run/coordplane/bootstrap"
 
+var claudeAllowedEfforts = []string{"low", "medium", "high"}
+
 type Claude struct{}
 
 func (Claude) Name() string { return claudeAdapterName }
 
 func (Claude) Metadata() Metadata {
-	return Metadata{ExecutionModel: ExecutionOneShot, SupportsResume: true}
+	return Metadata{
+		Name: claudeAdapterName, ExecutionModel: ExecutionOneShot, SupportsResume: true,
+		AllowedEfforts: append([]string(nil), claudeAllowedEfforts...),
+	}
 }
 
 func (Claude) BuildStartCommand(spec LaunchSpec) (CommandSpec, error) {
@@ -27,11 +32,7 @@ func (Claude) BuildStartCommand(spec LaunchSpec) (CommandSpec, error) {
 		"-p", "--bare", "--verbose", "--output-format", "stream-json",
 		"--dangerously-skip-permissions", "--", bootstrapReferencePrompt(),
 	}
-	return CommandSpec{
-		Executable: "claude",
-		Args:       args,
-		Env:        map[string]string{"HOME": spec.ContainerHome},
-	}, nil
+	return CommandSpec{Executable: "claude", Args: args, Env: claudeEnvironment(spec)}, nil
 }
 
 func (Claude) BuildResumeCommand(spec ResumeSpec) (CommandSpec, error) {
@@ -47,11 +48,7 @@ func (Claude) BuildResumeCommand(spec ResumeSpec) (CommandSpec, error) {
 		"--dangerously-skip-permissions", "--resume", sessionID,
 		"--", bootstrapReferencePrompt(),
 	}
-	return CommandSpec{
-		Executable: "claude",
-		Args:       args,
-		Env:        map[string]string{"HOME": spec.ContainerHome},
-	}, nil
+	return CommandSpec{Executable: "claude", Args: args, Env: claudeEnvironment(spec.LaunchSpec)}, nil
 }
 
 func (Claude) BuildInjectInput(MessageInput) (RuntimeInput, error) {
@@ -63,6 +60,23 @@ func (Claude) ResumeCompatible(previous, next SessionContext) bool {
 		previous.AgentID != "" && previous.AgentID == next.AgentID &&
 		previous.TaskID != "" && previous.TaskID == next.TaskID &&
 		previous.WorkspaceID == next.WorkspaceID
+}
+
+func claudeEnvironment(spec LaunchSpec) map[string]string {
+	env := map[string]string{"HOME": spec.ContainerHome}
+	if value := strings.TrimSpace(spec.Provider.Model); value != "" {
+		env["ANTHROPIC_MODEL"] = value
+	}
+	if value := strings.TrimSpace(spec.Provider.SubagentModel); value != "" {
+		env["CLAUDE_CODE_SUBAGENT_MODEL"] = value
+	}
+	if value := strings.TrimSpace(spec.Provider.BaseURL); value != "" {
+		env["ANTHROPIC_BASE_URL"] = value
+	}
+	if value := strings.TrimSpace(spec.Provider.Effort); value != "" {
+		env["CLAUDE_CODE_EFFORT_LEVEL"] = value
+	}
+	return env
 }
 
 func (Claude) ParseEvent(frame []byte) (Event, error) {

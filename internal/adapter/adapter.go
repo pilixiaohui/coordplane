@@ -18,9 +18,20 @@ const (
 var ErrInjectUnsupported = errors.New("adapter: runtime input injection is not supported")
 
 type Metadata struct {
+	Name           string
 	ExecutionModel ExecutionModel
 	SupportsResume bool
 	SupportsInject bool
+	AllowedEfforts []string
+}
+
+// ProviderConfig is the non-secret, per-Agent provider override carried into a
+// Run launch. Empty fields mean "leave the provider/global default alone".
+type ProviderConfig struct {
+	Model         string
+	SubagentModel string
+	BaseURL       string
+	Effort        string
 }
 
 type CommandSpec struct {
@@ -34,6 +45,7 @@ type LaunchSpec struct {
 	Conversation  bool
 	ContainerHome string
 	ContainerWork string
+	Provider      ProviderConfig
 }
 
 type ResumeSpec struct {
@@ -92,6 +104,7 @@ type Registry struct {
 
 var productionAdapters = []CLI{
 	Claude{},
+	Codex{},
 }
 
 func Production() Registry {
@@ -116,6 +129,9 @@ func newRegistry(entries []CLI) (Registry, error) {
 			return Registry{}, fmt.Errorf("adapter: duplicate registry name %q", name)
 		}
 		metadata := entry.Metadata()
+		if strings.TrimSpace(metadata.Name) != name {
+			return Registry{}, fmt.Errorf("adapter: %q metadata name must match its registry name", name)
+		}
 		switch metadata.ExecutionModel {
 		case ExecutionOneShot:
 		case ExecutionLive:
@@ -124,6 +140,16 @@ func newRegistry(entries []CLI) (Registry, error) {
 			}
 		default:
 			return Registry{}, fmt.Errorf("adapter: %q has invalid execution model %q", name, metadata.ExecutionModel)
+		}
+		seenEfforts := make(map[string]struct{}, len(metadata.AllowedEfforts))
+		for _, effort := range metadata.AllowedEfforts {
+			if strings.TrimSpace(effort) != effort || effort == "" {
+				return Registry{}, fmt.Errorf("adapter: %q has a non-canonical allowed effort %q", name, effort)
+			}
+			if _, duplicate := seenEfforts[effort]; duplicate {
+				return Registry{}, fmt.Errorf("adapter: %q has duplicate allowed effort %q", name, effort)
+			}
+			seenEfforts[effort] = struct{}{}
 		}
 		registry.entries[name] = entry
 		registry.names = append(registry.names, name)
