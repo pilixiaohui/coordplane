@@ -150,6 +150,41 @@ WHERE id='tsk_partial'`, headSHA)
 	if partial.Task.Task.EvidenceType != "" {
 		t.Fatalf("partial capture was misclassified as %q", partial.Task.Task.EvidenceType)
 	}
+	partialTasks, err := database.Tasks(ctx, core.TaskFilter{ProjectID: "prj_partial"})
+	requireNoError(t, err)
+	if len(partialTasks.Items) != 1 || partialTasks.Items[0].EvidenceType != "" {
+		t.Fatalf("legacy partial list projection = %#v, want one row with empty evidence_type", partialTasks.Items)
+	}
+}
+
+func TestLegacyHumanConfirmEvidenceProjectionStaysEmpty(t *testing.T) {
+	ctx := context.Background()
+	database := openTestStore(t, ctx, "legacy-human-confirm.db")
+	requireNoError(t, insertReadFixture(ctx, database, "human_legacy", core.TaskCompleted, core.RunExited, core.MessageAcknowledged, false))
+
+	// Emulate a row written before evidence_type existed: human-assigned,
+	// completed, and with no captured head. It must never be derived as captured
+	// in either the list or detail projection.
+	execTestSQL(t, ctx, database.db, `
+UPDATE tasks
+SET assignee_agent_id='', assignee_participant_id='participant-human',
+    head_sha='', head_run_id='', task_ref=''
+WHERE id='tsk_human_legacy'`)
+
+	tasks, err := database.Tasks(ctx, core.TaskFilter{ProjectID: "prj_human_legacy"})
+	requireNoError(t, err)
+	if len(tasks.Items) != 1 {
+		t.Fatalf("legacy human_confirm list = %#v, want one row", tasks.Items)
+	}
+	if tasks.Items[0].EvidenceType != "" || tasks.Items[0].HeadSHA != "" {
+		t.Fatalf("legacy human_confirm list projection = %#v, want empty evidence_type and head_sha", tasks.Items[0])
+	}
+
+	detail, err := database.TaskProjection(ctx, "tsk_human_legacy")
+	requireNoError(t, err)
+	if detail.Task.Task.EvidenceType != "" || detail.Task.Task.HeadSHA != "" || detail.Task.Task.AssigneeAgentID != "" {
+		t.Fatalf("legacy human_confirm detail projection = %#v, want empty evidence_type/head_sha/assignee_agent_id", detail.Task.Task)
+	}
 }
 
 func TestTaskHasStartedRunSearchesBeyondTheFirstHundredHistoryRows(t *testing.T) {
