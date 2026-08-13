@@ -37,12 +37,21 @@ const agentName = id => {
   return p ? esc(p.DisplayName) + ' <span class="muted">(human)</span>' : esc(id || "—");
 };
 const projName = id => { const p = projects.find(x => x.id === id); return p ? esc(p.name) : ""; };
-const evBadge = t => t.evidence_type === "human_confirm"
-  ? '<span class="pill ev-human">人工确认</span>'
-  : (t.evidence_type === "captured" ? `<span class="pill ev-captured">captured ${short(t.head_sha)}</span>` : "");
+const evBadge = t => !["submitted", "completed"].includes(t.status)
+  ? ""
+  : (t.evidence_type === "human_confirm"
+    ? '<span class="pill ev-human">人工确认</span>'
+    : (t.evidence_type === "captured" ? `<span class="pill ev-captured">captured ${short(t.head_sha)}</span>` : ""));
 const kindBadge = k => k === "human"
   ? '<span class="pill" style="background:#1d2740;color:#8bb8ff">human</span>'
   : '<span class="pill st-active">cli_agent</span>';
+const messagesErrorHTML = () => messagesError
+  ? `<div id="messages-error" class="banner">消息加载失败：${esc(messagesError)}</div>`
+  : '<div id="messages-error"></div>';
+const messagesInboxHTML = () => `<table id="inbox-table"><tr><th>来自</th><th>内容</th><th>时间</th><th></th></tr>
+${messagesCache.map(m => `<tr><td>${esc(m.sender_id || "")}</td><td>${esc(m.body)} ${m.state === "pending" || m.state === "delivered" ? '<span class="pill st-running">new</span>' : ""}</td><td class="muted">${esc(m.created_at)}</td>
+<td>${m.state !== "acknowledged" ? `<button class="btn" onclick="ackMsg('${m.id}')">ack</button>` : ""}</td></tr>`).join("") || '<tr><td colspan="4" class="muted">无</td></tr>'}
+</table>`;
 
 // api() 解包 Envelope: 成功返回 data.data, 失败抛出 {code, message}。
 async function api(method, path, body) {
@@ -342,16 +351,13 @@ const views = {
   messages() {
     const activeAgents = agents.filter(a => a.status === "active");
     return `<h1>Messages(收件箱)</h1>
-    ${messagesError ? `<div class="banner">消息加载失败：${esc(messagesError)}</div>` : ""}
-    <table><tr><th>来自</th><th>内容</th><th>时间</th><th></th></tr>
-    ${messagesCache.map(m => `<tr><td>${esc(m.sender_id || "")}</td><td>${esc(m.body)} ${m.state === "pending" || m.state === "delivered" ? '<span class="pill st-running">new</span>' : ""}</td><td class="muted">${esc(m.created_at)}</td>
-    <td>${m.state !== "acknowledged" ? `<button class="btn" onclick="ackMsg('${m.id}')">ack</button>` : ""}</td></tr>`).join("") || '<tr><td colspan="4" class="muted">无</td></tr>'}
-    </table>
+    ${messagesErrorHTML()}
+    ${messagesInboxHTML()}
     <h2>发送消息(chat)</h2>
     <div class="form-grid">
-      <label>项目</label><select id="chat-proj">${projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}</select>
-      <label>Agent</label><select id="chat-agent">${activeAgents.map(a => `<option value="${a.id}">${esc(a.display_name)}</option>`).join("")}</select>
-      <label>内容</label><textarea id="chat-body" rows="2"></textarea>
+      <label>项目</label><select id="chat-proj" onchange="beginChatEdit()">${projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}</select>
+      <label>Agent</label><select id="chat-agent" onchange="beginChatEdit()">${activeAgents.map(a => `<option value="${a.id}">${esc(a.display_name)}</option>`).join("")}</select>
+      <label>内容</label><textarea id="chat-body" rows="2" oninput="beginChatEdit()"></textarea>
       <button class="btn primary" onclick="sendChat()">发送</button>
     </div>`;
   },
@@ -429,6 +435,16 @@ function tc(t) {
   return `<div class="tcard" onclick="openTask('${t.id}')"><div class="title">${esc(t.title)}</div><div class="meta">${proj}${agentName(t.assignee_agent_id || t.assignee_participant_id)} · ${pill(t.status)} ${evBadge(t)}</div></div>`;
 }
 
+function beginChatEdit() { editMode = "chat"; }
+
+function refreshMessagesUI() {
+  if (view !== "messages") return;
+  const error = $("messages-error");
+  if (error) error.outerHTML = messagesErrorHTML();
+  const table = $("inbox-table");
+  if (table) table.outerHTML = messagesInboxHTML();
+}
+
 async function refreshMessages() {
   try {
     const d = await api("GET", "/v1/messages?recipient_kind=boss&limit=20");
@@ -439,6 +455,26 @@ async function refreshMessages() {
     messagesError = e.message || String(e);
     console.error("刷新 Messages 失败:", e);
   }
+  if (editMode === "chat") refreshMessagesUI();
+}
+async function sendChat() {
+  const bodyEl = $("chat-body");
+  if (!bodyEl) return;
+  const body = bodyEl.value.trim();
+  if (!body) { toast("消息内容不能为空", true); return; }
+  try {
+    await api("POST", "/v1/chat", {
+      project_id: $("chat-proj").value,
+      agent_id: $("chat-agent").value,
+      body,
+      request_id: rid(),
+    });
+    toast("已发送");
+    bodyEl.value = "";
+    editMode = "";
+    await refreshMessages();
+    render();
+  } catch (e) { toast(e.message, true); }
 }
 async function refreshRoles() { try { roles = await api("GET", "/v1/roles") || []; } catch (e) { /* 忽略 */ } }
 async function refreshParticipants() { try { participantsCache = await api("GET", "/v1/participants") || []; } catch (e) { /* 忽略 */ } }
@@ -538,9 +574,12 @@ async function createProject() {
   const body = { name: $("p-name").value.trim(), source: $("p-source").value.trim(), source_ref: $("p-source-ref").value.trim(), request_id: rid() };
   const integ = $("p-integration").value;
   if (integ) body.integration_agent_id = integ;
-  try { await api("POST", "/v1/projects", body); toast("项目已创建"); } catch (e) { toast(e.message, true); }
-  editMode = "";
-  view = "projects"; refreshAll();
+  try {
+    await api("POST", "/v1/projects", body);
+    toast("项目已创建");
+    editMode = "";
+    view = "projects"; refreshAll();
+  } catch (e) { toast(e.message, true); }
 }
 async function repairProject(id) {
   try { await api("POST", "/v1/projects/" + encodeURIComponent(id) + "/repair", { request_id: rid() }); toast("Repair 已提交"); } catch (e) { toast(e.message, true); }
@@ -604,9 +643,12 @@ function newAgentForm() {
   </div>`;
 }
 async function createAgent() {
-  try { await api("POST", "/v1/agents", { display_name: $("a-name").value.trim(), adapter_id: $("a-adapter").value.trim(), image: $("a-image").value.trim(), instructions_file: $("a-instr").value.trim(), request_id: rid() }); toast("Agent 已创建"); } catch (e) { toast(e.message, true); }
-  editMode = "";
-  view = "agents"; refreshAll();
+  try {
+    await api("POST", "/v1/agents", { display_name: $("a-name").value.trim(), adapter_id: $("a-adapter").value.trim(), image: $("a-image").value.trim(), instructions_file: $("a-instr").value.trim(), request_id: rid() });
+    toast("Agent 已创建");
+    editMode = "";
+    view = "agents"; refreshAll();
+  } catch (e) { toast(e.message, true); }
 }
 // ---------- 任务 ----------
 function newTaskForm() {
@@ -633,9 +675,12 @@ async function createTask() {
   if (budget > 0) body.budget_seconds = budget;
   if (sel.startsWith("agent:")) body.assignee_agent_id = sel.slice(6);
   else body.assignee_participant_id = sel.slice(6);
-  try { await api("POST", "/v1/tasks", body); toast("任务已创建"); } catch (e) { toast(e.message, true); }
-  editMode = "";
-  view = "tasks"; refreshAll();
+  try {
+    await api("POST", "/v1/tasks", body);
+    toast("任务已创建");
+    editMode = "";
+    view = "tasks"; refreshAll();
+  } catch (e) { toast(e.message, true); }
 }
 // ---------- 角色 / 绑定 ----------
 function newRoleForm() {
@@ -651,9 +696,12 @@ function newRoleForm() {
 }
 async function createRole() {
   const caps = $("r-caps").value.split(",").map(s => s.trim()).filter(Boolean);
-  try { await api("POST", "/v1/roles", { Name: $("r-name").value.trim(), Description: $("r-desc").value.trim(), Capabilities: caps, RequestID: rid() }); toast("角色已创建"); } catch (e) { toast(e.message, true); }
-  editMode = "";
-  view = "roles"; refreshAll();
+  try {
+    await api("POST", "/v1/roles", { Name: $("r-name").value.trim(), Description: $("r-desc").value.trim(), Capabilities: caps, RequestID: rid() });
+    toast("角色已创建");
+    editMode = "";
+    view = "roles"; refreshAll();
+  } catch (e) { toast(e.message, true); }
 }
 function editRoleForm(id) {
   editMode = "role-edit";
@@ -669,9 +717,12 @@ function editRoleForm(id) {
 }
 async function updateRole(id) {
   const caps = $("r-caps").value.split(",").map(s => s.trim()).filter(Boolean);
-  try { await api("PUT", "/v1/roles/" + encodeURIComponent(id), { Name: $("r-name").value.trim(), Description: $("r-desc").value.trim(), Capabilities: caps, RequestID: rid() }); toast("角色已更新"); } catch (e) { toast(e.message, true); }
-  editMode = "";
-  view = "roles"; refreshAll();
+  try {
+    await api("PUT", "/v1/roles/" + encodeURIComponent(id), { Name: $("r-name").value.trim(), Description: $("r-desc").value.trim(), Capabilities: caps, RequestID: rid() });
+    toast("角色已更新");
+    editMode = "";
+    view = "roles"; refreshAll();
+  } catch (e) { toast(e.message, true); }
 }
 async function deleteRole(id) {
   if (!confirm("确认删除角色 " + id + " ?")) return;
@@ -693,9 +744,12 @@ function newBindForm() {
 }
 async function bindRole() {
   const body = { ParticipantID: $("b-participant").value, ProjectID: $("b-project").value, RoleID: $("b-role").value, RequestID: rid() };
-  try { await api("POST", "/v1/participants/" + encodeURIComponent(body.ParticipantID) + "/roles", body); toast("已绑定"); } catch (e) { toast(e.message, true); }
-  editMode = "";
-  view = "roles"; refreshAll();
+  try {
+    await api("POST", "/v1/participants/" + encodeURIComponent(body.ParticipantID) + "/roles", body);
+    toast("已绑定");
+    editMode = "";
+    view = "roles"; refreshAll();
+  } catch (e) { toast(e.message, true); }
 }
 async function unbindRole(participantID, projectID, roleID) {
   if (!confirm("解绑角色?")) return;
