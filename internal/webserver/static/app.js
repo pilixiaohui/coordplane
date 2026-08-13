@@ -526,7 +526,7 @@ function renderTaskDetail() {
       ${["queued", "running", "waiting", "submitted", "failed"].includes(t.status) ? `<button class="btn" onclick="taskAction('${t.id}','rework')">Rework</button>` : ""}
       ${["queued", "running", "waiting"].includes(t.status) ? `<button class="btn danger" onclick="taskAction('${t.id}','cancel')">Cancel</button>` : ""}
       ${t.status === "failed" ? `<button class="btn" onclick="taskAction('${t.id}','retry')">Retry</button>` : ""}
-      ${t.status === "waiting" ? `<button class="btn" onclick="taskAction('${t.id}','wake')">Wake</button>` : ""}
+      ${t.status === "waiting" && !isHuman ? `<button class="btn" onclick="taskAction('${t.id}','wake')">Wake</button>` : ""}
       ${t.status === "waiting" ? `<button class="btn" onclick="closeConversation('${t.id}')">Close 会话</button>` : ""}
       ${["completed", "cancelled"].includes(t.status) ? `<button class="btn danger" onclick="deleteTask('${t.id}')">Delete</button>` : ""}
     </div>
