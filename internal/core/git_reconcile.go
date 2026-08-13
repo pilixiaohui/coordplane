@@ -205,6 +205,7 @@ func (s *Service) finalizeCapture(ctx context.Context, intent Task, intentRun Ru
 		task.HeadSHA = fact.HeadSHA
 		task.HeadRunID = run.ID
 		task.TaskRef = fact.TaskRef
+		task.EvidenceType = string(EvidenceCaptured)
 		task.ResultSummary = run.RequestedSummary
 		task.CurrentRunID = ""
 		task.Status = TaskSubmitted

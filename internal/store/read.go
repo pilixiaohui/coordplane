@@ -572,6 +572,7 @@ func taskSummary(task core.Task) core.TaskSummary {
 	waitReason, waitTruncated := boundedUTF8(task.WaitReason, 512)
 	resultSummary, resultTruncated := boundedUTF8(task.ResultSummary, 512)
 	failureReason, failureTruncated := boundedUTF8(task.FailureReason, 512)
+	task.EvidenceType = effectiveEvidenceType(task)
 	return core.TaskSummary{
 		ID: task.ID, ProjectID: task.ProjectID, Kind: task.Kind, ParentTaskID: task.ParentTaskID,
 		AssigneeAgentID: task.AssigneeAgentID, Title: title, TitleTruncated: truncated,

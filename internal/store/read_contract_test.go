@@ -118,6 +118,40 @@ func TestTaskRunAndMessageHistoryUseStableOpaqueCursorPages(t *testing.T) {
 	}
 }
 
+func TestLegacyCapturedTasksProjectEvidenceType(t *testing.T) {
+	ctx := context.Background()
+	database := openTestStore(t, ctx, "legacy-evidence.db")
+	requireNoError(t, insertReadFixture(ctx, database, "captured", core.TaskRunning, core.RunActive, core.MessagePending, false))
+	requireNoError(t, insertReadFixture(ctx, database, "partial", core.TaskRunning, core.RunActive, core.MessagePending, false))
+
+	headSHA := strings.Repeat("b", 40)
+	execTestSQL(t, ctx, database.db, `
+UPDATE tasks
+SET status='submitted', head_sha=?, head_run_id='run_captured', task_ref='refs/coordplane/tasks/tsk_captured/runs/run_captured'
+WHERE id='tsk_captured'`, headSHA)
+	execTestSQL(t, ctx, database.db, `
+UPDATE tasks
+SET status='submitted', head_sha=?, head_run_id='run_partial'
+WHERE id='tsk_partial'`, headSHA)
+
+	tasks, err := database.Tasks(ctx, core.TaskFilter{ProjectID: "prj_captured"})
+	requireNoError(t, err)
+	if len(tasks.Items) != 1 || tasks.Items[0].EvidenceType != string(core.EvidenceCaptured) {
+		t.Fatalf("legacy captured list projection = %#v", tasks.Items)
+	}
+	detail, err := database.TaskProjection(ctx, "tsk_captured")
+	requireNoError(t, err)
+	if detail.Task.Task.EvidenceType != string(core.EvidenceCaptured) {
+		t.Fatalf("legacy captured detail evidence_type = %q", detail.Task.Task.EvidenceType)
+	}
+
+	partial, err := database.TaskProjection(ctx, "tsk_partial")
+	requireNoError(t, err)
+	if partial.Task.Task.EvidenceType != "" {
+		t.Fatalf("partial capture was misclassified as %q", partial.Task.Task.EvidenceType)
+	}
+}
+
 func TestTaskHasStartedRunSearchesBeyondTheFirstHundredHistoryRows(t *testing.T) {
 	ctx := context.Background()
 	database := openTestStore(t, ctx, "run-history.db")

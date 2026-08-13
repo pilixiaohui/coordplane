@@ -226,6 +226,9 @@ func TestP2SubmitExpandsShortHashPrefix(t *testing.T) {
 	if task.Status != core.TaskSubmitted {
 		t.Fatalf("capture did not finish submit: %#v", task)
 	}
+	if task.EvidenceType != string(core.EvidenceCaptured) {
+		t.Fatalf("captured task evidence_type = %q, want captured", task.EvidenceType)
+	}
 }
 
 func TestP2SubmitShortPrefixFailureIsRetryable(t *testing.T) {
