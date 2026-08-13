@@ -67,7 +67,7 @@ that permitted index churn as a migration or startup side effect.
 | --- | --- | --- |
 | Static guard | 对象/表 allowlist、删除的入口和包、静态注册、文档一致性 | 源码和 schema扫描 |
 | Pure logic | FSM、排序、GC predicate、错误分类、ref名和状态投影 | 表驱动纯函数 |
-| Adapter conformance | 本版选定的production adapter（Codex或Claude）协议事件、session ID、exit、resume和声明能力 | 真实协议 frame；外部 provider可 fake |
+| Adapter conformance | Claude 与 Codex 两个 production adapter（静态注册 `[Claude{}, Codex{}]`）的协议事件、session ID、exit、resume、声明能力与 effort 元数据 | 真实协议 frame/golden transcript；外部 provider可 fake |
 | Public contract | `coordplane`、`coordlink`、scope、幂等、错误和 durable副作用 | 正式 CLI + 本地 Daemon/API |
 | Storage/state | claim、generation fencing、Message redelivery、migration、restart | file-backed真实 SQLite |
 | Git component | private clone、bundle/import、task ref、CAS、stale、GC | 真实临时 Git repo和git进程 |
@@ -156,6 +156,9 @@ events
 | INV-17 | 第一版production维护面保持在已声明SLOC预算内，超预算不能靠隐藏/压缩路径规避 |
 | INV-18 | 第一版不引入行业协议半成品接口：adapter 保持静态注册的 provider 私有协议（README.md §6.1）；ACP client adapter 只按 runtime.md §7.4 的采用前置条件实现，不按协议名写主循环特判 |
 | INV-19 | 内部多 Agent 协作只经 Daemon 的 Task/Message 机制；任何 agent↔agent 直连协议（含 A2A）不得出现在容器网络/Run 会话或生产入口（core.md §14） |
+| INV-20 | Agent 配置（`model/subagent_model/base_url/effort/instructions_text` + 提示词来源）写入必须通过字段校验、`agent.manage` 门禁与 version CAS，`agents`/`participants` 同事务镜像；Run 只保存 `config_fingerprint` 与 `instructions_hash`，model/base_url/instructions_text 原文不落库、不进 Event/run.log |
+| INV-21 | resume 仅在上一 Run `config_fingerprint` 非空且与当前一致时发生；配置变化或指纹为空一律 fresh start，不得把旧配置的 session 交给新配置 |
+| INV-22 | `GET /v1/adapters` 只读返回静态 descriptor（含 AllowedEfforts），不暴露 executable/argv/宿主路径/secret；POST/PUT/CLI/前端共用同一 `AgentConfigInput`，PUT 为全量替换（E5） |
 
 ## 6. Core 合同场景
 
@@ -279,6 +282,35 @@ Boundary：正式project/agent命令 +真实SQLite。
 - 没有accepted引用时Agent archive可原子清除Project默认integrator；后续accept必须选择另一个active Agent，不能复用archived默认值。
 - archived Project/Agent拒绝新Task和Agent-directed Message且不产生孤立pending行；Project error中的错误结果仍能由Boss读取。
 
+### CT-10 Agent 配置契约与三面入口
+
+Boundary：正式 `coordplane agent add/update` + `POST/PUT /v1/agents` + `GET /v1/adapters` + 前端编辑表单 + 真实 SQLite。
+覆盖：INV-02、INV-20、INV-22。
+
+必须断言：
+
+- `model/subagent_model/base_url/effort/instructions_text` 五个字段写入、读取、更新一致；`adapter_id` 必须来自静态 registry（v1 为 `claude`/`codex`）；`effort` 只接受该 adapter descriptor 的 `AllowedEfforts` 值（E2），未知值稳定拒绝且零副作用。
+- `instructions_file`/`instructions_text` 必须恰有其一：同时提供或同时为空稳定拒绝；file 必须 daemon 宿主绝对路径且 `filepath.Clean` 后不变；text 超过 1 MiB 拒绝。
+- `base_url` 带 userinfo/query/fragment 或非 `https://` 拒绝；`model`/`subagent_model` 非法 token 拒绝。
+- `UpdateAgent` 与 `AddAgent` 共用校验；同一 SQLite 事务写 `agents`/`participants` 镜像；旧 version 返回 `VERSION_CONFLICT` 且无部分写入。
+- PUT 是完整配置替换（E5）：body 缺失/省略字段按空处理并重新校验，不得保留旧值残留；CLI `agent update` 先 GET 当前值，overlay 显式出现的 flag 后全量 PUT；前端编辑提交全量字段。重复 `request_id` 幂等。
+- `GET /v1/adapters` 只读返回 descriptor 列表（Name/ExecutionModel/SupportsResume/SupportsInject/AllowedEfforts），不返回 executable/argv/宿主路径/secret。
+- `agent.updated` Event 只含版本与变化的字段名，不出现配置值或提示词原文；无 `agent.manage` 权限调用 update 返回 `SCOPE_DENIED` 且零副作用。
+
+### CT-11 v7 迁移、配置指纹与 resume 判定
+
+Boundary：真实 file-backed SQLite v6→v7 + Daemon 启动入口 + 纯函数指纹。
+覆盖：INV-20、INV-21。
+
+必须断言：
+
+- 迁移加列成功：`agents`/`participants` 五列默认空，`runs.config_fingerprint` 默认空；对 `kind='cli_agent'` 且与 `agents.id` 相同的 participants 行回填五字段，human 行保持空。
+- 旧 terminal Run 若已有 `adapter_id/image/instructions_hash`，按同一 canonical fingerprint 规则回填；启动中或 hash 为空留空（视为不可 resume）；迁移只写派生指纹、不额外造 Event，失败整体回滚。
+- 存在旧 v6 `codex` 行时 Daemon 拒绝启动并返回 `LEGACY_SCHEMA_REBUILD_REQUIRED`（E3 fail-closed），不导入旧 session。
+- `RuntimeConfigFingerprint` 对 trim/normalize 幂等；不含 provider secret；同配置同指纹、不同配置不同指纹。
+- `BeginRunLaunch` 同事务写 fingerprint；`selectLaunchMode`：同 adapter/Agent/Task/workspace + 旧指纹非空且相等 + adapter `ResumeCompatible` 才 resume，否则 fresh start。
+- Daemon SIGKILL 重启后配置与 fingerprint 从 SQLite 恢复；旧 Agent 不改配置时行为不变。
+
 ## 7. Runtime 场景
 
 ### RT-01 真实隔离
@@ -325,6 +357,7 @@ Boundary：adapter conformance +真实Run状态。
 - fresh Start不宣称恢复原模型上下文。
 - 不支持resume的adapter从一开始走Start，不进入无限retry。
 - Resume只选择同Task/Agent最新兼容terminal Run，不把旧adapter session交给新adapter，也不静默跳回更旧历史。
+- Resume 判定前先比较上一 Run 与当前配置指纹：不同或旧指纹为空直接 fresh start（INV-21）。
 
 ### RT-04 Cancel 和 timeout
 
@@ -360,6 +393,18 @@ Boundary：真实SQLite +真实Docker，进程级fault injection。
 Docker API不可达场景必须进入degraded并停止新调度，不能把所有Run标lost或cleanup removed。Container NotFound但per-Run socket/token/control目录仍存在时cleanup保持pending/blocked；只有所有Run-owned runtime资源absent才removed。
 
 SIGTERM测试必须证明Daemon先停止claim，grace到期后写`daemon_shutdown` stop intent并终结starting/active Run；已有outcome继续对应收尾，第一版不留下故意detach的无人监控container。无Run row的orphan container只能quarantine/manual，不能凭label猜nonce后删除。
+
+### RT-06 Codex adapter 真实启动与事件解析
+
+Boundary：真实 Docker + 固定 digest 镜像 + golden JSONL frame。
+覆盖：INV-06、INV-07、INV-20。
+
+必须断言：
+
+- 容器 argv/env 完全来自所选 adapter 的 `ProviderConfig` 映射（`-m`/`-c` override、`HOME=/home/agent`、`CODEX_HOME=/home/agent/.codex`、凭据经 allowlist 注入），无 shell 拼接、无任意命令字符串；镜像缺 codex 时 Run 以可诊断错误失败。
+- stdout 每行恰一个 JSON 对象；坏帧 fail-closed；未知但语法合法的事件类型忽略；reasoning/signature/encrypted_content/usage 不进入 `Event.Raw`。
+- 第一个稳定 thread/session ID 映射 `NativeSessionID`；同一 Run 冲突 ID 视为协议错误；明确 session/thread not found 按 golden fixture 固定词映射 `RESUME_UNAVAILABLE`。
+- Docker inspect 与 run.log 中不出现 secret、URL userinfo、`instructions_text` 原文；`run.instructions_hash` 等于有效提示词 hash。
 
 ## 8. Git 场景
 
@@ -522,6 +567,15 @@ Boundary：真实Git ref/reachability + workspace filesystem。
 - 最终canonical包含C0、A head、B head的祖先lineage，fixture test和`git fsck`通过。
 - 无remote push、PR、artifact或validation service参与。
 
+### 9.4 配置矩阵与迁移/resume 负例
+
+同一确定性 gate 追加：
+
+- 用 scripted CLI 跑 claude 与 codex 两 adapter 启动矩阵，断言容器内 argv/env 事实来自所选 adapter。
+- 相同配置的后续 Run `launch_mode=resume`；修改 model/effort/base_url 或有效提示词后 fresh start；session-not-found 产生 `run.resume_fallback`。
+- v6→v7 迁移往返、agents/participants 镜像、Daemon 重启后配置与 fingerprint 恢复；旧 Agent 不改配置时行为不变。
+- redaction 专项：SQLite、Event、run.log、Docker inspect 中 grep 已知 secret/URL userinfo/`instructions_text` 原文，均不得出现。
+
 ## 10. 真实 CLI E2E
 
 ### 10.1 Adapter smoke
@@ -536,7 +590,7 @@ Boundary：真实Git ref/reachability + workspace filesystem。
 
 ### 10.2 两个真实 Agent并发闭环
 
-产品完成前必须至少用一个production adapter的两个真实实例完成第9节等价闭环；不强制Codex和Claude混用。
+RMA-01 继续要求至少一个 production adapter 的两个真实实例完成第9节等价闭环；另按 E4，Claude 与 Codex 各自必须至少一次真实 work Task（Claude 证据可复用 RMA-01，Codex 另跑一次真实任务）。不要求 claude+codex 混合双 Agent 同 Project 收敛（未获授权，本轮不做）。
 
 要求：
 
@@ -654,20 +708,20 @@ Boundary：真实Git ref/reachability + workspace filesystem。
 
 ### 12.1 预算基线
 
-预算以一个production one-shot adapter、一个scripted test adapter、Docker-only runtime、local-Git-only（每Project一个repo）和两个薄CLI为基线。产品仍可管理多个Project，第一版真实可靠性验收只使用一个Project。不包含TUI/Web、host/external runtime、remote Git、Inject必选实现、第二provider adapter或平台化预留。
+预算以两个production one-shot adapter（Claude + Codex，D1）、一个scripted test adapter、Docker-only runtime、local-Git-only（每Project一个repo）和两个薄CLI为基线。产品仍可管理多个Project，第一版真实可靠性验收只使用一个Project。不包含TUI/Web平台化、host/external runtime、remote Git、Inject必选实现或平台化预留。
 
 SLOC是规划和架构漂移信号，不是质量分数。低于预算仍必须满足全部不变量；超过预算先检查重复边界和范围偏移，不能删除错误处理、recovery或测试来换取数字。
 
-Owner已批准保留上述完整产品范围和本节非空、非纯注释物理行统计口径，并用以下envelope透明替换旧预算；本次重基线不构成范围删除、统计排除或测试豁免：
+Owner已批准保留上述完整产品范围和本节非空、非纯注释物理行统计口径，并按 E1 用以下envelope透明替换旧预算（E1 为暂定上限，最终以 clean revision 实测值锁表）；本次重基线不构成范围删除、统计排除或测试豁免：
 
 | bucket | 旧目标/软阈值/发布或审查阈值 | 批准的目标/软阈值/发布或审查阈值 | 逐项增量 |
 | --- | ---: | ---: | ---: |
-| Production | `10,500 / 12,550 / 14,650` | `20,000 / 21,000 / 22,600` | `+9,500 / +8,450 / +7,950` |
-| Tests | `12,300 / 15,450 / 19,000` | `21,000 / 22,000 / 23,700` | `+8,700 / +6,550 / +4,700` |
-| Build/test infra | `250 / 400 / 600` | `250 / 400 / 600` | `0 / 0 / 0` |
-| Budgeted total | `23,050 / 28,400 / 34,250` | `41,250 / 43,400 / 47,000` | `+18,200 / +15,000 / +12,750` |
+| Production | `20,000 / 21,000 / 22,600` | `24,000 / 24,500 / 25,000` | `+4,000 / +3,500 / +2,400` |
+| Tests | `21,000 / 22,000 / 23,700` | `25,500 / 26,200 / 27,000` | `+4,500 / +4,200 / +3,300` |
+| Build/test infra | `250 / 400 / 600` | `250 / 500 / 700` | `0 / +100 / +100` |
+| Budgeted total | `41,250 / 43,400 / 47,000` | `49,750 / 51,200 / 52,700` | `+8,500 / +7,800 / +5,700` |
 
-**前端独立预算(Owner 已批准,2026-08-04)**:web 前端 SPA、`internal/webserver/*` 服务层与 web e2e(`tests/e2e/web_test.go`)计入独立的 `handwritten_frontend` 桶,发布阈值 `3,000` 物理行,不与后端核心 production/tests/infra/total 共享;后端预算包络不变。
+**前端独立预算(Owner 已批准,2026-08-04;2026-08-13 按 E1 改为三档)**:web 前端 SPA、`internal/webserver/*` 服务层与 web e2e(`tests/e2e/web_test.go`)计入独立的 `handwritten_frontend` 桶，目标/软阈值/发布阈值为 `2,000 / 2,500 / 3,000` 物理行，不与后端核心 production/tests/infra/total 共享；后端预算包络不变。
 
 Production和Tests新增空间先以透明、未分配的重基线reserve列入下表，保留原模块/测试边界审查值以持续暴露重复和owner漂移。第一版候选按12.6节报告实际模块分布；reserve不是忽略模块超限或弱化合同的授权。
 
@@ -681,14 +735,14 @@ Production和Tests新增空间先以透明、未分配的重基线reserve列入�
 | `store`：SQLite transaction/CAS/dedupe/migration | 1,500 | 1,800 | 2,100 |
 | `runtime`：Docker、launch、supervisor、resume、stop/cleanup/reconcile/log | 2,200 | 2,500 | 2,900 |
 | `git`：Project、private clone、capture、task ref、CAS、integration/GC | 1,900 | 2,250 | 2,600 |
-| `adapter`：静态接口/registry和一个production adapter | 550 | 700 | 850 |
+| `adapter`：静态接口/registry 与 production adapters（Claude+Codex） | 550 | 700 | 850 |
 | `daemon/config/shared`：wiring、file lock、worker registry、config、clock/ID/error/redaction | 700 | 850 | 1,000 |
-| Owner批准的未分配重基线reserve | 9,500 | 8,450 | 7,950 |
-| **Production合计** | **20,000** | **21,000** | **22,600** |
+| Owner批准的未分配重基线reserve | 13,500 | 11,950 | 10,350 |
+| **Production合计** | **24,000** | **24,500** | **25,000** |
 
-模块超过软阈值可以在production总软阈值内小幅调剂，但必须在变更说明中列出净增量、所属不变量和删除/合并计划。任一模块超过模块审查阈值时必须复核owner边界和重复实现，不能靠把语义搬到其他目录消除命中；只要production总量仍`<=22,600`、12.6节候选证据审查已完成且复核未发现范围漂移，模块命中本身不阻断发布。Production总量严格`>22,600`时阻断第一版发布，直到删除旧/重复路径，或owner先显式修改需求和预算。
+模块超过软阈值可以在production总软阈值内小幅调剂，但必须在变更说明中列出净增量、所属不变量和删除/合并计划。任一模块超过模块审查阈值时必须复核owner边界和重复实现，不能靠把语义搬到其他目录消除命中；只要production总量仍`<=25,000`、12.6节候选证据审查已完成且复核未发现范围漂移，模块命中本身不阻断发布。Production总量严格`>25,000`时阻断第一版发布，直到删除旧/重复路径，或owner先显式修改需求和预算。
 
-第二个production adapter不在基线内。确需第一版加入时，规划增量为adapter production目标/软/审查`+450/+550/+650` SLOC、adapter tests`+500/+650/+800` SLOC；完整预算将变为Production `20,450/21,550/23,250`、Tests `21,500/22,650/24,500`、budgeted总计`42,200/44,600/48,350`。必须先把完整表和README改成新基线，再实现并说明为什么一个adapter不能完成产品验收；只有更新后的完整表可作为`loc-budget`输入。
+v1 已批准 Claude+Codex 两个 production adapter（D1），其增量已并入上述 E1 重基线，不再单列“第二 adapter”增量预算。模块行沿用旧边界作为审查参考；Codex 引入的实际模块分布按 12.6 节在 clean revision LOC JSON 中列示，E1 数值为暂定上限，最终以实测锁表。
 
 ### 12.3 测试和基础设施预算
 
@@ -701,14 +755,14 @@ Production和Tests新增空间先以透明、未分配的重基线reserve列入�
 | 真实Docker runtime/fault matrix | 2,200 | 2,800 | 3,500 |
 | Deterministic + real CLI E2E harness | 1,500 | 1,900 | 2,300 |
 | 多Agent可靠性观测、故障编排和安全报告 | 800 | 1,100 | 1,500 |
-| Owner批准的未分配重基线reserve | 8,700 | 6,550 | 4,700 |
-| **Tests合计** | **21,000** | **22,000** | **23,700** |
+| Owner批准的未分配重基线reserve | 13,200 | 10,750 | 8,000 |
+| **Tests合计** | **25,500** | **26,200** | **27,000** |
 
 测试超过审查阈值只触发重复fixture/helper和边界重叠审查，不得仅因LOC删除测试。测试能否删除只由对应不变量已删除或已由更低、更真实边界完整替代决定。
 
 多Agent可靠性harness必须复用既有public CLI、Docker/Git fixture helper和状态断言；它只新增场景编排、环境观测和安全报告，不得复制Core/Runtime/Git实现，也不得把角色或provider特判写入主执行器。
 
-Budgeted build/test infrastructure（shell、Dockerfile、Makefile、手写YAML及语义型generated输入/输出）目标250、软阈值400、审查阈值600 SLOC。Budgeted maintained surface目标/软/审查为`41,250/43,400/47,000`；该总数包含语义型generated SLOC，不含机械generated输出和静态fixture，不能覆盖production超限，也不是减少测试的理由。
+Budgeted build/test infrastructure（shell、Dockerfile、Makefile、手写YAML及语义型generated输入/输出）目标250、软阈值500、审查阈值700 SLOC。Budgeted maintained surface目标/软/审查为`49,750/51,200/52,700`；该总数包含语义型generated SLOC，不含机械generated输出和静态fixture，不能覆盖production超限，也不是减少测试的理由。
 
 ### 12.4 统一统计口径
 
@@ -741,7 +795,7 @@ first_party_source_total = 所有上述源码物理行集合去重后的总数
 超预算时按以下顺序收敛：
 
 1. 删除已被替代的旧路径、重复DTO/renderer/store wrapper和第二套CLI/transport逻辑。
-2. 删除第一版非目标或可选项：Inject实现、第二adapter、TUI/fancy formatter、host runtime、remote/平台化预留。
+2. 删除第一版非目标或可选项：Inject实现、第三adapter、TUI/fancy formatter、host runtime、remote/平台化预留。
 3. 将真正新增的产品能力移出第一版，先修改需求再实现。
 4. 只有无法通过上述方式收敛时，由owner基于实际模块报告调整预算；调整必须先更新本节，不能在代码中加ignore名单。
 
@@ -756,7 +810,7 @@ first_party_source_total = 所有上述源码物理行集合去重后的总数
 1. 冻结一个clean候选revision `R`，运行第13节全部非provider Gate和`scripts/loc-budget.sh --check --output loc-budget.json`。
 2. LOC JSON必须记录并匹配`R`，保留全部原子桶、`budgeted_production/tests/infra/total`、每模块实际值、generated/fixture可见性、Git diff以及unknown path、file/function和gofmt质量blocker；不得只报告四个合计数。
 3. 第11节真实live报告必须记录其已验证revision。若候选`R`只比该revision多需求文档或其他不影响production/runtime/fixture的变更，可以通过精确diff复用证据；任何相关代码、测试fixture、image或adapter配置变化都必须重跑受影响的真实场景。
-4. 只有LOC四个发布值分别`<=22,600/23,700/600/47,000`、质量blocker清零、第11节真实场景通过且第14节不变量全部满足，第一版Gate才完成。
+4. 只有LOC四个发布值分别`<=25,000/27,000/700/52,700`、质量blocker清零、第11节真实场景通过且第14节不变量全部满足，第一版Gate才完成。
 5. 若要扩大envelope、排除源码或删减产品/测试合同，必须在实现前显式修改五份need；不得在脚本、报告或评论中暗改。
 
 ## 13. 验证命令和Gate
@@ -803,7 +857,7 @@ E2E失败后不得直接反复改E2E脚本或prompt。必须先分类到Core、R
 - Deterministic双Agent E2E通过。
 - `RMA-01`真实双Agent E2E通过且未SKIP；production adapter、Message、task ref、integration和canonical CAS形成完整证据。
 - `RMA-02`真实四Agent场景通过且未SKIP；4个source Run真实重叠，并在一次Daemon重启后继续收敛。
-- `budgeted_production/tests/infra/total <= 22,600/23,700/600/47,000`，质量blocker清零，测试未因LOC被弱化。
+- `budgeted_production/tests/infra/total <= 25,000/27,000/700/52,700`，质量blocker清零，测试未因LOC被弱化。
 - 验收结束后没有starting/active Run、owned orphan container、未解释capture/CAS intent或误删的task ref。
 - Boss能从正式命令读取最终Task、Run、Message、base/head和canonical SHA。
 - Boss和Reviewer能从正式入口实际读取、检出和测试精确未集成task head，而不获得control repo写权限。

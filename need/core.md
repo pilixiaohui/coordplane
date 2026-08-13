@@ -16,7 +16,7 @@ Core 是单用户 Daemon 的协调内核，负责：
 
 Core 不执行项目业务判断，不解析聊天文本，不保存代码，不代理 Git 开发命令，也不建设动态能力、策略、skill、验收或 artifact 平台。
 
-Owner批准的预算重基线不改变本文件的对象、状态、命令或不变量。全库production/tests/infra/total envelope固定为`20,000/21,000/22,600`、`21,000/22,000/23,700`、`250/400/600`和`41,250/43,400/47,000`；统计仍按`acceptance.md`的非空、非纯注释物理行口径。Core模块实际SLOC、质量blocker和diff必须进入clean候选revision的LOC JSON，并通过真实多Agent可靠性场景验证状态收敛；重基线reserve不得授权删除本文件合同。
+Owner已批准 Agent 可配置 CLI/模型/提示词 v1（D1–D7/E1–E5，2026-08-13）；本文件的对象、状态、命令或不变量不变，预算按 E1 重基线。全库production/tests/infra/total envelope固定为`24,000/24,500/25,000`、`25,500/26,200/27,000`、`250/500/700`和`49,750/51,200/52,700`（E1 暂定上限，最终以 clean revision 实测锁表）；统计仍按`acceptance.md`的非空、非纯注释物理行口径。Core模块实际SLOC、质量blocker和diff必须进入clean候选revision的LOC JSON，并通过真实多Agent可靠性场景验证状态收敛；重基线reserve不得授权删除本文件合同。
 
 ## 2. 持久化总则
 
@@ -24,6 +24,8 @@ Owner批准的预算重基线不改变本文件的对象、状态、命令或不
 
 - 第一版必须使用 file-backed SQLite，启用 WAL、foreign keys 和 busy timeout。
 - Schema migration 必须带单调版本号，并在 Daemon 开始调度前完成。
+- 配置域采用 schema v7（`coordplane_v7_agent_runtime_config`）：`agents`/`participants` 增加 `model/subagent_model/base_url/effort/instructions_text`（`TEXT NOT NULL DEFAULT ''`），`runs` 增加 `config_fingerprint`（`TEXT NOT NULL DEFAULT ''`）；迁移只加列并做派生回填、不重建表、不额外造 Event，失败必须整体回滚。
+- 旧 v6 `codex` 行保持 fail-closed：无法证明旧实现与新的 Codex session 协议兼容时，Daemon 拒绝启动并返回 `LEGACY_SCHEMA_REBUILD_REQUIRED`，不尝试导入旧 session（E3）。
 - 同一 `data_dir` 同时只允许一个写 Daemon；第二个实例必须立即失败，不能共同消费 Task。
 - 数据库损坏、migration 失败或 data directory 不可写时，Daemon 必须拒绝启动。
 - 所有时间使用 UTC，持久化精度和排序规则必须统一。
@@ -96,7 +98,11 @@ Agent 表示一个持久 CLI 员工身份，不表示常驻进程。
 | `display_name` | 可读名称 |
 | `adapter_id` | 静态注册的 CLI adapter 名 |
 | `image` | Docker image 名或 digest |
-| `instructions_file` | Boss 管理的指令文件路径 |
+| `instructions_file` | Boss 管理的指令文件路径；daemon 宿主绝对路径 |
+| `instructions_text` | 可编辑提示词正文（UTF-8）；与 `instructions_file` 必须恰有其一 |
+| `model/subagent_model` | 可空模型配置；非空时只接受安全 token |
+| `base_url` | 可空；非空时只接受无 userinfo/query/fragment 的 `https://` URL |
+| `effort` | 可空；取值由 adapter 静态元数据（AllowedEfforts）提供并写入期校验（E2） |
 | `status` | `active`、`paused` 或 `archived` |
 | `version` | CAS 版本 |
 | `created_at/updated_at` | 时间 |
@@ -110,7 +116,13 @@ Agent 表示一个持久 CLI 员工身份，不表示常驻进程。
 - archived Agent 不接受新Task/Message、不领取任务，历史 Task、Run 和 Message 保留。
 - Agent archive事务必须清除引用它的Project默认`integration_agent_id`并写Project Event；已接受Task保存的`accepted_integration_agent_id`不随默认值变化，且按上一条阻止archive直到收敛。
 - Agent 通过 Boss `agent add/update` 写入 SQLite；Daemon YAML 不保存第二份 Agent 列表。
-- Agent 字段修改只影响新 Run；已创建 Run 保存解析后的 adapter、image 和 instructions hash，不受后续修改影响。
+- `adapter_id` 必须来自静态注册 registry（v1 为 `claude`/`codex`）；`display_name`/`image` 非空。
+- `instructions_file` 与 `instructions_text` 必须恰有其一：file 必须为 daemon 宿主绝对路径且 `filepath.Clean` 后不变；text 不超过 1 MiB。两者同时非空在写入期稳定拒绝，启动期仍纵深防御 fail-closed（`INSTRUCTIONS_UNAVAILABLE`）；提示词全文不得进 Event/错误/日志，只允许 hash 与大小进入诊断。
+- `model`/`subagent_model` 可空；非空时只接受 `[A-Za-z0-9._:/-]` 安全 token，防止 shell/换行注入。`base_url` 可空；非空时只接受无 userinfo、无 query/fragment 的 `https://` URL，写入前规范化。`effort` 可空；允许值由 adapter 静态 descriptor 提供，core 在写入期按注入的 descriptor 校验（E2），不等 Run 启动才失败。
+- 新增 `UpdateAgent` 与 `AddAgent` 共用同一组字段校验；更新在同一 SQLite 事务内同时写 `agents` 与镜像 `participants` 行，任何一方 CAS 失败整体回滚并返回 `VERSION_CONFLICT`（零副作用）；`SetAgentStatus`/`ArchiveAgent` 同步镜像。`agent.updated` Event 只写版本和变化的字段名，不写配置值或提示词原文。
+- `UpdateAgent` 按 `agent.manage` 在 global scope 检查，`AddAgent` 在同阶段补齐同一门禁，避免三面入口出现不同权限语义。
+- 三面入口（`PUT /v1/agents/{id}`、`coordplane agent update`、前端编辑表单）共用同一 `AgentConfigInput` 写同一个 `UpdateAgent` operation；PUT 是完整配置替换（E5），CLI 先 GET 当前值再 overlay 显式 flag，前端发送全量字段。
+- Agent 字段修改只影响新 Run；已创建 Run 保存解析后的 adapter、image、instructions hash 和 config fingerprint，不受后续修改影响。
 
 ### 3.3 Task
 
@@ -189,6 +201,7 @@ Run 表示一次真实 CLI 进程执行。恢复同一个 CLI native session 也
 | `adapter_id` | 本 Run 固定 adapter |
 | `image` | 本 Run 固定 image 或 digest |
 | `instructions_hash` | 本 Run 使用的指令内容 hash |
+| `config_fingerprint` | 本 Run 使用的配置指纹：adapter/image/model/subagent_model/base_url/effort/instructions_hash 归一化稳定序列化后的 SHA-256；不含 secret |
 | `state` | `starting`、`active`、`exited`、`failed`、`interrupted`、`cancelled`、`timed_out` |
 | `workspace_path` | Daemon 内部 work/integration workspace 路径；conversation 可空 |
 | `container_id` | 创建容器后立即保存，可空 |
@@ -211,6 +224,7 @@ Run 表示一次真实 CLI 进程执行。恢复同一个 CLI native session 也
 规则：
 
 - `native_session_id` 只证明未来可能 resume，不证明进程或 turn 当前存活。
+- Run 不保存 model/base_url/instructions_text 原文，只保存 `config_fingerprint` 与 `instructions_hash`，减少可审计/可泄露面。
 - stdout/stderr 日志不是 Run 状态真相。
 - Run exit 0 不自动修改 Task 为 submitted/completed。
 - `exited` 表示 CLI 进程已得到可信 exit fact，可能在Run写active之前快速退出；exit code可以为0或非0。
@@ -287,7 +301,7 @@ Boss/Agent mutation产生的Event必须有request ID；Daemon外部动作的requ
 
 ```text
 project.creating / project.active / project.error / project.archived
-agent.created / agent.paused / agent.archived
+agent.created / agent.updated / agent.paused / agent.archived
 task.created / task.claimed / task.running / task.finishing / task.waiting
 task.submit_requested / task.submitted / task.requeued
 task.completed / task.failed / task.cancelled
@@ -541,6 +555,8 @@ same-turn Inject 只是第 1 步的可选优化。系统正确性不得依赖它
 | `gc preview / gc run --confirm` | preview返回原因和workspace fingerprint/ref SHA；run只清理满足`runtime.md`/`git.md`自动安全条件的资源 |
 | `gc discard-workspace --task T ... / discard-task-ref --task T --run U ...` | 单workspace或单run-ref危险放弃；必须携带preview得到的expected identity和request ID，且不能越过active/pending/ownership/source引用fence |
 
+`agent add/update` 的字段来自同一 `AgentConfigInput`：`display_name/adapter_id/image/instructions_file/instructions_text/model/subagent_model/base_url/effort`（update 另带 `version`）；`instructions_file` 与 `instructions_text` 互斥；PUT 为全量替换，CLI 与前端不发送部分字段。
+
 ### 8.2 Agent 的 `coordlink`
 
 | 命令 | 需求 |
@@ -665,6 +681,9 @@ reconcile 未完成前，查询可以只读开放，但不得 claim Task 或启�
 - Task/Message 表直接承担调度/递送队列，不建设通用 QueueItem。
 - 每次状态变化与 Event 同事务；每个外部动作都有 intent 和 reconciliation。
 - Daemon 不理解任务正文、角色名、代码或验收语义。
+- Agent 配置写入必须通过字段校验、version CAS 与 `agent.manage` 门禁；`agents`/`participants` 镜像在同一事务更新。
+- Run 只保存 `config_fingerprint` 与 `instructions_hash`；model/base_url/instructions_text 原文不落库、不进 Event 或日志。
+- resume 仅在上一 Run 的 `config_fingerprint` 非空且与当前一致时允许；配置变化或指纹为空一律 fresh start。
 
 ## 14. 未来能力与标准协议边界
 
