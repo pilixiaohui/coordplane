@@ -230,9 +230,9 @@ func TestOperatorHandlerMapsBodiesPathsAndQueriesWithoutGenericDispatch(t *testi
 	}
 }
 
-func TestOperatorHandlerAcceptsMaximumInstructionsTextButRejectsOverAllowance(t *testing.T) {
+func TestOperatorHandlerAcceptsMaximumInstructionsTextEncodingsButRejectsOverAllowance(t *testing.T) {
 	const envelopeAllowance = 64 << 10
-	const maxBodyBytes = core.MaximumInstructionsBytes + envelopeAllowance
+	const maxBodyBytes = core.MaximumInstructionsBytes*6 + envelopeAllowance
 	agentBody := func(instructionsText string) []byte {
 		body, err := json.Marshal(core.AddAgentInput{
 			DisplayName:      "Boundary Agent",
@@ -248,22 +248,33 @@ func TestOperatorHandlerAcceptsMaximumInstructionsTextButRejectsOverAllowance(t 
 		return body
 	}
 
-	t.Run("exact 1 MiB instructions text", func(t *testing.T) {
-		operations := &operatorFake{}
-		handler := transport.NewOperatorHandler(operations)
-		body := agentBody(strings.Repeat("x", core.MaximumInstructionsBytes))
-		if len(body) <= core.MaximumInstructionsBytes || len(body) >= maxBodyBytes {
-			t.Fatalf("exact-maximum body length = %d, want in (%d,%d)", len(body), core.MaximumInstructionsBytes, maxBodyBytes)
-		}
-		assertOK(t, invoke(t, handler, http.MethodPost, "/v1/agents", string(body), ""))
-		if len(operations.calls) != 2 || operations.calls[0].name != "authenticate_operator" || operations.calls[1].name != "add_agent" {
-			t.Fatalf("boundary request calls = %+v", operations.calls)
-		}
-		input := operations.calls[1].value.(core.AddAgentInput)
-		if len(input.InstructionsText) != core.MaximumInstructionsBytes {
-			t.Fatalf("instructions text length = %d, want %d", len(input.InstructionsText), core.MaximumInstructionsBytes)
-		}
-	})
+	for _, form := range []struct {
+		name string
+		text string
+	}{
+		{name: "plain", text: strings.Repeat("x", core.MaximumInstructionsBytes)},
+		{name: "newline", text: strings.Repeat("\n", core.MaximumInstructionsBytes)},
+		{name: "quote", text: strings.Repeat("\"", core.MaximumInstructionsBytes)},
+		{name: "backslash", text: strings.Repeat(`\`, core.MaximumInstructionsBytes)},
+		{name: "nul", text: strings.Repeat("\x00", core.MaximumInstructionsBytes)},
+	} {
+		t.Run("exact 1 MiB "+form.name+" text", func(t *testing.T) {
+			operations := &operatorFake{}
+			handler := transport.NewOperatorHandler(operations)
+			body := agentBody(form.text)
+			if len(body) >= maxBodyBytes {
+				t.Fatalf("%s encoded body length = %d, want below %d", form.name, len(body), maxBodyBytes)
+			}
+			assertOK(t, invoke(t, handler, http.MethodPost, "/v1/agents", string(body), ""))
+			if len(operations.calls) != 2 || operations.calls[0].name != "authenticate_operator" || operations.calls[1].name != "add_agent" {
+				t.Fatalf("%s boundary request calls = %+v", form.name, operations.calls)
+			}
+			input := operations.calls[1].value.(core.AddAgentInput)
+			if len(input.InstructionsText) != core.MaximumInstructionsBytes {
+				t.Fatalf("%s instructions text length = %d, want %d", form.name, len(input.InstructionsText), core.MaximumInstructionsBytes)
+			}
+		})
+	}
 
 	t.Run("one byte over envelope allowance", func(t *testing.T) {
 		operations := &operatorFake{}

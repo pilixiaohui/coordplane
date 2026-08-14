@@ -14,13 +14,14 @@ import (
 	"coordplane/internal/core"
 )
 
-// requestEnvelopeAllowanceBytes keeps the HTTP body ceiling above the shared
-// instructions text limit by enough room for the JSON envelope and the other
-// fixed config fields, so a legal 1 MiB instructions_text remains submittable
-// through every entry point.
+// requestEnvelopeAllowanceBytes is the room kept above the worst-case encoded
+// instructions text for the JSON envelope and the other fixed config fields.
+// The transport limits the encoded HTTP body, while core enforces the decoded
+// 1 MiB text limit; a NUL byte expands to the six-byte \u0000 escape, so six
+// times MaximumInstructionsBytes is the encoded worst case.
 const requestEnvelopeAllowanceBytes = 64 << 10
 
-const maxRequestBytes = core.MaximumInstructionsBytes + requestEnvelopeAllowanceBytes
+const maxRequestBytes = core.MaximumInstructionsBytes*6 + requestEnvelopeAllowanceBytes
 
 type actionRequest struct {
 	RequestID string `json:"request_id"`
