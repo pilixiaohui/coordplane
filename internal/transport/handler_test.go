@@ -230,6 +230,62 @@ func TestOperatorHandlerMapsBodiesPathsAndQueriesWithoutGenericDispatch(t *testi
 	}
 }
 
+func TestOperatorHandlerAcceptsMaximumInstructionsTextButRejectsOverAllowance(t *testing.T) {
+	const envelopeAllowance = 64 << 10
+	const maxBodyBytes = core.MaximumInstructionsBytes + envelopeAllowance
+	agentBody := func(instructionsText string) []byte {
+		body, err := json.Marshal(core.AddAgentInput{
+			DisplayName:      "Boundary Agent",
+			AdapterID:        "claude",
+			Image:            "agent:latest",
+			InstructionsFile: "",
+			InstructionsText: instructionsText,
+			RequestID:        "boundary-request",
+		})
+		if err != nil {
+			t.Fatalf("marshal boundary agent: %v", err)
+		}
+		return body
+	}
+
+	t.Run("exact 1 MiB instructions text", func(t *testing.T) {
+		operations := &operatorFake{}
+		handler := transport.NewOperatorHandler(operations)
+		body := agentBody(strings.Repeat("x", core.MaximumInstructionsBytes))
+		if len(body) <= core.MaximumInstructionsBytes || len(body) >= maxBodyBytes {
+			t.Fatalf("exact-maximum body length = %d, want in (%d,%d)", len(body), core.MaximumInstructionsBytes, maxBodyBytes)
+		}
+		assertOK(t, invoke(t, handler, http.MethodPost, "/v1/agents", string(body), ""))
+		if len(operations.calls) != 2 || operations.calls[0].name != "authenticate_operator" || operations.calls[1].name != "add_agent" {
+			t.Fatalf("boundary request calls = %+v", operations.calls)
+		}
+		input := operations.calls[1].value.(core.AddAgentInput)
+		if len(input.InstructionsText) != core.MaximumInstructionsBytes {
+			t.Fatalf("instructions text length = %d, want %d", len(input.InstructionsText), core.MaximumInstructionsBytes)
+		}
+	})
+
+	t.Run("one byte over envelope allowance", func(t *testing.T) {
+		operations := &operatorFake{}
+		handler := transport.NewOperatorHandler(operations)
+		shortBody := agentBody("x")
+		envelopeOverhead := len(shortBody) - len("x")
+		textLength := maxBodyBytes + 1 - envelopeOverhead
+		body := agentBody(strings.Repeat("x", textLength))
+		if len(body) != maxBodyBytes+1 {
+			t.Fatalf("over-allowance body length = %d, want %d", len(body), maxBodyBytes+1)
+		}
+		recorder := invoke(t, handler, http.MethodPost, "/v1/agents", string(body), "")
+		envelope := decodeEnvelope(t, recorder)
+		if recorder.Code != http.StatusBadRequest || envelope.Error == nil || envelope.Error.Code != core.CodeInvalidArgument {
+			t.Fatalf("over-allowance response = status:%d envelope:%+v", recorder.Code, envelope)
+		}
+		if len(operations.calls) != 1 || operations.calls[0].name != "authenticate_operator" {
+			t.Fatalf("over-allowance request reached core: %+v", operations.calls)
+		}
+	})
+}
+
 func TestRunHandlerForwardsOnlyBearerTokenToCore(t *testing.T) {
 	tests := []struct {
 		name   string

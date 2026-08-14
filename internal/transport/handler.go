@@ -14,7 +14,13 @@ import (
 	"coordplane/internal/core"
 )
 
-const maxRequestBytes = 1 << 20
+// requestEnvelopeAllowanceBytes keeps the HTTP body ceiling above the shared
+// instructions text limit by enough room for the JSON envelope and the other
+// fixed config fields, so a legal 1 MiB instructions_text remains submittable
+// through every entry point.
+const requestEnvelopeAllowanceBytes = 64 << 10
+
+const maxRequestBytes = core.MaximumInstructionsBytes + requestEnvelopeAllowanceBytes
 
 type actionRequest struct {
 	RequestID string `json:"request_id"`
