@@ -673,6 +673,7 @@ type p3DockerFixture struct {
 	ctx          context.Context
 	root         string
 	image        string
+	adapterID    string
 	instructions string
 	source       string
 	components   *components
@@ -825,12 +826,20 @@ func noneNetworkConfig(t *testing.T, root string) (string, []byte) {
 }
 
 func newP3DockerFixture(t *testing.T) *p3DockerFixture {
-	return newP3DockerFixtureWithRunTimeout(t, 0)
+	return newP3DockerFixtureAdapterWithRunTimeout(t, "claude", 0, 90*time.Second)
 }
 
 func newP3DockerFixtureWithRunTimeout(t *testing.T, runTimeout time.Duration) *p3DockerFixture {
+	return newP3DockerFixtureAdapterWithRunTimeout(t, "claude", runTimeout, 90*time.Second)
+}
+
+func newCodexDockerFixture(t *testing.T) *p3DockerFixture {
+	return newP3DockerFixtureAdapterWithRunTimeout(t, "codex", 0, 4*time.Minute)
+}
+
+func newP3DockerFixtureAdapterWithRunTimeout(t *testing.T, adapterName string, runTimeout, ctxTimeout time.Duration) *p3DockerFixture {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), ctxTimeout)
 	t.Cleanup(cancel)
 	executor, err := containerruntime.NewDockerExecutorFromEnvironment()
 	requireNoError(t, err)
@@ -850,7 +859,7 @@ func newP3DockerFixtureWithRunTimeout(t *testing.T, runTimeout time.Duration) *p
 	image := "coordplane-p3-test:" + fmt.Sprintf("%x", time.Now().UnixNano())
 	dockerConfig := filepath.Join(root, "docker-config")
 	requireNoError(t, os.MkdirAll(dockerConfig, 0o700))
-	imageRoot := filepath.Join(repositoryRoot, "internal", "daemon", "testdata", "claude-runtime")
+	imageRoot := filepath.Join(repositoryRoot, "internal", "daemon", "testdata", adapterName+"-runtime")
 	buildImage := exec.CommandContext(ctx, "docker", "build", "-q", "-t", image, imageRoot)
 	buildImage.Env = append(os.Environ(), "DOCKER_CONFIG="+dockerConfig)
 	if raw, err := buildImage.CombinedOutput(); err != nil {
@@ -869,7 +878,7 @@ func newP3DockerFixtureWithRunTimeout(t *testing.T, runTimeout time.Duration) *p
 	requireNoError(t, err)
 	assembled.runtime.coordlink = coordlinkPath
 	fixture := &p3DockerFixture{
-		ctx: ctx, root: root, image: image, instructions: instructions,
+		ctx: ctx, root: root, image: image, adapterID: adapterName, instructions: instructions,
 		source: source, components: assembled, executor: executor,
 	}
 	t.Cleanup(func() {
@@ -948,7 +957,7 @@ func prepareCreatedRunForReconcile(t *testing.T, fixture *p3DockerFixture, claim
 func (f *p3DockerFixture) addAgent(t *testing.T, name string) core.Agent {
 	t.Helper()
 	agent, err := f.components.service.AddAgent(f.ctx, core.AddAgentInput{
-		DisplayName: name, AdapterID: "claude", Image: f.image,
+		DisplayName: name, AdapterID: f.adapterID, Image: f.image,
 		InstructionsFile: f.instructions, RequestID: "agent-" + strings.ReplaceAll(name, " ", "-"),
 	})
 	requireNoError(t, err)

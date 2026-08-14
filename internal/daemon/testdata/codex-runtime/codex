@@ -1,0 +1,54 @@
+#!/bin/sh
+set -eu
+
+[ "${1:-}" = "exec" ]
+shift
+mode=start
+if [ "${1:-}" = "resume" ]; then
+	mode=resume
+	shift
+fi
+[ "${1:-}" = "--json" ]
+[ "${2:-}" = "--skip-git-repo-check" ]
+[ "${3:-}" = "--dangerously-bypass-approvals-and-sandbox" ]
+[ "${4:-}" = "--ignore-user-config" ]
+shift 4
+
+if [ "$mode" = "start" ]; then
+	[ "${1:-}" = "-C" ]
+	shift 2
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--) shift; break ;;
+			*) shift ;;
+		esac
+	done
+else
+	session=
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--) break ;;
+			-*) shift ;;
+			*) session=$1; shift; break ;;
+		esac
+	done
+	[ -n "$session" ]
+	[ "${1:-}" = "--" ]
+	shift
+fi
+[ "$#" -eq 1 ]
+
+bootstrap=/run/coordplane/bootstrap
+run_id=$(sed -n 's/^Run: //p' "$bootstrap")
+if [ "$mode" = "resume" ] && grep -q "resume error" "$bootstrap"; then
+	printf '{"type":"error","message":"Session not found for thread_id: %s"}\n' "$session"
+	exit 2
+fi
+
+printf '{"type":"thread.started","thread_id":"codex-session-%s"}\n' "$run_id"
+canary=$(sed -n '1p' "$bootstrap")
+printf '{"type":"item.completed","item":{"id":"i-1","type":"agent_message","role":"user","content":[{"type":"output_text","text":"%s"}]}}\n' "$canary"
+/usr/local/bin/coordlink progress --summary "CODEX-READY" --request-id "codex-ready-$run_id" --output json >/dev/null
+sleep 30
+printf '{"type":"thread.completed"}\n'
+printf '{"type":"result","subtype":"success","is_error":false,"result":"done"}\n'
