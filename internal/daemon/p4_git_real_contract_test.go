@@ -404,7 +404,8 @@ func (h *realP4Harness) activate(t *testing.T, claim core.Claim, workspace, pref
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: prefix + "-nonce",
 		WorkspacePath: workspace, HomePath: filepath.Join(h.root, "homes", claim.Run.ID),
 		LogPath: filepath.Join(h.root, "logs", claim.Run.ID+".log"), InstructionsHash: prefix + "-instructions",
-		LaunchMode: "start", CleanupOperationID: prefix + "-cleanup", RequestID: prefix + "-prepare",
+		ConfigFingerprint: strings.Repeat("a", 64),
+		LaunchMode:        "start", CleanupOperationID: prefix + "-cleanup", RequestID: prefix + "-prepare",
 	})
 	requireNoError(t, err)
 	fact := core.RunRuntimeFactInput{
@@ -630,7 +631,8 @@ func prepareP4ScriptedRun(t *testing.T, h *realP4Harness, claim core.Claim, pref
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: prefix + "-nonce",
 		WorkspacePath: workspace, HomePath: filepath.Join(h.root, "homes", claim.Run.ID),
 		LogPath: filepath.Join(h.root, "logs", claim.Run.ID+".log"), InstructionsHash: prefix,
-		LaunchMode: "start", CleanupOperationID: prefix + "-cleanup", RequestID: prefix + "-prepare",
+		ConfigFingerprint: strings.Repeat("a", 64),
+		LaunchMode:        "start", CleanupOperationID: prefix + "-cleanup", RequestID: prefix + "-prepare",
 	})
 	requireNoError(t, err)
 	controller := &runtimeController{service: h.service, workspaces: h.workspaces, controls: make(map[string]*runControl)}

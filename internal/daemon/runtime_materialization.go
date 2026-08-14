@@ -182,20 +182,37 @@ func randomRuntimeID(prefix string) (string, error) {
 	return prefix + "-" + hex.EncodeToString(raw), nil
 }
 
-func readInstructions(path string) (string, string, error) {
-	path = strings.TrimSpace(path)
-	if !filepath.IsAbs(path) {
-		return "", "", errors.New("Agent instructions file must be absolute")
+func readInstructions(agent core.Agent) (string, string, error) {
+	file := strings.TrimSpace(agent.InstructionsFile)
+	text := agent.InstructionsText
+	switch {
+	case file != "" && text != "":
+		return "", "", errors.New("Agent instructions_file and instructions_text are both set")
+	case file != "":
+		if !filepath.IsAbs(file) || filepath.Clean(file) != file {
+			return "", "", errors.New("Agent instructions file must be a canonical absolute path")
+		}
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			return "", "", fmt.Errorf("read Agent instructions: %w", err)
+		}
+		if len(raw) > core.MaximumInstructionsBytes {
+			return "", "", errors.New("Agent instructions exceed 1 MiB")
+		}
+		sum := sha256.Sum256(raw)
+		return string(raw), hex.EncodeToString(sum[:]), nil
+	case text != "":
+		if !utf8.ValidString(text) {
+			return "", "", errors.New("Agent instructions text is not valid UTF-8")
+		}
+		if len(text) > core.MaximumInstructionsBytes {
+			return "", "", errors.New("Agent instructions exceed 1 MiB")
+		}
+		sum := sha256.Sum256([]byte(text))
+		return text, hex.EncodeToString(sum[:]), nil
+	default:
+		return "", "", errors.New("Agent instructions source is missing")
 	}
-	raw, err := os.ReadFile(filepath.Clean(path))
-	if err != nil {
-		return "", "", fmt.Errorf("read Agent instructions: %w", err)
-	}
-	if len(raw) > 1<<20 {
-		return "", "", errors.New("Agent instructions exceed 1 MiB")
-	}
-	sum := sha256.Sum256(raw)
-	return string(raw), hex.EncodeToString(sum[:]), nil
 }
 
 func ensureRuntimeDirectory(path string, mode os.FileMode) error {

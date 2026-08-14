@@ -136,6 +136,7 @@ func buildComponents(ctx context.Context, configPath string) (*components, error
 	}
 	service, err := core.NewService(database, projectGitAdapter{initializer: initializer, workspaces: workspaceManager}, core.ServiceOptions{
 		MaxParallelRuns: cfg.MaxParallelRuns, AdapterIDs: adapter.Production().Names(),
+		Adapters:                    coreAdapterDescriptors(adapter.Production()),
 		CompletedWorkspaceRetention: cfg.Retention.CompletedWorkspace,
 		TerminalTaskRefRetention:    cfg.Retention.TerminalTaskRef,
 		AgentHomes:                  agentHomes,
@@ -163,6 +164,22 @@ func buildComponents(ctx context.Context, configPath string) (*components, error
 		return fail(fmt.Errorf("reconcile runtime: %w", err))
 	}
 	return result, nil
+}
+
+func coreAdapterDescriptors(registry adapter.Registry) []core.AdapterDescriptor {
+	descriptors := make([]core.AdapterDescriptor, 0, len(registry.Names()))
+	for _, name := range registry.Names() {
+		entry, ok := registry.Lookup(name)
+		if !ok {
+			continue
+		}
+		metadata := entry.Metadata()
+		descriptors = append(descriptors, core.AdapterDescriptor{
+			ID:             name,
+			AllowedEfforts: append([]string(nil), metadata.AllowedEfforts...),
+		})
+	}
+	return descriptors
 }
 
 func (c *components) Close() error {

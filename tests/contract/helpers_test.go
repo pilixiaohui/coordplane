@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"coordplane/internal/core"
@@ -61,7 +62,8 @@ func activateContractRuntimeRun(t *testing.T, ctx context.Context, service *core
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: prefix + "-nonce",
 		WorkspacePath: workspace, HomePath: filepath.Join(root, "home"),
 		LogPath: filepath.Join(root, "run.log"), InstructionsHash: prefix + "-instructions",
-		LaunchMode: "start", CleanupOperationID: prefix + "-cleanup", RequestID: prefix + "-prepare",
+		ConfigFingerprint: strings.Repeat("a", 64),
+		LaunchMode:        "start", CleanupOperationID: prefix + "-cleanup", RequestID: prefix + "-prepare",
 	})
 	requireNoError(t, err)
 	fact := core.RunRuntimeFactInput{

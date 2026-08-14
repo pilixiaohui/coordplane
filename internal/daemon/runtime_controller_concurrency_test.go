@@ -1199,7 +1199,8 @@ func activateRuntimeTestRun(t *testing.T, service *core.Service, claim core.Clai
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: "active-nonce",
 		WorkspacePath: filepath.Join(root, "workspace"), HomePath: filepath.Join(root, "home"),
 		LogPath: filepath.Join(root, "run.log"), InstructionsHash: "instructions-hash",
-		LaunchMode: "start", CleanupOperationID: "active-cleanup", RequestID: "prepare-active-run",
+		ConfigFingerprint: strings.Repeat("a", 64),
+		LaunchMode:        "start", CleanupOperationID: "active-cleanup", RequestID: "prepare-active-run",
 	}))
 	ref := runtimeRef(prepared)
 	ref.ContainerID = "container-active"

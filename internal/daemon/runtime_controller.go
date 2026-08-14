@@ -273,10 +273,22 @@ func (c *runtimeController) launchOwned(ctx context.Context, claim core.Claim, o
 	if !ok {
 		return c.failUnpreparedRun(ctx, launch.Run, "ADAPTER_NOT_REGISTERED", "adapter is not registered")
 	}
-	instructions, instructionsHash, err := readInstructions(launch.Agent.InstructionsFile)
+	instructions, instructionsHash, err := readInstructions(launch.Agent)
 	if err != nil {
 		message := c.runtimeRedaction(launch.Run, launch.Agent.InstructionsFile).Text(err.Error())
 		return c.failUnpreparedRun(ctx, launch.Run, "INSTRUCTIONS_UNAVAILABLE", message)
+	}
+	fingerprint, err := core.RuntimeConfigFingerprint(core.RuntimeConfigFingerprintInput{
+		AdapterID:        launch.Agent.AdapterID,
+		Image:            launch.Agent.Image,
+		Model:            launch.Agent.Model,
+		SubagentModel:    launch.Agent.SubagentModel,
+		BaseURL:          launch.Agent.BaseURL,
+		Effort:           launch.Agent.Effort,
+		InstructionsHash: instructionsHash,
+	})
+	if err != nil {
+		return c.failUnpreparedRun(ctx, launch.Run, "CONFIG_FINGERPRINT_UNAVAILABLE", c.runtimeRedaction(launch.Run).Text(err.Error()))
 	}
 
 	workspacePath := ""
@@ -295,7 +307,7 @@ func (c *runtimeController) launchOwned(ctx context.Context, claim core.Claim, o
 	logPath := filepath.Join(c.config.Runtime.LogRoot, launch.Run.ID, "run.log")
 	controlPath := filepath.Join(c.controlRoot, launch.Run.ID)
 
-	mode, resumedFrom, resumeSession := c.selectLaunchMode(ctx, launch, entry, workspacePath)
+	selection := c.selectLaunchMode(ctx, launch, entry, workspacePath, fingerprint)
 	deadline := runDeadlineAt(launch.Task.BudgetSeconds, c.config.Runtime.RunTimeout, time.Now())
 	nonce, err := randomRuntimeID("nonce")
 	if err != nil {
@@ -308,8 +320,8 @@ func (c *runtimeController) launchOwned(ctx context.Context, claim core.Claim, o
 	prepared, err := c.service.BeginRunLaunch(ctx, core.RunLaunchInput{
 		RunID: launch.Run.ID, Generation: launch.Run.Generation, LaunchNonce: nonce,
 		WorkspacePath: workspacePath, HomePath: homePath, LogPath: logPath,
-		InstructionsHash: instructionsHash, LaunchMode: mode,
-		ResumedFromRunID: resumedFrom, ResumeNativeSessionID: resumeSession,
+		InstructionsHash: instructionsHash, ConfigFingerprint: fingerprint, LaunchMode: selection.Mode,
+		ResumedFromRunID: selection.ResumedFromRunID, ResumeNativeSessionID: selection.ResumeNativeSessionID,
 		CleanupOperationID: cleanupOperation, IsolationSpecVersion: runtimeIsolationSpecVersion(), DeadlineAt: deadline,
 		RequestID: runtimeRequest(launch.Run, "prepare"),
 	})
@@ -548,19 +560,11 @@ func (c *runtimeController) selectLaunchMode(
 	launch core.RunLaunchContext,
 	entry adapter.CLI,
 	workspacePath string,
-) (mode, resumedFrom, session string) {
-	if !entry.Metadata().SupportsResume {
-		return "start", "", ""
-	}
+	currentFingerprint string,
+) core.LaunchModeSelection {
 	previous, err := c.service.LatestTerminalRun(ctx, launch.Task.ID, launch.Agent.ID)
-	if err != nil || previous.AdapterID != launch.Run.AdapterID {
-		return "start", "", ""
-	}
-	if previous.RuntimeErrorCode == string(core.CodeResumeUnavailable) {
-		return "start", previous.ID, ""
-	}
-	if previous.NativeSessionID == "" {
-		return "start", "", ""
+	if err != nil {
+		previous = core.Run{}
 	}
 	workspaceID := workspacePath
 	if launch.Task.Kind == core.TaskConversation {
@@ -570,14 +574,21 @@ func (c *runtimeController) selectLaunchMode(
 	if launch.Task.Kind == core.TaskConversation {
 		previousWorkspace = "conversation"
 	}
-	compatible := entry.ResumeCompatible(
-		adapter.SessionContext{AdapterID: previous.AdapterID, AgentID: previous.AgentID, TaskID: previous.TaskID, WorkspaceID: previousWorkspace},
-		adapter.SessionContext{AdapterID: launch.Run.AdapterID, AgentID: launch.Run.AgentID, TaskID: launch.Run.TaskID, WorkspaceID: workspaceID},
-	)
-	if !compatible {
-		return "start", "", ""
-	}
-	return "resume", previous.ID, previous.NativeSessionID
+	return core.SelectLaunchMode(core.ResumePolicy{
+		SupportsResume: entry.Metadata().SupportsResume,
+		Compatible: func(previous, next core.LaunchSessionContext) bool {
+			return entry.ResumeCompatible(
+				adapter.SessionContext{AdapterID: previous.AdapterID, AgentID: previous.AgentID, TaskID: previous.TaskID, WorkspaceID: previous.WorkspaceID},
+				adapter.SessionContext{AdapterID: next.AdapterID, AgentID: next.AgentID, TaskID: next.TaskID, WorkspaceID: next.WorkspaceID},
+			)
+		},
+	}, previous, core.LaunchSessionContext{
+		AdapterID: previous.AdapterID, AgentID: previous.AgentID,
+		TaskID: previous.TaskID, WorkspaceID: previousWorkspace,
+	}, core.LaunchSessionContext{
+		AdapterID: launch.Run.AdapterID, AgentID: launch.Run.AgentID,
+		TaskID: launch.Run.TaskID, WorkspaceID: workspaceID,
+	}, currentFingerprint)
 }
 
 func (c *runtimeController) containerSpec(

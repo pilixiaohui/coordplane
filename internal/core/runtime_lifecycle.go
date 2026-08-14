@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"path/filepath"
 	"strings"
 	"time"
@@ -27,6 +29,7 @@ type RunLaunchInput struct {
 	HomePath              string
 	LogPath               string
 	InstructionsHash      string
+	ConfigFingerprint     string
 	LaunchMode            string
 	ResumedFromRunID      string
 	ResumeNativeSessionID string
@@ -127,6 +130,7 @@ func (s *Service) BeginRunLaunch(ctx context.Context, input RunLaunchInput) (Run
 	input.LaunchNonce = strings.TrimSpace(input.LaunchNonce)
 	input.CleanupOperationID = strings.TrimSpace(input.CleanupOperationID)
 	input.InstructionsHash = strings.TrimSpace(input.InstructionsHash)
+	input.ConfigFingerprint = canonicalFingerprint(input.ConfigFingerprint)
 	input.ResumedFromRunID = strings.TrimSpace(input.ResumedFromRunID)
 	input.ResumeNativeSessionID = strings.TrimSpace(input.ResumeNativeSessionID)
 	if input.IsolationSpecVersion == 0 {
@@ -150,6 +154,9 @@ func (s *Service) BeginRunLaunch(ctx context.Context, input RunLaunchInput) (Run
 	}
 	if input.LaunchMode == "resume" && (input.ResumedFromRunID == "" || input.ResumeNativeSessionID == "") {
 		return Run{}, NewError(CodeInvalidArgument, "resume launch requires source Run and native session", false)
+	}
+	if err := validateConfigFingerprint(input.ConfigFingerprint); err != nil {
+		return Run{}, err
 	}
 	for name, path := range map[string]string{"home_path": input.HomePath, "log_path": input.LogPath} {
 		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
@@ -210,6 +217,7 @@ func (s *Service) BeginRunLaunch(ctx context.Context, input RunLaunchInput) (Run
 		run.HomePath = input.HomePath
 		run.LogPath = input.LogPath
 		run.InstructionsHash = input.InstructionsHash
+		run.ConfigFingerprint = input.ConfigFingerprint
 		run.LaunchMode = input.LaunchMode
 		run.ResumedFromRunID = input.ResumedFromRunID
 		run.ResumeNativeSessionID = input.ResumeNativeSessionID
@@ -237,10 +245,28 @@ func (s *Service) BeginRunLaunch(ctx context.Context, input RunLaunchInput) (Run
 func sameLaunchIntent(run Run, input RunLaunchInput) bool {
 	return run.Generation == input.Generation && run.LaunchNonce == input.LaunchNonce &&
 		run.WorkspacePath == input.WorkspacePath && run.HomePath == input.HomePath && run.LogPath == input.LogPath &&
-		run.InstructionsHash == input.InstructionsHash && run.LaunchMode == input.LaunchMode &&
+		run.InstructionsHash == input.InstructionsHash && run.ConfigFingerprint == input.ConfigFingerprint &&
+		run.LaunchMode == input.LaunchMode &&
 		run.ResumedFromRunID == input.ResumedFromRunID && run.ResumeNativeSessionID == input.ResumeNativeSessionID &&
 		run.CleanupOperationID == input.CleanupOperationID && run.DeadlineAt == input.DeadlineAt &&
 		run.IsolationSpecVersion == input.IsolationSpecVersion
+}
+
+func canonicalFingerprint(value string) string {
+	value = strings.TrimSpace(value)
+	raw, err := hex.DecodeString(value)
+	if err != nil || len(raw) != sha256.Size {
+		return value
+	}
+	return hex.EncodeToString(raw)
+}
+
+func validateConfigFingerprint(value string) error {
+	raw, err := hex.DecodeString(value)
+	if err != nil || len(raw) != sha256.Size {
+		return NewError(CodeInvalidArgument, "config_fingerprint must be a 64-character SHA-256 hex digest", false)
+	}
+	return nil
 }
 
 func (s *Service) RecordContainerCreated(ctx context.Context, input RunRuntimeFactInput) (Run, error) {

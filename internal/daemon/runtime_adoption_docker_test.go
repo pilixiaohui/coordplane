@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,7 +31,7 @@ func TestReconcileRefusesToStartInsecureSameLabelContainer(t *testing.T) {
 	requireNoError(t, err)
 	launch, err := fixture.components.service.RuntimeLaunchContext(fixture.ctx, claim.Run.ID)
 	requireNoError(t, err)
-	instructions, instructionsHash, err := readInstructions(launch.Agent.InstructionsFile)
+	instructions, instructionsHash, err := readInstructions(launch.Agent)
 	requireNoError(t, err)
 	workspaceSpec, err := gitWorkspaceSpec(task)
 	requireNoError(t, err)
@@ -39,6 +40,7 @@ func TestReconcileRefusesToStartInsecureSameLabelContainer(t *testing.T) {
 		WorkspacePath: workspacePath, HomePath: filepath.Join(fixture.components.config.Runtime.AgentHomeRoot, agent.ID),
 		LogPath:          filepath.Join(fixture.components.config.Runtime.LogRoot, claim.Run.ID, "run.log"),
 		InstructionsHash: instructionsHash, LaunchMode: "start",
+		ConfigFingerprint:  strings.Repeat("a", 64),
 		CleanupOperationID: "cleanup-insecure-adoption", RequestID: runtimeRequest(claim.Run, "prepare"),
 	})
 	requireNoError(t, err)

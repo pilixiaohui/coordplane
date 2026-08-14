@@ -798,7 +798,8 @@ func prepareTestRun(t *testing.T, h *harness, ctx context.Context, runID, reques
 		RunID: run.ID, Generation: run.Generation, LaunchNonce: "nonce-" + run.ID,
 		WorkspacePath: workspace, HomePath: filepath.Join(root, "home"),
 		LogPath: filepath.Join(root, "run.log"), InstructionsHash: "test-instructions",
-		LaunchMode: "start", CleanupOperationID: "cleanup-" + run.ID,
+		ConfigFingerprint: strings.Repeat("a", 64),
+		LaunchMode:        "start", CleanupOperationID: "cleanup-" + run.ID,
 		RequestID: requestID + "-prepare",
 	})
 }

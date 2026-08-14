@@ -889,7 +889,7 @@ func prepareCreatedRunForReconcile(t *testing.T, fixture *p3DockerFixture, claim
 	t.Helper()
 	launch, err := fixture.components.service.RuntimeLaunchContext(fixture.ctx, claim.Run.ID)
 	requireNoError(t, err)
-	instructions, instructionsHash, err := readInstructions(launch.Agent.InstructionsFile)
+	instructions, instructionsHash, err := readInstructions(launch.Agent)
 	requireNoError(t, err)
 	workspaceSpec, err := gitWorkspaceSpec(launch.Task)
 	requireNoError(t, err)
@@ -902,7 +902,8 @@ func prepareCreatedRunForReconcile(t *testing.T, fixture *p3DockerFixture, claim
 		RunID: launch.Run.ID, Generation: launch.Run.Generation, LaunchNonce: "rt05-created-nonce",
 		WorkspacePath: workspacePath, HomePath: homePath, LogPath: logPath,
 		InstructionsHash: instructionsHash, LaunchMode: "start", CleanupOperationID: "rt05-cleanup-operation",
-		RequestID: "rt05-prepare",
+		ConfigFingerprint: strings.Repeat("a", 64),
+		RequestID:         "rt05-prepare",
 	})
 	requireNoError(t, err)
 	requireNoError(t, fixture.components.runtime.prepareWorkspace(fixture.ctx, prepared, workspaceSpec))

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"coordplane/internal/core"
@@ -56,7 +57,8 @@ func TestP3RuntimeFactsAdvanceMonotonicallyAndFenceEveryExternalFact(t *testing.
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: "nonce-runtime-facts",
 		WorkspacePath: filepath.Join(root, "workspace"), HomePath: filepath.Join(root, "home"),
 		LogPath: filepath.Join(root, "logs", "run.log"), InstructionsHash: "sha256-instructions",
-		LaunchMode: "start", CleanupOperationID: "cleanup-runtime-facts",
+		ConfigFingerprint: strings.Repeat("a", 64),
+		LaunchMode:        "start", CleanupOperationID: "cleanup-runtime-facts",
 		RequestID: "prepare-runtime-facts",
 	})
 	requireNoError(t, err)
@@ -379,7 +381,8 @@ func prepareRuntimeRun(t *testing.T, h *harness, claim core.Claim, root, prefix 
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: prefix + "-nonce",
 		WorkspacePath: filepath.Join(root, "workspace"), HomePath: filepath.Join(root, "home"),
 		LogPath: filepath.Join(root, "run.log"), InstructionsHash: prefix + "-instructions",
-		LaunchMode: "start", CleanupOperationID: prefix + "-cleanup", RequestID: prefix + "-prepare",
+		ConfigFingerprint: strings.Repeat("a", 64),
+		LaunchMode:        "start", CleanupOperationID: prefix + "-cleanup", RequestID: prefix + "-prepare",
 	})
 	requireNoError(t, err)
 	return prepared
