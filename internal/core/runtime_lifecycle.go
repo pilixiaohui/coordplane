@@ -217,15 +217,7 @@ func (s *Service) BeginRunLaunch(ctx context.Context, input RunLaunchInput) (Run
 		if err != nil {
 			return err
 		}
-		fingerprint, err := RuntimeConfigFingerprint(RuntimeConfigFingerprintInput{
-			AdapterID:        agent.AdapterID,
-			Image:            agent.Image,
-			Model:            agent.Model,
-			SubagentModel:    agent.SubagentModel,
-			BaseURL:          agent.BaseURL,
-			Effort:           agent.Effort,
-			InstructionsHash: instructionsHash,
-		})
+		fingerprint, err := RuntimeConfigFingerprint(RuntimeConfigFingerprintInput{AdapterID: agent.AdapterID, Image: agent.Image, Model: agent.Model, SubagentModel: agent.SubagentModel, BaseURL: agent.BaseURL, Effort: agent.Effort, InstructionsHash: instructionsHash})
 		if err != nil {
 			return err
 		}

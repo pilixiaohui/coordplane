@@ -65,9 +65,7 @@ func TestRT01RealDockerKeepsTwoAgentsWorkspacesHomesAndMountsPrivate(t *testing.
 		t.Fatalf("container ref mutation changed canonical: before=%s after=%s", canonicalBefore, canonical)
 	}
 	for _, task := range []core.Task{taskA, taskB} {
-		if _, err := fixture.components.service.CancelTask(ctx, core.TaskActionInput{
-			TaskID: task.ID, Reason: "isolation assertion complete", RequestID: "cancel-" + task.ID,
-		}); err != nil {
+		if _, err := fixture.components.service.CancelTask(ctx, core.TaskActionInput{TaskID: task.ID, Reason: "isolation assertion complete", RequestID: "cancel-" + task.ID}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -90,19 +88,12 @@ func TestRT02RealDockerLaunchPreservesAllMessageIDsWithoutOversizedArgv(t *testi
 	requireNoError(t, os.WriteFile(fixture.instructions, []byte(strings.Repeat("I", 1<<20)), 0o600))
 	agent := fixture.addAgent(t, "Bootstrap Boundary Agent")
 	project := fixture.addProject(t, agent.ID)
-	task, err := fixture.components.service.CreateTask(fixture.ctx, core.CreateTaskInput{
-		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
-		Title: "verify all launch messages", Description: strings.Repeat("D", core.MaximumTaskDescriptionBytes),
-		MaxRetries: 0, RequestID: "bootstrap-boundary-task",
-	})
+	task, err := fixture.components.service.CreateTask(fixture.ctx, core.CreateTaskInput{ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork, Title: "verify all launch messages", Description: strings.Repeat("D", core.MaximumTaskDescriptionBytes), MaxRetries: 0, RequestID: "bootstrap-boundary-task"})
 	requireNoError(t, err)
 	wantMessages := make(map[string]struct{}, core.MessagePageLimit+5)
 	messageBody := strings.Repeat("消息", core.MaximumMessageBodyBytes/len("消息"))
 	for index := 0; index < core.MessagePageLimit+5; index++ {
-		message, err := fixture.components.service.SendBossMessage(fixture.ctx, core.BossMessageInput{
-			ProjectID: project.ID, AgentID: agent.ID, TaskID: task.ID,
-			Body: messageBody, Wake: false, RequestID: fmt.Sprintf("bootstrap-message-%02d", index),
-		})
+		message, err := fixture.components.service.SendBossMessage(fixture.ctx, core.BossMessageInput{ProjectID: project.ID, AgentID: agent.ID, TaskID: task.ID, Body: messageBody, Wake: false, RequestID: fmt.Sprintf("bootstrap-message-%02d", index)})
 		requireNoError(t, err)
 		wantMessages[message.ID] = struct{}{}
 	}
@@ -217,9 +208,7 @@ func TestRT04CancelStopsContainerButPreservesDirtyWorkspace(t *testing.T) {
 	active := waitForActiveProviderRun(t, fixture, task.ID)
 	dirty := filepath.Join(active.WorkspacePath, "dirty-runtime.txt")
 	waitForFile(t, fixture.ctx, dirty)
-	if _, err := fixture.components.service.CancelTask(fixture.ctx, core.TaskActionInput{
-		TaskID: task.ID, Reason: "Boss cancellation", RequestID: "cancel-dirty-task",
-	}); err != nil {
+	if _, err := fixture.components.service.CancelTask(fixture.ctx, core.TaskActionInput{TaskID: task.ID, Reason: "Boss cancellation", RequestID: "cancel-dirty-task"}); err != nil {
 		t.Fatal(err)
 	}
 	terminal := waitForRun(t, fixture, task.ID, func(run core.Run, task core.Task) bool {
@@ -245,9 +234,7 @@ func TestRT04RunStopInterruptsOnlyTheRunAndPreservesDirtyWorkspace(t *testing.T)
 	active := waitForActiveProviderRun(t, fixture, task.ID)
 	dirty := filepath.Join(active.WorkspacePath, "dirty-runtime.txt")
 	waitForFile(t, fixture.ctx, dirty)
-	if _, err := fixture.components.service.RequestRunStop(fixture.ctx, core.RunStopInput{
-		RunID: active.ID, Reason: "Boss stopped this Run", RequestID: "stop-dirty-run",
-	}); err != nil {
+	if _, err := fixture.components.service.RequestRunStop(fixture.ctx, core.RunStopInput{RunID: active.ID, Reason: "Boss stopped this Run", RequestID: "stop-dirty-run"}); err != nil {
 		t.Fatal(err)
 	}
 	terminal := waitForInterruptedRemoved(t, fixture, task.ID, active.ID)
@@ -300,10 +287,7 @@ func TestRT05ReconcileCreatedRunWithStopIntentNeverStartsCLI(t *testing.T) {
 	project := fixture.addProject(t, agent.ID)
 	task := fixture.addTask(t, project.ID, agent.ID, "reconcile stop must not start CLI", 0)
 	created := claimPreparedRun(t, fixture, project.ID)
-	stopped, err := fixture.components.service.RequestRuntimeStop(fixture.ctx, core.RunStopInput{
-		RunID: created.ID, Reason: "operator stop before daemon restart", OperationID: "rt05-stop-operation",
-		RequestID: "rt05-stop-request",
-	})
+	stopped, err := fixture.components.service.RequestRuntimeStop(fixture.ctx, core.RunStopInput{RunID: created.ID, Reason: "operator stop before daemon restart", OperationID: "rt05-stop-operation", RequestID: "rt05-stop-request"})
 	requireNoError(t, err)
 	if stopped.LaunchPhase != core.LaunchCreated || stopped.StopRequestedAt == "" {
 		t.Fatalf("created Run stop intent = %#v", stopped)
@@ -350,10 +334,7 @@ func TestRT05ReconcileAdoptsRunningContainerAndRebuildsRunSocket(t *testing.T) {
 	if err != nil || !state.Running || state.Ref.ContainerID != active.ContainerID {
 		t.Fatalf("restart changed the live container: state=%#v err=%v", state, err)
 	}
-	if _, err := fixture.components.service.RequestRuntimeStop(fixture.ctx, core.RunStopInput{
-		RunID: active.ID, Reason: "restart adoption assertion complete", OperationID: "rt05-active-stop",
-		RequestID: "rt05-active-stop-request",
-	}); err != nil {
+	if _, err := fixture.components.service.RequestRuntimeStop(fixture.ctx, core.RunStopInput{RunID: active.ID, Reason: "restart adoption assertion complete", OperationID: "rt05-active-stop", RequestID: "rt05-active-stop-request"}); err != nil {
 		t.Fatal(err)
 	}
 	terminal := waitForInterruptedRemoved(t, fixture, task.ID, active.ID)
@@ -399,15 +380,9 @@ func TestRT02MissingWorkspaceAfterStartIssuedFailsBeforeSecondContainer(t *testi
 	project := fixture.addProject(t, agent.ID)
 	fixture.addTask(t, project.ID, agent.ID, "workspace loss must fail loud", 1)
 	created := claimPreparedRun(t, fixture, project.ID)
-	started, err := fixture.components.service.RecordRunStartIssued(
-		fixture.ctx,
-		runtimeFactInput(created, runtimeRef(created), "rt02-start-issued"),
-	)
+	started, err := fixture.components.service.RecordRunStartIssued(fixture.ctx, runtimeFactInput(created, runtimeRef(created), "rt02-start-issued"))
 	requireNoError(t, err)
-	terminal, err := fixture.components.service.RecordRuntimeRunTerminal(fixture.ctx, runtimeTerminalInput(started, core.RunTerminalInput{
-		State: core.RunInterrupted, TerminalReason: "fault injected after start intent",
-		RequestID: "rt02-first-terminal", OperationID: started.LaunchOperationID,
-	}))
+	terminal, err := fixture.components.service.RecordRuntimeRunTerminal(fixture.ctx, runtimeTerminalInput(started, core.RunTerminalInput{State: core.RunInterrupted, TerminalReason: "fault injected after start intent", RequestID: "rt02-first-terminal", OperationID: started.LaunchOperationID}))
 	requireNoError(t, err)
 	if err := fixture.components.runtime.cleanupRun(
 		fixture.ctx,
@@ -495,20 +470,11 @@ func TestCT04RealDockerExitZeroAndDoneTextCannotCompleteTask(t *testing.T) {
 	requireNoError(t, err)
 	components.runtime.coordlink = coordlinkPath
 	t.Cleanup(func() { _ = components.Close() })
-	agent, err := components.service.AddAgent(ctx, core.AddAgentInput{
-		DisplayName: "P3 Docker Agent", AdapterID: "claude", Image: image,
-		InstructionsFile: instructions, RequestID: "p3-agent",
-	})
+	agent, err := components.service.AddAgent(ctx, core.AddAgentInput{DisplayName: "P3 Docker Agent", AdapterID: "claude", Image: image, InstructionsFile: instructions, RequestID: "p3-agent"})
 	requireNoError(t, err)
-	project, err := components.service.AddProject(ctx, core.AddProjectInput{
-		Name: "p3-project", Source: source, SourceRef: "refs/heads/main",
-		IntegrationAgentID: agent.ID, RequestID: "p3-project",
-	})
+	project, err := components.service.AddProject(ctx, core.AddProjectInput{Name: "p3-project", Source: source, SourceRef: "refs/heads/main", IntegrationAgentID: agent.ID, RequestID: "p3-project"})
 	requireNoError(t, err)
-	task, err := components.service.CreateTask(ctx, core.CreateTaskInput{
-		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
-		Title: "exit zero after saying done completed", MaxRetries: 0, RequestID: "p3-task",
-	})
+	task, err := components.service.CreateTask(ctx, core.CreateTaskInput{ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork, Title: "exit zero after saying done completed", MaxRetries: 0, RequestID: "p3-task"})
 	requireNoError(t, err)
 	components.runtime.Start(ctx)
 
@@ -723,11 +689,7 @@ func noneNetworkConfigWithProviderEnv(t *testing.T, root string, providerEnv []s
 	t.Helper()
 	dataDir := filepath.Join(root, "data")
 	configPath := filepath.Join(root, "coordplane.yaml")
-	raw := testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{
-		DataDir: dataDir, OperatorSocket: filepath.Join(dataDir, "operator.sock"),
-		MaxParallelRuns: 4, CompletedWorkspace: "24h", TerminalTaskRef: "168h", RunLog: "168h",
-		DockerNetwork: "coordplane", DefaultImage: "coordplane-agent:latest", ProviderEnv: providerEnv,
-	})
+	raw := testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{DataDir: dataDir, OperatorSocket: filepath.Join(dataDir, "operator.sock"), MaxParallelRuns: 4, CompletedWorkspace: "24h", TerminalTaskRef: "168h", RunLog: "168h", DockerNetwork: "coordplane", DefaultImage: "coordplane-agent:latest", ProviderEnv: providerEnv})
 	requireNoError(t, os.WriteFile(configPath, raw, 0o600))
 	return configPath, []byte(strings.ReplaceAll(string(raw), "  docker_network: coordplane\n", "  docker_network: none\n"))
 }
@@ -786,8 +748,7 @@ func newP3DockerFixtureAdapterWithProviderEnvAndRunTimeout(t *testing.T, adapter
 	}
 	configPath, rawConfig := noneNetworkConfigWithProviderEnv(t, root, providerEnv)
 	if runTimeout > 0 {
-		rawConfig = []byte(strings.Replace(string(rawConfig),
-			"  default_image:", "  run_timeout: "+runTimeout.String()+"\n  default_image:", 1))
+		rawConfig = []byte(strings.Replace(string(rawConfig), "  default_image:", "  run_timeout: "+runTimeout.String()+"\n  default_image:", 1))
 	}
 	requireNoError(t, os.WriteFile(configPath, rawConfig, 0o600))
 	instructions := filepath.Join(root, "instructions.md")
@@ -796,10 +757,7 @@ func newP3DockerFixtureAdapterWithProviderEnvAndRunTimeout(t *testing.T, adapter
 	assembled, err := buildComponents(ctx, configPath)
 	requireNoError(t, err)
 	assembled.runtime.coordlink = coordlinkPath
-	fixture := &p3DockerFixture{
-		ctx: ctx, root: root, image: image, adapterID: adapterName, instructions: instructions,
-		source: source, components: assembled, executor: executor,
-	}
+	fixture := &p3DockerFixture{ctx: ctx, root: root, image: image, adapterID: adapterName, instructions: instructions, source: source, components: assembled, executor: executor}
 	t.Cleanup(func() {
 		shutdown, stop := context.WithTimeout(context.Background(), 25*time.Second)
 		defer stop()
@@ -855,9 +813,7 @@ func prepareCreatedRunForReconcile(t *testing.T, fixture *p3DockerFixture, claim
 	if !ok {
 		t.Fatalf("adapter %q is not registered", prepared.AdapterID)
 	}
-	command, err := entry.BuildStartCommand(adapter.LaunchSpec{
-		BootstrapPath: adapter.ContainerBootstrapPath, ContainerHome: "/home/agent", ContainerWork: "/workspace/project",
-	})
+	command, err := entry.BuildStartCommand(adapter.LaunchSpec{BootstrapPath: adapter.ContainerBootstrapPath, ContainerHome: "/home/agent", ContainerWork: "/workspace/project"})
 	requireNoError(t, err)
 	containerSpec, err := fixture.components.runtime.containerSpec(prepared, launch.Task.Kind, command, controlPath)
 	requireNoError(t, err)
@@ -869,10 +825,7 @@ func prepareCreatedRunForReconcile(t *testing.T, fixture *p3DockerFixture, claim
 		_, _ = fixture.executor.Stop(cleanup, ref, 0)
 		_, _ = fixture.executor.Remove(cleanup, ref)
 	})
-	created, err := fixture.components.service.RecordContainerCreated(
-		fixture.ctx,
-		runtimeFactInput(prepared, ref, "rt05-created"),
-	)
+	created, err := fixture.components.service.RecordContainerCreated(fixture.ctx, runtimeFactInput(prepared, ref, "rt05-created"))
 	requireNoError(t, err)
 	return created
 }
@@ -900,17 +853,11 @@ func prepareCreatedRunAndActivate(t *testing.T, fixture *p3DockerFixture, projec
 	if _, err := fixture.executor.Attach(fixture.ctx, runtimeRef(created)); err != nil {
 		t.Fatal(err)
 	}
-	started, err := fixture.components.service.RecordRunStartIssued(
-		fixture.ctx,
-		runtimeFactInput(created, runtimeRef(created), startPhase),
-	)
+	started, err := fixture.components.service.RecordRunStartIssued(fixture.ctx, runtimeFactInput(created, runtimeRef(created), startPhase))
 	requireNoError(t, err)
 	startedRef, err := fixture.executor.Start(fixture.ctx, runtimeRef(started))
 	requireNoError(t, err)
-	active, err := fixture.components.service.ObserveProcessAndActivateRun(
-		fixture.ctx,
-		runtimeFactInput(started, startedRef, activePhase),
-	)
+	active, err := fixture.components.service.ObserveProcessAndActivateRun(fixture.ctx, runtimeFactInput(started, startedRef, activePhase))
 	requireNoError(t, err)
 	return active
 }
@@ -944,30 +891,21 @@ func restartRuntimeController(t *testing.T, fixture *p3DockerFixture, runID stri
 
 func (f *p3DockerFixture) addAgent(t *testing.T, name string) core.Agent {
 	t.Helper()
-	agent, err := f.components.service.AddAgent(f.ctx, core.AddAgentInput{
-		DisplayName: name, AdapterID: f.adapterID, Image: f.image,
-		InstructionsFile: f.instructions, RequestID: "agent-" + strings.ReplaceAll(name, " ", "-"),
-	})
+	agent, err := f.components.service.AddAgent(f.ctx, core.AddAgentInput{DisplayName: name, AdapterID: f.adapterID, Image: f.image, InstructionsFile: f.instructions, RequestID: "agent-" + strings.ReplaceAll(name, " ", "-")})
 	requireNoError(t, err)
 	return agent
 }
 
 func (f *p3DockerFixture) addProject(t *testing.T, integrationAgentID string) core.Project {
 	t.Helper()
-	project, err := f.components.service.AddProject(f.ctx, core.AddProjectInput{
-		Name: "project-" + integrationAgentID, Source: f.source, SourceRef: "refs/heads/main",
-		IntegrationAgentID: integrationAgentID, RequestID: "project-" + integrationAgentID,
-	})
+	project, err := f.components.service.AddProject(f.ctx, core.AddProjectInput{Name: "project-" + integrationAgentID, Source: f.source, SourceRef: "refs/heads/main", IntegrationAgentID: integrationAgentID, RequestID: "project-" + integrationAgentID})
 	requireNoError(t, err)
 	return project
 }
 
 func (f *p3DockerFixture) addTask(t *testing.T, projectID, agentID, title string, retries int) core.Task {
 	t.Helper()
-	task, err := f.components.service.CreateTask(f.ctx, core.CreateTaskInput{
-		ProjectID: projectID, AssigneeAgentID: agentID, Kind: core.TaskWork,
-		Title: title, MaxRetries: retries, RequestID: "task-" + strings.ReplaceAll(title, " ", "-"),
-	})
+	task, err := f.components.service.CreateTask(f.ctx, core.CreateTaskInput{ProjectID: projectID, AssigneeAgentID: agentID, Kind: core.TaskWork, Title: title, MaxRetries: retries, RequestID: "task-" + strings.ReplaceAll(title, " ", "-")})
 	requireNoError(t, err)
 	return task
 }
@@ -1157,10 +1095,7 @@ func mutatePrivateMainFromContainer(
 	privateSHA := strings.TrimSpace(gitIn(t, run.WorkspacePath, "rev-parse", "HEAD"))
 	gitIn(t, run.WorkspacePath, "update-ref", "refs/heads/main", canonicalSHA)
 
-	dockerExecOutput(t, fixture, run,
-		"/bin/sh", "-eu", "-c", `printf '%s\n' "$1" > /workspace/project/.git/refs/heads/main`,
-		"rt01-ref", privateSHA,
-	)
+	dockerExecOutput(t, fixture, run, "/bin/sh", "-eu", "-c", `printf '%s\n' "$1" > /workspace/project/.git/refs/heads/main`, "rt01-ref", privateSHA)
 	if actual := strings.TrimSpace(gitIn(t, run.WorkspacePath, "rev-parse", "refs/heads/main")); actual != privateSHA {
 		t.Fatalf("container private main = %s, want %s", actual, privateSHA)
 	}

@@ -321,10 +321,7 @@ func (c *runtimeController) reconcileDurableIntent(ctx context.Context, run core
 	if err != nil {
 		return core.Run{}, core.Task{}, false, err
 	}
-	updated, err := c.service.RequestRuntimeStop(ctx, core.RunStopInput{
-		RunID: run.ID, Reason: reason, OperationID: operation,
-		RequestID: runtimeRequest(run, "reconcile-stop"),
-	})
+	updated, err := c.service.RequestRuntimeStop(ctx, core.RunStopInput{RunID: run.ID, Reason: reason, OperationID: operation, RequestID: runtimeRequest(run, "reconcile-stop")})
 	if err != nil {
 		return core.Run{}, core.Task{}, false, err
 	}
@@ -697,10 +694,7 @@ func (c *runtimeController) persistShutdownIntents(ctx context.Context) error {
 			result = errors.Join(result, operationErr)
 			continue
 		}
-		_, stopErr := c.service.RequestRuntimeStop(ctx, core.RunStopInput{
-			RunID: run.ID, Reason: runtimeShutdownReason, OperationID: operation,
-			RequestID: runtimeRequest(run, "shutdown"),
-		})
+		_, stopErr := c.service.RequestRuntimeStop(ctx, core.RunStopInput{RunID: run.ID, Reason: runtimeShutdownReason, OperationID: operation, RequestID: runtimeRequest(run, "shutdown")})
 		if stopErr != nil {
 			latest, latestErr := c.service.Run(ctx, run.ID)
 			if latestErr == nil && (core.IsRunTerminal(latest.State) || latest.StopRequestedAt != "") {
@@ -807,10 +801,7 @@ func (c *runtimeController) shutdownRun(ctx context.Context, run core.Run) error
 		if err != nil {
 			return err
 		}
-		updated, err := c.service.RequestRuntimeStop(ctx, core.RunStopInput{
-			RunID: run.ID, Reason: runtimeShutdownReason, OperationID: operation,
-			RequestID: runtimeRequest(run, "shutdown"),
-		})
+		updated, err := c.service.RequestRuntimeStop(ctx, core.RunStopInput{RunID: run.ID, Reason: runtimeShutdownReason, OperationID: operation, RequestID: runtimeRequest(run, "shutdown")})
 		if err != nil {
 			return err
 		}
@@ -852,10 +843,7 @@ func (c *runtimeController) shutdownRun(ctx context.Context, run core.Run) error
 	c.mu.Lock()
 	control := c.controls[run.ID]
 	c.mu.Unlock()
-	monitor := &runMonitor{
-		runID: run.ID, ref: ref, entry: entry, control: control,
-		redact: c.runtimeRedaction(run), logs: make(chan error, 1),
-	}
+	monitor := &runMonitor{runID: run.ID, ref: ref, entry: entry, control: control, redact: c.runtimeRedaction(run), logs: make(chan error, 1)}
 	if monitor.redact.failClosed {
 		monitor.logs <- nil
 	} else {

@@ -215,19 +215,11 @@ func TestTaskHasStartedRunSearchesBeyondTheFirstHundredHistoryRows(t *testing.T)
 		}); err != nil {
 			return err
 		}
-		if err := tx.InsertAgent(core.Agent{
-			ID: agentID, DisplayName: "Run history", AdapterID: "test", Image: "test:latest",
-			InstructionsFile: "/instructions", Status: core.AgentActive,
-			Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime,
-		}); err != nil {
+		if err := tx.InsertAgent(core.Agent{ID: agentID, DisplayName: "Run history", AdapterID: "test", Image: "test:latest", InstructionsFile: "/instructions", Status: core.AgentActive, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime}); err != nil {
 			return err
 		}
 		for _, id := range []string{taskID, otherTask} {
-			if err := tx.InsertTask(core.Task{
-				ID: id, ProjectID: projectID, Kind: core.TaskWork, CreatedByKind: "boss",
-				AssigneeAgentID: agentID, Title: id, Status: core.TaskFailed, NextRunAt: readTestTime,
-				Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime,
-			}); err != nil {
+			if err := tx.InsertTask(core.Task{ID: id, ProjectID: projectID, Kind: core.TaskWork, CreatedByKind: "boss", AssigneeAgentID: agentID, Title: id, Status: core.TaskFailed, NextRunAt: readTestTime, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime}); err != nil {
 				return err
 			}
 		}
@@ -285,11 +277,7 @@ func TestEventHistoryUsesOpaqueIDCursorWithoutGapsOrDuplicates(t *testing.T) {
 	const eventCount = 47
 	if err := database.Transact(ctx, func(tx core.Transaction) error {
 		for index := 1; index <= eventCount; index++ {
-			if _, err := tx.AppendEvent(core.Event{
-				ProjectID: "prj_events", EntityType: "daemon", EntityID: "daemon",
-				Kind: fmt.Sprintf("test.event.%02d", index), ActorKind: "daemon",
-				PayloadJSON: string(payload), CreatedAt: readTestTime,
-			}); err != nil {
+			if _, err := tx.AppendEvent(core.Event{ProjectID: "prj_events", EntityType: "daemon", EntityID: "daemon", Kind: fmt.Sprintf("test.event.%02d", index), ActorKind: "daemon", PayloadJSON: string(payload), CreatedAt: readTestTime}); err != nil {
 				return err
 			}
 		}
@@ -302,9 +290,7 @@ func TestEventHistoryUsesOpaqueIDCursorWithoutGapsOrDuplicates(t *testing.T) {
 	seen := make(map[int64]bool, eventCount)
 	var previousOldest int64
 	for pageNumber := 0; pageNumber < eventCount; pageNumber++ {
-		page, err := database.EventsPage(ctx, core.EventFilter{
-			ProjectID: "prj_events", Cursor: cursor, Limit: core.MaximumEventPageLimit,
-		})
+		page, err := database.EventsPage(ctx, core.EventFilter{ProjectID: "prj_events", Cursor: cursor, Limit: core.MaximumEventPageLimit})
 		requireNoError(t, err)
 		if len(page.Items) == 0 {
 			t.Fatalf("event page %d made no cursor progress", pageNumber)
@@ -362,11 +348,7 @@ func TestStatusProjectionIsBoundedAndOmitsHistoricalPayloads(t *testing.T) {
 	err := database.Transact(ctx, func(tx core.Transaction) error {
 		for index := 0; index < core.StatusSnapshotLimit; index++ {
 			id := fmt.Sprintf("tsk_%03d", index)
-			if err := tx.InsertTask(core.Task{
-				ID: id, ProjectID: "prj_zzzz", Kind: core.TaskWork, CreatedByKind: "boss",
-				AssigneeAgentID: "agt_zzzz", Title: id, Status: core.TaskWaiting,
-				NextRunAt: readTestTime, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime,
-			}); err != nil {
+			if err := tx.InsertTask(core.Task{ID: id, ProjectID: "prj_zzzz", Kind: core.TaskWork, CreatedByKind: "boss", AssigneeAgentID: "agt_zzzz", Title: id, Status: core.TaskWaiting, NextRunAt: readTestTime, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime}); err != nil {
 				return err
 			}
 		}
@@ -472,11 +454,7 @@ func TestStatusProjectionMarksAgentsOmittedAfterRequiredSlotsFillTheBound(t *tes
 	err := database.Transact(ctx, func(tx core.Transaction) error {
 		for index := 0; index < core.StatusSnapshotLimit; index++ {
 			id := fmt.Sprintf("agt_required_%02d", index)
-			if err := tx.InsertAgent(core.Agent{
-				ID: id, DisplayName: id, AdapterID: "test", Image: "test:latest",
-				InstructionsFile: "/instructions", Status: core.AgentActive,
-				Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime,
-			}); err != nil {
+			if err := tx.InsertAgent(core.Agent{ID: id, DisplayName: id, AdapterID: "test", Image: "test:latest", InstructionsFile: "/instructions", Status: core.AgentActive, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime}); err != nil {
 				return err
 			}
 			if err := tx.InsertTask(core.Task{
@@ -488,11 +466,7 @@ func TestStatusProjectionMarksAgentsOmittedAfterRequiredSlotsFillTheBound(t *tes
 				return err
 			}
 		}
-		return tx.InsertAgent(core.Agent{
-			ID: "agt_omitted", DisplayName: "omitted", AdapterID: "test", Image: "test:latest",
-			InstructionsFile: "/instructions", Status: core.AgentActive,
-			Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime,
-		})
+		return tx.InsertAgent(core.Agent{ID: "agt_omitted", DisplayName: "omitted", AdapterID: "test", Image: "test:latest", InstructionsFile: "/instructions", Status: core.AgentActive, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime})
 	})
 	requireNoError(t, err)
 
@@ -529,18 +503,10 @@ func insertReadFixture(ctx context.Context, database *Store, suffix string, task
 		}); err != nil {
 			return err
 		}
-		if err := tx.InsertAgent(core.Agent{
-			ID: agentID, DisplayName: agentID, AdapterID: "test", Image: "test:latest",
-			InstructionsFile: "/instructions", Status: core.AgentActive,
-			Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime,
-		}); err != nil {
+		if err := tx.InsertAgent(core.Agent{ID: agentID, DisplayName: agentID, AdapterID: "test", Image: "test:latest", InstructionsFile: "/instructions", Status: core.AgentActive, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime}); err != nil {
 			return err
 		}
-		if err := tx.InsertTask(core.Task{
-			ID: taskID, ProjectID: projectID, Kind: core.TaskWork, CreatedByKind: "boss",
-			AssigneeAgentID: agentID, Title: taskID, Status: taskStatus, CurrentRunID: currentRunID,
-			NextRunAt: readTestTime, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime,
-		}); err != nil {
+		if err := tx.InsertTask(core.Task{ID: taskID, ProjectID: projectID, Kind: core.TaskWork, CreatedByKind: "boss", AssigneeAgentID: agentID, Title: taskID, Status: taskStatus, CurrentRunID: currentRunID, NextRunAt: readTestTime, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime}); err != nil {
 			return err
 		}
 		if err := tx.InsertRun(core.Run{
@@ -559,18 +525,11 @@ func insertReadFixture(ctx context.Context, database *Store, suffix string, task
 		}); err != nil {
 			return err
 		}
-		if _, err := tx.AppendEvent(core.Event{
-			ProjectID: projectID, EntityType: "task", EntityID: taskID, Kind: "task.created",
-			ActorKind: "boss", RequestID: "request-" + suffix, PayloadJSON: "{}", CreatedAt: readTestTime,
-		}); err != nil {
+		if _, err := tx.AppendEvent(core.Event{ProjectID: projectID, EntityType: "task", EntityID: taskID, Kind: "task.created", ActorKind: "boss", RequestID: "request-" + suffix, PayloadJSON: "{}", CreatedAt: readTestTime}); err != nil {
 			return err
 		}
 		if progress {
-			_, err := tx.AppendEvent(core.Event{
-				ProjectID: projectID, EntityType: "task", EntityID: taskID, Kind: "task.progress",
-				ActorKind: "agent", ActorID: agentID, RunID: runID,
-				RequestID: "progress-" + suffix, PayloadJSON: `{"summary":"ready"}`, CreatedAt: readTestTime,
-			})
+			_, err := tx.AppendEvent(core.Event{ProjectID: projectID, EntityType: "task", EntityID: taskID, Kind: "task.progress", ActorKind: "agent", ActorID: agentID, RunID: runID, RequestID: "progress-" + suffix, PayloadJSON: `{"summary":"ready"}`, CreatedAt: readTestTime})
 			return err
 		}
 		return nil

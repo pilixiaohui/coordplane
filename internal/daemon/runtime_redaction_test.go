@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -42,13 +43,28 @@ func TestRuntimeRedaction(t *testing.T) {
 	}
 }
 
+// newRunControlDir creates a per-run control directory under a fresh root and
+// returns the control root so the controller can resolve the run by ID.
+func newRunControlDir(t *testing.T, runID string, files map[string]string) string {
+	t.Helper()
+	controlRoot := filepath.Join(t.TempDir(), "run-control")
+	writeRunControl(t, controlRoot, runID, files)
+	return controlRoot
+}
+
+func writeRunControl(t *testing.T, controlRoot, runID string, files map[string]string) {
+	t.Helper()
+	path := filepath.Join(controlRoot, runID)
+	requireNoError(t, os.MkdirAll(path, 0o700))
+	for name, data := range files {
+		requireNoError(t, os.WriteFile(filepath.Join(path, name), []byte(data), 0o440))
+	}
+}
+
 func TestRuntimeRedactionDoesNotRereadAgentInstructions(t *testing.T) {
 	service := newRuntimeTestService(t)
 	canary := "REDACT-CANARY-INSTRUCTIONS"
-	agent := requireRuntimeValue(service.AddAgent(context.Background(), core.AddAgentInput{
-		DisplayName: "Redaction Agent", AdapterID: "claude", Image: "agent:test",
-		InstructionsText: canary, RequestID: "redaction-instructions-agent",
-	}))
+	agent := requireRuntimeValue(service.AddAgent(context.Background(), core.AddAgentInput{DisplayName: "Redaction Agent", AdapterID: "claude", Image: "agent:test", InstructionsText: canary, RequestID: "redaction-instructions-agent"}))
 	controller := &runtimeController{service: service, controlRoot: t.TempDir()}
 	run := core.Run{ID: "run-redaction", AgentID: agent.ID}
 
@@ -58,36 +74,34 @@ func TestRuntimeRedactionDoesNotRereadAgentInstructions(t *testing.T) {
 	}
 }
 
-func TestRuntimeRedactionIncludesBootstrapInstructions(t *testing.T) {
-	canary := "REDACT-CANARY-INSTRUCTIONS"
-	root := t.TempDir()
-	runID := "run-redaction"
-	controlPath := filepath.Join(root, "run-control", runID)
-	requireNoError(t, os.MkdirAll(controlPath, 0o700))
-	bootstrap := canary + "\n\nCoordPlane Run context\nProject: p\nAgent: a\nTask: t\nRun: " + runID + "\n"
-	requireNoError(t, os.WriteFile(filepath.Join(controlPath, "bootstrap"), []byte(bootstrap), 0o440))
-	controller := &runtimeController{controlRoot: filepath.Join(root, "run-control")}
-	run := core.Run{ID: runID}
+func TestRuntimeRedactionLegacyBootstrapRedactsInstructions(t *testing.T) {
+	canary := "LEGACY-CANARY"
+	bootstrap := "agent prompt\n" + canary + "\n\nCoordPlane Run context\nProject: p\nAgent: a\n"
+	controlRoot := newRunControlDir(t, "run-legacy", map[string]string{runtimeBootstrapFile: bootstrap})
+	controller := &runtimeController{controlRoot: controlRoot}
+	run := core.Run{ID: "run-legacy"}
 
-	text := controller.runtimeRedaction(run).Text("provider echoed " + canary)
+	values, ok := controller.runtimeRunInstructions(run)
+	if !ok || len(values) != 1 || values[0] != "agent prompt\n"+canary {
+		t.Fatalf("legacy runtimeRunInstructions = %#v ok=%t, want the bootstrap instructions prefix", values, ok)
+	}
+	redact := controller.runtimeRedaction(run)
+	if redact.failClosed {
+		t.Fatal("legacy run failed closed")
+	}
+	text := redact.Text("provider echoed " + values[0])
 	if strings.Contains(text, canary) {
-		t.Fatalf("runtime redaction retained instructions text: %q", text)
+		t.Fatalf("legacy bootstrap fallback leaked instructions: %q", text)
 	}
 	if !strings.Contains(text, redactedSecret) {
-		t.Fatalf("runtime redaction did not replace instructions text: %q", text)
+		t.Fatalf("legacy bootstrap fallback did not redact instructions: %q", text)
 	}
 }
 
 func TestRuntimeRedactionInstructionsFileIsCollisionSafe(t *testing.T) {
 	canary := "CANARY-AFTER-SEPARATOR"
 	instructions := "agent prompt header\n\nCoordPlane Run context\n" + canary
-	root := t.TempDir()
-	controlRoot := filepath.Join(root, "run-control")
-	controlPath := filepath.Join(controlRoot, "run-collision")
-	requireNoError(t, os.MkdirAll(controlPath, 0o700))
-	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeInstructionsFile), []byte(instructions), 0o440))
-	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeLaunchFile), []byte("#!/bin/sh\n"), 0o550))
-	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeSecretsFile), []byte(""), 0o440))
+	controlRoot := newRunControlDir(t, "run-collision", map[string]string{runtimeInstructionsFile: instructions, runtimeLaunchFile: "#!/bin/sh\n", runtimeSecretsFile: ""})
 	sum := sha256.Sum256([]byte(instructions))
 	controller := &runtimeController{controlRoot: controlRoot}
 	run := core.Run{ID: "run-collision", InstructionsHash: hex.EncodeToString(sum[:])}
@@ -111,16 +125,9 @@ func TestRuntimeRedactionInstructionsFileIsCollisionSafe(t *testing.T) {
 
 func TestRuntimeRedactionInstructionsFileMatchesLegacyBootstrap(t *testing.T) {
 	instructions := "system prompt with a normal body\nno separator line here\nkeep this whole text"
-	root := t.TempDir()
-	controlRoot := filepath.Join(root, "run-control")
-	controlPath := filepath.Join(controlRoot, "run-parity")
-	legacyPath := filepath.Join(controlRoot, "run-legacy-parity")
-	requireNoError(t, os.MkdirAll(controlPath, 0o700))
-	requireNoError(t, os.MkdirAll(legacyPath, 0o700))
-	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeInstructionsFile), []byte(instructions), 0o440))
-	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeLaunchFile), []byte("#!/bin/sh\n"), 0o550))
-	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeSecretsFile), []byte(""), 0o440))
-	requireNoError(t, os.WriteFile(filepath.Join(legacyPath, runtimeBootstrapFile), []byte(instructions+"\n\nCoordPlane Run context\nProject: p\n"), 0o440))
+	controlRoot := filepath.Join(t.TempDir(), "run-control")
+	writeRunControl(t, controlRoot, "run-parity", map[string]string{runtimeInstructionsFile: instructions, runtimeLaunchFile: "#!/bin/sh\n", runtimeSecretsFile: ""})
+	writeRunControl(t, controlRoot, "run-legacy-parity", map[string]string{runtimeBootstrapFile: instructions + "\n\nCoordPlane Run context\nProject: p\n"})
 	sum := sha256.Sum256([]byte(instructions))
 	controller := &runtimeController{controlRoot: controlRoot}
 	newLineage := controller.runtimeRedaction(core.Run{ID: "run-parity", InstructionsHash: hex.EncodeToString(sum[:])})
@@ -134,46 +141,10 @@ func TestRuntimeRedactionInstructionsFileMatchesLegacyBootstrap(t *testing.T) {
 	}
 }
 
-func TestRuntimeRedactionLegacyRunFallsBackToBootstrap(t *testing.T) {
-	canary := "LEGACY-CANARY"
-	bootstrap := "agent prompt\n" + canary + "\n\nCoordPlane Run context\nProject: p\nAgent: a\n"
-	root := t.TempDir()
-	controlRoot := filepath.Join(root, "run-control")
-	controlPath := filepath.Join(controlRoot, "run-legacy")
-	requireNoError(t, os.MkdirAll(controlPath, 0o700))
-	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeBootstrapFile), []byte(bootstrap), 0o440))
-	controller := &runtimeController{controlRoot: controlRoot}
-	run := core.Run{ID: "run-legacy"}
-
-	values, ok := controller.runtimeRunInstructions(run)
-	if !ok || len(values) != 1 || values[0] != "agent prompt\n"+canary {
-		t.Fatalf("legacy runtimeRunInstructions = %#v ok=%t, want the bootstrap instructions prefix", values, ok)
-	}
-	redact := controller.runtimeRedaction(run)
-	if redact.failClosed {
-		t.Fatal("legacy run failed closed")
-	}
-	text := redact.Text("provider echoed " + values[0])
-	if strings.Contains(text, canary) {
-		t.Fatalf("legacy bootstrap fallback leaked instructions: %q", text)
-	}
-	if !strings.Contains(text, redactedSecret) {
-		t.Fatalf("legacy bootstrap fallback did not redact instructions: %q", text)
-	}
-}
-
 func TestRuntimeRedactionNewLineageFailsClosedWithoutTrustedInstructions(t *testing.T) {
-	root := t.TempDir()
-	controlRoot := filepath.Join(root, "run-control")
-	controlPath := filepath.Join(controlRoot, "run-fail-closed")
-	requireNoError(t, os.MkdirAll(controlPath, 0o700))
-	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeLaunchFile), []byte("#!/bin/sh\n"), 0o550))
-	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeSecretsFile), []byte(""), 0o440))
-	controller := &runtimeController{controlRoot: controlRoot}
 	canary := "UNREDACTED-CANARY"
 	sum := sha256.Sum256([]byte("original prompt"))
 	run := core.Run{ID: "run-fail-closed", InstructionsHash: hex.EncodeToString(sum[:])}
-
 	for _, test := range []struct {
 		name string
 		raw  []byte
@@ -182,22 +153,21 @@ func TestRuntimeRedactionNewLineageFailsClosedWithoutTrustedInstructions(t *test
 		{name: "hash-mismatched instructions file", raw: []byte("tampered prompt")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			controlRoot := newRunControlDir(t, "run-fail-closed", map[string]string{runtimeLaunchFile: "#!/bin/sh\n", runtimeSecretsFile: ""})
+			controller := &runtimeController{controlRoot: controlRoot}
 			if test.raw != nil {
-				requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeInstructionsFile), test.raw, 0o440))
+				requireNoError(t, os.WriteFile(filepath.Join(controlRoot, "run-fail-closed", runtimeInstructionsFile), test.raw, 0o440))
 			}
 			if _, ok := controller.runtimeRunInstructions(run); ok {
-				t.Fatalf("runtimeRunInstructions did not fail closed")
+				t.Fatal("runtimeRunInstructions did not fail closed")
 			}
 			redact := controller.runtimeRedaction(run)
 			if !redact.failClosed {
 				t.Fatal("runtime redaction did not fail closed")
 			}
 			text := redact.Text("provider echoed " + canary)
-			if strings.Contains(text, canary) {
-				t.Fatalf("fail-closed redaction leaked content: %q", text)
-			}
-			if !strings.Contains(text, redactionUnavailableMarker) {
-				t.Fatalf("fail-closed redaction did not emit the unavailable marker: %q", text)
+			if strings.Contains(text, canary) || !strings.Contains(text, redactionUnavailableMarker) {
+				t.Fatalf("fail-closed redaction leaked content or missed the marker: %q", text)
 			}
 		})
 	}
@@ -240,21 +210,9 @@ func TestParseRunSecretsFile(t *testing.T) {
 			want:   []string{"one"},
 			wantOK: true,
 		},
-		{
-			name:   "unquoted value rejected",
-			raw:    "SECRET=bare-value\n",
-			wantOK: false,
-		},
-		{
-			name:   "invalid key rejected",
-			raw:    "1BAD='value'\n",
-			wantOK: false,
-		},
-		{
-			name:   "unterminated quote rejected",
-			raw:    "SECRET='oops\n",
-			wantOK: false,
-		},
+		{name: "unquoted value rejected", raw: "SECRET=bare-value\n", wantOK: false},
+		{name: "invalid key rejected", raw: "1BAD='value'\n", wantOK: false},
+		{name: "unterminated quote rejected", raw: "SECRET='oops\n", wantOK: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			values, ok := parseRunSecretsFile(test.raw)
@@ -264,13 +222,8 @@ func TestParseRunSecretsFile(t *testing.T) {
 			if !test.wantOK {
 				return
 			}
-			if len(values) != len(test.want) {
+			if !slices.Equal(values, test.want) {
 				t.Fatalf("parseRunSecretsFile values = %#v, want %#v", values, test.want)
-			}
-			for index := range test.want {
-				if values[index] != test.want[index] {
-					t.Fatalf("parseRunSecretsFile values = %#v, want %#v", values, test.want)
-				}
 			}
 		})
 	}
@@ -290,35 +243,24 @@ func TestSerializeRunSecretsFileRoundTrips(t *testing.T) {
 	if !ok {
 		t.Fatalf("serialized secrets file did not parse back: %q", raw)
 	}
-	got := append([]string(nil), parsed...)
 	want := []string{"sk-ant $(rm -rf /) ; | & > x*", `it's "quoted"`, "line one\nline two\nline three", "simple", ""}
-	sort.Strings(got)
+	sort.Strings(parsed)
 	sort.Strings(want)
-	if len(got) != len(want) {
-		t.Fatalf("round-trip secrets = %#v, want %#v", got, want)
-	}
-	for index := range want {
-		if got[index] != want[index] {
-			t.Fatalf("round-trip secrets = %#v, want %#v", got, want)
-		}
+	if !slices.Equal(parsed, want) {
+		t.Fatalf("round-trip secrets = %#v, want %#v", parsed, want)
 	}
 }
 
-func TestSerializeRunSecretsFileRejectsInvalidKey(t *testing.T) {
+func TestSerializeRunSecretsFileRejectsUnsafe(t *testing.T) {
 	for _, secrets := range []map[string]string{
 		{"1BAD": "value"},
 		{"": "value"},
 		{"GOOD_KEY": "ok", "BAD-KEY": "value"},
+		{"KEY": "a\x00b"},
 	} {
 		if _, err := serializeRunSecretsFile(secrets); err == nil {
-			t.Fatalf("serializeRunSecretsFile accepted unsafe keys: %#v", secrets)
+			t.Fatalf("serializeRunSecretsFile accepted unsafe secrets: %#v", secrets)
 		}
-	}
-}
-
-func TestSerializeRunSecretsFileRejectsNUL(t *testing.T) {
-	if _, err := serializeRunSecretsFile(map[string]string{"KEY": "a\x00b"}); err == nil {
-		t.Fatal("serializeRunSecretsFile accepted a NUL byte in a value")
 	}
 }
 
@@ -349,19 +291,13 @@ func TestRuntimeSecretsFileShellSourceSafety(t *testing.T) {
 
 func TestRuntimeRedactionLoadsSecretsFile(t *testing.T) {
 	canary := "REDACT-SECRET-FILE-VALUE $(with shell metachars)"
-	root := t.TempDir()
-	runID := "run-redaction-file"
-	controlPath := filepath.Join(root, "run-control", runID)
-	requireNoError(t, os.MkdirAll(controlPath, 0o700))
 	raw := "ANTHROPIC_AUTH_TOKEN='" + strings.ReplaceAll(canary, "'", "'\\''") + "'\n"
-	requireNoError(t, os.WriteFile(filepath.Join(controlPath, "secrets"), []byte(raw), 0o440))
+	controlRoot := newRunControlDir(t, "run-redaction-file", map[string]string{runtimeSecretsFile: raw})
 	controller := &runtimeController{
-		controlRoot: filepath.Join(root, "run-control"),
-		config: config.Config{Runtime: config.RuntimeConfig{
-			ProviderEnvAllowlist: []string{"UNRELATED_ENV"},
-		}},
+		controlRoot: controlRoot,
+		config:      config.Config{Runtime: config.RuntimeConfig{ProviderEnvAllowlist: []string{"UNRELATED_ENV"}}},
 	}
-	run := core.Run{ID: runID}
+	run := core.Run{ID: "run-redaction-file"}
 
 	text := controller.runtimeRedaction(run).Text("provider echoed " + canary)
 	if strings.Contains(text, canary) {
@@ -372,63 +308,41 @@ func TestRuntimeRedactionLoadsSecretsFile(t *testing.T) {
 	}
 }
 
-// R8: a new-lineage run whose control directory carries the launch file but no
-// secrets file must fail closed. The host provider allowlist env is never used
-// as a fallback for new lineages, so no unredacted content can be persisted.
-func TestRuntimeRedactionNewLineageFailsClosedWithoutSecretsFile(t *testing.T) {
+// R8/R9: a new-lineage run whose control directory carries the launch file but
+// no trusted secrets file must fail closed. The host provider allowlist env is
+// never used as a fallback for new lineages, so no unredacted content persists.
+func TestRuntimeRedactionNewLineageFailsClosedWithoutTrustedSecrets(t *testing.T) {
 	canary := "UNREDACTED-SECRETS-CANARY"
-	root := t.TempDir()
-	controlRoot := filepath.Join(root, "run-control")
-	controlPath := filepath.Join(controlRoot, "run-secrets-missing")
-	requireNoError(t, os.MkdirAll(controlPath, 0o700))
-	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeLaunchFile), []byte("#!/bin/sh\n"), 0o550))
 	t.Setenv("HOST_PROVIDER_TOKEN", canary)
-	controller := &runtimeController{
-		controlRoot: controlRoot,
-		config: config.Config{Runtime: config.RuntimeConfig{
-			ProviderEnvAllowlist: []string{"HOST_PROVIDER_TOKEN"},
-		}},
-	}
-	run := core.Run{ID: "run-secrets-missing"}
-
-	if _, ok := controller.runtimeRunSecrets(run); ok {
-		t.Fatal("new-lineage runtimeRunSecrets without a secrets file did not fail closed")
-	}
-	redact := controller.runtimeRedaction(run)
-	if !redact.failClosed {
-		t.Fatal("new-lineage runtime redaction did not fail closed")
-	}
-	text := redact.Text("provider echoed " + canary)
-	if strings.Contains(text, canary) {
-		t.Fatalf("fail-closed redaction leaked host env canary: %q", text)
-	}
-	if !strings.Contains(text, redactionUnavailableMarker) {
-		t.Fatalf("fail-closed redaction did not emit the unavailable marker: %q", text)
-	}
-}
-
-// R9: a new-lineage run whose secrets file exists but is not shell-sourceable
-// must fail closed instead of trusting a malformed value.
-func TestRuntimeRedactionNewLineageFailsClosedOnCorruptSecretsFile(t *testing.T) {
-	canary := "UNREDACTED-CORRUPT-CANARY"
-	root := t.TempDir()
-	controlRoot := filepath.Join(root, "run-control")
-	controlPath := filepath.Join(controlRoot, "run-secrets-corrupt")
-	requireNoError(t, os.MkdirAll(controlPath, 0o700))
-	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeLaunchFile), []byte("#!/bin/sh\n"), 0o550))
-	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeSecretsFile), []byte("HOST_PROVIDER_TOKEN=bare-canary\n"), 0o440))
-	controller := &runtimeController{controlRoot: controlRoot}
-	run := core.Run{ID: "run-secrets-corrupt"}
-
-	if _, ok := controller.runtimeRunSecrets(run); ok {
-		t.Fatal("new-lineage runtimeRunSecrets with a corrupt secrets file did not fail closed")
-	}
-	redact := controller.runtimeRedaction(run)
-	if !redact.failClosed {
-		t.Fatal("new-lineage runtime redaction did not fail closed on a corrupt secrets file")
-	}
-	if text := redact.Text("provider echoed " + canary); !strings.Contains(text, redactionUnavailableMarker) {
-		t.Fatalf("fail-closed redaction did not emit the unavailable marker: %q", text)
+	for _, test := range []struct {
+		name string
+		raw  []byte
+	}{
+		{name: "missing secrets file"},
+		{name: "corrupt secrets file", raw: []byte("HOST_PROVIDER_TOKEN=bare-canary\n")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			controlRoot := newRunControlDir(t, "run-secrets", map[string]string{runtimeLaunchFile: "#!/bin/sh\n"})
+			controller := &runtimeController{
+				controlRoot: controlRoot,
+				config:      config.Config{Runtime: config.RuntimeConfig{ProviderEnvAllowlist: []string{"HOST_PROVIDER_TOKEN"}}},
+			}
+			run := core.Run{ID: "run-secrets"}
+			if test.raw != nil {
+				requireNoError(t, os.WriteFile(filepath.Join(controlRoot, "run-secrets", runtimeSecretsFile), test.raw, 0o440))
+			}
+			if _, ok := controller.runtimeRunSecrets(run); ok {
+				t.Fatal("new-lineage runtimeRunSecrets did not fail closed")
+			}
+			redact := controller.runtimeRedaction(run)
+			if !redact.failClosed {
+				t.Fatal("new-lineage runtime redaction did not fail closed")
+			}
+			text := redact.Text("provider echoed " + canary)
+			if strings.Contains(text, canary) || !strings.Contains(text, redactionUnavailableMarker) {
+				t.Fatalf("fail-closed redaction leaked host env canary or missed the marker: %q", text)
+			}
+		})
 	}
 }
 
@@ -436,25 +350,17 @@ func TestRuntimeRedactionNewLineageFailsClosedOnCorruptSecretsFile(t *testing.T)
 // env fallback, so its redaction remains available and redacts provider values.
 func TestRuntimeRedactionLegacyRunFallsBackToHostProviderEnv(t *testing.T) {
 	canary := "HOST-PROVIDER-ENV-CANARY"
-	root := t.TempDir()
-	controlRoot := filepath.Join(root, "run-control")
-	controlPath := filepath.Join(controlRoot, "run-legacy-env")
-	requireNoError(t, os.MkdirAll(controlPath, 0o700))
+	controlRoot := newRunControlDir(t, "run-legacy-env", nil)
 	t.Setenv("HOST_PROVIDER_TOKEN", canary)
 	controller := &runtimeController{
 		controlRoot: controlRoot,
-		config: config.Config{Runtime: config.RuntimeConfig{
-			ProviderEnvAllowlist: []string{"HOST_PROVIDER_TOKEN"},
-		}},
+		config:      config.Config{Runtime: config.RuntimeConfig{ProviderEnvAllowlist: []string{"HOST_PROVIDER_TOKEN"}}},
 	}
 	run := core.Run{ID: "run-legacy-env"}
 
 	values, ok := controller.runtimeRunSecrets(run)
-	if !ok {
-		t.Fatal("legacy runtimeRunSecrets failed closed instead of falling back to host provider env")
-	}
-	if len(values) != 1 || values[0] != canary {
-		t.Fatalf("legacy runtimeRunSecrets = %#v, want the host provider env canary", values)
+	if !ok || len(values) != 1 || values[0] != canary {
+		t.Fatalf("legacy runtimeRunSecrets = %#v ok=%t, want the host provider env canary", values, ok)
 	}
 	redact := controller.runtimeRedaction(run)
 	if redact.failClosed {
@@ -478,10 +384,7 @@ func TestRuntimeLogBoundaryRedactsBoundsAndReplaysFromZero(t *testing.T) {
 		runToken     = "run-token-log-boundary"
 	)
 	t.Setenv(providerName, secretLineA+"\n"+secretLineB)
-	run := core.Run{
-		ID: "run-log-boundary", WorkspacePath: filepath.Join(root, "workspace"),
-		HomePath: filepath.Join(root, "home"), LogPath: filepath.Join(root, "logs", "run.log"),
-	}
+	run := core.Run{ID: "run-log-boundary", WorkspacePath: filepath.Join(root, "workspace"), HomePath: filepath.Join(root, "home"), LogPath: filepath.Join(root, "logs", "run.log")}
 	controlRoot := filepath.Join(root, "run-control")
 	controlPath := filepath.Join(controlRoot, run.ID)
 	requireNoError(t, os.MkdirAll(controlPath, 0o700))
@@ -496,10 +399,7 @@ func TestRuntimeLogBoundaryRedactsBoundsAndReplaysFromZero(t *testing.T) {
 	}
 	executor := &replayLogExecutor{payload: payload.String()}
 	controller := &runtimeController{
-		config: config.Config{DataDir: root, Runtime: config.RuntimeConfig{
-			ProviderEnvAllowlist: []string{providerName}, WorkspaceRoot: filepath.Join(root, "workspace"),
-			AgentHomeRoot: filepath.Join(root, "home"), LogRoot: filepath.Join(root, "logs"),
-		}},
+		config:   config.Config{DataDir: root, Runtime: config.RuntimeConfig{ProviderEnvAllowlist: []string{providerName}, WorkspaceRoot: filepath.Join(root, "workspace"), AgentHomeRoot: filepath.Join(root, "home"), LogRoot: filepath.Join(root, "logs")}},
 		executor: executor, controlRoot: controlRoot,
 	}
 	monitor := &runMonitor{redact: controller.runtimeRedaction(run)}

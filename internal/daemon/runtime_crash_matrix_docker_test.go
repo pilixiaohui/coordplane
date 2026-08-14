@@ -83,28 +83,17 @@ func TestRT05EarlyOwnerFallbackIsSoleContainerCleanup(t *testing.T) {
 		requireNoError(t, os.WriteFile(instructions, []byte("Execute only the owner-fallback crash task."), 0o600))
 		seed, err := buildComponents(ctx, configPath)
 		requireNoError(t, err)
-		agent, err := seed.service.AddAgent(ctx, core.AddAgentInput{
-			DisplayName: "RT-05 owner fallback", AdapterID: "claude", Image: artifacts.image,
-			InstructionsFile: instructions, RequestID: "rt05-owner-fallback-agent",
-		})
+		agent, err := seed.service.AddAgent(ctx, core.AddAgentInput{DisplayName: "RT-05 owner fallback", AdapterID: "claude", Image: artifacts.image, InstructionsFile: instructions, RequestID: "rt05-owner-fallback-agent"})
 		if err != nil {
 			_ = seed.Close()
 			t.Fatal(err)
 		}
-		project, err := seed.service.AddProject(ctx, core.AddProjectInput{
-			Name: "RT-05 owner fallback", Source: createSourceRepository(t, root),
-			SourceRef: "refs/heads/main", IntegrationAgentID: agent.ID,
-			RequestID: "rt05-owner-fallback-project",
-		})
+		project, err := seed.service.AddProject(ctx, core.AddProjectInput{Name: "RT-05 owner fallback", Source: createSourceRepository(t, root), SourceRef: "refs/heads/main", IntegrationAgentID: agent.ID, RequestID: "rt05-owner-fallback-project"})
 		if err != nil {
 			_ = seed.Close()
 			t.Fatal(err)
 		}
-		task, err := seed.service.CreateTask(ctx, core.CreateTaskInput{
-			ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
-			Title: "crash before immutable cleanup registration", MaxRetries: 0,
-			RequestID: "rt05-owner-fallback-task",
-		})
+		task, err := seed.service.CreateTask(ctx, core.CreateTaskInput{ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork, Title: "crash before immutable cleanup registration", MaxRetries: 0, RequestID: "rt05-owner-fallback-task"})
 		if err != nil {
 			_ = seed.Close()
 			t.Fatal(err)
@@ -117,10 +106,7 @@ func TestRT05EarlyOwnerFallbackIsSoleContainerCleanup(t *testing.T) {
 
 		socket := filepath.Join(root, "data", "operator.sock")
 		readyPath := filepath.Join(root, "runtime-phase-ready")
-		first := startP3DaemonProcessWithEnv(t, artifacts.daemon, configPath, socket, filepath.Join(root, "daemon-first.log"), []string{
-			"COORDPLANE_CONTRACT_RUNTIME_PHASE=" + string(runtimePhaseContainerCreated),
-			"COORDPLANE_CONTRACT_RUNTIME_PHASE_READY=" + readyPath,
-		})
+		first := startP3DaemonProcessWithEnv(t, artifacts.daemon, configPath, socket, filepath.Join(root, "daemon-first.log"), []string{"COORDPLANE_CONTRACT_RUNTIME_PHASE=" + string(runtimePhaseContainerCreated), "COORDPLANE_CONTRACT_RUNTIME_PHASE_READY=" + readyPath})
 		t.Cleanup(func() { killP3DaemonProcess(t, first) })
 		client, err := transport.NewUnixClient(socket)
 		requireNoError(t, err)
@@ -188,8 +174,7 @@ func buildRT05ProcessArtifacts(t *testing.T, ctx context.Context) rt05ProcessArt
 			t.Fatalf("build RT-05 binary %s: %v\n%s", target.path, err, raw)
 		}
 	}
-	build := exec.CommandContext(ctx, "docker", "build", "-q", "-t", artifacts.image,
-		filepath.Join(repositoryRoot, "internal", "daemon", "testdata", "claude-runtime"))
+	build := exec.CommandContext(ctx, "docker", "build", "-q", "-t", artifacts.image, filepath.Join(repositoryRoot, "internal", "daemon", "testdata", "claude-runtime"))
 	build.Env = append(os.Environ(), "DOCKER_CONFIG="+artifacts.dockerConf)
 	if raw, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build RT-05 image: %v\n%s", err, raw)
@@ -229,20 +214,12 @@ func runRT05ProcessCase(
 	requireNoError(t, os.WriteFile(instructions, []byte("Execute only the assigned crash-matrix task."), 0o600))
 	seed, err := buildComponents(ctx, configPath)
 	requireNoError(t, err)
-	agent, err := seed.service.AddAgent(ctx, core.AddAgentInput{
-		DisplayName: "RT-05 " + string(phase) + " " + intent,
-		AdapterID:   "claude", Image: artifacts.image, InstructionsFile: instructions,
-		RequestID: "rt05-agent-" + string(phase) + "-" + intent,
-	})
+	agent, err := seed.service.AddAgent(ctx, core.AddAgentInput{DisplayName: "RT-05 " + string(phase) + " " + intent, AdapterID: "claude", Image: artifacts.image, InstructionsFile: instructions, RequestID: "rt05-agent-" + string(phase) + "-" + intent})
 	if err != nil {
 		_ = seed.Close()
 		t.Fatal(err)
 	}
-	project, err := seed.service.AddProject(ctx, core.AddProjectInput{
-		Name:   "RT-05 " + string(phase) + " " + intent,
-		Source: createSourceRepository(t, root), SourceRef: "refs/heads/main",
-		IntegrationAgentID: agent.ID, RequestID: "rt05-project-" + string(phase) + "-" + intent,
-	})
+	project, err := seed.service.AddProject(ctx, core.AddProjectInput{Name: "RT-05 " + string(phase) + " " + intent, Source: createSourceRepository(t, root), SourceRef: "refs/heads/main", IntegrationAgentID: agent.ID, RequestID: "rt05-project-" + string(phase) + "-" + intent})
 	if err != nil {
 		_ = seed.Close()
 		t.Fatal(err)
@@ -251,10 +228,7 @@ func runRT05ProcessCase(
 	if phase == runtimePhaseProcessExited {
 		title = "exit after active for crash matrix"
 	}
-	task, err := seed.service.CreateTask(ctx, core.CreateTaskInput{
-		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
-		Title: title, MaxRetries: 0, RequestID: "rt05-task-" + string(phase) + "-" + intent,
-	})
+	task, err := seed.service.CreateTask(ctx, core.CreateTaskInput{ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork, Title: title, MaxRetries: 0, RequestID: "rt05-task-" + string(phase) + "-" + intent})
 	if err != nil {
 		_ = seed.Close()
 		t.Fatal(err)
@@ -264,10 +238,7 @@ func runRT05ProcessCase(
 
 	socket := filepath.Join(root, "data", "operator.sock")
 	readyPath := filepath.Join(root, "runtime-phase-ready")
-	first := startP3DaemonProcessWithEnv(t, artifacts.daemon, configPath, socket, filepath.Join(root, "daemon-first.log"), []string{
-		"COORDPLANE_CONTRACT_RUNTIME_PHASE=" + string(phase),
-		"COORDPLANE_CONTRACT_RUNTIME_PHASE_READY=" + readyPath,
-	})
+	first := startP3DaemonProcessWithEnv(t, artifacts.daemon, configPath, socket, filepath.Join(root, "daemon-first.log"), []string{"COORDPLANE_CONTRACT_RUNTIME_PHASE=" + string(phase), "COORDPLANE_CONTRACT_RUNTIME_PHASE_READY=" + readyPath})
 	t.Cleanup(func() { killP3DaemonProcess(t, first) })
 	client, err := transport.NewUnixClient(socket)
 	requireNoError(t, err)
@@ -429,9 +400,7 @@ func waitForRT05DurableProgress(t *testing.T, ctx context.Context, root string, 
 	for time.Now().Before(deadline) {
 		database, err := store.Open(ctx, filepath.Join(root, "data", "coordplane.db"))
 		requireNoError(t, err)
-		events, readErr := database.Events(ctx, core.EventFilter{
-			ProjectID: run.ProjectID, RunID: run.ID, EntityType: "task", EntityID: run.TaskID,
-		})
+		events, readErr := database.Events(ctx, core.EventFilter{ProjectID: run.ProjectID, RunID: run.ID, EntityType: "task", EntityID: run.TaskID})
 		closeErr := database.Close()
 		if readErr != nil || closeErr != nil {
 			t.Fatalf("read RT-05 progress barrier: events=%v close=%v", readErr, closeErr)
@@ -472,15 +441,10 @@ func applyRT05Intent(
 		}
 		token, err := os.ReadFile(filepath.Join(root, "data", "run-control", run.ID, "token"))
 		requireNoError(t, err)
-		runClient, err := transport.NewUnixClient(
-			filepath.Join(root, "data", "run-control", run.ID, "api.sock"),
-			transport.WithBearerToken(strings.TrimSpace(string(token))),
-		)
+		runClient, err := transport.NewUnixClient(filepath.Join(root, "data", "run-control", run.ID, "api.sock"), transport.WithBearerToken(strings.TrimSpace(string(token))))
 		requireNoError(t, err)
 		var result core.OutcomeResult
-		err = runClient.JSON(ctx, http.MethodPost, "/v1/task/outcome", core.OutcomeInput{
-			Outcome: core.OutcomeWait, Reason: "RT-05 durable outcome", RequestID: requestID,
-		}, &result)
+		err = runClient.JSON(ctx, http.MethodPost, "/v1/task/outcome", core.OutcomeInput{Outcome: core.OutcomeWait, Reason: "RT-05 durable outcome", RequestID: requestID}, &result)
 		if !outcomeAllowed {
 			typed := core.AsError(err)
 			if !core.IsCode(err, core.CodeRunStarting) || !typed.Retryable || typed.State != string(core.RunStarting) || typed.Version != run.Version {
@@ -498,17 +462,13 @@ func applyRT05Intent(
 		return true
 	case "stop":
 		var updated core.Run
-		if err := client.JSON(ctx, http.MethodPost, "/v1/runs/"+run.ID+"/stop", core.RunStopInput{
-			Reason: "RT-05 durable stop", RequestID: "rt05-stop-" + run.ID,
-		}, &updated); err != nil || updated.StopRequestedAt == "" {
+		if err := client.JSON(ctx, http.MethodPost, "/v1/runs/"+run.ID+"/stop", core.RunStopInput{Reason: "RT-05 durable stop", RequestID: "rt05-stop-" + run.ID}, &updated); err != nil || updated.StopRequestedAt == "" {
 			t.Fatalf("persist stop: Run=%#v err=%v", updated, err)
 		}
 		return true
 	case "cancel":
 		var cancelled core.Task
-		if err := client.JSON(ctx, http.MethodPost, "/v1/tasks/"+task.ID+"/cancel", core.TaskActionInput{
-			Reason: "RT-05 durable cancel", RequestID: "rt05-cancel-" + run.ID,
-		}, &cancelled); err != nil || cancelled.Status != core.TaskCancelled {
+		if err := client.JSON(ctx, http.MethodPost, "/v1/tasks/"+task.ID+"/cancel", core.TaskActionInput{Reason: "RT-05 durable cancel", RequestID: "rt05-cancel-" + run.ID}, &cancelled); err != nil || cancelled.Status != core.TaskCancelled {
 			t.Fatalf("persist cancel: Task=%#v err=%v", cancelled, err)
 		}
 		return true

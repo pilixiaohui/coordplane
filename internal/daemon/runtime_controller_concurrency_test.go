@@ -27,10 +27,7 @@ import (
 )
 
 func TestRunOperationOwnershipSerializesRuntimeSideEffects(t *testing.T) {
-	controller := &runtimeController{
-		monitors:      make(map[string]*runMonitor),
-		runOperations: make(map[string]*runOperation),
-	}
+	controller := &runtimeController{monitors: make(map[string]*runMonitor), runOperations: make(map[string]*runOperation)}
 	const contenders = 32
 	start := make(chan struct{})
 	winners := make(chan *runOperation, contenders)
@@ -113,8 +110,7 @@ func TestInspectHelperDiscardRetryReinspectsMutatedWorkspace(t *testing.T) {
 	executable := filepath.Join(root, "coordplane-git-helper")
 	requireNoError(t, os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o700))
 	executor := &staleInspectExecutor{head: head}
-	helper, err := newDockerCaptureHelper(executor, config.GitConfig{CaptureHelperImage: "helper", CaptureTimeout: 20 * time.Millisecond,
-		MaximumObjects: 100, MaximumBundleBytes: 1 << 20, MaximumHandoffBytes: 2 << 20}, filepath.Join(root, "handoff"), executable)
+	helper, err := newDockerCaptureHelper(executor, config.GitConfig{CaptureHelperImage: "helper", CaptureTimeout: 20 * time.Millisecond, MaximumObjects: 100, MaximumBundleBytes: 1 << 20, MaximumHandoffBytes: 2 << 20}, filepath.Join(root, "handoff"), executable)
 	requireNoError(t, err)
 	manager, err := gitrepo.NewWorkspaceManager(fixture.initializer, filepath.Join(root, "retry-workspaces"), helper)
 	requireNoError(t, err)
@@ -186,17 +182,11 @@ func TestReconcileSkipsRunOwnedBetweenClaimAndMonitorRegistration(t *testing.T) 
 	coordlink := filepath.Join(root, "coordlink")
 	requireNoError(t, os.WriteFile(coordlink, []byte("#!/bin/sh\nexit 0\n"), 0o700))
 	agent, project := addRuntimeTestProject(service, "Run only the assigned conversation.")
-	if _, err := service.Chat(context.Background(), core.ChatInput{
-		ProjectID: project.ID, AgentID: agent.ID, Body: "exercise launch ownership",
-		Wake: true, RequestID: "wake-launch-race",
-	}); err != nil {
+	if _, err := service.Chat(context.Background(), core.ChatInput{ProjectID: project.ID, AgentID: agent.ID, Body: "exercise launch ownership", Wake: true, RequestID: "wake-launch-race"}); err != nil {
 		t.Fatal(err)
 	}
 	executor := newBlockingLaunchExecutor()
-	cfg := config.Config{DataDir: root, Runtime: config.RuntimeConfig{
-		DockerNetwork: "none", WorkspaceRoot: filepath.Join(root, "workspaces"),
-		AgentHomeRoot: filepath.Join(root, "homes"), LogRoot: filepath.Join(root, "logs"),
-	}}
+	cfg := config.Config{DataDir: root, Runtime: config.RuntimeConfig{DockerNetwork: "none", WorkspaceRoot: filepath.Join(root, "workspaces"), AgentHomeRoot: filepath.Join(root, "homes"), LogRoot: filepath.Join(root, "logs")}}
 	controller := newRuntimeController(cfg, service, executor, adapter.Production(), nil, coordlink)
 	controller.ctx, controller.cancel = context.WithCancel(context.Background())
 	t.Cleanup(func() { _ = controller.Close() })
@@ -228,16 +218,12 @@ func TestReconcileSkipsRunOwnedBetweenClaimAndMonitorRegistration(t *testing.T) 
 	})
 	if executor.createCalls.Load() != 1 || executor.startCalls.Load() != 1 ||
 		executor.waitCalls.Load() != 1 || executor.logCalls.Load() != 1 {
-		t.Fatalf("launch/reconcile duplicated runtime side effects: create=%d start=%d wait=%d logs=%d",
-			executor.createCalls.Load(), executor.startCalls.Load(), executor.waitCalls.Load(), executor.logCalls.Load())
+		t.Fatalf("launch/reconcile duplicated runtime side effects: create=%d start=%d wait=%d logs=%d", executor.createCalls.Load(), executor.startCalls.Load(), executor.waitCalls.Load(), executor.logCalls.Load())
 	}
 	if controller.monitor(active.ID) == nil {
 		t.Fatal("active Run has no registered monitor")
 	}
-	if _, err := service.RequestRuntimeStop(context.Background(), core.RunStopInput{
-		RunID: active.ID, Reason: "race assertion complete", OperationID: "stop-launch-race",
-		RequestID: "stop-launch-race-request",
-	}); err != nil {
+	if _, err := service.RequestRuntimeStop(context.Background(), core.RunStopInput{RunID: active.ID, Reason: "race assertion complete", OperationID: "stop-launch-race", RequestID: "stop-launch-race-request"}); err != nil {
 		t.Fatal(err)
 	}
 	terminal := waitForRuntimeTestRun(t, service, active.ID, func(run core.Run) bool {
@@ -446,9 +432,7 @@ func TestSupervisorAbandonmentCancelsAndCollectsMonitor(t *testing.T) {
 			})
 		},
 	}
-	controller := &runtimeController{
-		service: service, monitors: map[string]*runMonitor{monitor.runID: monitor},
-	}
+	controller := &runtimeController{service: service, monitors: map[string]*runMonitor{monitor.runID: monitor}}
 	controller.supervise(monitor)
 	select {
 	case <-cancelled:
@@ -467,10 +451,7 @@ func TestSupervisorStopsRunAfterSessionPersistenceFailure(t *testing.T) {
 	service, claim := claimRuntimeTestRun(t)
 	active, ref := activateRuntimeTestRun(t, service, claim)
 	executor := &monitorFailureExecutor{stopped: make(chan struct{})}
-	monitor := &runMonitor{
-		runID: active.ID, ref: ref,
-		wait: make(chan waitResult, 1), logs: make(chan error, 1),
-	}
+	monitor := &runMonitor{runID: active.ID, ref: ref, wait: make(chan waitResult, 1), logs: make(chan error, 1)}
 	controller := newRuntimeTestController(t, service, executor)
 	controller.monitors[active.ID] = monitor
 	monitor.logs <- errors.Join(errRuntimeSessionPersist, errors.New("injected persistence failure"))
@@ -507,10 +488,7 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			service, claim := claimRuntimeTestRun(t)
-			message := requireRuntimeValue(service.SendBossMessage(context.Background(), core.BossMessageInput{
-				ProjectID: claim.Task.ProjectID, AgentID: claim.Task.AssigneeAgentID, TaskID: claim.Task.ID,
-				Body: "must remain pending", RequestID: "protocol-message-" + test.name,
-			}))
+			message := requireRuntimeValue(service.SendBossMessage(context.Background(), core.BossMessageInput{ProjectID: claim.Task.ProjectID, AgentID: claim.Task.AssigneeAgentID, TaskID: claim.Task.ID, Body: "must remain pending", RequestID: "protocol-message-" + test.name}))
 			active, ref := activateRuntimeTestRun(t, service, claim)
 			frame, ordinary, accepted := test.frame, "", []byte(nil)
 			secret, lowerDigest, upperDigest := "", "", ""
@@ -616,17 +594,13 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 					requireRuntimeCondition(t, len(raw) <= runtimeLogLimit && strings.Count(string(raw), runtimeLogTruncatedMarker) == 1 && savedFrame == fmt.Sprintf(`{"bytes":%d,"sanitized":false}`, len(strings.Split(frame, "\n")[len(strings.Split(frame, "\n"))-1])), "reserved rejected-frame boundary: bytes=", len(raw), " evidence=", evidence)
 				}
 				if test.evidence != "metadata" && !test.exitFirst {
-					requireRuntimeCondition(t, !core.IsRunTerminal(beforeFailure.State) && beforeFailure.CleanupState != core.CleanupRemoved && beforeFailure.NativeSessionID == test.session &&
-						beforeFailure.RequestedOutcome == "" && beforeTask.LatestProgress == nil && beforeTask.Task.Status == core.TaskRunning &&
-						beforeTask.Task.HeadSHA == "" && beforeTask.Task.IntegrationTaskID == "" && beforeTask.Task.FinalCanonicalSHA == "" && beforeCleanup.Projects[0].CanonicalSHA == canonical, "protocol diagnostic advanced state before failure/cleanup: Run=", beforeFailure, " Task=", beforeTask, " Project=", beforeCleanup.Projects[0])
+					requireRuntimeCondition(t, !core.IsRunTerminal(beforeFailure.State) && beforeFailure.CleanupState != core.CleanupRemoved && beforeFailure.NativeSessionID == test.session && beforeFailure.RequestedOutcome == "" && beforeTask.LatestProgress == nil && beforeTask.Task.Status == core.TaskRunning && beforeTask.Task.HeadSHA == "" && beforeTask.Task.IntegrationTaskID == "" && beforeTask.Task.FinalCanonicalSHA == "" && beforeCleanup.Projects[0].CanonicalSHA == canonical, "protocol diagnostic advanced state before failure/cleanup: Run=", beforeFailure, " Task=", beforeTask, " Project=", beforeCleanup.Projects[0])
 				}
 			}
 			requireRuntimeCondition(t, executor.stopCalls.Load() > 0 && executor.removeCalls.Load() > 0, "protocol failure cleanup calls stop=", executor.stopCalls.Load(), " remove=", executor.removeCalls.Load())
 			persisted := requireRuntimeValue(service.Run(context.Background(), active.ID))
 			task := requireRuntimeValue(service.Task(context.Background(), claim.Task.ID)).Task
-			requireRuntimeCondition(t, persisted.State == core.RunInterrupted && persisted.RuntimeErrorCode == runtimeLogFailureCode &&
-				persisted.NativeSessionID == test.session && persisted.RequestedOutcome == "" && persisted.CleanupState == core.CleanupRemoved && persisted.LastError != "" &&
-				task.Status == core.TaskQueued && task.CurrentRunID == "", "protocol frame did not fail closed: Run=", persisted, " Task=", task)
+			requireRuntimeCondition(t, persisted.State == core.RunInterrupted && persisted.RuntimeErrorCode == runtimeLogFailureCode && persisted.NativeSessionID == test.session && persisted.RequestedOutcome == "" && persisted.CleanupState == core.CleanupRemoved && persisted.LastError != "" && task.Status == core.TaskQueued && task.CurrentRunID == "", "protocol frame did not fail closed: Run=", persisted, " Task=", task)
 			messages := requireRuntimeValue(service.ListMessages(context.Background(), core.MessageFilter{TaskID: claim.Task.ID}))
 			requireRuntimeCondition(t, len(messages.Items) == 1 && messages.Items[0].ID == message.ID && messages.Items[0].State != core.MessageAcknowledged, "protocol frame acknowledged a Message: ", messages.Items)
 		})
@@ -729,10 +703,7 @@ func TestUnavailableContainerRemovalKeepsTerminalCleanupBlocked(t *testing.T) {
 	service, claim := claimRuntimeTestRun(t)
 	active, ref := activateRuntimeTestRun(t, service, claim)
 	exitCode := 1
-	terminal := requireRuntimeValue(service.RecordRuntimeRunTerminal(context.Background(), runtimeTerminalInput(active, core.RunTerminalInput{
-		State: core.RunExited, ExitCode: &exitCode, TerminalReason: "provider exited",
-		RequestID: "terminal-before-cleanup-outage", OperationID: active.LaunchOperationID,
-	})))
+	terminal := requireRuntimeValue(service.RecordRuntimeRunTerminal(context.Background(), runtimeTerminalInput(active, core.RunTerminalInput{State: core.RunExited, ExitCode: &exitCode, TerminalReason: "provider exited", RequestID: "terminal-before-cleanup-outage", OperationID: active.LaunchOperationID})))
 	executor := &cleanupBlockingExecutor{}
 	controller := &runtimeController{service: service, executor: executor, controlRoot: t.TempDir()}
 	if err := controller.cleanupRun(context.Background(), terminal.Run, ref, nil, nil); !errors.Is(err, containerruntime.ErrUnavailable) {
@@ -1139,10 +1110,7 @@ func claimRuntimeTestRun(t *testing.T) (*core.Service, core.Claim) {
 	t.Helper()
 	service := newRuntimeTestService(t)
 	agent, project := addRuntimeTestProject(service, "Run only the assigned conversation.")
-	task := requireRuntimeValue(service.CreateTask(context.Background(), core.CreateTaskInput{
-		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
-		Title: "Runtime task", RequestID: "add-runtime-task",
-	}))
+	task := requireRuntimeValue(service.CreateTask(context.Background(), core.CreateTaskInput{ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork, Title: "Runtime task", RequestID: "add-runtime-task"}))
 	claim, ok, err := service.ClaimNext(context.Background(), "")
 	if err != nil || !ok || claim.Task.ID != task.ID {
 		t.Fatalf("claim runtime test Run: claim=%#v ok=%t err=%v", claim, ok, err)
@@ -1151,20 +1119,13 @@ func claimRuntimeTestRun(t *testing.T) (*core.Service, core.Claim) {
 }
 
 func newRuntimeTestController(t *testing.T, service *core.Service, executor containerruntime.Executor) *runtimeController {
-	return &runtimeController{
-		service: service, executor: executor, adapters: adapter.Production(), controlRoot: t.TempDir(),
-		monitors: make(map[string]*runMonitor), controls: make(map[string]*runControl), runOperations: make(map[string]*runOperation),
-	}
+	return &runtimeController{service: service, executor: executor, adapters: adapter.Production(), controlRoot: t.TempDir(), monitors: make(map[string]*runMonitor), controls: make(map[string]*runControl), runOperations: make(map[string]*runOperation)}
 }
 
 func addRuntimeTestProject(service *core.Service, instructionsText string) (core.Agent, core.Project) {
 	ctx := context.Background()
-	agent := requireRuntimeValue(service.AddAgent(ctx, core.AddAgentInput{
-		DisplayName: "Runtime Agent", AdapterID: "claude", Image: "agent:test", InstructionsText: instructionsText, RequestID: "add-runtime-agent",
-	}))
-	project := requireRuntimeValue(service.AddProject(ctx, core.AddProjectInput{
-		Name: "Runtime Project", Source: "/source", SourceRef: "refs/heads/main", IntegrationAgentID: agent.ID, RequestID: "add-runtime-project",
-	}))
+	agent := requireRuntimeValue(service.AddAgent(ctx, core.AddAgentInput{DisplayName: "Runtime Agent", AdapterID: "claude", Image: "agent:test", InstructionsText: instructionsText, RequestID: "add-runtime-agent"}))
+	project := requireRuntimeValue(service.AddProject(ctx, core.AddProjectInput{Name: "Runtime Project", Source: "/source", SourceRef: "refs/heads/main", IntegrationAgentID: agent.ID, RequestID: "add-runtime-project"}))
 	return agent, project
 }
 
