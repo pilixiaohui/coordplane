@@ -82,6 +82,25 @@ func TestCT07V6ToV7AgentRuntimeConfigMigration(t *testing.T) {
 	}
 }
 
+// TestCT07LegalV6SchemaWithCodexStateFailsClosed pins the E3 contract: a
+// genuine v6 schema containing a pre-v7 Codex row is unprovable legacy state
+// and must be rejected before any migration or ready transition.
+func TestCT07LegalV6SchemaWithCodexStateFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "v6-codex.db")
+	const now = "2026-08-13T00:00:00Z"
+	db := buildV6TestDatabase(t, path, now)
+	execTestSQL(t, ctx, db, `INSERT INTO agents(id,display_name,adapter_id,image,instructions_file,status,version,created_at,updated_at) VALUES('agt-legacy-codex','Legacy Codex','codex','agent:latest','/instructions','active',1,?,?)`, now, now)
+	requireNoError(t, db.Close())
+
+	if opened, err := Open(ctx, path); !core.IsCode(err, core.CodeLegacySchemaRebuildRequired) {
+		if opened != nil {
+			_ = opened.Close()
+		}
+		t.Fatalf("legal v6 schema with Codex state error = %v, want %s", err, core.CodeLegacySchemaRebuildRequired)
+	}
+}
+
 // TestCT07V6ToV7MigrationRollsBackAtomically forces the derived Run backfill
 // to abort after the DDL has run and proves the whole transaction is undone:
 // no v7 column or migration record is observable after reopening the file.
