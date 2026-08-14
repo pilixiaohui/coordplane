@@ -203,6 +203,9 @@ func (s *Service) BeginRunLaunch(ctx context.Context, input RunLaunchInput) (Run
 				!IsRunTerminal(previous.State) || previous.RuntimeErrorCode != string(CodeResumeUnavailable) {
 				return Conflict(CodeResumeUnavailable, "fresh start fallback source is not a failed resume Run", string(previous.State), previous.Version)
 			}
+			if previous.ConfigFingerprint != input.ConfigFingerprint {
+				return Conflict(CodeResumeUnavailable, "fresh start fallback source config fingerprint changed", string(previous.State), previous.Version)
+			}
 			resumeFallback = true
 		}
 		if run.LaunchNonce != "" {
