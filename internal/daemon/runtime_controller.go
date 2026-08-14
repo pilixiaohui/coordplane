@@ -33,6 +33,7 @@ const (
 	runtimeSessionFailureCode = "SESSION_PERSIST_FAILED"
 	runtimeLaunchFile         = "launch"
 	runtimeLaunchExecutable   = "/run/coordplane/launch"
+	runtimeLaunchScript       = "#!/bin/sh\nset -a\n. \"$COORDPLANE_SECRETS_FILE\"\nset +a\nexec \"$@\"\n"
 )
 
 var (
@@ -425,8 +426,7 @@ func writeRuntimeSecrets(state *runtimePrepareState) error {
 // real command, so the container entrypoint stays under CoordPlane control
 // and adoption can verify it.
 func writeRuntimeLaunch(state *runtimePrepareState) error {
-	launcher := "#!/bin/sh\nset -a\n. \"$COORDPLANE_SECRETS_FILE\"\nset +a\nexec \"$@\"\n"
-	return writeRuntimeFile(filepath.Join(state.controlPath, runtimeLaunchFile), []byte(launcher), 0o550)
+	return writeRuntimeFile(filepath.Join(state.controlPath, runtimeLaunchFile), []byte(runtimeLaunchScript), 0o550)
 }
 
 func openRuntimeControl(state *runtimePrepareState) error {
@@ -664,7 +664,11 @@ func (c *runtimeController) containerSpec(
 	gid := strconv.Itoa(os.Getgid())
 	return containerruntime.ContainerSpec{
 		Ref: runtimeRef(run), Image: run.Image,
-		Command:          containerruntime.CommandSpec{Executable: runtimeLaunchExecutable, Args: command.Args, Env: env},
+		Command: containerruntime.CommandSpec{
+			Executable: runtimeLaunchExecutable,
+			Args:       append([]string{command.Executable}, command.Args...),
+			Env:        env,
+		},
 		SensitiveEnvKeys: append([]string(nil), c.config.Runtime.ProviderEnvAllowlist...),
 		WorkingDir:       containerWorkingDirectory(kind), User: strconv.Itoa(runtimeContainerUID) + ":" + gid,
 		GroupAdd: []string{gid}, Network: c.config.Runtime.DockerNetwork,
