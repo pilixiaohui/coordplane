@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"strings"
 )
 
@@ -18,6 +19,15 @@ var codexAllowedEfforts = []string{"low", "medium", "high", "xhigh", "max", "ult
 // codexResumeUnavailableMarkers is fixed from the Codex 0.146.0 binary
 // ("Session not found for thread_id:") and its thread/session counterparts.
 var codexResumeUnavailableMarkers = []string{"session not found", "thread not found"}
+
+// codexPrivateToolCallArgumentFields are provider-internal fields that must
+// never survive inside tool_call arguments. The same names are rejected at
+// every nesting level, including inside arrays.
+var codexPrivateToolCallArgumentFields = map[string]bool{
+	"signature":         true,
+	"encrypted_content": true,
+	"usage":             true,
+}
 
 // Verification status: testdata/codex-0.146.0-partial-golden.jsonl is a real
 // local CLI capture of thread.started, turn.started, top-level error, and an
@@ -245,13 +255,50 @@ func codexVisibleToolCall(item codexItem) (map[string]any, error) {
 	projected := map[string]any{"type": "tool_call", "id": id, "name": name}
 	rawArguments := bytes.TrimSpace(call.Arguments)
 	if len(rawArguments) > 0 && !bytes.Equal(rawArguments, []byte("null")) {
-		var arguments map[string]json.RawMessage
-		if err := json.Unmarshal(rawArguments, &arguments); err != nil {
-			return nil, errors.New("adapter: invalid Codex tool_call arguments")
+		arguments, err := codexVisibleToolCallArguments(rawArguments)
+		if err != nil {
+			return nil, err
 		}
 		projected["arguments"] = arguments
 	}
 	return projected, nil
+}
+
+func codexVisibleToolCallArguments(raw json.RawMessage) (any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var arguments map[string]any
+	if err := decoder.Decode(&arguments); err != nil || arguments == nil {
+		return nil, errors.New("adapter: invalid Codex tool_call arguments")
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, errors.New("adapter: invalid Codex tool_call arguments")
+	}
+	return codexSanitizeToolCallArguments(arguments), nil
+}
+
+// codexSanitizeToolCallArguments keeps normal tool inputs but recursively
+// removes provider-private fields from every object and array.
+func codexSanitizeToolCallArguments(value any) any {
+	switch typed := value.(type) {
+	case []any:
+		clean := make([]any, len(typed))
+		for index, item := range typed {
+			clean[index] = codexSanitizeToolCallArguments(item)
+		}
+		return clean
+	case map[string]any:
+		clean := make(map[string]any, len(typed))
+		for key, item := range typed {
+			if codexPrivateToolCallArgumentFields[key] {
+				continue
+			}
+			clean[key] = codexSanitizeToolCallArguments(item)
+		}
+		return clean
+	default:
+		return value
+	}
 }
 
 func codexErrorEvent(projection map[string]any, message string) (Event, error) {

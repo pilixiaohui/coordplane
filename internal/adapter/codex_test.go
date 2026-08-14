@@ -3,6 +3,7 @@ package adapter
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -145,6 +146,48 @@ func TestCodexJSONLWhitelistAndPrivateFieldDropping(t *testing.T) {
 			}
 			requireCodex(t, event.Kind == test.kind && event.NativeSessionID == test.session && event.Message == test.message && rawOK && (test.forbidden == "" || !strings.Contains(string(event.Raw), test.forbidden)), "event = ", event)
 		})
+	}
+}
+
+func TestCodexToolCallArgumentsDropPrivateFieldsAtEveryDepth(t *testing.T) {
+	frame := `{"type":"item.completed","item":{"id":"item_1","type":"tool_call","tool_call":{"id":"call-1","name":"Read","arguments":{"path":"README.md","signature":"private-signature","nested":{"encrypted_content":"private-encrypted","keep":"visible","children":[{"line":1,"usage":{"input_tokens":7}},{"line":2,"usage":"private-usage"}]}}}}}`
+	event, err := (Codex{}).ParseEvent([]byte(frame))
+	testsupport.RequireNoError(t, err)
+	requireCodex(t, event.Kind == EventProtocol, "nested tool call event = ", event)
+
+	var projection struct {
+		Item struct {
+			Type      string         `json:"type"`
+			Arguments map[string]any `json:"arguments"`
+		} `json:"item"`
+	}
+	testsupport.RequireNoError(t, json.Unmarshal(event.Raw, &projection))
+	arguments := projection.Item.Arguments
+	requireCodex(t, projection.Item.Type == "tool_call", "tool call projection = ", string(event.Raw))
+	requireCodex(t, arguments["path"] == "README.md", "visible argument was lost: ", string(event.Raw))
+	if _, leaked := arguments["signature"]; leaked {
+		t.Fatalf("top-level signature leaked: %s", event.Raw)
+	}
+
+	nested, ok := arguments["nested"].(map[string]any)
+	requireCodex(t, ok, "nested arguments were not preserved: ", string(event.Raw))
+	if _, leaked := nested["encrypted_content"]; leaked {
+		t.Fatalf("nested encrypted_content leaked: %s", event.Raw)
+	}
+	requireCodex(t, nested["keep"] == "visible", "nested visible argument was lost: ", string(event.Raw))
+
+	children, ok := nested["children"].([]any)
+	requireCodex(t, ok && len(children) == 2, "nested children were not preserved: ", string(event.Raw))
+	for index, child := range children {
+		object, ok := child.(map[string]any)
+		requireCodex(t, ok, "child ", index, " is not an object: ", string(event.Raw))
+		if _, leaked := object["usage"]; leaked {
+			t.Fatalf("child %d leaked usage: %s", index, event.Raw)
+		}
+	}
+
+	for _, forbidden := range []string{"signature", "encrypted_content", "usage", "private-signature", "private-encrypted", "private-usage"} {
+		requireCodex(t, !strings.Contains(string(event.Raw), forbidden), "nested arguments leaked ", forbidden, ": ", string(event.Raw))
 	}
 }
 
