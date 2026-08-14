@@ -98,6 +98,9 @@ func (s *Service) RuntimeLaunchContext(ctx context.Context, runID string) (RunLa
 			result.Task.AssigneeAgentID != result.Run.AgentID {
 			return Conflict(CodeStaleRun, "runtime launch context fence changed", string(result.Run.State), result.Run.Version)
 		}
+		if result.Agent.AdapterID != result.Run.AdapterID || result.Agent.Image != result.Run.Image {
+			return Conflict(CodeStaleRun, "agent runtime config fence changed", string(result.Run.State), result.Run.Version)
+		}
 		messages, err := tx.MessagesForRecipient("agent", result.Run.AgentID)
 		if err != nil {
 			return err

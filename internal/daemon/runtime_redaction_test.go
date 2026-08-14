@@ -38,15 +38,32 @@ func TestRuntimeRedaction(t *testing.T) {
 	}
 }
 
-func TestRuntimeRedactionIncludesInstructionsText(t *testing.T) {
+func TestRuntimeRedactionDoesNotRereadAgentInstructions(t *testing.T) {
 	service := newRuntimeTestService(t)
 	canary := "REDACT-CANARY-INSTRUCTIONS"
 	agent := requireRuntimeValue(service.AddAgent(context.Background(), core.AddAgentInput{
 		DisplayName: "Redaction Agent", AdapterID: "claude", Image: "agent:test",
 		InstructionsText: canary, RequestID: "redaction-instructions-agent",
 	}))
-	controller := &runtimeController{service: service}
+	controller := &runtimeController{service: service, controlRoot: t.TempDir()}
 	run := core.Run{ID: "run-redaction", AgentID: agent.ID}
+
+	text := controller.runtimeRedaction(run).Text("provider echoed " + canary)
+	if !strings.Contains(text, canary) {
+		t.Fatalf("runtime redaction re-read the mutable Agent instructions: %q", text)
+	}
+}
+
+func TestRuntimeRedactionIncludesBootstrapInstructions(t *testing.T) {
+	canary := "REDACT-CANARY-INSTRUCTIONS"
+	root := t.TempDir()
+	runID := "run-redaction"
+	controlPath := filepath.Join(root, "run-control", runID)
+	requireNoError(t, os.MkdirAll(controlPath, 0o700))
+	bootstrap := canary + "\n\nCoordPlane Run context\nProject: p\nAgent: a\nTask: t\nRun: " + runID + "\n"
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, "bootstrap"), []byte(bootstrap), 0o440))
+	controller := &runtimeController{controlRoot: filepath.Join(root, "run-control")}
+	run := core.Run{ID: runID}
 
 	text := controller.runtimeRedaction(run).Text("provider echoed " + canary)
 	if strings.Contains(text, canary) {
@@ -54,6 +71,104 @@ func TestRuntimeRedactionIncludesInstructionsText(t *testing.T) {
 	}
 	if !strings.Contains(text, redactedSecret) {
 		t.Fatalf("runtime redaction did not replace instructions text: %q", text)
+	}
+}
+
+func TestParseRunSecretsFile(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		raw    string
+		want   []string
+		wantOK bool
+	}{
+		{
+			name:   "spaces and shell metacharacters",
+			raw:    "ANTHROPIC_AUTH_TOKEN='sk-ant $(rm -rf /) ; | & > x*'\n",
+			want:   []string{"sk-ant $(rm -rf /) ; | & > x*"},
+			wantOK: true,
+		},
+		{
+			name:   "embedded single quotes",
+			raw:    "SECRET='it'\\''s \"quoted\"'\n",
+			want:   []string{`it's "quoted"`},
+			wantOK: true,
+		},
+		{
+			name:   "newlines inside quotes",
+			raw:    "MULTILINE='line one\nline two\nline three'\n",
+			want:   []string{"line one\nline two\nline three"},
+			wantOK: true,
+		},
+		{
+			name:   "multiple entries",
+			raw:    "A='one'\nB='two words'\n",
+			want:   []string{"one", "two words"},
+			wantOK: true,
+		},
+		{
+			name:   "comments and blank lines are ignored",
+			raw:    "# comment\n\nA='one'\n",
+			want:   []string{"one"},
+			wantOK: true,
+		},
+		{
+			name:   "unquoted value rejected",
+			raw:    "SECRET=bare-value\n",
+			wantOK: false,
+		},
+		{
+			name:   "invalid key rejected",
+			raw:    "1BAD='value'\n",
+			wantOK: false,
+		},
+		{
+			name:   "unterminated quote rejected",
+			raw:    "SECRET='oops\n",
+			wantOK: false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			values, ok := parseRunSecretsFile(test.raw)
+			if ok != test.wantOK {
+				t.Fatalf("parseRunSecretsFile ok = %v, want %v (values=%#v)", ok, test.wantOK, values)
+			}
+			if !test.wantOK {
+				return
+			}
+			if len(values) != len(test.want) {
+				t.Fatalf("parseRunSecretsFile values = %#v, want %#v", values, test.want)
+			}
+			for index := range test.want {
+				if values[index] != test.want[index] {
+					t.Fatalf("parseRunSecretsFile values = %#v, want %#v", values, test.want)
+				}
+			}
+		})
+	}
+}
+
+func TestRuntimeRedactionLoadsSecretsFile(t *testing.T) {
+	canary := "REDACT-SECRET-FILE-VALUE $(with shell metachars)"
+	root := t.TempDir()
+	runID := "run-redaction-file"
+	controlPath := filepath.Join(root, "run-control", runID)
+	requireNoError(t, os.MkdirAll(controlPath, 0o700))
+	raw := "ANTHROPIC_AUTH_TOKEN='" + strings.ReplaceAll(canary, "'", "'\\''") + "'\n"
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, "secrets"), []byte(raw), 0o440))
+	controller := &runtimeController{
+		controlRoot: filepath.Join(root, "run-control"),
+		config: config.Config{Runtime: config.RuntimeConfig{
+			ProviderEnvAllowlist: []string{"UNRELATED_ENV"},
+		}},
+	}
+	run := core.Run{ID: runID}
+
+	text := controller.runtimeRedaction(run).Text("provider echoed " + canary)
+	if strings.Contains(text, canary) {
+		t.Fatalf("runtime redaction retained secrets-file value: %q", text)
+	}
+	if !strings.Contains(text, redactedSecret) {
+		t.Fatalf("runtime redaction did not replace secrets-file value: %q", text)
 	}
 }
 
