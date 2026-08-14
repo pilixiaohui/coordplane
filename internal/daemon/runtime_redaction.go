@@ -52,13 +52,17 @@ func (c *runtimeController) runtimeRedaction(run core.Run, extraPaths ...string)
 	if dockerHost := strings.TrimSpace(os.Getenv("DOCKER_HOST")); strings.HasPrefix(dockerHost, "unix://") {
 		paths = append(paths, strings.TrimPrefix(dockerHost, "unix://"))
 	}
-	secrets := c.runtimeRunSecrets(run)
+	secrets, ok := c.runtimeRunSecrets(run)
 	if run.ID != "" && c.controlRoot != "" {
 		if token, err := os.ReadFile(filepath.Join(c.controlRoot, run.ID, "token")); err == nil {
 			secrets = append(secrets, strings.TrimSpace(string(token)))
 		}
 	}
 	redaction := newRuntimeRedaction(paths, secrets)
+	if !ok {
+		redaction.failClosed = true
+		return redaction
+	}
 	instructions, ok := c.runtimeRunInstructions(run)
 	if !ok {
 		redaction.failClosed = true
@@ -70,13 +74,25 @@ func (c *runtimeController) runtimeRedaction(run core.Run, extraPaths ...string)
 	return redaction
 }
 
-// runtimeRunSecrets returns the run-scoped provider secrets: values read from
-// the run's immutable secrets file when it exists, falling back to the host
-// provider allowlist env for legacy runs adopted before the file was written.
-// It never re-reads the mutable Agent.
-func (c *runtimeController) runtimeRunSecrets(run core.Run) []string {
+// runtimeRunSecrets returns the run-scoped provider secrets and whether they are
+// trustworthy. A new-run lineage (its control directory carries the launch file)
+// must carry a valid secrets file: a missing or malformed file reports ok=false
+// so the caller fails closed instead of falling back to unredacted host env.
+// Legacy adopted runs never wrote the file and fall back to the host provider
+// allowlist env on a best-effort basis, always reporting ok=true because the
+// env values themselves are the redaction source. It never re-reads the mutable
+// Agent.
+func (c *runtimeController) runtimeRunSecrets(run core.Run) ([]string, bool) {
+	controlPath := filepath.Join(c.controlRoot, run.ID)
+	if c.controlRoot != "" && strings.TrimSpace(run.ID) != "" && hasRuntimeLineage(controlPath) {
+		values, ok := c.readRunSecretsFile(run.ID)
+		if !ok {
+			return nil, false
+		}
+		return values, true
+	}
 	if values, ok := c.readRunSecretsFile(run.ID); ok {
-		return values
+		return values, true
 	}
 	secrets := make([]string, 0, len(c.config.Runtime.ProviderEnvAllowlist))
 	for _, name := range c.config.Runtime.ProviderEnvAllowlist {
@@ -84,13 +100,13 @@ func (c *runtimeController) runtimeRunSecrets(run core.Run) []string {
 			secrets = append(secrets, value)
 		}
 	}
-	return secrets
+	return secrets, true
 }
 
 // readRunSecretsFile parses the run's secrets file (shell-sourceable
 // NAME='value' lines written by the launch path) and returns the unquoted
-// values. A missing, empty, or malformed file reports ok=false so callers fall
-// back to the host allowlist env.
+// values. A missing or malformed file reports ok=false; a present but empty
+// file is a valid no-secret run and reports ok=true.
 func (c *runtimeController) readRunSecretsFile(runID string) ([]string, bool) {
 	if c.controlRoot == "" || strings.TrimSpace(runID) == "" {
 		return nil, false

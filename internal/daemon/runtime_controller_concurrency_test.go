@@ -562,7 +562,7 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 			}
 			if test.waitFirst {
 				executor.releaseWait, executor.releaseLogs = make(chan struct{}), make(chan struct{})
-				monitor := controller.newMonitor(active, ref, adapter.Claude{}, nil)
+				monitor := requireRuntimeValue(controller.newMonitor(active, ref, adapter.Claude{}, nil))
 				monitor.wait, monitor.waitDelivered = make(chan waitResult), make(chan struct{})
 				done := make(chan struct{})
 				go func() {
@@ -574,7 +574,7 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 				close(executor.releaseLogs)
 				waitRuntimeSignal(t, done, time.Second, "Wait-first supervisor did not converge")
 			} else {
-				monitor := controller.newMonitor(active, ref, adapter.Claude{}, nil)
+				monitor := requireRuntimeValue(controller.newMonitor(active, ref, adapter.Claude{}, nil))
 				controller.supervise(monitor)
 			}
 			if test.evidence != "" {
@@ -657,7 +657,7 @@ func TestShutdownReplaysTailLogsBeforeTerminalConvergence(t *testing.T) {
 	if !ok {
 		t.Fatalf("lookup shutdown replay adapter %q", active.AdapterID)
 	}
-	monitor := controller.newMonitor(active, ref, entry, nil)
+	monitor := requireRuntimeValue(controller.newMonitor(active, ref, entry, nil))
 	controller.monitors[active.ID] = monitor
 	controller.wg.Add(1)
 	go func() {

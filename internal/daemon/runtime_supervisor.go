@@ -382,6 +382,40 @@ func (c *runtimeController) failPreparedRun(
 	return cause
 }
 
+// failSecretsUnavailable terminates a run whose redaction cannot be trusted
+// because its run-scoped secrets could not be loaded (new-lineage fail-closed).
+// It must never persist unredacted content, so no log streaming or replay is
+// attempted. The terminal state follows the run: an active run is interrupted,
+// a starting run fails.
+func (c *runtimeController) failSecretsUnavailable(
+	ctx context.Context,
+	run core.Run,
+	ref containerruntime.RuntimeRef,
+	control *runControl,
+) error {
+	state := core.RunFailed
+	reason := "Run launch failed"
+	if run.State == core.RunActive {
+		state = core.RunInterrupted
+		reason = "Run interrupted: run secrets are unavailable"
+	}
+	terminal, err := c.service.RecordRuntimeRunTerminal(ctx, runtimeTerminalInput(run, core.RunTerminalInput{
+		State: state, TerminalReason: reason,
+		RuntimeErrorCode: runtimeSecretsFailureCode,
+		RequestID:        runtimeRequest(run, "secrets-unavailable"), OperationID: run.LaunchOperationID,
+	}))
+	if err == nil {
+		if ref.RunID == "" {
+			ref = runtimeRef(terminal.Run)
+		}
+		_ = c.cleanupRun(context.Background(), terminal.Run, ref, control, nil)
+	}
+	if err != nil {
+		return err
+	}
+	return errRuntimeSecretsUnavailable
+}
+
 func (c *runtimeController) cleanupRun(
 	ctx context.Context,
 	run core.Run,

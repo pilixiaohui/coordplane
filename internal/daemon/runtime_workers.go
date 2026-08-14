@@ -265,7 +265,10 @@ func (c *runtimeController) reconcileRun(ctx context.Context, run core.Run) erro
 	}
 	switch state.Status {
 	case containerruntime.StatusExited:
-		monitor := c.newMonitor(run, ref, entry, control)
+		monitor, err := c.newMonitor(run, ref, entry, control)
+		if err != nil {
+			return c.failSecretsUnavailable(ctx, run, ref, control)
+		}
 		result := <-monitor.wait
 		return c.finishObservedRun(run, monitor, result)
 	case containerruntime.StatusCreated:
@@ -403,7 +406,10 @@ func (c *runtimeController) stopReconciledRun(
 		return c.cleanupRun(ctx, terminal.Run, ref, nil, nil)
 	}
 
-	monitor := c.newMonitor(run, ref, entry, nil)
+	monitor, err := c.newMonitor(run, ref, entry, nil)
+	if err != nil {
+		return c.failSecretsUnavailable(ctx, run, ref, nil)
+	}
 	if err := c.registerMonitor(monitor); err != nil {
 		_ = monitor.cancelAndCollectLogs(2 * time.Second)
 		return err
@@ -435,7 +441,10 @@ func (c *runtimeController) adoptRunning(
 	entry adapter.CLI,
 	control *runControl,
 ) error {
-	monitor := c.newMonitor(run, ref, entry, control)
+	monitor, err := c.newMonitor(run, ref, entry, control)
+	if err != nil {
+		return c.failSecretsUnavailable(ctx, run, ref, control)
+	}
 	if err := c.registerMonitor(monitor); err != nil {
 		_ = monitor.cancelAndCollectLogs(2 * time.Second)
 		return err
@@ -847,7 +856,11 @@ func (c *runtimeController) shutdownRun(ctx context.Context, run core.Run) error
 		runID: run.ID, ref: ref, entry: entry, control: control,
 		redact: c.runtimeRedaction(run), logs: make(chan error, 1),
 	}
-	monitor.logs <- c.streamLogs(ctx, run, ref, entry, monitor)
+	if monitor.redact.failClosed {
+		monitor.logs <- nil
+	} else {
+		monitor.logs <- c.streamLogs(ctx, run, ref, entry, monitor)
+	}
 	return c.finishObservedRunContext(ctx, run, monitor, waitResult{fact: exit, err: waitErr})
 }
 

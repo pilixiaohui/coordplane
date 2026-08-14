@@ -847,7 +847,8 @@ func prepareCreatedRunForReconcile(t *testing.T, fixture *p3DockerFixture, claim
 	requireNoError(t, writeRunControlMarker(controlPath, prepared))
 	requireNoError(t, writeRuntimeFile(filepath.Join(controlPath, "token"), []byte(claim.Token+"\n"), 0o440))
 	requireNoError(t, writeRuntimeFile(filepath.Join(controlPath, "bootstrap"), []byte(bootstrap), 0o440))
-	prepareState := &runtimePrepareState{controller: fixture.components.runtime, controlPath: controlPath}
+	prepareState := &runtimePrepareState{controller: fixture.components.runtime, controlPath: controlPath, instructions: instructions}
+	requireNoError(t, writeRuntimeInstructions(prepareState))
 	requireNoError(t, writeRuntimeSecrets(prepareState))
 	requireNoError(t, writeRuntimeLaunch(prepareState))
 	entry, ok := fixture.components.runtime.adapters.Lookup(prepared.AdapterID)

@@ -31,14 +31,16 @@ const (
 	runtimeLogFailureReason   = "runtime log monitoring failed"
 	runtimeLogFailureCode     = "LOG_STREAM_FAILED"
 	runtimeSessionFailureCode = "SESSION_PERSIST_FAILED"
+	runtimeSecretsFailureCode = "SECRETS_UNAVAILABLE"
 	runtimeLaunchFile         = "launch"
 	runtimeLaunchExecutable   = "/run/coordplane/launch"
 	runtimeLaunchScript       = "#!/bin/sh\nset -a\n. \"$COORDPLANE_SECRETS_FILE\"\nset +a\nexec \"$@\"\n"
 )
 
 var (
-	errRuntimeLogDrainTimeout = errors.New("runtime log stream did not finish")
-	errRuntimeSessionPersist  = errors.New("runtime session event was not persisted")
+	errRuntimeLogDrainTimeout    = errors.New("runtime log stream did not finish")
+	errRuntimeSessionPersist     = errors.New("runtime session event was not persisted")
+	errRuntimeSecretsUnavailable = errors.New("runtime run secrets are unavailable")
 )
 
 type runtimeController struct {
@@ -336,6 +338,9 @@ func (c *runtimeController) launchOwned(ctx context.Context, claim core.Claim, o
 			c.setDegraded(cause.Error())
 			return cause
 		}
+		if errors.Is(cause, errRuntimeSecretsUnavailable) {
+			code = runtimeSecretsFailureCode
+		}
 		return c.failPreparedRun(context.Background(), state.run, state.ref, state.control, code, cause)
 	}
 	for _, step := range runtimePrepareSteps {
@@ -507,7 +512,10 @@ func startRuntimeCLI(state *runtimePrepareState) error {
 }
 
 func verifyRuntimeLive(state *runtimePrepareState) error {
-	monitor := state.controller.newMonitor(state.run, state.ref, state.entry, state.control)
+	monitor, err := state.controller.newMonitor(state.run, state.ref, state.entry, state.control)
+	if err != nil {
+		return err
+	}
 	if err := state.controller.registerMonitor(monitor); err != nil {
 		_ = monitor.cancelAndCollectLogs(time.Second)
 		return err

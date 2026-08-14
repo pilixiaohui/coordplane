@@ -87,6 +87,7 @@ func TestRuntimeRedactionInstructionsFileIsCollisionSafe(t *testing.T) {
 	requireNoError(t, os.MkdirAll(controlPath, 0o700))
 	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeInstructionsFile), []byte(instructions), 0o440))
 	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeLaunchFile), []byte("#!/bin/sh\n"), 0o550))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeSecretsFile), []byte(""), 0o440))
 	sum := sha256.Sum256([]byte(instructions))
 	controller := &runtimeController{controlRoot: controlRoot}
 	run := core.Run{ID: "run-collision", InstructionsHash: hex.EncodeToString(sum[:])}
@@ -118,6 +119,7 @@ func TestRuntimeRedactionInstructionsFileMatchesLegacyBootstrap(t *testing.T) {
 	requireNoError(t, os.MkdirAll(legacyPath, 0o700))
 	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeInstructionsFile), []byte(instructions), 0o440))
 	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeLaunchFile), []byte("#!/bin/sh\n"), 0o550))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeSecretsFile), []byte(""), 0o440))
 	requireNoError(t, os.WriteFile(filepath.Join(legacyPath, runtimeBootstrapFile), []byte(instructions+"\n\nCoordPlane Run context\nProject: p\n"), 0o440))
 	sum := sha256.Sum256([]byte(instructions))
 	controller := &runtimeController{controlRoot: controlRoot}
@@ -166,6 +168,7 @@ func TestRuntimeRedactionNewLineageFailsClosedWithoutTrustedInstructions(t *test
 	controlPath := filepath.Join(controlRoot, "run-fail-closed")
 	requireNoError(t, os.MkdirAll(controlPath, 0o700))
 	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeLaunchFile), []byte("#!/bin/sh\n"), 0o550))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeSecretsFile), []byte(""), 0o440))
 	controller := &runtimeController{controlRoot: controlRoot}
 	canary := "UNREDACTED-CANARY"
 	sum := sha256.Sum256([]byte("original prompt"))
@@ -366,6 +369,103 @@ func TestRuntimeRedactionLoadsSecretsFile(t *testing.T) {
 	}
 	if !strings.Contains(text, redactedSecret) {
 		t.Fatalf("runtime redaction did not replace secrets-file value: %q", text)
+	}
+}
+
+// R8: a new-lineage run whose control directory carries the launch file but no
+// secrets file must fail closed. The host provider allowlist env is never used
+// as a fallback for new lineages, so no unredacted content can be persisted.
+func TestRuntimeRedactionNewLineageFailsClosedWithoutSecretsFile(t *testing.T) {
+	canary := "UNREDACTED-SECRETS-CANARY"
+	root := t.TempDir()
+	controlRoot := filepath.Join(root, "run-control")
+	controlPath := filepath.Join(controlRoot, "run-secrets-missing")
+	requireNoError(t, os.MkdirAll(controlPath, 0o700))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeLaunchFile), []byte("#!/bin/sh\n"), 0o550))
+	t.Setenv("HOST_PROVIDER_TOKEN", canary)
+	controller := &runtimeController{
+		controlRoot: controlRoot,
+		config: config.Config{Runtime: config.RuntimeConfig{
+			ProviderEnvAllowlist: []string{"HOST_PROVIDER_TOKEN"},
+		}},
+	}
+	run := core.Run{ID: "run-secrets-missing"}
+
+	if _, ok := controller.runtimeRunSecrets(run); ok {
+		t.Fatal("new-lineage runtimeRunSecrets without a secrets file did not fail closed")
+	}
+	redact := controller.runtimeRedaction(run)
+	if !redact.failClosed {
+		t.Fatal("new-lineage runtime redaction did not fail closed")
+	}
+	text := redact.Text("provider echoed " + canary)
+	if strings.Contains(text, canary) {
+		t.Fatalf("fail-closed redaction leaked host env canary: %q", text)
+	}
+	if !strings.Contains(text, redactionUnavailableMarker) {
+		t.Fatalf("fail-closed redaction did not emit the unavailable marker: %q", text)
+	}
+}
+
+// R9: a new-lineage run whose secrets file exists but is not shell-sourceable
+// must fail closed instead of trusting a malformed value.
+func TestRuntimeRedactionNewLineageFailsClosedOnCorruptSecretsFile(t *testing.T) {
+	canary := "UNREDACTED-CORRUPT-CANARY"
+	root := t.TempDir()
+	controlRoot := filepath.Join(root, "run-control")
+	controlPath := filepath.Join(controlRoot, "run-secrets-corrupt")
+	requireNoError(t, os.MkdirAll(controlPath, 0o700))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeLaunchFile), []byte("#!/bin/sh\n"), 0o550))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeSecretsFile), []byte("HOST_PROVIDER_TOKEN=bare-canary\n"), 0o440))
+	controller := &runtimeController{controlRoot: controlRoot}
+	run := core.Run{ID: "run-secrets-corrupt"}
+
+	if _, ok := controller.runtimeRunSecrets(run); ok {
+		t.Fatal("new-lineage runtimeRunSecrets with a corrupt secrets file did not fail closed")
+	}
+	redact := controller.runtimeRedaction(run)
+	if !redact.failClosed {
+		t.Fatal("new-lineage runtime redaction did not fail closed on a corrupt secrets file")
+	}
+	if text := redact.Text("provider echoed " + canary); !strings.Contains(text, redactionUnavailableMarker) {
+		t.Fatalf("fail-closed redaction did not emit the unavailable marker: %q", text)
+	}
+}
+
+// R10: a legacy adopted run (no launch file) keeps the host provider allowlist
+// env fallback, so its redaction remains available and redacts provider values.
+func TestRuntimeRedactionLegacyRunFallsBackToHostProviderEnv(t *testing.T) {
+	canary := "HOST-PROVIDER-ENV-CANARY"
+	root := t.TempDir()
+	controlRoot := filepath.Join(root, "run-control")
+	controlPath := filepath.Join(controlRoot, "run-legacy-env")
+	requireNoError(t, os.MkdirAll(controlPath, 0o700))
+	t.Setenv("HOST_PROVIDER_TOKEN", canary)
+	controller := &runtimeController{
+		controlRoot: controlRoot,
+		config: config.Config{Runtime: config.RuntimeConfig{
+			ProviderEnvAllowlist: []string{"HOST_PROVIDER_TOKEN"},
+		}},
+	}
+	run := core.Run{ID: "run-legacy-env"}
+
+	values, ok := controller.runtimeRunSecrets(run)
+	if !ok {
+		t.Fatal("legacy runtimeRunSecrets failed closed instead of falling back to host provider env")
+	}
+	if len(values) != 1 || values[0] != canary {
+		t.Fatalf("legacy runtimeRunSecrets = %#v, want the host provider env canary", values)
+	}
+	redact := controller.runtimeRedaction(run)
+	if redact.failClosed {
+		t.Fatal("legacy run failed closed")
+	}
+	text := redact.Text("provider echoed " + canary)
+	if strings.Contains(text, canary) {
+		t.Fatalf("legacy host env fallback did not redact the provider value: %q", text)
+	}
+	if !strings.Contains(text, redactedSecret) {
+		t.Fatalf("legacy host env fallback did not replace the provider value: %q", text)
 	}
 }
 
