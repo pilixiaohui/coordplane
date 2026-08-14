@@ -248,7 +248,7 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "  coordplane serve --config FILE")
 	fmt.Fprintln(writer, "  coordplane status [--project ID] [--socket PATH] [--output human|json]")
 	fmt.Fprintln(writer, "  coordplane project add|list|show|repair|archive|delete ...")
-	fmt.Fprintln(writer, "  coordplane agent add|list|show|pause|resume|archive ...")
+	fmt.Fprintln(writer, "  coordplane agent add|list|show|update|pause|resume|archive ...")
 	fmt.Fprintln(writer, "  coordplane chat --project ID --agent ID --body TEXT [--request-id ID]")
 	fmt.Fprintln(writer, "  coordplane message send|list|read|ack|retry ...")
 	fmt.Fprintln(writer, "  coordplane task create|list|show|checkout|wake|retry|cancel|delete|accept|rework|close ...")
