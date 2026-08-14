@@ -4,10 +4,6 @@ package daemon
 
 import (
 	"crypto/sha256"
-	"encoding/hex"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -16,61 +12,6 @@ import (
 	"coordplane/internal/core"
 	containerruntime "coordplane/internal/runtime"
 )
-
-func TestCodexScriptedDockerStartArgvEnvAndLogRedaction(t *testing.T) {
-	secret := "provider-secret-codex-matrix-001"
-	t.Setenv("ANTHROPIC_AUTH_TOKEN", secret)
-	fixture := newCodexDockerFixtureWithProviderEnv(t, []string{"ANTHROPIC_AUTH_TOKEN"})
-	canary := "REDACT-CANARY-CODEX-MATRIX"
-	agent := addProviderInstructionsAgent(t, fixture, "Codex Start Agent", canary)
-	project := fixture.addProject(t, agent.ID)
-	task := fixture.addTask(t, project.ID, agent.ID, "codex matrix hold", 0)
-	fixture.components.runtime.Start(fixture.ctx)
-
-	active := waitForRun(t, fixture, task.ID, func(run core.Run, task core.Task) bool {
-		return run.State == core.RunActive && task.Status == core.TaskRunning
-	})
-	state, err := fixture.executor.Inspect(fixture.ctx, runtimeRef(active))
-	requireNoError(t, err)
-	assertCodexStartShape(t, state, "/workspace/project")
-
-	raw, err := exec.CommandContext(fixture.ctx, "docker", "inspect", active.ContainerID).CombinedOutput()
-	requireNoError(t, err)
-	for _, forbidden := range []string{canary, secret} {
-		if strings.Contains(string(raw), forbidden) {
-			t.Fatalf("Docker inspect leaked %q", forbidden)
-		}
-	}
-
-	// I1: the provider secret must reach the provider process as a runtime env
-	// value (sourced from the secrets file), observable by writing it into the
-	// host-mounted workspace from inside the container.
-	observed, err := os.ReadFile(filepath.Join(active.WorkspacePath, "secret-observed"))
-	requireNoError(t, err)
-	if string(observed) != secret {
-		t.Fatalf("provider secret observed in workspace = %q, want %q", observed, secret)
-	}
-
-	if _, err := fixture.components.service.RequestRunStop(fixture.ctx, core.RunStopInput{
-		RunID: active.ID, Reason: "codex matrix stop", RequestID: "codex-stop-" + active.ID,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	terminal := waitForRun(t, fixture, task.ID, func(run core.Run, task core.Task) bool {
-		return run.ID == active.ID && run.State == core.RunInterrupted &&
-			run.CleanupState == core.CleanupRemoved && task.Status == core.TaskQueued
-	})
-	logRaw, err := os.ReadFile(terminal.LogPath)
-	requireNoError(t, err)
-	for _, forbidden := range []string{canary, secret} {
-		if strings.Contains(string(logRaw), forbidden) {
-			t.Fatalf("run.log leaked %q: %s", forbidden, logRaw)
-		}
-	}
-	if !strings.Contains(string(logRaw), redactedSecret) {
-		t.Fatalf("run.log did not redact echoed provider secret: %s", logRaw)
-	}
-}
 
 func TestCodexScriptedDockerResumeFreshFallbackMatrix(t *testing.T) {
 	fixture := newCodexDockerFixture(t)
@@ -161,51 +102,6 @@ func TestCodexScriptedDockerResumeFreshFallbackMatrix(t *testing.T) {
 	})
 }
 
-func TestCodexScriptedDockerProviderConfigFingerprint(t *testing.T) {
-	model := "codex-mini"
-	subagent := "codex-haiku"
-	baseURL := "https://example.invalid/v1"
-	effort := "max"
-	canary := "REDACT-CANARY-CODEX-PROVIDER"
-	fixture := newCodexDockerFixture(t)
-	agent, err := fixture.components.service.AddAgent(fixture.ctx, core.AddAgentInput{
-		DisplayName: "Codex Provider Agent", AdapterID: "codex", Image: fixture.image,
-		InstructionsText: canary, Model: model, SubagentModel: subagent, BaseURL: baseURL, Effort: effort,
-		RequestID: "codex-provider-agent",
-	})
-	requireNoError(t, err)
-	project := fixture.addProject(t, agent.ID)
-	task := fixture.addTask(t, project.ID, agent.ID, "codex provider matrix", 0)
-	fixture.components.runtime.Start(fixture.ctx)
-
-	active := waitForActiveProviderRun(t, fixture, task.ID)
-	state := inspectProviderRun(t, fixture, active)
-	if len(state.Entrypoint) != 1 || state.Entrypoint[0] != runtimeLaunchExecutable {
-		t.Fatalf("Codex entrypoint = %#v, want [%s]", state.Entrypoint, runtimeLaunchExecutable)
-	}
-	want := []string{"codex", "exec", "--json", "--skip-git-repo-check",
-		"--dangerously-bypass-approvals-and-sandbox", "--ignore-user-config", "-C", "/workspace/project",
-		"-m", model, "-c", "default_subagent_model=" + subagent, "-c", "model_reasoning_effort=" + effort,
-		"-c", "model_providers.codex.name=codex", "-c", "model_providers.codex.base_url=" + baseURL,
-		"--", runtimeBootstrapPrompt()}
-	if !reflect.DeepEqual(state.CommandArgs, want) {
-		t.Fatalf("Codex provider argv = %#v, want %#v", state.CommandArgs, want)
-	}
-	assertCodexEnvironment(t, state)
-
-	// I4: the persisted ConfigFingerprint must equal the fingerprint derived
-	// from the same launch inputs.
-	wantFingerprint, err := core.RuntimeConfigFingerprint(core.RuntimeConfigFingerprintInput{
-		AdapterID: "codex", Image: fixture.image, Model: model, SubagentModel: subagent,
-		BaseURL: baseURL, Effort: effort, InstructionsHash: hex.EncodeToString(sha256Sum(canary)),
-	})
-	requireNoError(t, err)
-	if active.ConfigFingerprint != wantFingerprint {
-		t.Fatalf("Codex ConfigFingerprint = %q, want %q", active.ConfigFingerprint, wantFingerprint)
-	}
-	cancelProviderTask(t, fixture, task.ID)
-}
-
 func addProviderInstructionsAgent(t *testing.T, fixture *p3DockerFixture, name, instructionsText string) core.Agent {
 	t.Helper()
 	agent, err := fixture.components.service.AddAgent(fixture.ctx, core.AddAgentInput{
@@ -226,11 +122,16 @@ func waitForActiveProviderRun(t *testing.T, fixture *p3DockerFixture, taskID str
 func interruptProviderRun(t *testing.T, fixture *p3DockerFixture, taskID, runID, requestID string) {
 	t.Helper()
 	if _, err := fixture.components.service.RequestRunStop(fixture.ctx, core.RunStopInput{
-		RunID: runID, Reason: "codex matrix interrupt", RequestID: requestID,
+		RunID: runID, Reason: "provider matrix interrupt", RequestID: requestID,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitForRun(t, fixture, taskID, func(run core.Run, task core.Task) bool {
+	waitForInterruptedRemoved(t, fixture, taskID, runID)
+}
+
+func waitForInterruptedRemoved(t *testing.T, fixture *p3DockerFixture, taskID, runID string) core.Run {
+	t.Helper()
+	return waitForRun(t, fixture, taskID, func(run core.Run, task core.Task) bool {
 		return run.ID == runID && run.State == core.RunInterrupted &&
 			run.CleanupState == core.CleanupRemoved && task.Status == core.TaskQueued
 	})
@@ -239,7 +140,7 @@ func interruptProviderRun(t *testing.T, fixture *p3DockerFixture, taskID, runID,
 func cancelProviderTask(t *testing.T, fixture *p3DockerFixture, taskID string) {
 	t.Helper()
 	if _, err := fixture.components.service.CancelTask(fixture.ctx, core.TaskActionInput{
-		TaskID: taskID, Reason: "codex matrix complete", RequestID: "codex-cancel-" + taskID,
+		TaskID: taskID, Reason: "provider matrix complete", RequestID: "provider-cancel-" + taskID,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -259,57 +160,58 @@ func runtimeBootstrapPrompt() string {
 	return "Read and follow the complete CoordPlane run bootstrap at " + adapter.ContainerBootstrapPath + " before acting."
 }
 
+func assertEntrypoint(t *testing.T, state containerruntime.LiveState) {
+	t.Helper()
+	if len(state.Entrypoint) != 1 || state.Entrypoint[0] != runtimeLaunchExecutable {
+		t.Fatalf("entrypoint = %#v, want [%s]", state.Entrypoint, runtimeLaunchExecutable)
+	}
+}
+
+func assertCommandArgs(t *testing.T, state containerruntime.LiveState, what string, want []string) {
+	t.Helper()
+	if !reflect.DeepEqual(state.CommandArgs, want) {
+		t.Fatalf("%s argv = %#v, want %#v", what, state.CommandArgs, want)
+	}
+}
+
 func assertCodexStartShape(t *testing.T, state containerruntime.LiveState, workdir string) {
 	t.Helper()
 	assertCodexStartArgv(t, state, workdir, nil)
-	assertCodexEnvironment(t, state)
+	assertEnvDigests(t, state, map[string]string{"HOME": "/home/agent", "CODEX_HOME": "/home/agent/.codex"})
 }
 
 func assertCodexStartShapeWithEffort(t *testing.T, state containerruntime.LiveState, workdir, effort string) {
 	t.Helper()
 	assertCodexStartArgv(t, state, workdir, []string{"-c", "model_reasoning_effort=" + effort})
-	assertCodexEnvironment(t, state)
+	assertEnvDigests(t, state, map[string]string{"HOME": "/home/agent", "CODEX_HOME": "/home/agent/.codex"})
 }
 
 func assertCodexStartArgv(t *testing.T, state containerruntime.LiveState, workdir string, providerArgs []string) {
 	t.Helper()
-	if len(state.Entrypoint) != 1 || state.Entrypoint[0] != runtimeLaunchExecutable {
-		t.Fatalf("Codex entrypoint = %#v, want [%s]", state.Entrypoint, runtimeLaunchExecutable)
-	}
+	assertEntrypoint(t, state)
 	want := []string{"codex", "exec", "--json", "--skip-git-repo-check",
 		"--dangerously-bypass-approvals-and-sandbox", "--ignore-user-config", "-C", workdir}
 	want = append(want, providerArgs...)
 	want = append(want, "--", runtimeBootstrapPrompt())
-	if !reflect.DeepEqual(state.CommandArgs, want) {
-		t.Fatalf("Codex start argv = %#v, want %#v", state.CommandArgs, want)
-	}
+	assertCommandArgs(t, state, "Codex start", want)
 }
 
 func assertCodexResumeShape(t *testing.T, state containerruntime.LiveState, sessionID string) {
 	t.Helper()
-	if len(state.Entrypoint) != 1 || state.Entrypoint[0] != runtimeLaunchExecutable {
-		t.Fatalf("Codex entrypoint = %#v, want [%s]", state.Entrypoint, runtimeLaunchExecutable)
-	}
+	assertEntrypoint(t, state)
 	want := []string{"codex", "exec", "resume", "--json", "--skip-git-repo-check",
 		"--dangerously-bypass-approvals-and-sandbox", "--ignore-user-config", sessionID, "--", runtimeBootstrapPrompt()}
-	if !reflect.DeepEqual(state.CommandArgs, want) {
-		t.Fatalf("Codex resume argv = %#v, want %#v", state.CommandArgs, want)
-	}
-	assertCodexEnvironment(t, state)
+	assertCommandArgs(t, state, "Codex resume", want)
+	assertEnvDigests(t, state, map[string]string{"HOME": "/home/agent", "CODEX_HOME": "/home/agent/.codex"})
 }
 
-func assertCodexEnvironment(t *testing.T, state containerruntime.LiveState) {
+func assertCodexProviderShape(t *testing.T, state containerruntime.LiveState, model, subagent, baseURL, effort string) {
 	t.Helper()
-	digests := make(map[string]string, len(state.Environment))
-	for _, fact := range state.Environment {
-		digests[fact.Name] = fact.ValueDigest
-	}
-	for name, value := range map[string]string{"HOME": "/home/agent", "CODEX_HOME": "/home/agent/.codex"} {
-		want := hex.EncodeToString(sha256Sum(value))
-		if digests[name] != want {
-			t.Fatalf("Codex env %s digest = %q, want %q (facts=%#v)", name, digests[name], want, state.Environment)
-		}
-	}
+	assertCodexStartArgv(t, state, "/workspace/project", []string{
+		"-m", model, "-c", "default_subagent_model=" + subagent, "-c", "model_reasoning_effort=" + effort,
+		"-c", "model_providers.codex.name=codex", "-c", "model_providers.codex.base_url=" + baseURL,
+	})
+	assertEnvDigests(t, state, map[string]string{"HOME": "/home/agent", "CODEX_HOME": "/home/agent/.codex"})
 }
 
 func sha256Sum(value string) []byte {

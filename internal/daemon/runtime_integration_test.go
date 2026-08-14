@@ -33,12 +33,8 @@ func TestRT01RealDockerKeepsTwoAgentsWorkspacesHomesAndMountsPrivate(t *testing.
 	taskA := fixture.addTask(t, project.ID, agentA.ID, "hold until stopped A", 0)
 	taskB := fixture.addTask(t, project.ID, agentB.ID, "hold until stopped B", 0)
 	fixture.components.runtime.Start(ctx)
-	runA := waitForRun(t, fixture, taskA.ID, func(run core.Run, task core.Task) bool {
-		return run.State == core.RunActive && task.Status == core.TaskRunning
-	})
-	runB := waitForRun(t, fixture, taskB.ID, func(run core.Run, task core.Task) bool {
-		return run.State == core.RunActive && task.Status == core.TaskRunning
-	})
+	runA := waitForActiveProviderRun(t, fixture, taskA.ID)
+	runB := waitForActiveProviderRun(t, fixture, taskB.ID)
 	if runA.ContainerID == runB.ContainerID || runA.WorkspacePath == runB.WorkspacePath ||
 		runA.HomePath == runB.HomePath || runA.LaunchNonce == runB.LaunchNonce {
 		t.Fatalf("Run isolation collapsed: A=%#v B=%#v", runA, runB)
@@ -117,9 +113,7 @@ func TestRT02RealDockerLaunchPreservesAllMessageIDsWithoutOversizedArgv(t *testi
 	if err != nil || strings.TrimSpace(string(rawCount)) != fmt.Sprint(len(wantMessages)) {
 		t.Fatalf("container-observed Message count = %q err=%v, want %d", rawCount, err, len(wantMessages))
 	}
-	active := waitForRun(t, fixture, task.ID, func(run core.Run, task core.Task) bool {
-		return run.State == core.RunActive && task.Status == core.TaskRunning
-	})
+	active := waitForActiveProviderRun(t, fixture, task.ID)
 	state, err := fixture.executor.Inspect(fixture.ctx, runtimeRef(active))
 	requireNoError(t, err)
 	for _, argument := range state.CommandArgs {
@@ -220,9 +214,7 @@ func TestRT04CancelStopsContainerButPreservesDirtyWorkspace(t *testing.T) {
 	project := fixture.addProject(t, agent.ID)
 	task := fixture.addTask(t, project.ID, agent.ID, "hold until stopped cancel", 0)
 	fixture.components.runtime.Start(fixture.ctx)
-	active := waitForRun(t, fixture, task.ID, func(run core.Run, task core.Task) bool {
-		return run.State == core.RunActive && task.Status == core.TaskRunning
-	})
+	active := waitForActiveProviderRun(t, fixture, task.ID)
 	dirty := filepath.Join(active.WorkspacePath, "dirty-runtime.txt")
 	waitForFile(t, fixture.ctx, dirty)
 	if _, err := fixture.components.service.CancelTask(fixture.ctx, core.TaskActionInput{
@@ -250,9 +242,7 @@ func TestRT04RunStopInterruptsOnlyTheRunAndPreservesDirtyWorkspace(t *testing.T)
 	project := fixture.addProject(t, agent.ID)
 	task := fixture.addTask(t, project.ID, agent.ID, "hold until stopped run only", 0)
 	fixture.components.runtime.Start(fixture.ctx)
-	active := waitForRun(t, fixture, task.ID, func(run core.Run, task core.Task) bool {
-		return run.State == core.RunActive && task.Status == core.TaskRunning
-	})
+	active := waitForActiveProviderRun(t, fixture, task.ID)
 	dirty := filepath.Join(active.WorkspacePath, "dirty-runtime.txt")
 	waitForFile(t, fixture.ctx, dirty)
 	if _, err := fixture.components.service.RequestRunStop(fixture.ctx, core.RunStopInput{
@@ -260,10 +250,7 @@ func TestRT04RunStopInterruptsOnlyTheRunAndPreservesDirtyWorkspace(t *testing.T)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	terminal := waitForRun(t, fixture, task.ID, func(run core.Run, task core.Task) bool {
-		return run.ID == active.ID && run.State == core.RunInterrupted &&
-			run.CleanupState == core.CleanupRemoved && task.Status == core.TaskQueued
-	})
+	terminal := waitForInterruptedRemoved(t, fixture, task.ID, active.ID)
 	persistedTask, err := fixture.components.store.Task(fixture.ctx, task.ID)
 	requireNoError(t, err)
 	if terminal.StopOperationID == "" || terminal.TokenRevokedAt == "" ||
@@ -283,9 +270,7 @@ func TestRT04DeadlineTimesOutRunAndRequeuesTaskForResume(t *testing.T) {
 	project := fixture.addProject(t, agent.ID)
 	task := fixture.addTask(t, project.ID, agent.ID, "hold until stopped timeout", 0)
 	fixture.components.runtime.Start(fixture.ctx)
-	active := waitForRun(t, fixture, task.ID, func(run core.Run, task core.Task) bool {
-		return run.State == core.RunActive && task.Status == core.TaskRunning
-	})
+	active := waitForActiveProviderRun(t, fixture, task.ID)
 	if active.DeadlineAt == "" {
 		t.Fatalf("active Run has no durable deadline: %#v", active)
 	}
@@ -314,11 +299,7 @@ func TestRT05ReconcileCreatedRunWithStopIntentNeverStartsCLI(t *testing.T) {
 	agent := fixture.addAgent(t, "Reconcile Stop Agent")
 	project := fixture.addProject(t, agent.ID)
 	task := fixture.addTask(t, project.ID, agent.ID, "reconcile stop must not start CLI", 0)
-	claim, ok, err := fixture.components.service.ClaimNext(fixture.ctx, project.ID)
-	if err != nil || !ok {
-		t.Fatalf("claim created reconcile fixture: ok=%v err=%v", ok, err)
-	}
-	created := prepareCreatedRunForReconcile(t, fixture, claim)
+	created := claimPreparedRun(t, fixture, project.ID)
 	stopped, err := fixture.components.service.RequestRuntimeStop(fixture.ctx, core.RunStopInput{
 		RunID: created.ID, Reason: "operator stop before daemon restart", OperationID: "rt05-stop-operation",
 		RequestID: "rt05-stop-request",
@@ -354,51 +335,9 @@ func TestRT05ReconcileAdoptsRunningContainerAndRebuildsRunSocket(t *testing.T) {
 	fixture := newP3DockerFixture(t)
 	agent := fixture.addAgent(t, "Reconcile Active Agent")
 	project := fixture.addProject(t, agent.ID)
-	fixture.addTask(t, project.ID, agent.ID, "hold until stopped restart adoption", 0)
-	claim, ok, err := fixture.components.service.ClaimNext(fixture.ctx, project.ID)
-	if err != nil || !ok {
-		t.Fatalf("claim active reconcile fixture: ok=%v err=%v", ok, err)
-	}
-	created := prepareCreatedRunForReconcile(t, fixture, claim)
-	controlPath := filepath.Join(fixture.components.runtime.controlRoot, created.ID)
-	control, err := fixture.components.runtime.openRunControl(created, controlPath)
-	requireNoError(t, err)
-	fixture.components.runtime.registerControl(created.ID, control)
-	if _, err := fixture.executor.Attach(fixture.ctx, runtimeRef(created)); err != nil {
-		t.Fatal(err)
-	}
-	started, err := fixture.components.service.RecordRunStartIssued(
-		fixture.ctx,
-		runtimeFactInput(created, runtimeRef(created), "rt05-active-start"),
-	)
-	requireNoError(t, err)
-	startedRef, err := fixture.executor.Start(fixture.ctx, runtimeRef(started))
-	requireNoError(t, err)
-	active, err := fixture.components.service.ObserveProcessAndActivateRun(
-		fixture.ctx,
-		runtimeFactInput(started, startedRef, "rt05-active-observed"),
-	)
-	requireNoError(t, err)
-	fixture.components.runtime.mu.Lock()
-	oldControl := fixture.components.runtime.controls[active.ID]
-	fixture.components.runtime.mu.Unlock()
-	if oldControl == nil {
-		t.Fatal("fault fixture has no original Run control")
-	}
-	requireNoError(t, fixture.components.runtime.closeControl(active.ID, oldControl))
-
-	restarted := newRuntimeController(
-		fixture.components.config,
-		fixture.components.service,
-		fixture.executor,
-		adapter.Production(),
-		fixture.components.runtime.workspaces,
-		fixture.components.runtime.coordlink,
-	)
-	t.Cleanup(func() { _ = restarted.Close() })
-	requireNoError(t, restarted.Reconcile(fixture.ctx))
-	adopted, err := fixture.components.store.Run(fixture.ctx, active.ID)
-	requireNoError(t, err)
+	task := fixture.addTask(t, project.ID, agent.ID, "hold until stopped restart adoption", 0)
+	active := prepareCreatedRunAndActivate(t, fixture, project.ID, "rt05-active-start", "rt05-active-observed")
+	restarted, adopted := restartRuntimeController(t, fixture, active.ID)
 	if adopted.State != core.RunActive || adopted.ContainerID != active.ContainerID ||
 		adopted.Generation != active.Generation || restarted.monitor(active.ID) == nil {
 		t.Fatalf("restart did not adopt the durable active Run: before=%#v after=%#v", active, adopted)
@@ -417,10 +356,7 @@ func TestRT05ReconcileAdoptsRunningContainerAndRebuildsRunSocket(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	terminal := waitForRun(t, fixture, claim.Task.ID, func(run core.Run, task core.Task) bool {
-		return run.ID == active.ID && run.State == core.RunInterrupted &&
-			run.CleanupState == core.CleanupRemoved && task.Status == core.TaskQueued
-	})
+	terminal := waitForInterruptedRemoved(t, fixture, task.ID, active.ID)
 	if _, err := fixture.executor.Inspect(fixture.ctx, runtimeRef(terminal)); !errors.Is(err, containerruntime.ErrNotFound) {
 		t.Fatalf("adopted container survived terminal cleanup: %v", err)
 	}
@@ -430,38 +366,15 @@ func TestRT05ReconcilePreservesOutcomeRecordedBeforeRestart(t *testing.T) {
 	fixture := newP3DockerFixture(t)
 	agent := fixture.addAgent(t, "Reconcile Outcome Agent")
 	project := fixture.addProject(t, agent.ID)
-	fixture.addTask(t, project.ID, agent.ID, "outcome then hold across restart", 0)
-	claim, ok, err := fixture.components.service.ClaimNext(fixture.ctx, project.ID)
-	if err != nil || !ok {
-		t.Fatalf("claim outcome reconcile fixture: ok=%v err=%v", ok, err)
-	}
-	created := prepareCreatedRunForReconcile(t, fixture, claim)
-	controlPath := filepath.Join(fixture.components.runtime.controlRoot, created.ID)
-	control, err := fixture.components.runtime.openRunControl(created, controlPath)
-	requireNoError(t, err)
-	fixture.components.runtime.registerControl(created.ID, control)
-	if _, err := fixture.executor.Attach(fixture.ctx, runtimeRef(created)); err != nil {
-		t.Fatal(err)
-	}
-	started, err := fixture.components.service.RecordRunStartIssued(
-		fixture.ctx,
-		runtimeFactInput(created, runtimeRef(created), "rt05-outcome-start"),
-	)
-	requireNoError(t, err)
-	startedRef, err := fixture.executor.Start(fixture.ctx, runtimeRef(started))
-	requireNoError(t, err)
-	if _, err := fixture.components.service.ObserveProcessAndActivateRun(
-		fixture.ctx,
-		runtimeFactInput(started, startedRef, "rt05-outcome-active"),
-	); err != nil {
-		t.Fatal(err)
-	}
+	task := fixture.addTask(t, project.ID, agent.ID, "outcome then hold across restart", 0)
+	active := prepareCreatedRunAndActivate(t, fixture, project.ID, "rt05-outcome-start", "rt05-outcome-active")
 
 	deadline := time.Now().Add(10 * time.Second)
-	var outcome core.Run
+	outcome := active
 	for time.Now().Before(deadline) {
-		outcome, err = fixture.components.store.Run(fixture.ctx, started.ID)
+		next, err := fixture.components.store.Run(fixture.ctx, active.ID)
 		requireNoError(t, err)
+		outcome = next
 		if outcome.RequestedOutcome == string(core.OutcomeWait) {
 			break
 		}
@@ -470,21 +383,8 @@ func TestRT05ReconcilePreservesOutcomeRecordedBeforeRestart(t *testing.T) {
 	if outcome.RequestedOutcome != string(core.OutcomeWait) {
 		t.Fatalf("provider did not persist outcome before restart: %#v", outcome)
 	}
-	requireNoError(t, fixture.components.runtime.closeControl(outcome.ID, control))
-
-	restarted := newRuntimeController(
-		fixture.components.config,
-		fixture.components.service,
-		fixture.executor,
-		adapter.Production(),
-		fixture.components.runtime.workspaces,
-		fixture.components.runtime.coordlink,
-	)
-	t.Cleanup(func() { _ = restarted.Close() })
-	requireNoError(t, restarted.Reconcile(fixture.ctx))
-	terminal, err := fixture.components.store.Run(fixture.ctx, outcome.ID)
-	requireNoError(t, err)
-	persistedTask, err := fixture.components.store.Task(fixture.ctx, claim.Task.ID)
+	_, terminal := restartRuntimeController(t, fixture, outcome.ID)
+	persistedTask, err := fixture.components.store.Task(fixture.ctx, task.ID)
 	requireNoError(t, err)
 	if terminal.State != core.RunExited || terminal.RequestedOutcome != string(core.OutcomeWait) ||
 		terminal.StopRequestedAt == "" || terminal.CleanupState != core.CleanupRemoved ||
@@ -498,11 +398,7 @@ func TestRT02MissingWorkspaceAfterStartIssuedFailsBeforeSecondContainer(t *testi
 	agent := fixture.addAgent(t, "Workspace Fence Agent")
 	project := fixture.addProject(t, agent.ID)
 	fixture.addTask(t, project.ID, agent.ID, "workspace loss must fail loud", 1)
-	claim, ok, err := fixture.components.service.ClaimNext(fixture.ctx, project.ID)
-	if err != nil || !ok {
-		t.Fatalf("claim first workspace Run: ok=%v err=%v", ok, err)
-	}
-	created := prepareCreatedRunForReconcile(t, fixture, claim)
+	created := claimPreparedRun(t, fixture, project.ID)
 	started, err := fixture.components.service.RecordRunStartIssued(
 		fixture.ctx,
 		runtimeFactInput(created, runtimeRef(created), "rt02-start-issued"),
@@ -525,6 +421,7 @@ func TestRT02MissingWorkspaceAfterStartIssuedFailsBeforeSecondContainer(t *testi
 	requireNoError(t, os.RemoveAll(started.WorkspacePath))
 
 	var retry core.Claim
+	var ok bool
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		retry, ok, err = fixture.components.service.ClaimNext(fixture.ctx, project.ID)
@@ -977,6 +874,71 @@ func prepareCreatedRunForReconcile(t *testing.T, fixture *p3DockerFixture, claim
 	)
 	requireNoError(t, err)
 	return created
+}
+
+func claimPreparedRun(t *testing.T, fixture *p3DockerFixture, projectID string) core.Run {
+	t.Helper()
+	claim, ok, err := fixture.components.service.ClaimNext(fixture.ctx, projectID)
+	if err != nil || !ok {
+		t.Fatalf("claim created reconcile fixture: ok=%v err=%v", ok, err)
+	}
+	return prepareCreatedRunForReconcile(t, fixture, claim)
+}
+
+// prepareCreatedRunAndActivate drives a freshly claimed Run through the manual
+// reconcile path (create, attach, start, observe) to the active state, exactly
+// as the fault-injection tests did inline. The caller must already have a task
+// in queue; the returned Run is live in Docker.
+func prepareCreatedRunAndActivate(t *testing.T, fixture *p3DockerFixture, projectID, startPhase, activePhase string) core.Run {
+	t.Helper()
+	created := claimPreparedRun(t, fixture, projectID)
+	controlPath := filepath.Join(fixture.components.runtime.controlRoot, created.ID)
+	control, err := fixture.components.runtime.openRunControl(created, controlPath)
+	requireNoError(t, err)
+	fixture.components.runtime.registerControl(created.ID, control)
+	if _, err := fixture.executor.Attach(fixture.ctx, runtimeRef(created)); err != nil {
+		t.Fatal(err)
+	}
+	started, err := fixture.components.service.RecordRunStartIssued(
+		fixture.ctx,
+		runtimeFactInput(created, runtimeRef(created), startPhase),
+	)
+	requireNoError(t, err)
+	startedRef, err := fixture.executor.Start(fixture.ctx, runtimeRef(started))
+	requireNoError(t, err)
+	active, err := fixture.components.service.ObserveProcessAndActivateRun(
+		fixture.ctx,
+		runtimeFactInput(started, startedRef, activePhase),
+	)
+	requireNoError(t, err)
+	return active
+}
+
+// restartRuntimeController closes the live Run control and reconciles a fresh
+// runtime controller over the same durable state, simulating a daemon restart.
+// It returns the fresh controller and the persisted Run after adoption.
+func restartRuntimeController(t *testing.T, fixture *p3DockerFixture, runID string) (*runtimeController, core.Run) {
+	t.Helper()
+	fixture.components.runtime.mu.Lock()
+	oldControl := fixture.components.runtime.controls[runID]
+	fixture.components.runtime.mu.Unlock()
+	if oldControl == nil {
+		t.Fatal("fault fixture has no original Run control")
+	}
+	requireNoError(t, fixture.components.runtime.closeControl(runID, oldControl))
+	restarted := newRuntimeController(
+		fixture.components.config,
+		fixture.components.service,
+		fixture.executor,
+		adapter.Production(),
+		fixture.components.runtime.workspaces,
+		fixture.components.runtime.coordlink,
+	)
+	t.Cleanup(func() { _ = restarted.Close() })
+	requireNoError(t, restarted.Reconcile(fixture.ctx))
+	adopted, err := fixture.components.store.Run(fixture.ctx, runID)
+	requireNoError(t, err)
+	return restarted, adopted
 }
 
 func (f *p3DockerFixture) addAgent(t *testing.T, name string) core.Agent {
