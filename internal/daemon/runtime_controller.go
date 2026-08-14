@@ -412,6 +412,12 @@ func createRuntimeContainer(state *runtimePrepareState) error {
 	launchSpec := adapter.LaunchSpec{
 		BootstrapPath: adapter.ContainerBootstrapPath, Conversation: state.launch.Task.Kind == core.TaskConversation,
 		ContainerHome: "/home/agent", ContainerWork: containerWorkingDirectory(state.launch.Task.Kind),
+		Provider: adapter.ProviderConfig{
+			Model:         state.launch.Agent.Model,
+			SubagentModel: state.launch.Agent.SubagentModel,
+			BaseURL:       state.launch.Agent.BaseURL,
+			Effort:        state.launch.Agent.Effort,
+		},
 	}
 	var command adapter.CommandSpec
 	var err error
