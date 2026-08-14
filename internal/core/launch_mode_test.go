@@ -47,9 +47,17 @@ func TestSelectLaunchModeOnlyResumesIdenticalFingerprintAndCompatibleContext(t *
 		{"task changed", policy, previous, mutateContext(previousContext, "task"), currentContext, fingerprint, "", false},
 		{"workspace changed", policy, previous, mutateContext(previousContext, "workspace"), currentContext, fingerprint, "", false},
 		{"empty current fingerprint", policy, previous, previousContext, currentContext, "", "", false},
-		{"empty previous fingerprint", policy, func() Run { value := previous; value.ConfigFingerprint = ""; return value }(), previousContext, currentContext, fingerprint, "", false},
+		{"empty previous fingerprint", policy, func() Run {
+			value := previous
+			value.ConfigFingerprint = ""
+			return value
+		}(), previousContext, currentContext, fingerprint, "", false},
 		{"fingerprint changed", policy, previous, previousContext, currentContext, otherFingerprint, "", false},
-		{"missing native session", policy, func() Run { value := previous; value.NativeSessionID = ""; return value }(), previousContext, currentContext, fingerprint, "", false},
+		{"missing native session", policy, func() Run {
+			value := previous
+			value.NativeSessionID = ""
+			return value
+		}(), previousContext, currentContext, fingerprint, "", false},
 		{"adapter incompatible", policy, previous, previousContext, currentContext, fingerprint, "", true},
 	}
 	for _, test := range tests {

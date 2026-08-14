@@ -296,7 +296,9 @@ func runTaskDelete(ctx context.Context, args []string, getenv environment, stdou
 		return err
 	}
 	if strings.EqualFold(strings.TrimSpace(cfg.output), "json") {
-		return render(stdout, cfg.output, struct{ OK bool `json:"ok"` }{OK: true})
+		return render(stdout, cfg.output, struct {
+			OK bool `json:"ok"`
+		}{OK: true})
 	}
 	_, err = fmt.Fprintf(stdout, "task %s deleted\n", id)
 	return err
