@@ -71,7 +71,7 @@ func NewService(repository Repository, projectGit ProjectGit, options ServiceOpt
 		if _, duplicate := adapters[adapterID]; duplicate {
 			return nil, NewError(CodeInvalidArgument, "adapter IDs must be unique", false)
 		}
-		adapters[adapterID] = AdapterDescriptor{ID: adapterID}
+		adapters[adapterID] = AdapterDescriptor{ID: adapterID, Name: adapterID}
 	}
 	if len(adapters) == 0 {
 		// AdapterIDs is retained as the compact legacy constructor; when only
@@ -122,6 +122,12 @@ func NewService(repository Repository, projectGit ProjectGit, options ServiceOpt
 }
 
 func normalizeAdapterDescriptor(descriptor AdapterDescriptor) (AdapterDescriptor, error) {
+	if descriptor.Name == "" {
+		descriptor.Name = descriptor.ID
+	}
+	if descriptor.Name != descriptor.ID {
+		return AdapterDescriptor{}, NewError(CodeInvalidArgument, "adapter descriptor name must match its ID", false)
+	}
 	seen := make(map[string]struct{}, len(descriptor.AllowedEfforts))
 	efforts := make([]string, 0, len(descriptor.AllowedEfforts))
 	for _, effort := range descriptor.AllowedEfforts {
@@ -136,6 +142,25 @@ func normalizeAdapterDescriptor(descriptor AdapterDescriptor) (AdapterDescriptor
 	}
 	descriptor.AllowedEfforts = efforts
 	return descriptor, nil
+}
+
+// ListAdapters returns a sorted, detached copy of the read-only adapter
+// descriptors injected at service construction. It exposes only public
+// metadata and never executable names, argv templates, host paths, or
+// credentials.
+func (s *Service) ListAdapters(context.Context) ([]AdapterDescriptor, error) {
+	names := make([]string, 0, len(s.adapters))
+	for name := range s.adapters {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	descriptors := make([]AdapterDescriptor, 0, len(names))
+	for _, name := range names {
+		descriptor := s.adapters[name]
+		descriptor.AllowedEfforts = append([]string{}, descriptor.AllowedEfforts...)
+		descriptors = append(descriptors, descriptor)
+	}
+	return descriptors, nil
 }
 
 func (s *Service) SetReady(ready bool, reason string) {

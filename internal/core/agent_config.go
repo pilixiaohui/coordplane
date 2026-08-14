@@ -20,11 +20,17 @@ const maximumBaseURLBytes = 2048
 var configTokenPattern = regexp.MustCompile(`^[A-Za-z0-9._:/-]+$`)
 
 // AdapterDescriptor is the read-only adapter metadata core needs for
-// write-time Agent validation. It is injected by the runtime owner and never
-// constructed from user input.
+// write-time Agent validation and GET /v1/adapters. It is injected by the
+// runtime owner from the immutable production registry and never constructed
+// from user input. The JSON shape intentionally contains no executable, argv
+// template, host path, or secret.
 type AdapterDescriptor struct {
-	ID             string
-	AllowedEfforts []string
+	ID             string   `json:"-"`
+	Name           string   `json:"name"`
+	ExecutionModel string   `json:"execution_model"`
+	SupportsResume bool     `json:"supports_resume"`
+	SupportsInject bool     `json:"supports_inject"`
+	AllowedEfforts []string `json:"allowed_efforts"`
 }
 
 // agentConfig is the normalized, validated config-domain projection shared by

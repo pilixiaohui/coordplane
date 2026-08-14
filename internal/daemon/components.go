@@ -176,6 +176,10 @@ func coreAdapterDescriptors(registry adapter.Registry) []core.AdapterDescriptor 
 		metadata := entry.Metadata()
 		descriptors = append(descriptors, core.AdapterDescriptor{
 			ID:             name,
+			Name:           metadata.Name,
+			ExecutionModel: string(metadata.ExecutionModel),
+			SupportsResume: metadata.SupportsResume,
+			SupportsInject: metadata.SupportsInject,
 			AllowedEfforts: append([]string(nil), metadata.AllowedEfforts...),
 		})
 	}

@@ -145,8 +145,10 @@ func (s *Service) UpdateAgent(ctx context.Context, input UpdateAgentInput) (Agen
 		if err := tx.UpdateParticipant(participant, expectedParticipantVersion); err != nil {
 			return err
 		}
-		_, err = tx.AppendEvent(event("", "agent", agent.ID, "agent.updated", "boss", "", "", requestID, "", agentUpdatedEventPayload(agent.Version, changed), now))
-		return err
+		if _, err := tx.AppendEvent(event("", "agent", agent.ID, "agent.updated", "boss", "", "", requestID, "", agentUpdatedEventPayload(agent.Version, changed), now)); err != nil {
+			return err
+		}
+		return dedupe.record(tx, agent.ID, "", now)
 	})
 	if err != nil {
 		return Agent{}, err

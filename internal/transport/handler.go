@@ -129,8 +129,24 @@ func registerProjectAgentRoutes(mux *http.ServeMux, operations OperatorOperation
 			methodNotAllowed(w, "GET, POST")
 		}
 	})
-	mux.HandleFunc("/v1/agents/{id}", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
-		result, err := operations.Agent(r.Context(), strings.TrimSpace(r.PathValue("id")))
+	mux.HandleFunc("/v1/agents/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimSpace(r.PathValue("id"))
+		switch r.Method {
+		case http.MethodGet:
+			result, err := operations.Agent(r.Context(), id)
+			writeResult(w, result, err)
+		case http.MethodPut:
+			updateAgent := decodeCall(func(ctx requestContext, input core.UpdateAgentInput) (any, error) {
+				input.ID = id
+				return operations.UpdateAgent(ctx.Context, input)
+			})
+			updateAgent(w, r)
+		default:
+			methodNotAllowed(w, "GET, PUT")
+		}
+	})
+	mux.HandleFunc("/v1/adapters", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		result, err := operations.ListAdapters(r.Context())
 		writeResult(w, result, err)
 	}))
 	mux.HandleFunc("/v1/agents/{id}/pause", requireMethod(http.MethodPost, actionCall(func(ctx requestContext, id, requestID string) (any, error) {
@@ -513,7 +529,7 @@ func NewScopedRunHandler(operations ScopedRunOperations, expected core.RunScope)
 
 func fenceMutations(readiness Readiness, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
+		if r.Method == http.MethodPost || r.Method == http.MethodPut {
 			if err := readiness.RequireReady(); err != nil {
 				writeError(w, err)
 				return

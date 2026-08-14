@@ -31,8 +31,16 @@ func newAgentConfigHarness(t *testing.T) *agentConfigHarness {
 		Now: clock.Now, NewID: ids.New, MaxParallelRuns: 4,
 		AdapterIDs: []string{"claude", "codex"},
 		Adapters: []core.AdapterDescriptor{
-			{ID: "claude", AllowedEfforts: []string{"low", "medium", "high"}},
-			{ID: "codex", AllowedEfforts: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
+			{
+				ID: "claude", Name: "claude", ExecutionModel: "one_shot",
+				SupportsResume: true, SupportsInject: false,
+				AllowedEfforts: []string{"low", "medium", "high"},
+			},
+			{
+				ID: "codex", Name: "codex", ExecutionModel: "one_shot",
+				SupportsResume: true, SupportsInject: false,
+				AllowedEfforts: []string{"low", "medium", "high", "xhigh", "max", "ultra"},
+			},
 		},
 	})
 	requireNoError(t, err)
@@ -101,6 +109,38 @@ func TestAgentConfigValidationRejectsUnsafeOrIncompleteInputWithoutWrites(t *tes
 			}
 			h.requireAgentDurableState(t, before)
 		})
+	}
+}
+
+func TestListAdaptersReturnsSortedDetachedReadOnlyMetadata(t *testing.T) {
+	h := newAgentConfigHarness(t)
+	descriptors, err := h.service.ListAdapters(context.Background())
+	requireNoError(t, err)
+	if len(descriptors) != 2 || descriptors[0].ID != "claude" || descriptors[1].ID != "codex" {
+		t.Fatalf("adapter descriptors = %#v", descriptors)
+	}
+	if descriptors[0].Name != "claude" || descriptors[0].ExecutionModel != "one_shot" ||
+		!descriptors[0].SupportsResume || descriptors[0].SupportsInject ||
+		len(descriptors[0].AllowedEfforts) != 3 || descriptors[0].AllowedEfforts[0] != "low" {
+		t.Fatalf("Claude descriptor = %#v", descriptors[0])
+	}
+	if descriptors[1].Name != "codex" || descriptors[1].ExecutionModel != "one_shot" ||
+		!descriptors[1].SupportsResume || descriptors[1].SupportsInject ||
+		len(descriptors[1].AllowedEfforts) != 6 || descriptors[1].AllowedEfforts[5] != "ultra" {
+		t.Fatalf("Codex descriptor = %#v", descriptors[1])
+	}
+	descriptors[0].AllowedEfforts[0] = "tampered"
+	again, err := h.service.ListAdapters(context.Background())
+	requireNoError(t, err)
+	if again[0].AllowedEfforts[0] != "low" {
+		t.Fatalf("ListAdapters exposed its internal effort slice: %#v", again[0].AllowedEfforts)
+	}
+	raw, err := json.Marshal(descriptors)
+	requireNoError(t, err)
+	for _, forbidden := range []string{"executable", "argv", "secret", "password", "/usr/bin"} {
+		if strings.Contains(string(raw), forbidden) {
+			t.Fatalf("adapter descriptors leaked read-only boundary %q: %s", forbidden, raw)
+		}
 	}
 }
 
@@ -174,6 +214,34 @@ func TestUpdateAgentCASMirrorsBothRowsAndRedactsChangedValues(t *testing.T) {
 	}
 	if after := h.agentDurableState(added.ID); after != before {
 		t.Fatalf("stale update changed durable state\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+func TestUpdateAgentRequestIDReplayIsIdempotent(t *testing.T) {
+	h := newAgentConfigHarness(t)
+	added, err := h.service.AddAgent(context.Background(), core.AddAgentInput{
+		DisplayName: "Idempotent Update", AdapterID: "claude", Image: "agent:latest",
+		InstructionsText: "before", RequestID: "add-idempotent-update",
+	})
+	requireNoError(t, err)
+	replacement := validConfigInput()
+	replacement.DisplayName = "Idempotent After"
+	input := core.UpdateAgentInput{
+		ID: added.ID, Version: added.Version, AgentConfigInput: replacement,
+		RequestID: "update-idempotent",
+	}
+	first, err := h.service.UpdateAgent(context.Background(), input)
+	requireNoError(t, err)
+	events, err := h.database.Events(context.Background(), core.EventFilter{EntityType: "agent", EntityID: added.ID})
+	requireNoError(t, err)
+	replayed, err := h.service.UpdateAgent(context.Background(), input)
+	requireNoError(t, err)
+	replayedEvents, err := h.database.Events(context.Background(), core.EventFilter{EntityType: "agent", EntityID: added.ID})
+	requireNoError(t, err)
+	if replayed.Version != first.Version || replayed.UpdatedAt != first.UpdatedAt ||
+		replayed.DisplayName != "Idempotent After" || len(replayedEvents) != len(events) {
+		t.Fatalf("replayed update = %#v (events %d -> %d), want unchanged durable result",
+			replayed, len(events), len(replayedEvents))
 	}
 }
 
