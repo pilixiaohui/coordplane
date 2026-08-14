@@ -15,9 +15,9 @@ const (
 	redactedHostPath = "[REDACTED_HOST_PATH]"
 	redactedSecret   = "[REDACTED_SECRET]"
 
-	runtimeSecretsFile    = "secrets"
-	runtimeBootstrapFile  = "bootstrap"
-	runContextSeparator   = "\n\nCoordPlane Run context\n"
+	runtimeSecretsFile     = "secrets"
+	runtimeBootstrapFile   = "bootstrap"
+	runContextSeparator    = "\n\nCoordPlane Run context\n"
 	shellSingleQuoteEscape = "'\\''"
 )
 
@@ -123,7 +123,7 @@ func bootstrapInstructionsPrefix(bootstrap string) string {
 }
 
 // parseRunSecretsFile decodes the shell-sourceable secrets file written by the
-// launch path. Each entry is NAME='value' with single quotes and '\'' escapes;
+// launch path. Each entry is NAME='value' with single quotes and '\” escapes;
 // values may contain any byte including spaces, shell metacharacters, and
 // newlines, so scanning is quote-aware rather than line-based. A malformed or
 // non-single-quoted entry rejects the whole file so callers fall back to the
@@ -184,7 +184,7 @@ func parseRunSecretsFile(raw string) ([]string, bool) {
 }
 
 // scanShellSingleQuoted reads a shell single-quoted string starting with '.
-// Inside single quotes every byte is literal except the '\'' escape, which
+// Inside single quotes every byte is literal except the '\” escape, which
 // yields a single quote. It returns the decoded value and the unconsumed tail.
 func scanShellSingleQuoted(raw string) (value, rest string, ok bool) {
 	if !strings.HasPrefix(raw, "'") {
@@ -225,7 +225,7 @@ func validRunSecretKey(key string) bool {
 
 // serializeRunSecretsFile renders the run-scoped provider secrets as a
 // shell-sourceable file. Each entry is a validated NAME='value' line whose
-// value is single-quoted with interior quotes escaped as '\'' so sourcing the
+// value is single-quoted with interior quotes escaped as '\” so sourcing the
 // file can never execute metacharacters; keys are sorted for deterministic
 // output. A key that is not a valid environment name, or a value containing a
 // NUL byte, rejects the whole file rather than emitting an unsafe line.
