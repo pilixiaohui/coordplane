@@ -15,15 +15,24 @@ import (
 )
 
 func TestSnapshotUsesOneFileBackedSQLiteReadTransaction(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// Opening a file-backed store now runs the full schema migration chain and
+	// builds canonical schemas for validation. Keep that setup off the short
+	// snapshot barrier so a loaded parallel test runner cannot time out while
+	// opening the store. The five-second timeout remains scoped to proving the
+	// transaction barrier itself.
+	setupCtx, cancelSetup := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelSetup()
+
 	path := filepath.Join(t.TempDir(), "snapshot.db")
-	reader, err := Open(ctx, path)
+	reader, err := Open(setupCtx, path)
 	requireNoError(t, err)
 	defer reader.Close()
-	writer, err := Open(ctx, path)
+	writer, err := Open(setupCtx, path)
 	requireNoError(t, err)
 	defer writer.Close()
+
+	barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelBarrier()
 
 	reachedBarrier := make(chan struct{})
 	releaseReader := make(chan struct{})
@@ -33,7 +42,7 @@ func TestSnapshotUsesOneFileBackedSQLiteReadTransaction(t *testing.T) {
 	}
 	resultCh := make(chan result, 1)
 	go func() {
-		snapshot, err := reader.snapshot(ctx, "", func() {
+		snapshot, err := reader.snapshot(barrierCtx, "", func() {
 			close(reachedBarrier)
 			<-releaseReader
 		})
@@ -42,10 +51,10 @@ func TestSnapshotUsesOneFileBackedSQLiteReadTransaction(t *testing.T) {
 
 	select {
 	case <-reachedBarrier:
-	case <-ctx.Done():
+	case <-barrierCtx.Done():
 		t.Fatal("snapshot did not reach the post-project barrier")
 	}
-	writeErr := insertReadFixture(ctx, writer, "after", core.TaskQueued, core.RunStarting, core.MessagePending, true)
+	writeErr := insertReadFixture(setupCtx, writer, "after", core.TaskQueued, core.RunStarting, core.MessagePending, true)
 	close(releaseReader)
 	if writeErr != nil {
 		t.Fatal(writeErr)
@@ -54,7 +63,7 @@ func TestSnapshotUsesOneFileBackedSQLiteReadTransaction(t *testing.T) {
 	var during result
 	select {
 	case during = <-resultCh:
-	case <-ctx.Done():
+	case <-barrierCtx.Done():
 		t.Fatal("snapshot did not return after the writer committed")
 	}
 	if during.err != nil {
@@ -63,7 +72,7 @@ func TestSnapshotUsesOneFileBackedSQLiteReadTransaction(t *testing.T) {
 	if got := snapshotFamilySizes(during.snapshot); got != [6]int{} {
 		t.Fatalf("snapshot mixed a post-barrier commit into the old view: %v", got)
 	}
-	after, err := reader.Snapshot(ctx, "")
+	after, err := reader.Snapshot(setupCtx, "")
 	requireNoError(t, err)
 	if got := snapshotFamilySizes(after); got != [6]int{1, 1, 1, 1, 1, 2} {
 		t.Fatalf("next snapshot did not see the complete committed view: %v", got)
