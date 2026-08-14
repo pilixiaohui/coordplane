@@ -24,7 +24,7 @@ func TestRuntimeBuildToDeleteStepsComeFromStaticLists(t *testing.T) {
 	}
 	wantPrepare := []string{
 		"prepareWorkspace", "prepareAgentHome", "writeRunToken", "writeBootstrap",
-		"writeSecrets", "writeLaunch",
+		"writeInstructions", "writeSecrets", "writeLaunch",
 		"openRunAPISocket", "createContainer", "attachStreams", "startCLI", "verifyLive",
 	}
 	if !reflect.DeepEqual(prepareNames, wantPrepare) {

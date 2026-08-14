@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"os"
 	"os/exec"
@@ -73,6 +75,128 @@ func TestRuntimeRedactionIncludesBootstrapInstructions(t *testing.T) {
 	}
 	if !strings.Contains(text, redactedSecret) {
 		t.Fatalf("runtime redaction did not replace instructions text: %q", text)
+	}
+}
+
+func TestRuntimeRedactionInstructionsFileIsCollisionSafe(t *testing.T) {
+	canary := "CANARY-AFTER-SEPARATOR"
+	instructions := "agent prompt header\n\nCoordPlane Run context\n" + canary
+	root := t.TempDir()
+	controlRoot := filepath.Join(root, "run-control")
+	controlPath := filepath.Join(controlRoot, "run-collision")
+	requireNoError(t, os.MkdirAll(controlPath, 0o700))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeInstructionsFile), []byte(instructions), 0o440))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeLaunchFile), []byte("#!/bin/sh\n"), 0o550))
+	sum := sha256.Sum256([]byte(instructions))
+	controller := &runtimeController{controlRoot: controlRoot}
+	run := core.Run{ID: "run-collision", InstructionsHash: hex.EncodeToString(sum[:])}
+
+	values, ok := controller.runtimeRunInstructions(run)
+	if !ok || len(values) != 1 || values[0] != instructions {
+		t.Fatalf("runtimeRunInstructions = %#v ok=%t, want the whole instructions %q", values, ok, instructions)
+	}
+	redact := controller.runtimeRedaction(run)
+	if redact.failClosed {
+		t.Fatal("collision-safe instructions file failed closed")
+	}
+	text := redact.Text("provider echoed:\n" + instructions + "\nend")
+	if strings.Contains(text, canary) {
+		t.Fatalf("runtime redaction leaked text after the separator collision: %q", text)
+	}
+	if !strings.Contains(text, redactedSecret) {
+		t.Fatalf("runtime redaction did not replace the echoed instructions: %q", text)
+	}
+}
+
+func TestRuntimeRedactionInstructionsFileMatchesLegacyBootstrap(t *testing.T) {
+	instructions := "system prompt with a normal body\nno separator line here\nkeep this whole text"
+	root := t.TempDir()
+	controlRoot := filepath.Join(root, "run-control")
+	controlPath := filepath.Join(controlRoot, "run-parity")
+	legacyPath := filepath.Join(controlRoot, "run-legacy-parity")
+	requireNoError(t, os.MkdirAll(controlPath, 0o700))
+	requireNoError(t, os.MkdirAll(legacyPath, 0o700))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeInstructionsFile), []byte(instructions), 0o440))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeLaunchFile), []byte("#!/bin/sh\n"), 0o550))
+	requireNoError(t, os.WriteFile(filepath.Join(legacyPath, runtimeBootstrapFile), []byte(instructions+"\n\nCoordPlane Run context\nProject: p\n"), 0o440))
+	sum := sha256.Sum256([]byte(instructions))
+	controller := &runtimeController{controlRoot: controlRoot}
+	newLineage := controller.runtimeRedaction(core.Run{ID: "run-parity", InstructionsHash: hex.EncodeToString(sum[:])})
+	legacy := controller.runtimeRedaction(core.Run{ID: "run-legacy-parity"})
+	if newLineage.failClosed || legacy.failClosed {
+		t.Fatal("parity redaction failed closed")
+	}
+	input := "provider echoed " + instructions
+	if got, want := newLineage.Text(input), legacy.Text(input); got != want {
+		t.Fatalf("new-lineage redaction %q differs from legacy bootstrap redaction %q", got, want)
+	}
+}
+
+func TestRuntimeRedactionLegacyRunFallsBackToBootstrap(t *testing.T) {
+	canary := "LEGACY-CANARY"
+	bootstrap := "agent prompt\n" + canary + "\n\nCoordPlane Run context\nProject: p\nAgent: a\n"
+	root := t.TempDir()
+	controlRoot := filepath.Join(root, "run-control")
+	controlPath := filepath.Join(controlRoot, "run-legacy")
+	requireNoError(t, os.MkdirAll(controlPath, 0o700))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeBootstrapFile), []byte(bootstrap), 0o440))
+	controller := &runtimeController{controlRoot: controlRoot}
+	run := core.Run{ID: "run-legacy"}
+
+	values, ok := controller.runtimeRunInstructions(run)
+	if !ok || len(values) != 1 || values[0] != "agent prompt\n"+canary {
+		t.Fatalf("legacy runtimeRunInstructions = %#v ok=%t, want the bootstrap instructions prefix", values, ok)
+	}
+	redact := controller.runtimeRedaction(run)
+	if redact.failClosed {
+		t.Fatal("legacy run failed closed")
+	}
+	text := redact.Text("provider echoed " + values[0])
+	if strings.Contains(text, canary) {
+		t.Fatalf("legacy bootstrap fallback leaked instructions: %q", text)
+	}
+	if !strings.Contains(text, redactedSecret) {
+		t.Fatalf("legacy bootstrap fallback did not redact instructions: %q", text)
+	}
+}
+
+func TestRuntimeRedactionNewLineageFailsClosedWithoutTrustedInstructions(t *testing.T) {
+	root := t.TempDir()
+	controlRoot := filepath.Join(root, "run-control")
+	controlPath := filepath.Join(controlRoot, "run-fail-closed")
+	requireNoError(t, os.MkdirAll(controlPath, 0o700))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeLaunchFile), []byte("#!/bin/sh\n"), 0o550))
+	controller := &runtimeController{controlRoot: controlRoot}
+	canary := "UNREDACTED-CANARY"
+	sum := sha256.Sum256([]byte("original prompt"))
+	run := core.Run{ID: "run-fail-closed", InstructionsHash: hex.EncodeToString(sum[:])}
+
+	for _, test := range []struct {
+		name string
+		raw  []byte
+	}{
+		{name: "missing instructions file"},
+		{name: "hash-mismatched instructions file", raw: []byte("tampered prompt")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.raw != nil {
+				requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeInstructionsFile), test.raw, 0o440))
+			}
+			if _, ok := controller.runtimeRunInstructions(run); ok {
+				t.Fatalf("runtimeRunInstructions did not fail closed")
+			}
+			redact := controller.runtimeRedaction(run)
+			if !redact.failClosed {
+				t.Fatal("runtime redaction did not fail closed")
+			}
+			text := redact.Text("provider echoed " + canary)
+			if strings.Contains(text, canary) {
+				t.Fatalf("fail-closed redaction leaked content: %q", text)
+			}
+			if !strings.Contains(text, redactionUnavailableMarker) {
+				t.Fatalf("fail-closed redaction did not emit the unavailable marker: %q", text)
+			}
+		})
 	}
 }
 

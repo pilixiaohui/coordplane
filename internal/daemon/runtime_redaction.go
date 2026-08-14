@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,14 +16,17 @@ const (
 	redactedHostPath = "[REDACTED_HOST_PATH]"
 	redactedSecret   = "[REDACTED_SECRET]"
 
-	runtimeSecretsFile     = "secrets"
-	runtimeBootstrapFile   = "bootstrap"
-	runContextSeparator    = "\n\nCoordPlane Run context\n"
-	shellSingleQuoteEscape = "'\\''"
+	runtimeSecretsFile         = "secrets"
+	runtimeBootstrapFile       = "bootstrap"
+	runtimeInstructionsFile    = "instructions"
+	runContextSeparator        = "\n\nCoordPlane Run context\n"
+	shellSingleQuoteEscape     = "'\\''"
+	redactionUnavailableMarker = "[coordplane: redaction unavailable; content suppressed]"
 )
 
 type runtimeRedaction struct {
-	values []runtimeRedactionValue
+	values     []runtimeRedactionValue
+	failClosed bool
 }
 
 type runtimeRedactionValue struct {
@@ -55,8 +59,13 @@ func (c *runtimeController) runtimeRedaction(run core.Run, extraPaths ...string)
 		}
 	}
 	redaction := newRuntimeRedaction(paths, secrets)
-	if exact := c.runtimeRunInstructions(run); len(exact) > 0 {
-		redaction = redaction.withExactValues(exact...)
+	instructions, ok := c.runtimeRunInstructions(run)
+	if !ok {
+		redaction.failClosed = true
+		return redaction
+	}
+	if len(instructions) > 0 {
+		redaction = redaction.withExactValues(instructions...)
 	}
 	return redaction
 }
@@ -93,24 +102,59 @@ func (c *runtimeController) readRunSecretsFile(runID string) ([]string, bool) {
 	return parseRunSecretsFile(string(raw))
 }
 
-// runtimeRunInstructions returns the Agent instructions text captured in the
-// run's immutable bootstrap file so provider output that echoes the prompt is
-// redacted from run logs. The lookup is best-effort and never re-reads the
-// mutable Agent: a missing or malformed bootstrap file skips exact-value
-// redaction rather than failing monitor creation.
-func (c *runtimeController) runtimeRunInstructions(run core.Run) []string {
+// runtimeRunInstructions returns the Agent instructions text captured for the
+// run so provider output that echoes the prompt is redacted from run logs. The
+// lookup never re-reads the mutable Agent.
+//
+// New-run lineages write a dedicated instructions file during prepare; that
+// file is read whole (construction-based, no separator parsing) and reconciled
+// against the run's immutable InstructionsHash. A missing or hash-mismatched
+// file fails closed (ok=false) so no unredacted content can be persisted.
+// Legacy adopted runs never wrote the file and fall back to extracting the
+// instructions prefix from the run's bootstrap file on a best-effort basis.
+func (c *runtimeController) runtimeRunInstructions(run core.Run) ([]string, bool) {
 	if c == nil || c.controlRoot == "" || strings.TrimSpace(run.ID) == "" {
-		return nil
+		return nil, true
 	}
-	raw, err := os.ReadFile(filepath.Join(c.controlRoot, run.ID, runtimeBootstrapFile))
+	controlPath := filepath.Join(c.controlRoot, run.ID)
+	if hasRuntimeLineage(controlPath) {
+		raw, err := os.ReadFile(filepath.Join(controlPath, runtimeInstructionsFile))
+		if err != nil {
+			return nil, false
+		}
+		if run.InstructionsHash != "" {
+			sum := sha256.Sum256(raw)
+			if hex.EncodeToString(sum[:]) != run.InstructionsHash {
+				return nil, false
+			}
+		}
+		text := strings.TrimSpace(string(raw))
+		if text == "" {
+			return nil, true
+		}
+		return []string{text}, true
+	}
+	raw, err := os.ReadFile(filepath.Join(controlPath, runtimeBootstrapFile))
 	if err != nil {
-		return nil
+		return nil, true
 	}
 	text := strings.TrimSpace(bootstrapInstructionsPrefix(string(raw)))
 	if text == "" {
-		return nil
+		return nil, true
 	}
-	return []string{text}
+	return []string{text}, true
+}
+
+// hasRuntimeLineage reports whether the run's control directory carries the
+// launch file that the launch path always writes. Containers adopted before
+// the file existed never wrote it, so its presence cleanly distinguishes
+// new-run lineages from adopted ones.
+func hasRuntimeLineage(controlPath string) bool {
+	if controlPath == "" {
+		return false
+	}
+	info, err := os.Lstat(filepath.Join(controlPath, runtimeLaunchFile))
+	return err == nil && info.Mode()&os.ModeSymlink == 0
 }
 
 // bootstrapInstructionsPrefix extracts the instructions text that buildBootstrap
@@ -286,6 +330,9 @@ func newRuntimeRedaction(paths, secrets []string) runtimeRedaction {
 }
 
 func (r runtimeRedaction) Text(value string) string {
+	if r.failClosed {
+		return redactionUnavailableMarker
+	}
 	for _, item := range r.values {
 		value = strings.ReplaceAll(value, item.value, item.replacement)
 	}

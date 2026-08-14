@@ -104,23 +104,25 @@ type waitResult struct {
 }
 
 type runtimePrepareState struct {
-	controller    *runtimeController
-	ctx           context.Context
-	claim         core.Claim
-	launch        core.RunLaunchContext
-	entry         adapter.CLI
-	workspaceSpec gitrepo.WorkspaceSpec
-	run           core.Run
-	workspacePath string
-	homePath      string
-	logPath       string
-	controlPath   string
-	bootstrap     string
-	ref           containerruntime.RuntimeRef
-	control       *runControl
-	quickExit     bool
-	complete      bool
-	completionErr error
+	controller       *runtimeController
+	ctx              context.Context
+	claim            core.Claim
+	launch           core.RunLaunchContext
+	entry            adapter.CLI
+	workspaceSpec    gitrepo.WorkspaceSpec
+	run              core.Run
+	workspacePath    string
+	homePath         string
+	logPath          string
+	controlPath      string
+	bootstrap        string
+	instructions     string
+	instructionsHash string
+	ref              containerruntime.RuntimeRef
+	control          *runControl
+	quickExit        bool
+	complete         bool
+	completionErr    error
 }
 
 type runtimePrepareStep struct {
@@ -134,6 +136,7 @@ var runtimePrepareSteps = []runtimePrepareStep{
 	{name: "prepareAgentHome", failureCode: "RUNTIME_DIRECTORY_PREPARE_FAILED", run: prepareRuntimeDirectories},
 	{name: "writeRunToken", failureCode: "TOKEN_PREPARE_FAILED", run: writeRuntimeToken},
 	{name: "writeBootstrap", failureCode: "BOOTSTRAP_PREPARE_FAILED", run: writeRuntimeBootstrap},
+	{name: "writeInstructions", failureCode: "INSTRUCTIONS_PREPARE_FAILED", run: writeRuntimeInstructions},
 	{name: "writeSecrets", failureCode: "SECRETS_PREPARE_FAILED", run: writeRuntimeSecrets},
 	{name: "writeLaunch", failureCode: "LAUNCH_PREPARE_FAILED", run: writeRuntimeLaunch},
 	{name: "openRunAPISocket", failureCode: "RUN_SOCKET_PREPARE_FAILED", run: openRuntimeControl},
@@ -338,7 +341,9 @@ func (c *runtimeController) launchOwned(ctx context.Context, claim core.Claim, o
 		controller: c, ctx: ctx, claim: claim, launch: launch, entry: entry,
 		workspaceSpec: workspaceSpec, run: prepared, workspacePath: workspacePath,
 		homePath: homePath, logPath: logPath, controlPath: controlPath,
-		bootstrap: buildBootstrap(launch, prepared, instructions, workspacePath, workspaceSpec),
+		bootstrap:        buildBootstrap(launch, prepared, instructions, workspacePath, workspaceSpec),
+		instructions:     instructions,
+		instructionsHash: instructionsHash,
 	}
 	fail := func(cause error, code string) error {
 		if errors.Is(cause, containerruntime.ErrUnavailable) {
@@ -401,6 +406,15 @@ func writeRuntimeToken(state *runtimePrepareState) error {
 
 func writeRuntimeBootstrap(state *runtimePrepareState) error {
 	return writeRuntimeFile(filepath.Join(state.controlPath, "bootstrap"), []byte(state.bootstrap), 0o440)
+}
+
+// writeRuntimeInstructions snapshots the exact Agent instructions text into the
+// run's immutable control directory so redaction can read it whole (never
+// reconstructing it from the bootstrap separator) and reconcile it against the
+// launch snapshot hash. It runs before writeLaunch, so a new-lineage run
+// always carries both the instructions file and the lineage launch file.
+func writeRuntimeInstructions(state *runtimePrepareState) error {
+	return writeRuntimeFile(filepath.Join(state.controlPath, runtimeInstructionsFile), []byte(state.instructions), 0o440)
 }
 
 // writeRuntimeSecrets snapshots the daemon's provider allowlist env into the
