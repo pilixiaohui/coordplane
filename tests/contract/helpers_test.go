@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"coordplane/internal/core"
@@ -58,11 +57,13 @@ func activateContractRuntimeRun(t *testing.T, ctx context.Context, service *core
 	if claim.Task.Kind != core.TaskConversation {
 		workspace = filepath.Join(root, "workspace")
 	}
+	launch, err := service.RuntimeLaunchContext(ctx, claim.Run.ID)
+	requireNoError(t, err)
 	prepared, err := service.BeginRunLaunch(ctx, core.RunLaunchInput{
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: prefix + "-nonce",
 		WorkspacePath: workspace, HomePath: filepath.Join(root, "home"),
-		LogPath: filepath.Join(root, "run.log"), InstructionsHash: prefix + "-instructions",
-		ConfigFingerprint: strings.Repeat("a", 64),
+		LogPath: filepath.Join(root, "run.log"), InstructionsHash: launch.InstructionsHash,
+		ConfigFingerprint: launch.ConfigFingerprint,
 		LaunchMode:        "start", CleanupOperationID: prefix + "-cleanup", RequestID: prefix + "-prepare",
 	})
 	requireNoError(t, err)

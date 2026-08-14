@@ -355,8 +355,8 @@ func newRealP4Harness(t *testing.T) *realP4Harness {
 		CanonicalSHA: preflight.InitialSHA, IntegrationAgentID: "agent-real-integrator",
 		Status: core.ProjectActive, Version: 1,
 	}
-	worker := core.Agent{ID: "agent-real-worker", DisplayName: "Worker", AdapterID: "claude", Image: "agent:test", Status: core.AgentActive, Version: 1}
-	integrator := core.Agent{ID: "agent-real-integrator", DisplayName: "Integrator", AdapterID: "claude", Image: "agent:test", Status: core.AgentActive, Version: 1}
+	worker := core.Agent{ID: "agent-real-worker", DisplayName: "Worker", AdapterID: "claude", Image: "agent:test", InstructionsText: "Work only on the assigned Task.", Status: core.AgentActive, Version: 1}
+	integrator := core.Agent{ID: "agent-real-integrator", DisplayName: "Integrator", AdapterID: "claude", Image: "agent:test", InstructionsText: "Work only on the assigned Task.", Status: core.AgentActive, Version: 1}
 	now := clock.Now().UTC().Format(time.RFC3339Nano)
 	project.CreatedAt, project.UpdatedAt = now, now
 	worker.CreatedAt, worker.UpdatedAt = now, now
@@ -400,11 +400,13 @@ func (h *realP4Harness) reconcileGit(t *testing.T) {
 
 func (h *realP4Harness) activate(t *testing.T, claim core.Claim, workspace, prefix string) core.Run {
 	t.Helper()
+	launch, err := h.service.RuntimeLaunchContext(context.Background(), claim.Run.ID)
+	requireNoError(t, err)
 	run, err := h.service.BeginRunLaunch(context.Background(), core.RunLaunchInput{
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: prefix + "-nonce",
 		WorkspacePath: workspace, HomePath: filepath.Join(h.root, "homes", claim.Run.ID),
-		LogPath: filepath.Join(h.root, "logs", claim.Run.ID+".log"), InstructionsHash: prefix + "-instructions",
-		ConfigFingerprint: strings.Repeat("a", 64),
+		LogPath: filepath.Join(h.root, "logs", claim.Run.ID+".log"), InstructionsHash: launch.InstructionsHash,
+		ConfigFingerprint: launch.ConfigFingerprint,
 		LaunchMode:        "start", CleanupOperationID: prefix + "-cleanup", RequestID: prefix + "-prepare",
 	})
 	requireNoError(t, err)
@@ -630,8 +632,8 @@ func prepareP4ScriptedRun(t *testing.T, h *realP4Harness, claim core.Claim, pref
 	run, err := h.service.BeginRunLaunch(ctx, core.RunLaunchInput{
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: prefix + "-nonce",
 		WorkspacePath: workspace, HomePath: filepath.Join(h.root, "homes", claim.Run.ID),
-		LogPath: filepath.Join(h.root, "logs", claim.Run.ID+".log"), InstructionsHash: prefix,
-		ConfigFingerprint: strings.Repeat("a", 64),
+		LogPath: filepath.Join(h.root, "logs", claim.Run.ID+".log"), InstructionsHash: launch.InstructionsHash,
+		ConfigFingerprint: launch.ConfigFingerprint,
 		LaunchMode:        "start", CleanupOperationID: prefix + "-cleanup", RequestID: prefix + "-prepare",
 	})
 	requireNoError(t, err)

@@ -17,7 +17,7 @@ func TestP2CoordlinkBinaryFixedSurfacePersistsSuccessfulCoordination(t *testing.
 		t.Helper()
 		agent, err := service.AddAgent(ctx, core.AddAgentInput{
 			DisplayName: name, AdapterID: "one-shot", Image: "agent:latest",
-			InstructionsFile: "/instructions", RequestID: "p2-surface-agent-" + name,
+			InstructionsText: "Work only on the assigned Task.", RequestID: "p2-surface-agent-" + name,
 		})
 		requireNoError(t, err)
 		return agent

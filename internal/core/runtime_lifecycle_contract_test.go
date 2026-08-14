@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"coordplane/internal/core"
@@ -116,11 +115,12 @@ func TestP3RuntimeFactsAdvanceMonotonicallyAndFenceEveryExternalFact(t *testing.
 	h := newHarness(t)
 	project, claim := createClaimedWorkRun(t, h, "p3-runtime-facts", 0)
 	root := t.TempDir()
+	instructionsHash, fingerprint := launchFingerprint(t, h, claim.Run.ID)
 	prepared, err := h.service.BeginRunLaunch(context.Background(), core.RunLaunchInput{
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: "nonce-runtime-facts",
 		WorkspacePath: filepath.Join(root, "workspace"), HomePath: filepath.Join(root, "home"),
-		LogPath: filepath.Join(root, "logs", "run.log"), InstructionsHash: "sha256-instructions",
-		ConfigFingerprint: strings.Repeat("a", 64),
+		LogPath: filepath.Join(root, "logs", "run.log"), InstructionsHash: instructionsHash,
+		ConfigFingerprint: fingerprint,
 		LaunchMode:        "start", CleanupOperationID: "cleanup-runtime-facts",
 		RequestID: "prepare-runtime-facts",
 	})
@@ -440,11 +440,12 @@ func prepareAndActivateRuntimeRun(t *testing.T, h *harness, claim core.Claim, ro
 
 func prepareRuntimeRun(t *testing.T, h *harness, claim core.Claim, root, prefix string) core.Run {
 	t.Helper()
+	instructionsHash, fingerprint := launchFingerprint(t, h, claim.Run.ID)
 	prepared, err := h.service.BeginRunLaunch(context.Background(), core.RunLaunchInput{
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: prefix + "-nonce",
 		WorkspacePath: filepath.Join(root, "workspace"), HomePath: filepath.Join(root, "home"),
-		LogPath: filepath.Join(root, "run.log"), InstructionsHash: prefix + "-instructions",
-		ConfigFingerprint: strings.Repeat("a", 64),
+		LogPath: filepath.Join(root, "run.log"), InstructionsHash: instructionsHash,
+		ConfigFingerprint: fingerprint,
 		LaunchMode:        "start", CleanupOperationID: prefix + "-cleanup", RequestID: prefix + "-prepare",
 	})
 	requireNoError(t, err)

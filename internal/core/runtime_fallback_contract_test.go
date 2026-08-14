@@ -14,10 +14,10 @@ func TestBeginRunLaunchFallbackSourceRequiresMatchingConfigFingerprint(t *testin
 	t.Run("matching fingerprint is accepted", func(t *testing.T) {
 		h := newHarness(t)
 		project, claim := createClaimedWorkRun(t, h, "fallback-match", 0)
-		fingerprint := strings.Repeat("a", 64)
+		_, fingerprint := launchFingerprint(t, h, claim.Run.ID)
 		previous := insertFailedResumeFallbackSource(t, h, project, claim, fingerprint)
 
-		prepared, err := h.service.BeginRunLaunch(context.Background(), fallbackLaunchInput(t, claim, previous, fingerprint, "prepare-fallback-match"))
+		prepared, err := h.service.BeginRunLaunch(context.Background(), fallbackLaunchInput(t, h, claim, previous, fingerprint, "prepare-fallback-match"))
 		requireNoError(t, err)
 		if prepared.ConfigFingerprint != fingerprint || prepared.ResumedFromRunID != previous.ID {
 			t.Fatalf("prepared fallback = %#v", prepared)
@@ -32,10 +32,11 @@ func TestBeginRunLaunchFallbackSourceRequiresMatchingConfigFingerprint(t *testin
 	t.Run("changed fingerprint is rejected", func(t *testing.T) {
 		h := newHarness(t)
 		project, claim := createClaimedWorkRun(t, h, "fallback-mismatch", 0)
+		_, fingerprint := launchFingerprint(t, h, claim.Run.ID)
 		previous := insertFailedResumeFallbackSource(t, h, project, claim, strings.Repeat("b", 64))
 		before := durableSignature(t, h.database, project.ID)
 
-		if _, err := h.service.BeginRunLaunch(context.Background(), fallbackLaunchInput(t, claim, previous, strings.Repeat("a", 64), "prepare-fallback-mismatch")); !core.IsCode(err, core.CodeResumeUnavailable) {
+		if _, err := h.service.BeginRunLaunch(context.Background(), fallbackLaunchInput(t, h, claim, previous, fingerprint, "prepare-fallback-mismatch")); !core.IsCode(err, core.CodeResumeUnavailable) {
 			t.Fatalf("changed fingerprint error = %v, want %s", err, core.CodeResumeUnavailable)
 		}
 		h.requireDurableSignature(t, project.ID, before)
@@ -69,13 +70,14 @@ func insertFailedResumeFallbackSource(t *testing.T, h *harness, project core.Pro
 	return previous
 }
 
-func fallbackLaunchInput(t *testing.T, claim core.Claim, previous core.Run, fingerprint, requestID string) core.RunLaunchInput {
+func fallbackLaunchInput(t *testing.T, h *harness, claim core.Claim, previous core.Run, fingerprint, requestID string) core.RunLaunchInput {
 	t.Helper()
 	root := t.TempDir()
+	instructionsHash, _ := launchFingerprint(t, h, claim.Run.ID)
 	return core.RunLaunchInput{
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: "nonce-" + requestID,
 		WorkspacePath: filepath.Join(root, "workspace"), HomePath: filepath.Join(root, "home"),
-		LogPath: filepath.Join(root, "run.log"), InstructionsHash: "sha256-instructions",
+		LogPath: filepath.Join(root, "run.log"), InstructionsHash: instructionsHash,
 		ConfigFingerprint: fingerprint, LaunchMode: "start", ResumedFromRunID: previous.ID,
 		CleanupOperationID: "cleanup-" + requestID, RequestID: requestID,
 	}

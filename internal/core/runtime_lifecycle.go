@@ -66,11 +66,14 @@ type RunCleanupInput struct {
 }
 
 type RunLaunchContext struct {
-	Project  Project
-	Agent    Agent
-	Task     Task
-	Run      Run
-	Messages []Message
+	Project           Project
+	Agent             Agent
+	Task              Task
+	Run               Run
+	Messages          []Message
+	Instructions      string
+	InstructionsHash  string
+	ConfigFingerprint string
 }
 
 func (s *Service) RuntimeLaunchContext(ctx context.Context, runID string) (RunLaunchContext, error) {
@@ -100,6 +103,22 @@ func (s *Service) RuntimeLaunchContext(ctx context.Context, runID string) (RunLa
 		}
 		if result.Agent.AdapterID != result.Run.AdapterID || result.Agent.Image != result.Run.Image {
 			return Conflict(CodeStaleRun, "agent runtime config fence changed", string(result.Run.State), result.Run.Version)
+		}
+		result.Instructions, result.InstructionsHash, err = ReadAgentInstructions(result.Agent)
+		if err != nil {
+			return err
+		}
+		result.ConfigFingerprint, err = RuntimeConfigFingerprint(RuntimeConfigFingerprintInput{
+			AdapterID:        result.Agent.AdapterID,
+			Image:            result.Agent.Image,
+			Model:            result.Agent.Model,
+			SubagentModel:    result.Agent.SubagentModel,
+			BaseURL:          result.Agent.BaseURL,
+			Effort:           result.Agent.Effort,
+			InstructionsHash: result.InstructionsHash,
+		})
+		if err != nil {
+			return err
 		}
 		messages, err := tx.MessagesForRecipient("agent", result.Run.AgentID)
 		if err != nil {
@@ -189,6 +208,29 @@ func (s *Service) BeginRunLaunch(ctx context.Context, input RunLaunchInput) (Run
 			task.Status != TaskQueued || task.CurrentRunID != run.ID || task.Generation != run.Generation ||
 			run.Generation != input.Generation {
 			return Conflict(CodeStaleRun, "run launch fence changed", string(run.State), run.Version)
+		}
+		agent, err := tx.Agent(run.AgentID)
+		if err != nil {
+			return err
+		}
+		_, instructionsHash, err := ReadAgentInstructions(agent)
+		if err != nil {
+			return err
+		}
+		fingerprint, err := RuntimeConfigFingerprint(RuntimeConfigFingerprintInput{
+			AdapterID:        agent.AdapterID,
+			Image:            agent.Image,
+			Model:            agent.Model,
+			SubagentModel:    agent.SubagentModel,
+			BaseURL:          agent.BaseURL,
+			Effort:           agent.Effort,
+			InstructionsHash: instructionsHash,
+		})
+		if err != nil {
+			return err
+		}
+		if fingerprint != input.ConfigFingerprint {
+			return Conflict(CodeStaleRun, "run launch config snapshot changed", string(run.State), run.Version)
 		}
 		if task.Kind == TaskConversation && input.WorkspacePath != "" {
 			return NewError(CodeInvalidArgument, "conversation Run cannot have a workspace", false)

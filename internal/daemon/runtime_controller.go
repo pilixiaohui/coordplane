@@ -281,23 +281,9 @@ func (c *runtimeController) launchOwned(ctx context.Context, claim core.Claim, o
 	if !ok {
 		return c.failUnpreparedRun(ctx, launch.Run, "ADAPTER_NOT_REGISTERED", "adapter is not registered")
 	}
-	instructions, instructionsHash, err := readInstructions(launch.Agent)
-	if err != nil {
-		message := c.runtimeRedaction(launch.Run, launch.Agent.InstructionsFile).Text(err.Error())
-		return c.failUnpreparedRun(ctx, launch.Run, "INSTRUCTIONS_UNAVAILABLE", message)
-	}
-	fingerprint, err := core.RuntimeConfigFingerprint(core.RuntimeConfigFingerprintInput{
-		AdapterID:        launch.Agent.AdapterID,
-		Image:            launch.Agent.Image,
-		Model:            launch.Agent.Model,
-		SubagentModel:    launch.Agent.SubagentModel,
-		BaseURL:          launch.Agent.BaseURL,
-		Effort:           launch.Agent.Effort,
-		InstructionsHash: instructionsHash,
-	})
-	if err != nil {
-		return c.failUnpreparedRun(ctx, launch.Run, "CONFIG_FINGERPRINT_UNAVAILABLE", c.runtimeRedaction(launch.Run).Text(err.Error()))
-	}
+	instructions := launch.Instructions
+	instructionsHash := launch.InstructionsHash
+	fingerprint := launch.ConfigFingerprint
 
 	workspacePath := ""
 	workspaceSpec := gitrepo.WorkspaceSpec{}

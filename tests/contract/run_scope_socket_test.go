@@ -14,12 +14,12 @@ func TestRT01PerRunSocketsRequireMatchingTokenScope(t *testing.T) {
 	ctx, root, database, _, service := newContractServiceFixture(t, core.ServiceOptions{MaxParallelRuns: 2, AdapterIDs: []string{"one-shot"}})
 	agentA, err := service.AddAgent(ctx, core.AddAgentInput{
 		DisplayName: "Socket A", AdapterID: "one-shot", Image: "agent:latest",
-		InstructionsFile: "/instructions/a", RequestID: "socket-agent-a",
+		InstructionsText: "Socket A instructions", RequestID: "socket-agent-a",
 	})
 	requireNoError(t, err)
 	agentB, err := service.AddAgent(ctx, core.AddAgentInput{
 		DisplayName: "Socket B", AdapterID: "one-shot", Image: "agent:latest",
-		InstructionsFile: "/instructions/b", RequestID: "socket-agent-b",
+		InstructionsText: "Socket B instructions", RequestID: "socket-agent-b",
 	})
 	requireNoError(t, err)
 	project, err := service.AddProject(ctx, core.AddProjectInput{

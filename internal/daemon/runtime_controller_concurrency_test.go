@@ -183,11 +183,9 @@ func TestRunLogRetentionTreatsPreLaunchEmptyPathAsAbsentAndLeavesGCReady(t *test
 func TestReconcileSkipsRunOwnedBetweenClaimAndMonitorRegistration(t *testing.T) {
 	service := newRuntimeTestService(t)
 	root := t.TempDir()
-	instructions := filepath.Join(root, "instructions.md")
-	requireNoError(t, os.WriteFile(instructions, []byte("Run only the assigned conversation."), 0o600))
 	coordlink := filepath.Join(root, "coordlink")
 	requireNoError(t, os.WriteFile(coordlink, []byte("#!/bin/sh\nexit 0\n"), 0o700))
-	agent, project := addRuntimeTestProject(service, instructions)
+	agent, project := addRuntimeTestProject(service, "Run only the assigned conversation.")
 	if _, err := service.Chat(context.Background(), core.ChatInput{
 		ProjectID: project.ID, AgentID: agent.ID, Body: "exercise launch ownership",
 		Wake: true, RequestID: "wake-launch-race",
@@ -1140,7 +1138,7 @@ func newRuntimeTestService(t *testing.T) *core.Service {
 func claimRuntimeTestRun(t *testing.T) (*core.Service, core.Claim) {
 	t.Helper()
 	service := newRuntimeTestService(t)
-	agent, project := addRuntimeTestProject(service, "/instructions/runtime.md")
+	agent, project := addRuntimeTestProject(service, "Run only the assigned conversation.")
 	task := requireRuntimeValue(service.CreateTask(context.Background(), core.CreateTaskInput{
 		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
 		Title: "Runtime task", RequestID: "add-runtime-task",
@@ -1159,10 +1157,10 @@ func newRuntimeTestController(t *testing.T, service *core.Service, executor cont
 	}
 }
 
-func addRuntimeTestProject(service *core.Service, instructions string) (core.Agent, core.Project) {
+func addRuntimeTestProject(service *core.Service, instructionsText string) (core.Agent, core.Project) {
 	ctx := context.Background()
 	agent := requireRuntimeValue(service.AddAgent(ctx, core.AddAgentInput{
-		DisplayName: "Runtime Agent", AdapterID: "claude", Image: "agent:test", InstructionsFile: instructions, RequestID: "add-runtime-agent",
+		DisplayName: "Runtime Agent", AdapterID: "claude", Image: "agent:test", InstructionsText: instructionsText, RequestID: "add-runtime-agent",
 	}))
 	project := requireRuntimeValue(service.AddProject(ctx, core.AddProjectInput{
 		Name: "Runtime Project", Source: "/source", SourceRef: "refs/heads/main", IntegrationAgentID: agent.ID, RequestID: "add-runtime-project",
@@ -1173,11 +1171,12 @@ func addRuntimeTestProject(service *core.Service, instructions string) (core.Age
 func activateRuntimeTestRun(t *testing.T, service *core.Service, claim core.Claim) (core.Run, containerruntime.RuntimeRef) {
 	t.Helper()
 	root := t.TempDir()
+	launch := requireRuntimeValue(service.RuntimeLaunchContext(context.Background(), claim.Run.ID))
 	prepared := requireRuntimeValue(service.BeginRunLaunch(context.Background(), core.RunLaunchInput{
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: "active-nonce",
 		WorkspacePath: filepath.Join(root, "workspace"), HomePath: filepath.Join(root, "home"),
-		LogPath: filepath.Join(root, "run.log"), InstructionsHash: "instructions-hash",
-		ConfigFingerprint: strings.Repeat("a", 64),
+		LogPath: filepath.Join(root, "run.log"), InstructionsHash: launch.InstructionsHash,
+		ConfigFingerprint: launch.ConfigFingerprint,
 		LaunchMode:        "start", CleanupOperationID: "active-cleanup", RequestID: "prepare-active-run",
 	}))
 	ref := runtimeRef(prepared)

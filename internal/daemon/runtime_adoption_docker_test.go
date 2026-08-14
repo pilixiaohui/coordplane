@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -40,7 +39,7 @@ func TestReconcileRefusesToStartInsecureSameLabelContainer(t *testing.T) {
 		WorkspacePath: workspacePath, HomePath: filepath.Join(fixture.components.config.Runtime.AgentHomeRoot, agent.ID),
 		LogPath:          filepath.Join(fixture.components.config.Runtime.LogRoot, claim.Run.ID, "run.log"),
 		InstructionsHash: instructionsHash, LaunchMode: "start",
-		ConfigFingerprint:  strings.Repeat("a", 64),
+		ConfigFingerprint:  launch.ConfigFingerprint,
 		CleanupOperationID: "cleanup-insecure-adoption", RequestID: runtimeRequest(claim.Run, "prepare"),
 	})
 	requireNoError(t, err)

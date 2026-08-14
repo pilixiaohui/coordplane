@@ -798,6 +798,7 @@ func TestP1BinaryReadSurfacesStayBoundedPastTwoMiBLedger(t *testing.T) {
 	source := testsupport.CreateGitRepository(t, root, "CoordPlane Contract", "contract@coordplane.local")
 	daemon := startDaemon(t, configPath, socket)
 	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
+	requireNoError(t, os.WriteFile(filepath.Join(root, "agent.md"), []byte("Work only on the assigned Task."), 0o600))
 
 	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"agent", "add", "--socket", socket, "--display-name", "Bounded Agent",
@@ -1014,7 +1015,7 @@ func TestCT03CoordlinkBinaryRejectsStaleRunWithoutSideEffects(t *testing.T) {
 		MaxParallelRuns: 2, AdapterIDs: []string{"one-shot"},
 		Now: func() time.Time { return now },
 	})
-	agent, err := service.AddAgent(ctx, core.AddAgentInput{DisplayName: "Agent", AdapterID: "one-shot", Image: "agent:latest", InstructionsFile: "/instructions", RequestID: "agent"})
+	agent, err := service.AddAgent(ctx, core.AddAgentInput{DisplayName: "Agent", AdapterID: "one-shot", Image: "agent:latest", InstructionsText: "Work only on the assigned Task.", RequestID: "agent"})
 	requireNoError(t, err)
 	project, err := service.AddProject(ctx, core.AddProjectInput{Name: "Project", Source: "/source", SourceRef: "refs/heads/main", RequestID: "project"})
 	requireNoError(t, err)
@@ -1103,7 +1104,7 @@ func TestP2CoordlinkBinaryPersistsOutcomeIntentBeforeTerminalFact(t *testing.T) 
 			ctx, _, database, gitFacts, service := newContractServiceFixture(t, core.ServiceOptions{MaxParallelRuns: 1, AdapterIDs: []string{"one-shot"}})
 			agent, err := service.AddAgent(ctx, core.AddAgentInput{
 				DisplayName: "Agent", AdapterID: "one-shot", Image: "agent:latest",
-				InstructionsFile: "/instructions", RequestID: "agent-" + test.name,
+				InstructionsText: "Work only on the assigned Task.", RequestID: "agent-" + test.name,
 			})
 			requireNoError(t, err)
 			project, err := service.AddProject(ctx, core.AddProjectInput{

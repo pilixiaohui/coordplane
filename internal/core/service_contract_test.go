@@ -756,7 +756,7 @@ func (h *harness) addAgent(t *testing.T, name string) core.Agent {
 	t.Helper()
 	agent, err := h.service.AddAgent(context.Background(), core.AddAgentInput{
 		DisplayName: name, AdapterID: "one-shot", Image: "agent:latest",
-		InstructionsFile: "/instructions/agent.md", RequestID: "add-agent-" + name,
+		InstructionsText: "Work only on the assigned Task.", RequestID: "add-agent-" + name,
 	})
 	requireNoError(t, err)
 	return agent
@@ -794,14 +794,29 @@ func prepareTestRun(t *testing.T, h *harness, ctx context.Context, runID, reques
 	if task.Kind != core.TaskConversation {
 		workspace = filepath.Join(root, "workspace")
 	}
+	launch, err := h.service.RuntimeLaunchContext(ctx, runID)
+	if err != nil {
+		return core.Run{}, err
+	}
 	return h.service.BeginRunLaunch(ctx, core.RunLaunchInput{
 		RunID: run.ID, Generation: run.Generation, LaunchNonce: "nonce-" + run.ID,
 		WorkspacePath: workspace, HomePath: filepath.Join(root, "home"),
-		LogPath: filepath.Join(root, "run.log"), InstructionsHash: "test-instructions",
-		ConfigFingerprint: strings.Repeat("a", 64),
+		LogPath: filepath.Join(root, "run.log"), InstructionsHash: launch.InstructionsHash,
+		ConfigFingerprint: launch.ConfigFingerprint,
 		LaunchMode:        "start", CleanupOperationID: "cleanup-" + run.ID,
 		RequestID: requestID + "-prepare",
 	})
+}
+
+// launchFingerprint returns the claim-time InstructionsHash and
+// ConfigFingerprint that RuntimeLaunchContext computes for the Run, so
+// BeginRunLaunch callers can pass the exact snapshot the re-verification
+// expects instead of a placeholder.
+func launchFingerprint(t *testing.T, h *harness, runID string) (instructionsHash, fingerprint string) {
+	t.Helper()
+	launch, err := h.service.RuntimeLaunchContext(context.Background(), runID)
+	requireNoError(t, err)
+	return launch.InstructionsHash, launch.ConfigFingerprint
 }
 
 func activateRun(t *testing.T, h *harness, ctx context.Context, runID, requestID string) (core.Run, error) {

@@ -79,6 +79,7 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 	source := testsupport.CreateGitRepository(t, root, "CoordPlane Contract", "contract@coordplane.local")
 	daemon := startDaemon(t, configPath, socket)
 	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
+	requireNoError(t, os.WriteFile(filepath.Join(root, "agent.md"), []byte("Work only on the assigned Task."), 0o600))
 
 	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"agent", "add", "--socket", socket,

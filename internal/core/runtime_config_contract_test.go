@@ -13,19 +13,18 @@ func TestBeginRunLaunchPersistsFingerprintAndIncludesItInLaunchIntent(t *testing
 	h := newHarness(t)
 	project, claim := createClaimedWorkRun(t, h, "fingerprint-launch", 0)
 	root := t.TempDir()
-	firstFingerprint := strings.Repeat("a", 64)
-	secondFingerprint := strings.Repeat("b", 64)
+	instructionsHash, fingerprint := launchFingerprint(t, h, claim.Run.ID)
 	input := core.RunLaunchInput{
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: "nonce-fingerprint",
 		WorkspacePath: filepath.Join(root, "workspace"), HomePath: filepath.Join(root, "home"),
-		LogPath: filepath.Join(root, "run.log"), InstructionsHash: "sha256-instructions",
-		ConfigFingerprint: firstFingerprint, LaunchMode: "start",
+		LogPath: filepath.Join(root, "run.log"), InstructionsHash: instructionsHash,
+		ConfigFingerprint: fingerprint, LaunchMode: "start",
 		CleanupOperationID: "cleanup-fingerprint", RequestID: "prepare-fingerprint",
 	}
 	prepared, err := h.service.BeginRunLaunch(context.Background(), input)
 	requireNoError(t, err)
-	if prepared.ConfigFingerprint != firstFingerprint {
-		t.Fatalf("persisted fingerprint = %q, want %q", prepared.ConfigFingerprint, firstFingerprint)
+	if prepared.ConfigFingerprint != fingerprint {
+		t.Fatalf("persisted fingerprint = %q, want %q", prepared.ConfigFingerprint, fingerprint)
 	}
 	before := durableSignature(t, h.database, project.ID)
 	replayed, err := h.service.BeginRunLaunch(context.Background(), input)
@@ -35,13 +34,25 @@ func TestBeginRunLaunchPersistsFingerprintAndIncludesItInLaunchIntent(t *testing
 	}
 	h.requireDurableSignature(t, project.ID, before)
 
-	changed := input
-	changed.ConfigFingerprint = secondFingerprint
-	changed.RequestID = "different-fingerprint"
-	if _, err := h.service.BeginRunLaunch(context.Background(), changed); !core.IsCode(err, core.CodeActionInProgress) {
-		t.Fatalf("different fingerprint error = %v, want %s", err, core.CodeActionInProgress)
-	}
-	h.requireDurableSignature(t, project.ID, before)
+	t.Run("same fingerprint different nonce is action in progress", func(t *testing.T) {
+		changed := input
+		changed.LaunchNonce = "different-nonce"
+		changed.RequestID = "different-nonce"
+		if _, err := h.service.BeginRunLaunch(context.Background(), changed); !core.IsCode(err, core.CodeActionInProgress) {
+			t.Fatalf("different nonce error = %v, want %s", err, core.CodeActionInProgress)
+		}
+		h.requireDurableSignature(t, project.ID, before)
+	})
+
+	t.Run("changed fingerprint is a stale run", func(t *testing.T) {
+		changed := input
+		changed.ConfigFingerprint = strings.Repeat("b", 64)
+		changed.RequestID = "different-fingerprint"
+		if _, err := h.service.BeginRunLaunch(context.Background(), changed); !core.IsCode(err, core.CodeStaleRun) {
+			t.Fatalf("different fingerprint error = %v, want %s", err, core.CodeStaleRun)
+		}
+		h.requireDurableSignature(t, project.ID, before)
+	})
 }
 
 func TestBeginRunLaunchRejectsInvalidFingerprintWithoutWrites(t *testing.T) {
