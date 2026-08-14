@@ -28,7 +28,9 @@ func scanParticipant(row rowScanner) (core.Participant, error) {
 	var kind string
 	if err := row.Scan(&participant.ID, &kind, &participant.DisplayName, &participant.Status,
 		&participant.CredentialID, &participant.AdapterID, &participant.Image,
-		&participant.InstructionsFile, &participant.Version, &participant.CreatedAt, &participant.UpdatedAt); err != nil {
+		&participant.InstructionsFile, &participant.Model, &participant.SubagentModel,
+		&participant.BaseURL, &participant.Effort, &participant.InstructionsText,
+		&participant.Version, &participant.CreatedAt, &participant.UpdatedAt); err != nil {
 		return core.Participant{}, err
 	}
 	participant.Kind = core.ParticipantKind(kind)

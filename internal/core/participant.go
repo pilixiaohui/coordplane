@@ -36,6 +36,11 @@ type Participant struct {
 	AdapterID        string
 	Image            string
 	InstructionsFile string
+	InstructionsText string
+	Model            string
+	SubagentModel    string
+	BaseURL          string
+	Effort           string
 	Version          int64
 	CreatedAt        string
 	UpdatedAt        string

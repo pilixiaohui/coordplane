@@ -94,6 +94,7 @@ type Transaction interface {
 	Participant(string) (Participant, error)
 	Participants() ([]Participant, error)
 	InsertParticipant(Participant) error
+	UpdateParticipant(Participant, int64) error
 	ParticipantRoles(string) ([]ParticipantRoleBinding, error)
 	InsertParticipantRole(ParticipantRoleBinding) error
 	DeleteParticipantRole(string, string, string) error

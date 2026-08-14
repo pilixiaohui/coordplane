@@ -94,17 +94,19 @@ func (u *unitOfWork) Agent(id string) (core.Agent, error) {
 }
 
 func (u *unitOfWork) InsertAgent(agent core.Agent) error {
-	_, err := u.tx.ExecContext(u.ctx, `INSERT INTO agents(id,display_name,adapter_id,image,instructions_file,status,version,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+	_, err := u.tx.ExecContext(u.ctx, `INSERT INTO agents(id,display_name,adapter_id,image,instructions_file,model,subagent_model,base_url,effort,instructions_text,status,version,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		agent.ID, agent.DisplayName, agent.AdapterID, agent.Image, agent.InstructionsFile,
+		agent.Model, agent.SubagentModel, agent.BaseURL, agent.Effort, agent.InstructionsText,
 		agent.Status, agent.Version, agent.CreatedAt, agent.UpdatedAt,
 	)
 	return err
 }
 
 func (u *unitOfWork) UpdateAgent(agent core.Agent, expectedVersion int64, expectedStatus core.AgentStatus) error {
-	result, err := u.tx.ExecContext(u.ctx, `UPDATE agents SET display_name=?,adapter_id=?,image=?,instructions_file=?,status=?,version=?,updated_at=? WHERE id=? AND version=? AND status=?`,
-		agent.DisplayName, agent.AdapterID, agent.Image, agent.InstructionsFile, agent.Status,
-		agent.Version, agent.UpdatedAt, agent.ID, expectedVersion, expectedStatus,
+	result, err := u.tx.ExecContext(u.ctx, `UPDATE agents SET display_name=?,adapter_id=?,image=?,instructions_file=?,model=?,subagent_model=?,base_url=?,effort=?,instructions_text=?,status=?,version=?,updated_at=? WHERE id=? AND version=? AND status=?`,
+		agent.DisplayName, agent.AdapterID, agent.Image, agent.InstructionsFile,
+		agent.Model, agent.SubagentModel, agent.BaseURL, agent.Effort, agent.InstructionsText,
+		agent.Status, agent.Version, agent.UpdatedAt, agent.ID, expectedVersion, expectedStatus,
 	)
 	return u.casResult(result, err, "agent", agent.ID)
 }
@@ -190,8 +192,8 @@ func (u *unitOfWork) RunByTokenHash(tokenHash string) (core.Run, error) {
 
 func (u *unitOfWork) InsertRun(run core.Run) error {
 	_, err := u.tx.ExecContext(u.ctx, `
-	INSERT INTO runs(id,project_id,task_id,agent_id,generation,resumed_from_run_id,adapter_id,image,instructions_hash,state,workspace_path,container_id,native_session_id,log_path,token_hash,token_revoked_at,requested_outcome,requested_summary,expected_head,requested_at,stop_requested_at,stop_reason,stop_operation_id,heartbeat_at,exit_code,terminal_reason,last_error,cleanup_state,launch_nonce,launch_operation_id,launch_phase,home_path,container_name,deadline_at,last_observed_at,launch_mode,resume_native_session_id,runtime_error_code,cleanup_operation_id,isolation_spec_version,version,created_at,started_at,ended_at)
-	VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	INSERT INTO runs(id,project_id,task_id,agent_id,generation,resumed_from_run_id,adapter_id,image,instructions_hash,config_fingerprint,state,workspace_path,container_id,native_session_id,log_path,token_hash,token_revoked_at,requested_outcome,requested_summary,expected_head,requested_at,stop_requested_at,stop_reason,stop_operation_id,heartbeat_at,exit_code,terminal_reason,last_error,cleanup_state,launch_nonce,launch_operation_id,launch_phase,home_path,container_name,deadline_at,last_observed_at,launch_mode,resume_native_session_id,runtime_error_code,cleanup_operation_id,isolation_spec_version,version,created_at,started_at,ended_at)
+	VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		runValues(run)...,
 	)
 	return err
@@ -199,9 +201,9 @@ func (u *unitOfWork) InsertRun(run core.Run) error {
 
 func (u *unitOfWork) UpdateRun(run core.Run, expectedVersion int64, expectedState core.RunState) error {
 	result, err := u.tx.ExecContext(u.ctx, `
-	UPDATE runs SET resumed_from_run_id=?,instructions_hash=?,state=?,workspace_path=?,container_id=?,native_session_id=?,log_path=?,token_revoked_at=?,requested_outcome=?,requested_summary=?,expected_head=?,requested_at=?,stop_requested_at=?,stop_reason=?,stop_operation_id=?,heartbeat_at=?,exit_code=?,terminal_reason=?,last_error=?,cleanup_state=?,launch_nonce=?,launch_operation_id=?,launch_phase=?,home_path=?,container_name=?,deadline_at=?,last_observed_at=?,launch_mode=?,resume_native_session_id=?,runtime_error_code=?,cleanup_operation_id=?,isolation_spec_version=?,version=?,started_at=?,ended_at=?
+	UPDATE runs SET resumed_from_run_id=?,instructions_hash=?,config_fingerprint=?,state=?,workspace_path=?,container_id=?,native_session_id=?,log_path=?,token_revoked_at=?,requested_outcome=?,requested_summary=?,expected_head=?,requested_at=?,stop_requested_at=?,stop_reason=?,stop_operation_id=?,heartbeat_at=?,exit_code=?,terminal_reason=?,last_error=?,cleanup_state=?,launch_nonce=?,launch_operation_id=?,launch_phase=?,home_path=?,container_name=?,deadline_at=?,last_observed_at=?,launch_mode=?,resume_native_session_id=?,runtime_error_code=?,cleanup_operation_id=?,isolation_spec_version=?,version=?,started_at=?,ended_at=?
 WHERE id=? AND version=? AND state=?`,
-		run.ResumedFromRunID, run.InstructionsHash, run.State, run.WorkspacePath,
+		run.ResumedFromRunID, run.InstructionsHash, run.ConfigFingerprint, run.State, run.WorkspacePath,
 		run.ContainerID, run.NativeSessionID, run.LogPath, run.TokenRevokedAt,
 		run.RequestedOutcome, run.RequestedSummary, run.ExpectedHead, run.RequestedAt,
 		run.StopRequestedAt, run.StopReason, run.StopOperationID, run.HeartbeatAt,
@@ -341,11 +343,12 @@ func (u *unitOfWork) casResult(result sql.Result, err error, entity, id string) 
 	}
 	if count != 1 {
 		query, ok := map[string]string{
-			"project": `SELECT status,version FROM projects WHERE id=?`,
-			"agent":   `SELECT status,version FROM agents WHERE id=?`,
-			"task":    `SELECT status,version FROM tasks WHERE id=?`,
-			"run":     `SELECT state,version FROM runs WHERE id=?`,
-			"message": `SELECT state,version FROM messages WHERE id=?`,
+			"project":     `SELECT status,version FROM projects WHERE id=?`,
+			"agent":       `SELECT status,version FROM agents WHERE id=?`,
+			"participant": `SELECT status,version FROM participants WHERE id=?`,
+			"task":        `SELECT status,version FROM tasks WHERE id=?`,
+			"run":         `SELECT state,version FROM runs WHERE id=?`,
+			"message":     `SELECT state,version FROM messages WHERE id=?`,
 		}[entity]
 		if !ok {
 			return core.NewError(core.CodeInternal, "unknown CAS entity", false)
@@ -383,7 +386,8 @@ func taskValues(task core.Task) []any {
 func runValues(run core.Run) []any {
 	return []any{
 		run.ID, run.ProjectID, run.TaskID, run.AgentID, run.Generation,
-		run.ResumedFromRunID, run.AdapterID, run.Image, run.InstructionsHash, run.State,
+		run.ResumedFromRunID, run.AdapterID, run.Image, run.InstructionsHash,
+		run.ConfigFingerprint, run.State,
 		run.WorkspacePath, run.ContainerID, run.NativeSessionID, run.LogPath, run.TokenHash,
 		run.TokenRevokedAt, run.RequestedOutcome, run.RequestedSummary, run.ExpectedHead,
 		run.RequestedAt, run.StopRequestedAt, run.StopReason, run.StopOperationID,
@@ -609,12 +613,27 @@ ORDER BY b.project_id,b.role_id`, participantID)
 
 func (u *unitOfWork) InsertParticipant(participant core.Participant) error {
 	_, err := u.tx.ExecContext(u.ctx, `
-INSERT INTO participants(id,kind,display_name,status,credential_id,adapter_id,image,instructions_file,version,created_at,updated_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+INSERT INTO participants(id,kind,display_name,status,credential_id,adapter_id,image,instructions_file,model,subagent_model,base_url,effort,instructions_text,version,created_at,updated_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		participant.ID, string(participant.Kind), participant.DisplayName, participant.Status,
 		participant.CredentialID, participant.AdapterID, participant.Image,
-		participant.InstructionsFile, participant.Version, participant.CreatedAt, participant.UpdatedAt)
+		participant.InstructionsFile, participant.Model, participant.SubagentModel,
+		participant.BaseURL, participant.Effort, participant.InstructionsText,
+		participant.Version, participant.CreatedAt, participant.UpdatedAt)
 	return err
+}
+
+func (u *unitOfWork) UpdateParticipant(participant core.Participant, expectedVersion int64) error {
+	result, err := u.tx.ExecContext(u.ctx, `
+UPDATE participants SET display_name=?,status=?,credential_id=?,adapter_id=?,image=?,instructions_file=?,model=?,subagent_model=?,base_url=?,effort=?,instructions_text=?,version=?,updated_at=?
+WHERE id=? AND version=?`,
+		participant.DisplayName, participant.Status, participant.CredentialID,
+		participant.AdapterID, participant.Image, participant.InstructionsFile,
+		participant.Model, participant.SubagentModel, participant.BaseURL,
+		participant.Effort, participant.InstructionsText, participant.Version,
+		participant.UpdatedAt, participant.ID, expectedVersion,
+	)
+	return u.casResult(result, err, "participant", participant.ID)
 }
 
 func (u *unitOfWork) InsertParticipantRole(binding core.ParticipantRoleBinding) error {

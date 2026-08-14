@@ -6,26 +6,24 @@ import (
 )
 
 func (s *Service) AddAgent(ctx context.Context, input AddAgentInput) (Agent, error) {
+	if err := s.requireOperatorCapability(ctx, CapabilityAgentManage, GlobalProjectID); err != nil {
+		return Agent{}, err
+	}
 	requestedID, err := optionalTextWithin("id", input.ID, 256)
 	if err != nil {
 		return Agent{}, err
 	}
-	displayName, err := requireText("display_name", input.DisplayName)
-	if err != nil {
-		return Agent{}, err
-	}
-	adapterID, err := requireText("adapter_id", input.AdapterID)
-	if err != nil {
-		return Agent{}, err
-	}
-	if _, registered := s.adapters[adapterID]; !registered {
-		return Agent{}, NewError(CodeInvalidArgument, "adapter_id is not registered", false)
-	}
-	image, err := requireText("image", input.Image)
-	if err != nil {
-		return Agent{}, err
-	}
-	instructions, err := requireText("instructions_file", input.InstructionsFile)
+	config, err := s.validateAgentConfig(AgentConfigInput{
+		DisplayName:      input.DisplayName,
+		AdapterID:        input.AdapterID,
+		Image:            input.Image,
+		InstructionsFile: input.InstructionsFile,
+		InstructionsText: input.InstructionsText,
+		Model:            input.Model,
+		SubagentModel:    input.SubagentModel,
+		BaseURL:          input.BaseURL,
+		Effort:           input.Effort,
+	})
 	if err != nil {
 		return Agent{}, err
 	}
@@ -34,8 +32,9 @@ func (s *Service) AddAgent(ctx context.Context, input AddAgentInput) (Agent, err
 		return Agent{}, err
 	}
 	inputHash, err := inputFingerprint(struct {
-		ID, DisplayName, AdapterID, Image, InstructionsFile string
-	}{requestedID, displayName, adapterID, image, instructions})
+		ID, RequestID string
+		Config        agentConfig
+	}{requestedID, requestID, config})
 	if err != nil {
 		return Agent{}, err
 	}
@@ -62,21 +61,14 @@ func (s *Service) AddAgent(ctx context.Context, input AddAgentInput) (Agent, err
 			return err
 		}
 		now := s.nowText()
-		agent = Agent{
-			ID: agentID, DisplayName: displayName, AdapterID: adapterID, Image: image,
-			InstructionsFile: instructions, Status: AgentActive, Version: 1,
-			CreatedAt: now, UpdatedAt: now,
-		}
+		agent = agentFromConfig(agentID, config, now)
 		if err := tx.InsertAgent(agent); err != nil {
 			return err
 		}
 		// Every CLI agent is also a participant in the unified framework, so
-		// role bindings can target it like any other participant.
-		if err := tx.InsertParticipant(Participant{
-			ID: agent.ID, Kind: ParticipantKindCLIAgent, DisplayName: displayName,
-			Status: string(AgentActive), AdapterID: adapterID, Image: image,
-			InstructionsFile: instructions, Version: 1, CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
+		// role bindings can target it like any other participant. The
+		// participant row is an exact config-domain mirror.
+		if err := tx.InsertParticipant(participantFromAgent(agent)); err != nil {
 			return err
 		}
 		if _, err := tx.AppendEvent(event("", "agent", agent.ID, "agent.created", "boss", "", "", requestID, "", "{}", now)); err != nil {
@@ -85,6 +77,81 @@ func (s *Service) AddAgent(ctx context.Context, input AddAgentInput) (Agent, err
 		return dedupe.record(tx, agent.ID, "", now)
 	})
 	return agent, err
+}
+
+// UpdateAgent replaces the complete Agent configuration in one transaction.
+// It shares AddAgent's field validation and requires the caller to prove the
+// current version; an old version conflicts before either mirror row is
+// written, so a failed update has zero side effects.
+func (s *Service) UpdateAgent(ctx context.Context, input UpdateAgentInput) (Agent, error) {
+	if err := s.requireOperatorCapability(ctx, CapabilityAgentManage, GlobalProjectID); err != nil {
+		return Agent{}, err
+	}
+	agentID, err := optionalTextWithin("id", input.ID, 256)
+	if err != nil {
+		return Agent{}, err
+	}
+	if agentID == "" {
+		return Agent{}, NewError(CodeInvalidArgument, "id is required", false)
+	}
+	if input.Version < 1 {
+		return Agent{}, NewError(CodeInvalidArgument, "version is required", false)
+	}
+	config, err := s.validateAgentConfig(input.AgentConfigInput)
+	if err != nil {
+		return Agent{}, err
+	}
+	requestID, err := s.requestID(input.RequestID)
+	if err != nil {
+		return Agent{}, err
+	}
+	inputHash, err := inputFingerprint(struct {
+		ID, RequestID string
+		Version       int64
+		Config        agentConfig
+	}{agentID, requestID, input.Version, config})
+	if err != nil {
+		return Agent{}, err
+	}
+	dedupe := requestDedupe{"boss", "agent.update", requestID, inputHash}
+	var agent Agent
+	err = s.repository.Transact(ctx, func(tx Transaction) error {
+		if replay, ok, err := dedupe.replay(tx); err != nil {
+			return err
+		} else if ok {
+			agent, err = tx.Agent(replay.ID)
+			return err
+		}
+		agent, err = tx.Agent(agentID)
+		if err != nil {
+			return err
+		}
+		if agent.Version != input.Version {
+			return Conflict(CodeVersionConflict, "agent configuration changed", string(agent.Status), agent.Version)
+		}
+		changed := agentChangedFieldNames(agent, config)
+		now := s.nowText()
+		expectedAgentVersion := agent.Version
+		applyAgentConfig(&agent, config, now)
+		if err := tx.UpdateAgent(agent, expectedAgentVersion, agent.Status); err != nil {
+			return err
+		}
+		participant, err := tx.Participant(agent.ID)
+		if err != nil {
+			return err
+		}
+		expectedParticipantVersion := participant.Version
+		applyParticipantConfig(&participant, config, agent.Status, now)
+		if err := tx.UpdateParticipant(participant, expectedParticipantVersion); err != nil {
+			return err
+		}
+		_, err = tx.AppendEvent(event("", "agent", agent.ID, "agent.updated", "boss", "", "", requestID, "", agentUpdatedEventPayload(agent.Version, changed), now))
+		return err
+	})
+	if err != nil {
+		return Agent{}, err
+	}
+	return agent, nil
 }
 
 func (s *Service) SetAgentStatus(ctx context.Context, agentID string, status AgentStatus, requestID string) (Agent, error) {
@@ -114,6 +181,9 @@ func (s *Service) SetAgentStatus(ctx context.Context, agentID string, status Age
 		agent.Version++
 		agent.UpdatedAt = now
 		if err := tx.UpdateAgent(agent, expectedVersion, expectedStatus); err != nil {
+			return err
+		}
+		if err := mirrorAgentParticipantStatus(tx, agent.ID, string(agent.Status), now); err != nil {
 			return err
 		}
 		kind := "agent.paused"
@@ -156,6 +226,9 @@ func (s *Service) ArchiveAgent(ctx context.Context, agentID, requestID string) (
 		if err := tx.UpdateAgent(agent, expectedVersion, expectedStatus); err != nil {
 			return err
 		}
+		if err := mirrorAgentParticipantStatus(tx, agent.ID, string(agent.Status), now); err != nil {
+			return err
+		}
 		projects, err := tx.ProjectsByIntegrationAgent(agent.ID)
 		if err != nil {
 			return err
@@ -177,4 +250,67 @@ func (s *Service) ArchiveAgent(ctx context.Context, agentID, requestID string) (
 		return err
 	})
 	return agent, err
+}
+
+func agentFromConfig(id string, config agentConfig, now string) Agent {
+	return Agent{
+		ID: id, DisplayName: config.DisplayName, AdapterID: config.AdapterID,
+		Image: config.Image, InstructionsFile: config.InstructionsFile,
+		InstructionsText: config.InstructionsText, Model: config.Model,
+		SubagentModel: config.SubagentModel, BaseURL: config.BaseURL,
+		Effort: config.Effort, Status: AgentActive, Version: 1,
+		CreatedAt: now, UpdatedAt: now,
+	}
+}
+
+func participantFromAgent(agent Agent) Participant {
+	return Participant{
+		ID: agent.ID, Kind: ParticipantKindCLIAgent, DisplayName: agent.DisplayName,
+		Status: string(agent.Status), AdapterID: agent.AdapterID, Image: agent.Image,
+		InstructionsFile: agent.InstructionsFile, InstructionsText: agent.InstructionsText,
+		Model: agent.Model, SubagentModel: agent.SubagentModel, BaseURL: agent.BaseURL,
+		Effort: agent.Effort, Version: agent.Version, CreatedAt: agent.CreatedAt,
+		UpdatedAt: agent.UpdatedAt,
+	}
+}
+
+func applyAgentConfig(agent *Agent, config agentConfig, now string) {
+	agent.DisplayName = config.DisplayName
+	agent.AdapterID = config.AdapterID
+	agent.Image = config.Image
+	agent.InstructionsFile = config.InstructionsFile
+	agent.InstructionsText = config.InstructionsText
+	agent.Model = config.Model
+	agent.SubagentModel = config.SubagentModel
+	agent.BaseURL = config.BaseURL
+	agent.Effort = config.Effort
+	agent.Version++
+	agent.UpdatedAt = now
+}
+
+func applyParticipantConfig(participant *Participant, config agentConfig, status AgentStatus, now string) {
+	participant.DisplayName = config.DisplayName
+	participant.Status = string(status)
+	participant.AdapterID = config.AdapterID
+	participant.Image = config.Image
+	participant.InstructionsFile = config.InstructionsFile
+	participant.InstructionsText = config.InstructionsText
+	participant.Model = config.Model
+	participant.SubagentModel = config.SubagentModel
+	participant.BaseURL = config.BaseURL
+	participant.Effort = config.Effort
+	participant.Version++
+	participant.UpdatedAt = now
+}
+
+func mirrorAgentParticipantStatus(tx Transaction, agentID, status, now string) error {
+	participant, err := tx.Participant(agentID)
+	if err != nil {
+		return err
+	}
+	expectedVersion := participant.Version
+	participant.Status = status
+	participant.Version++
+	participant.UpdatedAt = now
+	return tx.UpdateParticipant(participant, expectedVersion)
 }

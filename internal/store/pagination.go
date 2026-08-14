@@ -99,7 +99,7 @@ func invalidCursor() error {
 var _ core.Repository = (*Store)(nil)
 
 const roleSelect = `SELECT id,name,description,capabilities,version,created_at,updated_at FROM roles`
-const participantSelect = `SELECT id,kind,display_name,status,credential_id,adapter_id,image,instructions_file,version,created_at,updated_at FROM participants`
+const participantSelect = `SELECT id,kind,display_name,status,credential_id,adapter_id,image,instructions_file,model,subagent_model,base_url,effort,instructions_text,version,created_at,updated_at FROM participants`
 
 type rowScanner interface {
 	Scan(dest ...any) error
