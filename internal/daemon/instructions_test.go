@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"coordplane/internal/core"
 )
@@ -26,6 +28,50 @@ func TestReadInstructionsSupportsFileAndTextWithIdenticalHashSemantics(t *testin
 	text, hash, err = readInstructions(core.Agent{InstructionsFile: file})
 	if err != nil || text != prompt || hash != wantHex {
 		t.Fatalf("file instructions = %q %q %v", text, hash, err)
+	}
+}
+
+func TestReadInstructionsFileSupportsExactLimitAndRejectsNonRegularSources(t *testing.T) {
+	dir := t.TempDir()
+	exact := strings.Repeat("x", core.MaximumInstructionsBytes)
+	exactFile := filepath.Join(dir, "exact.md")
+	requireNoError(t, os.WriteFile(exactFile, []byte(exact), 0o600))
+	want := sha256.Sum256([]byte(exact))
+
+	text, hash, err := readInstructions(core.Agent{InstructionsFile: exactFile})
+	if err != nil || text != exact || hash != hex.EncodeToString(want[:]) {
+		t.Fatalf("exact-limit file instructions = %d bytes %q %v", len(text), hash, err)
+	}
+
+	symlink := filepath.Join(dir, "symlink.md")
+	requireNoError(t, os.Symlink(exactFile, symlink))
+	if _, _, err := readInstructions(core.Agent{InstructionsFile: symlink}); err == nil {
+		t.Fatal("symlinked instructions file was accepted")
+	}
+
+	directory := filepath.Join(dir, "directory")
+	requireNoError(t, os.Mkdir(directory, 0o700))
+	if _, _, err := readInstructions(core.Agent{InstructionsFile: directory}); err == nil {
+		t.Fatal("directory instructions source was accepted")
+	}
+}
+
+func TestReadInstructionsFileRejectsNamedPipeBeforeOpen(t *testing.T) {
+	pipePath := filepath.Join(t.TempDir(), "instructions.pipe")
+	requireNoError(t, syscall.Mkfifo(pipePath, 0o600))
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := readInstructions(core.Agent{InstructionsFile: pipePath})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("named pipe instructions source was accepted")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("readInstructions blocked while opening a named pipe")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -192,7 +193,19 @@ func readInstructions(agent core.Agent) (string, string, error) {
 		if !filepath.IsAbs(file) || filepath.Clean(file) != file {
 			return "", "", errors.New("Agent instructions file must be a canonical absolute path")
 		}
-		raw, err := os.ReadFile(file)
+		info, err := os.Lstat(file)
+		if err != nil {
+			return "", "", fmt.Errorf("inspect Agent instructions: %w", err)
+		}
+		if !info.Mode().IsRegular() {
+			return "", "", errors.New("Agent instructions file is not a regular file")
+		}
+		handle, err := os.Open(file)
+		if err != nil {
+			return "", "", fmt.Errorf("open Agent instructions: %w", err)
+		}
+		defer handle.Close()
+		raw, err := io.ReadAll(io.LimitReader(handle, core.MaximumInstructionsBytes+1))
 		if err != nil {
 			return "", "", fmt.Errorf("read Agent instructions: %w", err)
 		}
