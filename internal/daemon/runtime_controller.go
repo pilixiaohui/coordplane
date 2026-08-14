@@ -31,6 +31,8 @@ const (
 	runtimeLogFailureReason   = "runtime log monitoring failed"
 	runtimeLogFailureCode     = "LOG_STREAM_FAILED"
 	runtimeSessionFailureCode = "SESSION_PERSIST_FAILED"
+	runtimeLaunchFile         = "launch"
+	runtimeLaunchExecutable   = "/run/coordplane/launch"
 )
 
 var (
@@ -131,6 +133,8 @@ var runtimePrepareSteps = []runtimePrepareStep{
 	{name: "prepareAgentHome", failureCode: "RUNTIME_DIRECTORY_PREPARE_FAILED", run: prepareRuntimeDirectories},
 	{name: "writeRunToken", failureCode: "TOKEN_PREPARE_FAILED", run: writeRuntimeToken},
 	{name: "writeBootstrap", failureCode: "BOOTSTRAP_PREPARE_FAILED", run: writeRuntimeBootstrap},
+	{name: "writeSecrets", failureCode: "SECRETS_PREPARE_FAILED", run: writeRuntimeSecrets},
+	{name: "writeLaunch", failureCode: "LAUNCH_PREPARE_FAILED", run: writeRuntimeLaunch},
 	{name: "openRunAPISocket", failureCode: "RUN_SOCKET_PREPARE_FAILED", run: openRuntimeControl},
 	{name: "createContainer", failureCode: "CONTAINER_CREATE_FAILED", run: createRuntimeContainer},
 	{name: "attachStreams", failureCode: "CONTAINER_ATTACH_FAILED", run: attachRuntimeStreams},
@@ -398,6 +402,33 @@ func writeRuntimeBootstrap(state *runtimePrepareState) error {
 	return writeRuntimeFile(filepath.Join(state.controlPath, "bootstrap"), []byte(state.bootstrap), 0o440)
 }
 
+// writeRuntimeSecrets snapshots the daemon's provider allowlist env into the
+// run's immutable secrets file so the launcher can expose them inside the
+// container without the daemon ever serializing them into the container
+// environment (which `docker inspect` would reveal).
+func writeRuntimeSecrets(state *runtimePrepareState) error {
+	secrets := make(map[string]string, len(state.controller.config.Runtime.ProviderEnvAllowlist))
+	for _, name := range state.controller.config.Runtime.ProviderEnvAllowlist {
+		if value, ok := os.LookupEnv(name); ok {
+			secrets[name] = value
+		}
+	}
+	raw, err := serializeRunSecretsFile(secrets)
+	if err != nil {
+		return err
+	}
+	return writeRuntimeFile(filepath.Join(state.controlPath, runtimeSecretsFile), raw, 0o440)
+}
+
+// writeRuntimeLaunch installs the entrypoint that sources the run's secrets
+// file (auto-exporting its validated variables) and then execs the adapter's
+// real command, so the container entrypoint stays under CoordPlane control
+// and adoption can verify it.
+func writeRuntimeLaunch(state *runtimePrepareState) error {
+	launcher := "#!/bin/sh\nset -a\n. \"$COORDPLANE_SECRETS_FILE\"\nset +a\nexec \"$@\"\n"
+	return writeRuntimeFile(filepath.Join(state.controlPath, runtimeLaunchFile), []byte(launcher), 0o550)
+}
+
 func openRuntimeControl(state *runtimePrepareState) error {
 	control, err := state.controller.openRunControl(state.run, state.controlPath)
 	if err != nil {
@@ -615,17 +646,13 @@ func (c *runtimeController) containerSpec(
 	if err != nil {
 		return containerruntime.ContainerSpec{}, err
 	}
-	env := make(map[string]string, len(command.Env)+2+len(c.config.Runtime.ProviderEnvAllowlist))
-	for _, key := range c.config.Runtime.ProviderEnvAllowlist {
-		if value, ok := os.LookupEnv(key); ok {
-			env[key] = value
-		}
-	}
+	env := make(map[string]string, len(command.Env)+3)
 	for key, value := range command.Env {
 		env[key] = value
 	}
 	env["COORDPLANE_RUN_SOCKET"] = "/run/coordplane/api.sock"
 	env["COORDPLANE_RUN_TOKEN_FILE"] = "/run/coordplane/token"
+	env["COORDPLANE_SECRETS_FILE"] = "/run/coordplane/secrets"
 	mounts := []containerruntime.Mount{
 		{Source: run.HomePath, Target: "/home/agent"},
 		{Source: coordlink, Target: "/usr/local/bin/coordlink", ReadOnly: true},
@@ -637,7 +664,7 @@ func (c *runtimeController) containerSpec(
 	gid := strconv.Itoa(os.Getgid())
 	return containerruntime.ContainerSpec{
 		Ref: runtimeRef(run), Image: run.Image,
-		Command:          containerruntime.CommandSpec{Executable: command.Executable, Args: command.Args, Env: env},
+		Command:          containerruntime.CommandSpec{Executable: runtimeLaunchExecutable, Args: command.Args, Env: env},
 		SensitiveEnvKeys: append([]string(nil), c.config.Runtime.ProviderEnvAllowlist...),
 		WorkingDir:       containerWorkingDirectory(kind), User: strconv.Itoa(runtimeContainerUID) + ":" + gid,
 		GroupAdd: []string{gid}, Network: c.config.Runtime.DockerNetwork,

@@ -4,7 +4,9 @@ import (
 	"context"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -144,6 +146,77 @@ func TestParseRunSecretsFile(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSerializeRunSecretsFileRoundTrips(t *testing.T) {
+	values := map[string]string{
+		"ANTHROPIC_AUTH_TOKEN": "sk-ant $(rm -rf /) ; | & > x*",
+		"QUOTED":               `it's "quoted"`,
+		"MULTILINE":            "line one\nline two\nline three",
+		"PLAIN":                "simple",
+		"EMPTY":                "",
+	}
+	raw, err := serializeRunSecretsFile(values)
+	requireNoError(t, err)
+	parsed, ok := parseRunSecretsFile(string(raw))
+	if !ok {
+		t.Fatalf("serialized secrets file did not parse back: %q", raw)
+	}
+	got := append([]string(nil), parsed...)
+	want := []string{"sk-ant $(rm -rf /) ; | & > x*", `it's "quoted"`, "line one\nline two\nline three", "simple", ""}
+	sort.Strings(got)
+	sort.Strings(want)
+	if len(got) != len(want) {
+		t.Fatalf("round-trip secrets = %#v, want %#v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("round-trip secrets = %#v, want %#v", got, want)
+		}
+	}
+}
+
+func TestSerializeRunSecretsFileRejectsInvalidKey(t *testing.T) {
+	for _, secrets := range []map[string]string{
+		{"1BAD": "value"},
+		{"": "value"},
+		{"GOOD_KEY": "ok", "BAD-KEY": "value"},
+	} {
+		if _, err := serializeRunSecretsFile(secrets); err == nil {
+			t.Fatalf("serializeRunSecretsFile accepted unsafe keys: %#v", secrets)
+		}
+	}
+}
+
+func TestSerializeRunSecretsFileRejectsNUL(t *testing.T) {
+	if _, err := serializeRunSecretsFile(map[string]string{"KEY": "a\x00b"}); err == nil {
+		t.Fatal("serializeRunSecretsFile accepted a NUL byte in a value")
+	}
+}
+
+func TestRuntimeSecretsFileShellSourceSafety(t *testing.T) {
+	payload := filepath.Join(t.TempDir(), "pwned")
+	canary := "sk-ant-'$(touch " + payload + ")' ; | & > *\nsecond line"
+	raw, err := serializeRunSecretsFile(map[string]string{"ANTHROPIC_AUTH_TOKEN": canary})
+	requireNoError(t, err)
+	secretsPath := filepath.Join(t.TempDir(), runtimeSecretsFile)
+	requireNoError(t, os.WriteFile(secretsPath, raw, 0o440))
+
+	// Source exactly like the real launcher does (allexport then dot) and print
+	// the value: the shell must see the literal secret, never execute it.
+	launcherPath := filepath.Join(t.TempDir(), runtimeLaunchFile)
+	launcher := "#!/bin/sh\nset -a\n. \"$COORDPLANE_SECRETS_FILE\"\nset +a\nexec \"$@\"\n"
+	requireNoError(t, os.WriteFile(launcherPath, []byte(launcher), 0o550))
+	cmd := exec.Command(launcherPath, "sh", "-c", `printf %s "$ANTHROPIC_AUTH_TOKEN"`)
+	cmd.Env = append(os.Environ(), "COORDPLANE_SECRETS_FILE="+secretsPath)
+	out, err := cmd.Output()
+	requireNoError(t, err)
+	if string(out) != canary {
+		t.Fatalf("launcher sourced secret = %q, want %q (file: %q)", out, canary, raw)
+	}
+	if _, statErr := os.Stat(payload); statErr == nil {
+		t.Fatalf("sourcing secrets file executed a command substitution payload")
 	}
 }
 

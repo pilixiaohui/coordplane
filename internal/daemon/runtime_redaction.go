@@ -223,6 +223,35 @@ func validRunSecretKey(key string) bool {
 	return true
 }
 
+// serializeRunSecretsFile renders the run-scoped provider secrets as a
+// shell-sourceable file. Each entry is a validated NAME='value' line whose
+// value is single-quoted with interior quotes escaped as '\'' so sourcing the
+// file can never execute metacharacters; keys are sorted for deterministic
+// output. A key that is not a valid environment name, or a value containing a
+// NUL byte, rejects the whole file rather than emitting an unsafe line.
+func serializeRunSecretsFile(secrets map[string]string) ([]byte, error) {
+	names := make([]string, 0, len(secrets))
+	for name := range secrets {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var builder strings.Builder
+	for _, name := range names {
+		if !validRunSecretKey(name) {
+			return nil, fmt.Errorf("run secret key %q is not a valid environment name", name)
+		}
+		value := secrets[name]
+		if strings.IndexByte(value, 0) >= 0 {
+			return nil, fmt.Errorf("run secret %q contains a NUL byte", name)
+		}
+		builder.WriteString(name)
+		builder.WriteString("='")
+		builder.WriteString(strings.ReplaceAll(value, "'", shellSingleQuoteEscape))
+		builder.WriteString("'\n")
+	}
+	return []byte(builder.String()), nil
+}
+
 func newRuntimeRedaction(paths, secrets []string) runtimeRedaction {
 	unique := make(map[string]string, len(paths)+len(secrets))
 	for _, path := range paths {

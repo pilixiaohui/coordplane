@@ -276,70 +276,48 @@ func TestReconcileRefreshesCanonicalRunAfterOwnershipHandoff(t *testing.T) {
 }
 
 func TestReconcileRejectsSensitiveEnvironmentMismatchBeforeMonitor(t *testing.T) {
-	const providerName, currentValue, staleValue = "ANTHROPIC_AUTH_TOKEN", "current-auth-canary", "stale-auth-canary"
-	tests := []struct {
-		name, actualValue string
-		expectedPresent   bool
-	}{{name: "rotated", expectedPresent: true, actualValue: staleValue}, {name: "removed", actualValue: staleValue}, {name: "missing", expectedPresent: true}}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if test.expectedPresent {
-				t.Setenv(providerName, currentValue)
-			} else {
-				previous, present := os.LookupEnv(providerName)
-				requireNoError(t, os.Unsetenv(providerName))
-				t.Cleanup(func() {
-					if present {
-						_ = os.Setenv(providerName, previous)
-					}
-				})
-			}
-			service, claim := claimRuntimeTestRun(t)
-			active, _ := activateRuntimeTestRun(t, service, claim)
-			requireRuntimeValue(service.SendBossMessage(context.Background(), core.BossMessageInput{ProjectID: active.ProjectID, AgentID: active.AgentID, TaskID: active.TaskID, Body: "remain pending across rejected adoption", RequestID: "adoption-message-" + test.name}))
-			executor := &runtimeTestExecutor{}
-			controller := newRuntimeTestController(t, service, executor)
-			controller.config.Runtime = config.RuntimeConfig{DockerNetwork: "none", ProviderEnvAllowlist: []string{providerName}}
-			controller.coordlink = requireRuntimeValue(os.Executable())
-			controlPath := filepath.Join(controller.controlRoot, active.ID)
-			requireNoError(t, os.Mkdir(controlPath, runControlDirectoryMode))
-			requireNoError(t, writeRunControlMarker(controlPath, active))
-			requireNoError(t, writeRuntimeFile(filepath.Join(controlPath, "bootstrap"), []byte("adoption bootstrap"), runControlFileMode))
-			command := requireRuntimeValue((adapter.Claude{}).BuildStartCommand(adapter.LaunchSpec{BootstrapPath: adapter.ContainerBootstrapPath, ContainerHome: "/home/agent", ContainerWork: "/workspace/project"}))
-			spec := requireRuntimeValue(controller.containerSpec(active, claim.Task.Kind, command, controlPath))
-			state := containerruntime.LiveState{Ref: spec.Ref, Image: spec.Image, Entrypoint: []string{spec.Command.Executable}, CommandArgs: spec.Command.Args, Status: containerruntime.StatusRunning, Running: true}
-			for name, value := range spec.Command.Env {
-				if name == providerName {
-					value = test.actualValue
-					if value == "" {
-						continue
-					}
-				}
-				state.Environment = append(state.Environment, containerruntime.EnvironmentFact{Name: name, ValueDigest: fmt.Sprintf("%x", sha256.Sum256([]byte(value)))})
-			}
-			if !test.expectedPresent {
-				state.Environment = append(state.Environment, containerruntime.EnvironmentFact{Name: providerName, ValueDigest: fmt.Sprintf("%x", sha256.Sum256([]byte(test.actualValue)))})
-			}
-			executor.state = &state
-			before := requireRuntimeValue(json.Marshal(requireRuntimeValue(service.Snapshot(context.Background(), active.ProjectID))))
-			requireNoError(t, controller.Reconcile(context.Background()))
-			after := requireRuntimeValue(json.Marshal(requireRuntimeValue(service.Snapshot(context.Background(), active.ProjectID))))
-			if string(before) != string(after) {
-				t.Fatal("rejected adoption advanced durable Task, Run, session, outcome, Message, or Event state")
-			}
-			time.Sleep(10 * time.Millisecond)
-			if executor.logCalls.Load() != 0 || executor.waitCalls.Load() != 0 || controller.monitor(active.ID) != nil {
-				t.Fatalf("rejected adoption side effects: Logs=%d Wait=%d monitor=%v", executor.logCalls.Load(), executor.waitCalls.Load(), controller.monitor(active.ID) != nil)
-			}
-			if _, err := os.Stat(active.LogPath); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("rejected adoption created a runtime log: %v", err)
-			}
-			healthy, reason := controller.Healthy()
-			wantReason := fmt.Sprintf("reconcile Run %s: %s: container isolation environment mismatch", active.ID, containerruntime.ErrOwnership)
-			if healthy || reason != wantReason {
-				t.Fatal("rejected adoption did not degrade with only the generic ownership error")
-			}
-		})
+	const providerName = "ANTHROPIC_AUTH_TOKEN"
+	t.Setenv(providerName, "current-auth-canary")
+	service, claim := claimRuntimeTestRun(t)
+	active, _ := activateRuntimeTestRun(t, service, claim)
+	requireRuntimeValue(service.SendBossMessage(context.Background(), core.BossMessageInput{ProjectID: active.ProjectID, AgentID: active.AgentID, TaskID: active.TaskID, Body: "remain pending across rejected adoption", RequestID: "adoption-message-rogue-env"}))
+	executor := &runtimeTestExecutor{}
+	controller := newRuntimeTestController(t, service, executor)
+	controller.config.Runtime = config.RuntimeConfig{DockerNetwork: "none", ProviderEnvAllowlist: []string{providerName}}
+	controller.coordlink = requireRuntimeValue(os.Executable())
+	controlPath := filepath.Join(controller.controlRoot, active.ID)
+	requireNoError(t, os.Mkdir(controlPath, runControlDirectoryMode))
+	requireNoError(t, writeRunControlMarker(controlPath, active))
+	requireNoError(t, writeRuntimeFile(filepath.Join(controlPath, "bootstrap"), []byte("adoption bootstrap"), runControlFileMode))
+	command := requireRuntimeValue((adapter.Claude{}).BuildStartCommand(adapter.LaunchSpec{BootstrapPath: adapter.ContainerBootstrapPath, ContainerHome: "/home/agent", ContainerWork: "/workspace/project"}))
+	spec := requireRuntimeValue(controller.containerSpec(active, claim.Task.Kind, command, controlPath))
+	state := containerruntime.LiveState{Ref: spec.Ref, Image: spec.Image, Entrypoint: []string{spec.Command.Executable}, CommandArgs: spec.Command.Args, Status: containerruntime.StatusRunning, Running: true}
+	for name, value := range spec.Command.Env {
+		state.Environment = append(state.Environment, containerruntime.EnvironmentFact{Name: name, ValueDigest: fmt.Sprintf("%x", sha256.Sum256([]byte(value)))})
+	}
+	// The spec no longer carries provider secrets in the container environment,
+	// so the only sensitive-key mismatch that remains is a rogue container that
+	// smuggled an allowlisted secret into its environment. Adoption must refuse
+	// to start it.
+	state.Environment = append(state.Environment, containerruntime.EnvironmentFact{Name: providerName, ValueDigest: fmt.Sprintf("%x", sha256.Sum256([]byte("leaked-auth-canary")))})
+	executor.state = &state
+	before := requireRuntimeValue(json.Marshal(requireRuntimeValue(service.Snapshot(context.Background(), active.ProjectID))))
+	requireNoError(t, controller.Reconcile(context.Background()))
+	after := requireRuntimeValue(json.Marshal(requireRuntimeValue(service.Snapshot(context.Background(), active.ProjectID))))
+	if string(before) != string(after) {
+		t.Fatal("rejected adoption advanced durable Task, Run, session, outcome, Message, or Event state")
+	}
+	time.Sleep(10 * time.Millisecond)
+	if executor.logCalls.Load() != 0 || executor.waitCalls.Load() != 0 || controller.monitor(active.ID) != nil {
+		t.Fatalf("rejected adoption side effects: Logs=%d Wait=%d monitor=%v", executor.logCalls.Load(), executor.waitCalls.Load(), controller.monitor(active.ID) != nil)
+	}
+	if _, err := os.Stat(active.LogPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected adoption created a runtime log: %v", err)
+	}
+	healthy, reason := controller.Healthy()
+	wantReason := fmt.Sprintf("reconcile Run %s: %s: container isolation environment mismatch", active.ID, containerruntime.ErrOwnership)
+	if healthy || reason != wantReason {
+		t.Fatal("rejected adoption did not degrade with only the generic ownership error")
 	}
 }
 
