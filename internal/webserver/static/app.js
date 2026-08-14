@@ -27,6 +27,7 @@ let gcPreview = null;
 let editMode = "";
 let messagesError = "";
 let agentDetailData = null;
+let agentEditRequest = 0;
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -76,7 +77,7 @@ async function api(method, path, body) {
   return data ? data.data : null;
 }
 const rid = () => "web-" + Math.random().toString(36).slice(2, 10);
-const leaveEdit = targetView => { editMode = ""; view = targetView; render(); };
+const leaveEdit = targetView => { agentEditRequest++; editMode = ""; view = targetView; render(); };
 
 function toast(msg, isErr) {
   const t = $("toast");
@@ -282,7 +283,7 @@ const views = {
       return `<tr><td><b>${esc(a.display_name)}</b></td><td>${pill(a.status)}</td>
       <td>${t ? esc(t.title) + " " + pill(t.status) : '<span class="muted">空闲</span>'}</td>
       <td><span class="progress"><i style="width:${t ? (t.status === "running" ? 60 : t.status === "waiting" ? 40 : 20) : 0}%"></i></span></td>
-      <td><button class="btn" onclick="openAgent('${a.id}')">详情</button></td></tr>`; }).join("")}
+      <td><button class="btn" data-agent-action="open" data-agent-id="${esc(a.id)}">详情</button></td></tr>`; }).join("")}
     </table>
     <h2>项目 <button class="btn" style="float:right" onclick="newProjectForm()">+ 新建项目</button></h2>
     <table>
@@ -320,9 +321,9 @@ const views = {
     ${agents.map(a => { const t = tasks.find(x => x.assignee_agent_id === a.id && ["queued", "running", "finishing", "waiting"].includes(x.status));
       return `<tr><td><b>${esc(a.display_name)}</b></td><td>${pill(a.status)}</td><td class="mono">${esc(a.adapter_id)}</td>
       <td>${t ? esc(t.title) : '<span class="muted">空闲</span>'}</td>
-      <td><button class="btn" onclick="openAgent('${a.id}')">进度/配置</button>
-      ${a.status === "active" ? `<button class="btn" onclick="agentAction('${a.id}','pause')">暂停</button>` : `<button class="btn" onclick="agentAction('${a.id}','resume')">恢复</button>`}
-      <button class="btn danger" onclick="agentAction('${a.id}','archive')">归档</button></td></tr>`; }).join("")}
+      <td><button class="btn" data-agent-action="open" data-agent-id="${esc(a.id)}">进度/配置</button>
+      ${a.status === "active" ? `<button class="btn" data-agent-action="pause" data-agent-id="${esc(a.id)}">暂停</button>` : `<button class="btn" data-agent-action="resume" data-agent-id="${esc(a.id)}">恢复</button>`}
+      <button class="btn danger" data-agent-action="archive" data-agent-id="${esc(a.id)}">归档</button></td></tr>`; }).join("")}
     </table>`;
   },
   tasks() {
@@ -648,13 +649,15 @@ function agentEffortOptions(adapterID, selected) {
   return `<option value="">(默认)</option>` +
     (descriptor?.allowed_efforts || []).map(e => `<option value="${esc(e)}" ${e === selected ? "selected" : ""}>${esc(e)}</option>`).join("");
 }
-function agentFormHTML(agent, heading, submitCall) {
+function agentFormHTML(agent, heading) {
   const a = agent || {
     display_name: "", adapter_id: (adapters.find(x => x.name === "claude") || adapters[0])?.name || "",
     image: "node:22-bookworm", instructions_file: "/instructions/agent.md", instructions_text: "",
     model: "", subagent_model: "", base_url: "", effort: "",
   };
   const source = a.instructions_text ? "text" : "file";
+  const agentAction = a.id ? "update" : "create";
+  const agentIDAttribute = a.id ? ` data-agent-id="${esc(a.id)}"` : "";
   const adapterOptions = adapters.map(d => `<option value="${esc(d.name)}" ${d.name === a.adapter_id ? "selected" : ""}>${esc(d.name)}${d.execution_model ? ` (${esc(d.execution_model)})` : ""}</option>`).join("");
   return `
   <h1>${heading}</h1>
@@ -672,7 +675,7 @@ function agentFormHTML(agent, heading, submitCall) {
     </span>
     <label>instructions 文件(daemon 宿主绝对路径)</label><input id="a-instr" value="${esc(a.instructions_file)}" ${source === "text" ? "disabled" : ""}>
     <label>instructions 文本(≤1 MiB)</label><textarea id="a-instr-text" rows="6" ${source === "file" ? "disabled" : ""}>${esc(a.instructions_text)}</textarea>
-    <div style="grid-column:1/-1;margin-top:8px"><button class="btn primary" onclick="${submitCall}">保存</button><button class="btn" onclick="leaveEdit('agents')">取消</button></div>
+    <div style="grid-column:1/-1;margin-top:8px"><button class="btn primary" data-agent-action="${agentAction}"${agentIDAttribute}>保存</button><button class="btn" onclick="leaveEdit('agents')">取消</button></div>
   </div>`;
 }
 function toggleAgentInstructions(source) {
@@ -702,7 +705,7 @@ function agentFormPayload() {
 }
 function newAgentForm() {
   editMode = "agent";
-  $("main").innerHTML = agentFormHTML(null, "新建 Agent", "createAgent()");
+  $("main").innerHTML = agentFormHTML(null, "新建 Agent");
 }
 async function createAgent() {
   try {
@@ -712,14 +715,21 @@ async function createAgent() {
     view = "agents"; refreshAll();
   } catch (e) { toast(e.message, true); }
 }
+function renderAgentEditForm(agent, id) {
+  $("main").innerHTML = agentFormHTML(agent, `编辑 Agent <span class="mono">${esc(id)}</span>`);
+}
+
 async function editAgentForm(id) {
   editMode = "agent-edit";
+  const request = ++agentEditRequest;
   $("main").innerHTML = `<h1>加载 Agent 配置…</h1>`;
   try {
     const agent = await api("GET", "/v1/agents/" + encodeURIComponent(id));
+    if (request !== agentEditRequest || editMode !== "agent-edit" || view !== "agent") return;
     agentDetailData = agent;
-    $("main").innerHTML = agentFormHTML(agent, `编辑 Agent <span class="mono">${esc(id)}</span>`, `updateAgent('${id}')`);
+    renderAgentEditForm(agent, id);
   } catch (e) {
+    if (request !== agentEditRequest || editMode !== "agent-edit" || view !== "agent") return;
     toast(e.message, true);
     editMode = "";
     view = "agent"; render();
@@ -736,7 +746,25 @@ async function updateAgent(id) {
     await refreshAll();
     agentDetailData = await api("GET", "/v1/agents/" + encodeURIComponent(id));
     render();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    if (e.code === "VERSION_CONFLICT") {
+      const request = agentEditRequest;
+      toast("Agent 配置已变化，正在载入最新版本", true);
+      try {
+        const latest = await api("GET", "/v1/agents/" + encodeURIComponent(id));
+        if (request === agentEditRequest && editMode === "agent-edit" && view === "agent") {
+          agentDetailData = latest;
+          renderAgentEditForm(latest, id);
+        }
+      } catch (reloadErr) {
+        if (request === agentEditRequest && editMode === "agent-edit" && view === "agent") {
+          toast("重新加载最新 Agent 失败: " + reloadErr.message, true);
+        }
+      }
+      return;
+    }
+    toast(e.message, true);
+  }
 }
 // ---------- 任务 ----------
 function newTaskForm() {
@@ -906,9 +934,9 @@ function renderAgentDetail() {
     <div class="row"><span class="k">effort</span><span class="mono">${esc(a.effort || "—")}</span></div>
     <div class="row"><span class="k">创建</span><span class="muted">${esc(a.created_at)}</span></div>
     <div class="actions">
-      <button class="btn primary" onclick="editAgentForm('${a.id}')">编辑配置</button>
-      ${a.status === "active" ? `<button class="btn" onclick="agentAction('${a.id}','pause')">暂停</button>` : `<button class="btn" onclick="agentAction('${a.id}','resume')">恢复</button>`}
-      <button class="btn danger" onclick="agentAction('${a.id}','archive')">归档</button>
+      <button class="btn primary" data-agent-action="edit" data-agent-id="${esc(a.id)}">编辑配置</button>
+      ${a.status === "active" ? `<button class="btn" data-agent-action="pause" data-agent-id="${esc(a.id)}">暂停</button>` : `<button class="btn" data-agent-action="resume" data-agent-id="${esc(a.id)}">恢复</button>`}
+      <button class="btn danger" data-agent-action="archive" data-agent-id="${esc(a.id)}">归档</button>
     </div>
   </div>
   <h2>当前进度</h2>
@@ -931,6 +959,23 @@ async function refreshAll() {
   } catch (e) { if (e.code === "SCOPE_DENIED") { sessionStorage.removeItem(KEY); showLogin("凭据已失效"); } else { toast(e.message, true); } }
   if (!editMode) render();
 }
-$("nav").addEventListener("click", e => { const a = e.target.closest("a"); if (!a) return; editMode = ""; view = a.dataset.v; render(); if (view === "events") refreshAll(); });
+document.addEventListener("click", e => {
+  const button = e.target.closest("button[data-agent-action]");
+  if (!button) return;
+  const action = button.dataset.agentAction;
+  const id = button.dataset.agentId || "";
+  switch (action) {
+    case "create": createAgent(); break;
+    case "update": if (id) updateAgent(id); break;
+    case "edit": if (id) editAgentForm(id); break;
+    case "open": if (id) openAgent(id); break;
+    case "pause":
+    case "resume":
+    case "archive":
+      if (id) agentAction(id, action);
+      break;
+  }
+});
+$("nav").addEventListener("click", e => { const a = e.target.closest("a"); if (!a) return; agentEditRequest++; editMode = ""; view = a.dataset.v; render(); if (view === "events") refreshAll(); });
 boot();
 setInterval(() => { if (view !== "login") refreshAll(); }, 5000);
