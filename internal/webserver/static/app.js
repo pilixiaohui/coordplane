@@ -736,19 +736,23 @@ async function editAgentForm(id) {
   }
 }
 async function updateAgent(id) {
+  const request = agentEditRequest;
   const body = agentFormPayload();
   body.version = agentDetailData?.version || 0;
   try {
     await api("PUT", "/v1/agents/" + encodeURIComponent(id), body);
+    if (request !== agentEditRequest || editMode !== "agent-edit" || view !== "agent") return;
     toast("Agent 已更新");
     editMode = "";
     view = "agent";
     await refreshAll();
+    if (request !== agentEditRequest || view !== "agent") return;
     agentDetailData = await api("GET", "/v1/agents/" + encodeURIComponent(id));
+    if (request !== agentEditRequest || view !== "agent") return;
     render();
   } catch (e) {
+    if (request !== agentEditRequest || editMode !== "agent-edit" || view !== "agent") return;
     if (e.code === "VERSION_CONFLICT") {
-      const request = agentEditRequest;
       toast("Agent 配置已变化，正在载入最新版本", true);
       try {
         const latest = await api("GET", "/v1/agents/" + encodeURIComponent(id));
