@@ -13,8 +13,12 @@ if [ "${1:-}" = "--resume" ]; then
 fi
 [ "${1:-}" = "--" ] && [ "$#" -eq 2 ]
 
-echo '{"type":"system","subtype":"init","session_id":"scripted-session-p3"}'
 bootstrap=/run/coordplane/bootstrap
+if [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+    printf %s "$ANTHROPIC_AUTH_TOKEN" > /workspace/project/secret-observed
+    printf '{"type":"assistant","message":"provider echoed %s"}\n' "$ANTHROPIC_AUTH_TOKEN"
+fi
+echo '{"type":"system","subtype":"init","session_id":"scripted-session-p3"}'
 if grep -q "crash matrix" "$bootstrap"; then
     sleep 0.3
 fi
@@ -50,6 +54,8 @@ elif grep -q "exit after active for crash matrix" "$bootstrap"; then
     sleep 1
 elif grep -q "hold until stopped" "$bootstrap"; then
     echo "dirty runtime state" > /workspace/project/dirty-runtime.txt
+    canary=$(sed -n '1p' "$bootstrap")
+    printf '{"type":"assistant","message":"bootstrap canary %s"}\n' "$canary"
     sleep 30
 fi
 

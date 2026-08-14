@@ -28,6 +28,7 @@ else
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 			--) break ;;
+			-c|-m) shift 2 ;;
 			-*) shift ;;
 			*) session=$1; shift; break ;;
 		esac
@@ -40,6 +41,10 @@ fi
 
 bootstrap=/run/coordplane/bootstrap
 run_id=$(sed -n 's/^Run: //p' "$bootstrap")
+if [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+	printf %s "$ANTHROPIC_AUTH_TOKEN" > /workspace/project/secret-observed
+	printf '{"type":"item.completed","item":{"id":"i-2","type":"agent_message","role":"user","content":[{"type":"output_text","text":"echoed provider secret %s"}]}}\n' "$ANTHROPIC_AUTH_TOKEN"
+fi
 if [ "$mode" = "resume" ] && grep -q "resume error" "$bootstrap"; then
 	printf '{"type":"error","message":"Session not found for thread_id: %s"}\n' "$session"
 	exit 2

@@ -819,10 +819,20 @@ func waitForOperatorRun(t *testing.T, client *transport.Client, taskID string, r
 
 func noneNetworkConfig(t *testing.T, root string) (string, []byte) {
 	t.Helper()
-	path := writeTestConfig(t, root)
-	raw, err := os.ReadFile(path)
-	requireNoError(t, err)
-	return path, []byte(strings.ReplaceAll(string(raw), "  docker_network: coordplane\n", "  docker_network: none\n"))
+	return noneNetworkConfigWithProviderEnv(t, root, nil)
+}
+
+func noneNetworkConfigWithProviderEnv(t *testing.T, root string, providerEnv []string) (string, []byte) {
+	t.Helper()
+	dataDir := filepath.Join(root, "data")
+	configPath := filepath.Join(root, "coordplane.yaml")
+	raw := testsupport.RuntimeConfigYAML(testsupport.RuntimeConfigFixture{
+		DataDir: dataDir, OperatorSocket: filepath.Join(dataDir, "operator.sock"),
+		MaxParallelRuns: 4, CompletedWorkspace: "24h", TerminalTaskRef: "168h", RunLog: "168h",
+		DockerNetwork: "coordplane", DefaultImage: "coordplane-agent:latest", ProviderEnv: providerEnv,
+	})
+	requireNoError(t, os.WriteFile(configPath, raw, 0o600))
+	return configPath, []byte(strings.ReplaceAll(string(raw), "  docker_network: coordplane\n", "  docker_network: none\n"))
 }
 
 func newP3DockerFixture(t *testing.T) *p3DockerFixture {
@@ -837,7 +847,19 @@ func newCodexDockerFixture(t *testing.T) *p3DockerFixture {
 	return newP3DockerFixtureAdapterWithRunTimeout(t, "codex", 0, 4*time.Minute)
 }
 
+func newP3DockerFixtureWithProviderEnv(t *testing.T, providerEnv []string) *p3DockerFixture {
+	return newP3DockerFixtureAdapterWithProviderEnvAndRunTimeout(t, "claude", 0, 90*time.Second, providerEnv)
+}
+
+func newCodexDockerFixtureWithProviderEnv(t *testing.T, providerEnv []string) *p3DockerFixture {
+	return newP3DockerFixtureAdapterWithProviderEnvAndRunTimeout(t, "codex", 0, 4*time.Minute, providerEnv)
+}
+
 func newP3DockerFixtureAdapterWithRunTimeout(t *testing.T, adapterName string, runTimeout, ctxTimeout time.Duration) *p3DockerFixture {
+	return newP3DockerFixtureAdapterWithProviderEnvAndRunTimeout(t, adapterName, runTimeout, ctxTimeout, nil)
+}
+
+func newP3DockerFixtureAdapterWithProviderEnvAndRunTimeout(t *testing.T, adapterName string, runTimeout, ctxTimeout time.Duration, providerEnv []string) *p3DockerFixture {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), ctxTimeout)
 	t.Cleanup(cancel)
@@ -865,7 +887,7 @@ func newP3DockerFixtureAdapterWithRunTimeout(t *testing.T, adapterName string, r
 	if raw, err := buildImage.CombinedOutput(); err != nil {
 		t.Fatalf("build deterministic one-shot image: %v\n%s", err, raw)
 	}
-	configPath, rawConfig := noneNetworkConfig(t, root)
+	configPath, rawConfig := noneNetworkConfigWithProviderEnv(t, root, providerEnv)
 	if runTimeout > 0 {
 		rawConfig = []byte(strings.Replace(string(rawConfig),
 			"  default_image:", "  run_timeout: "+runTimeout.String()+"\n  default_image:", 1))
@@ -928,6 +950,9 @@ func prepareCreatedRunForReconcile(t *testing.T, fixture *p3DockerFixture, claim
 	requireNoError(t, writeRunControlMarker(controlPath, prepared))
 	requireNoError(t, writeRuntimeFile(filepath.Join(controlPath, "token"), []byte(claim.Token+"\n"), 0o440))
 	requireNoError(t, writeRuntimeFile(filepath.Join(controlPath, "bootstrap"), []byte(bootstrap), 0o440))
+	prepareState := &runtimePrepareState{controller: fixture.components.runtime, controlPath: controlPath}
+	requireNoError(t, writeRuntimeSecrets(prepareState))
+	requireNoError(t, writeRuntimeLaunch(prepareState))
 	entry, ok := fixture.components.runtime.adapters.Lookup(prepared.AdapterID)
 	if !ok {
 		t.Fatalf("adapter %q is not registered", prepared.AdapterID)
