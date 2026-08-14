@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"os"
@@ -55,7 +56,26 @@ func (c *runtimeController) runtimeRedaction(run core.Run, extraPaths ...string)
 			secrets = append(secrets, strings.TrimSpace(string(token)))
 		}
 	}
-	return newRuntimeRedaction(paths, secrets)
+	return newRuntimeRedaction(paths, secrets).withExactValues(c.runtimeInstructionSecrets(run)...)
+}
+
+// runtimeInstructionSecrets returns the Agent instructions text so provider
+// output that echoes the prompt is redacted from run logs. The lookup is
+// best-effort: monitor creation must never fail because instructions cannot be
+// re-read (the launch path already validated them).
+func (c *runtimeController) runtimeInstructionSecrets(run core.Run) []string {
+	if c == nil || c.service == nil || strings.TrimSpace(run.AgentID) == "" {
+		return nil
+	}
+	agent, err := c.service.Agent(context.Background(), run.AgentID)
+	if err != nil {
+		return nil
+	}
+	text, _, err := readInstructions(agent)
+	if err != nil || text == "" {
+		return nil
+	}
+	return []string{text}
 }
 
 func newRuntimeRedaction(paths, secrets []string) runtimeRedaction {
@@ -96,4 +116,25 @@ func (r runtimeRedaction) Text(value string) string {
 		value = strings.ReplaceAll(value, item.value, item.replacement)
 	}
 	return value
+}
+
+// withExactValues appends whole-string secrets (for example the full
+// instructions text) without expanding them into fields. Field expansion is
+// reserved for provider credentials; expanding an instruction sentence would
+// over-redact ordinary words such as "on" or "the" inside unrelated output.
+func (r runtimeRedaction) withExactValues(values ...string) runtimeRedaction {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		r.values = append(r.values, runtimeRedactionValue{value: value, replacement: redactedSecret})
+	}
+	sort.Slice(r.values, func(left, right int) bool {
+		if len(r.values[left].value) != len(r.values[right].value) {
+			return len(r.values[left].value) > len(r.values[right].value)
+		}
+		return r.values[left].value < r.values[right].value
+	})
+	return r
 }

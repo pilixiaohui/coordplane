@@ -38,6 +38,25 @@ func TestRuntimeRedaction(t *testing.T) {
 	}
 }
 
+func TestRuntimeRedactionIncludesInstructionsText(t *testing.T) {
+	service := newRuntimeTestService(t)
+	canary := "REDACT-CANARY-INSTRUCTIONS"
+	agent := requireRuntimeValue(service.AddAgent(context.Background(), core.AddAgentInput{
+		DisplayName: "Redaction Agent", AdapterID: "claude", Image: "agent:test",
+		InstructionsText: canary, RequestID: "redaction-instructions-agent",
+	}))
+	controller := &runtimeController{service: service}
+	run := core.Run{ID: "run-redaction", AgentID: agent.ID}
+
+	text := controller.runtimeRedaction(run).Text("provider echoed " + canary)
+	if strings.Contains(text, canary) {
+		t.Fatalf("runtime redaction retained instructions text: %q", text)
+	}
+	if !strings.Contains(text, redactedSecret) {
+		t.Fatalf("runtime redaction did not replace instructions text: %q", text)
+	}
+}
+
 func TestRuntimeLogBoundaryRedactsBoundsAndReplaysFromZero(t *testing.T) {
 	root := t.TempDir()
 	const (
