@@ -745,6 +745,13 @@ func TestRT05HelperContainersDoNotTripOrphanIsolation(t *testing.T) {
 	rawConfig = []byte(strings.ReplaceAll(string(rawConfig), "  docker_network: coordplane\n", "  docker_network: none\n"))
 	requireNoError(t, os.WriteFile(configPath, rawConfig, 0o600))
 
+	// A stale fixture container from a previously interrupted run can trip the
+	// daemon's orphan isolation during the stays-ready window. Clean only the
+	// containers this test's fixture labels own before starting the daemon.
+	cleanupCtx, cleanupCancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cleanupCancel()
+	removeRT05HelperFixtureResidue(t, cleanupCtx, executor)
+
 	socket := filepath.Join(root, "data", "operator.sock")
 	daemon := startP3DaemonProcessWithEnv(t, artifacts.daemon, configPath, socket, filepath.Join(root, "daemon.log"), nil)
 	t.Cleanup(func() { killP3DaemonProcess(t, daemon) })
@@ -790,6 +797,22 @@ func TestRT05HelperContainersDoNotTripOrphanIsolation(t *testing.T) {
 	// Fail-closed property unchanged: a run-shaped container with no Run row
 	// must still be quarantined/manual and degrade the daemon.
 	assertRT05DaemonDegradedOrphan(t, client, 10*time.Second)
+}
+
+func removeRT05HelperFixtureResidue(t *testing.T, ctx context.Context, executor *containerruntime.DockerExecutor) {
+	t.Helper()
+	states, err := executor.Managed(ctx)
+	requireNoError(t, err)
+	for _, state := range states {
+		if state.Ref.ProjectID != "prj_rt05_helper" ||
+			(state.Ref.AgentID != "git-helper" && state.Ref.AgentID != "agt_rt05_helper") {
+			continue
+		}
+		_, _ = executor.Stop(ctx, state.Ref, 0)
+		if _, err := executor.Remove(ctx, state.Ref); err != nil && !errors.Is(err, containerruntime.ErrNotFound) {
+			t.Fatalf("remove stale RT-05 fixture container %s: %v", state.Ref.ContainerName, err)
+		}
+	}
 }
 
 func waitForRT05DaemonReady(t *testing.T, client *transport.Client) {
