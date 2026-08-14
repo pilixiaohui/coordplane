@@ -14,6 +14,7 @@ let taskProjFilter = "";
 let showCancelled = false;
 let projects = [];
 let agents = [];
+let adapters = [];
 let tasks = [];
 let runs = [];
 let participants = [];
@@ -25,6 +26,7 @@ let credsCache = null;
 let gcPreview = null;
 let editMode = "";
 let messagesError = "";
+let agentDetailData = null;
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -87,15 +89,17 @@ function toast(msg, isErr) {
 }
 
 async function loadData() {
-  const [p, a, t, r, parts] = await Promise.all([
+  const [p, a, ad, t, r, parts] = await Promise.all([
     api("GET", "/v1/projects?limit=100"),
     api("GET", "/v1/agents?limit=100"),
+    api("GET", "/v1/adapters"),
     api("GET", "/v1/tasks?limit=100"),
     api("GET", "/v1/runs?limit=100"),
     api("GET", "/v1/participants"),
   ]);
   projects = p.items || [];
   agents = a.items || [];
+  adapters = ad || [];
   tasks = t.items || [];
   runs = r.items || [];
   participants = parts || [];
@@ -639,24 +643,99 @@ function renderProjectDetail() {
   <div style="margin-top:10px"><button class="btn" onclick="view='projects';render()">← 返回项目</button></div>`;
 }
 // ---------- Agent ----------
+function agentEffortOptions(adapterID, selected) {
+  const descriptor = adapters.find(a => a.name === adapterID);
+  return `<option value="">(默认)</option>` +
+    (descriptor?.allowed_efforts || []).map(e => `<option value="${esc(e)}" ${e === selected ? "selected" : ""}>${esc(e)}</option>`).join("");
+}
+function agentFormHTML(agent, heading, submitCall) {
+  const a = agent || {
+    display_name: "", adapter_id: (adapters.find(x => x.name === "claude") || adapters[0])?.name || "",
+    image: "node:22-bookworm", instructions_file: "/instructions/agent.md", instructions_text: "",
+    model: "", subagent_model: "", base_url: "", effort: "",
+  };
+  const source = a.instructions_text ? "text" : "file";
+  const adapterOptions = adapters.map(d => `<option value="${esc(d.name)}" ${d.name === a.adapter_id ? "selected" : ""}>${esc(d.name)}${d.execution_model ? ` (${esc(d.execution_model)})` : ""}</option>`).join("");
+  return `
+  <h1>${heading}</h1>
+  <div class="form-grid">
+    <label>显示名</label><input id="a-name" value="${esc(a.display_name)}">
+    <label>adapter</label><select id="a-adapter" onchange="syncAgentEffort(this.value)">${adapterOptions || `<option value="">无可用 adapter</option>`}</select>
+    <label>image</label><input id="a-image" value="${esc(a.image)}">
+    <label>model(可空)</label><input id="a-model" value="${esc(a.model)}">
+    <label>subagent model(可空)</label><input id="a-subagent" value="${esc(a.subagent_model)}">
+    <label>base URL(可空,仅 https)</label><input id="a-base-url" value="${esc(a.base_url)}">
+    <label>effort(可空)</label><select id="a-effort">${agentEffortOptions(a.adapter_id, a.effort)}</select>
+    <label>提示词来源(互斥)</label><span>
+      <label><input type="radio" name="a-source" value="file" ${source === "file" ? "checked" : ""} onchange="toggleAgentInstructions(this.value)"> 文件</label>
+      <label><input type="radio" name="a-source" value="text" ${source === "text" ? "checked" : ""} onchange="toggleAgentInstructions(this.value)"> 文本</label>
+    </span>
+    <label>instructions 文件(daemon 宿主绝对路径)</label><input id="a-instr" value="${esc(a.instructions_file)}" ${source === "text" ? "disabled" : ""}>
+    <label>instructions 文本(≤1 MiB)</label><textarea id="a-instr-text" rows="6" ${source === "file" ? "disabled" : ""}>${esc(a.instructions_text)}</textarea>
+    <div style="grid-column:1/-1;margin-top:8px"><button class="btn primary" onclick="${submitCall}">保存</button><button class="btn" onclick="leaveEdit('agents')">取消</button></div>
+  </div>`;
+}
+function toggleAgentInstructions(source) {
+  const fileInput = $("a-instr");
+  const textInput = $("a-instr-text");
+  fileInput.disabled = source === "text";
+  textInput.disabled = source === "file";
+}
+function syncAgentEffort(adapterID) {
+  const select = $("a-effort");
+  if (select) select.innerHTML = agentEffortOptions(adapterID, "");
+}
+function agentFormPayload() {
+  const source = document.querySelector('input[name="a-source"]:checked')?.value || "file";
+  return {
+    display_name: $("a-name").value.trim(),
+    adapter_id: $("a-adapter").value,
+    image: $("a-image").value.trim(),
+    instructions_file: source === "file" ? $("a-instr").value.trim() : "",
+    instructions_text: source === "text" ? $("a-instr-text").value : "",
+    model: $("a-model").value.trim(),
+    subagent_model: $("a-subagent").value.trim(),
+    base_url: $("a-base-url").value.trim(),
+    effort: $("a-effort").value,
+    request_id: rid(),
+  };
+}
 function newAgentForm() {
   editMode = "agent";
-  $("main").innerHTML = `
-  <h1>新建 Agent</h1>
-  <div class="form-grid">
-    <label>显示名</label><input id="a-name" placeholder="Agent Name">
-    <label>adapter</label><input id="a-adapter" value="claude">
-    <label>image</label><input id="a-image" value="node:22-bookworm">
-    <label>instructions 文件(绝对路径)</label><input id="a-instr" value="/instructions/agent.md">
-    <div style="grid-column:1/-1;margin-top:8px"><button class="btn primary" onclick="createAgent()">创建</button><button class="btn" onclick="leaveEdit('agents')">取消</button></div>
-  </div>`;
+  $("main").innerHTML = agentFormHTML(null, "新建 Agent", "createAgent()");
 }
 async function createAgent() {
   try {
-    await api("POST", "/v1/agents", { display_name: $("a-name").value.trim(), adapter_id: $("a-adapter").value.trim(), image: $("a-image").value.trim(), instructions_file: $("a-instr").value.trim(), request_id: rid() });
+    await api("POST", "/v1/agents", agentFormPayload());
     toast("Agent 已创建");
     editMode = "";
     view = "agents"; refreshAll();
+  } catch (e) { toast(e.message, true); }
+}
+async function editAgentForm(id) {
+  editMode = "agent-edit";
+  $("main").innerHTML = `<h1>加载 Agent 配置…</h1>`;
+  try {
+    const agent = await api("GET", "/v1/agents/" + encodeURIComponent(id));
+    agentDetailData = agent;
+    $("main").innerHTML = agentFormHTML(agent, `编辑 Agent <span class="mono">${esc(id)}</span>`, `updateAgent('${id}')`);
+  } catch (e) {
+    toast(e.message, true);
+    editMode = "";
+    view = "agent"; render();
+  }
+}
+async function updateAgent(id) {
+  const body = agentFormPayload();
+  body.version = agentDetailData?.version || 0;
+  try {
+    await api("PUT", "/v1/agents/" + encodeURIComponent(id), body);
+    toast("Agent 已更新");
+    editMode = "";
+    view = "agent";
+    await refreshAll();
+    agentDetailData = await api("GET", "/v1/agents/" + encodeURIComponent(id));
+    render();
   } catch (e) { toast(e.message, true); }
 }
 // ---------- 任务 ----------
@@ -793,21 +872,41 @@ async function rotateCred() {
 }
 async function revokeCred() { try { await api("POST", "/v1/credentials/" + encodeURIComponent("participant-owner") + "/revoke", { request_id: rid() }); } catch (e) { /* fence 已拒 */ } sessionStorage.removeItem(KEY); showLogin("凭据已吊销,请轮换后重新登录"); }
 
-async function openAgent(id) { view = "agent"; detailAgent = id; render(); }
+async function openAgent(id) {
+  view = "agent";
+  detailAgent = id;
+  agentDetailData = null;
+  render();
+  try {
+    agentDetailData = await api("GET", "/v1/agents/" + encodeURIComponent(id));
+    render();
+  } catch (e) {
+    toast(e.message, true);
+    editMode = "";
+    view = "agents"; render();
+  }
+}
 function renderAgentDetail() {
-  const a = agents.find(x => x.id === detailAgent);
+  const summary = agents.find(x => x.id === detailAgent);
+  const a = agentDetailData && agentDetailData.id === detailAgent ? agentDetailData : summary;
   if (!a) return `<h1>Loading…</h1>`;
   const myTasks = tasks.filter(t => t.assignee_agent_id === a.id);
   const cur = myTasks.find(t => ["queued", "running", "finishing", "waiting"].includes(t.status));
+  const sourceText = a.instructions_text;
   return `
   <h1>Agent <span class="mono">${esc(a.id)}</span></h1>
   <div class="detail">
     <div class="row"><span class="k">显示名</span><b>${esc(a.display_name)}</b></div>
     <div class="row"><span class="k">状态</span>${pill(a.status)}</div>
     <div class="row"><span class="k">adapter / image</span><span class="mono">${esc(a.adapter_id)} / ${esc(a.image)}</span></div>
-    <div class="row"><span class="k">instructions</span><span class="mono">${esc(a.instructions_file)}</span></div>
+    ${sourceText ? `<div class="row"><span class="k">instructions text</span><pre class="prompt">${esc(sourceText)}</pre></div>` : `<div class="row"><span class="k">instructions 文件</span><span class="mono">${esc(a.instructions_file)}</span></div>`}
+    <div class="row"><span class="k">model</span><span class="mono">${esc(a.model || "—")}</span></div>
+    <div class="row"><span class="k">subagent model</span><span class="mono">${esc(a.subagent_model || "—")}</span></div>
+    <div class="row"><span class="k">base URL</span><span class="mono">${esc(a.base_url || "—")}</span></div>
+    <div class="row"><span class="k">effort</span><span class="mono">${esc(a.effort || "—")}</span></div>
     <div class="row"><span class="k">创建</span><span class="muted">${esc(a.created_at)}</span></div>
     <div class="actions">
+      <button class="btn primary" onclick="editAgentForm('${a.id}')">编辑配置</button>
       ${a.status === "active" ? `<button class="btn" onclick="agentAction('${a.id}','pause')">暂停</button>` : `<button class="btn" onclick="agentAction('${a.id}','resume')">恢复</button>`}
       <button class="btn danger" onclick="agentAction('${a.id}','archive')">归档</button>
     </div>
