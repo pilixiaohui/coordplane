@@ -10,7 +10,7 @@ import (
 
 type testEvent struct{ Action, Test string }
 
-var expected = map[string]bool{"TestRealClaudeAdapterSmoke": true, "TestRealClaudeTwoAgentConvergence": true, "TestRealClaudeUnifiedParticipantTwoProjectConvergence": true}
+var expected = map[string]bool{"TestRealClaudeAdapterSmoke": true, "TestRealClaudeTwoAgentConvergence": true}
 
 func main() {
 	decoder := json.NewDecoder(os.Stdin)

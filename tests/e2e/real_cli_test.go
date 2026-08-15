@@ -68,8 +68,8 @@ func TestRealCLIGateRejectsMutableAndScriptedImagesBeforeLiveTests(t *testing.T)
 	testsupport.WriteFile(t, filepath.Join(stubDir, "docker"), []byte("#!/bin/sh\ncase \"$1\" in version) exit 0;; image) printf '%s\\n' \"$5\";; run) printf '%s\\n' '"+realClaudeVersion+"';; *) exit 2;; esac\n"), 0o700)
 	testsupport.WriteFile(t, filepath.Join(stubDir, "make"), []byte("#!/bin/sh\nexit 0\n"), 0o700)
 	testsupport.WriteFile(t, filepath.Join(stubDir, "go"), []byte("#!/bin/sh\ncase \"$1\" in test) [ \"$E2E_PROVIDER_ENV_ALLOWLIST\" = \"$E2E_EXPECTED_PROVIDER_ENV\" ] || exit 4; cat \"$E2E_GATE_FIXTURE\";; run) exec \"$E2E_REAL_GO\" \"$@\";; *) exit 2;; esac\n"), 0o700)
-	const smoke, agents, rma03 = "TestRealClaudeAdapterSmoke", "TestRealClaudeTwoAgentConvergence", "TestRealClaudeUnifiedParticipantTwoProjectConvergence"
-	exact := `{"Action":"run","Test":"` + smoke + `"}` + "\n" + `{"Action":"run","Test":"` + smoke + `/resume"}` + "\n" + `{"Action":"pass","Test":"` + smoke + `/resume"}` + "\n" + `{"Action":"pass","Test":"` + smoke + `"}` + "\n" + `{"Action":"run","Test":"` + agents + `"}` + "\n" + `{"Action":"pass","Test":"` + agents + `"}` + "\n" + `{"Action":"run","Test":"` + rma03 + `"}` + "\n" + `{"Action":"pass","Test":"` + rma03 + `"}`
+	const smoke, agents = "TestRealClaudeAdapterSmoke", "TestRealClaudeTwoAgentConvergence"
+	exact := `{"Action":"run","Test":"` + smoke + `"}` + "\n" + `{"Action":"run","Test":"` + smoke + `/resume"}` + "\n" + `{"Action":"pass","Test":"` + smoke + `/resume"}` + "\n" + `{"Action":"pass","Test":"` + smoke + `"}` + "\n" + `{"Action":"run","Test":"` + agents + `"}` + "\n" + `{"Action":"pass","Test":"` + agents + `"}`
 	mutants := []struct {
 		name, input string
 		pass        bool

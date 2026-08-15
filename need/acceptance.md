@@ -1,7 +1,10 @@
 # CoordPlane 验收需求
 
 状态：Draft for owner review
+版本：0.5
+日期：2026-08-15
 依赖：`README.md`、`core.md`、`runtime.md`、`git.md`
+（本版并入统一参与者框架修订：业务对象与 schema allowlist 扩展为九类，新增角色/权限/凭据/人类生命周期不变量；RMA-03 从 §10.3 真实 live gate 覆盖表述移除，真实人类身份验收见独立验收方案）
 
 ## 1. 目标和非目标
 
@@ -9,7 +12,7 @@
 
 验收必须证明：
 
-- 六类协调事实能持久化、并发更新和恢复。
+- 九类业务对象事实（Project、Participant、Task、Run、Message、Event、Role、ParticipantProjectRole、Credential）能持久化、并发更新和恢复；schema 共 12 张表：9 类业务表 + `agents` 兼容镜像表 + schema_migrations/request dedupe 两个内部辅助表。
 - Boss/Agent 使用正式 CLI入口完成任务和通信。
 - 两个 CLI Agent 在真实隔离环境中并发。
 - Message 在 Inject、Run退出和 Daemon重启后不丢。
@@ -99,14 +102,17 @@ that permitted index churn as a migration or startup side effect.
 
 ```text
 projects
-agents
+participants
 tasks
 runs
 messages
 events
+roles
+participant_project_role
+credentials
 ```
 
-允许少量纯基础设施表，例如 `schema_migrations` 和 request dedupe，但它们不得有独立业务状态机或公开 API。新增业务表必须先修改本需求。
+`agents` 表自 v3 引入 `participants` 后保留为 cli_agent participant 的兼容镜像：v3 在同一事务建立 `participants`/`roles`/`participant_project_role`/`credentials` 并写入四项 seed（`participant-owner` human、`role-owner`、`role-agent`、owner 的 global binding），v4 增加人类任务/消息并从 `agents` 回填既有 cli_agent participant，v7 只为 agents/participants 增加 Agent 运行配置列并派生回填；镜像行与 `participants` 同一 SQLite 事务同步写，任何一方 CAS 失败整体回滚。镜像不是独立业务状态机；旧读取路径移除前调度/配置读取仍可读 `agents`，不得出现 agents-only 生产入口或新 writer。允许少量纯基础设施表，例如 `schema_migrations` 和 request dedupe，但它们不得有独立业务状态机或公开 API。新增业务表必须先修改本需求。
 
 ### 4.3 删除旧入口
 
@@ -138,7 +144,7 @@ events
 | ID | 不变量 |
 | --- | --- |
 | INV-01 | SQLite只保存协调事实，Git refs/objects只保存代码事实，prompt/log不是真相 |
-| INV-02 | 业务对象只有 Project、Agent、Task、Run、Message、Event |
+| INV-02 | 业务对象只有 Project、Participant、Task、Run、Message、Event、Role、ParticipantProjectRole、Credential；`agents` 只是 `participants`(kind=cli_agent) 的兼容镜像（v3 引入 participants 后保留，同一事务同步写、CAS 失败回滚），不是独立业务状态机，且旧读取路径移除前不得声称 participant 是唯一权威 |
 | INV-03 | Task和Run分离；outcome先进入finishing，Run terminal/capture后才改变结果；旧Run受generation fence阻止 |
 | INV-04 | 同一Agent和同一Task最多一个starting/active Run，claim不重复 |
 | INV-05 | Message先持久化、至少一次递送、pending/delivered可原子ack、有限重投；Inject失败不丢消息 |
@@ -159,6 +165,9 @@ events
 | INV-20 | Agent 配置（`model/subagent_model/base_url/effort/instructions_text` + 提示词来源）写入必须通过字段校验、`agent.manage` 门禁与 version CAS，`agents`/`participants` 同事务镜像；Run 只保存 `config_fingerprint` 与 `instructions_hash`，model/base_url/instructions_text 原文不落库、不进 Event/run.log |
 | INV-21 | resume 仅在上一 Run `config_fingerprint` 非空且与当前一致时发生；配置变化或指纹为空一律 fresh start，不得把旧配置的 session 交给新配置 |
 | INV-22 | `GET /v1/adapters` 只读返回静态 descriptor（含 AllowedEfforts），不暴露 executable/argv/宿主路径/secret；POST/PUT/CLI/前端共用同一 `AgentConfigInput`，PUT 为全量替换（E5） |
+| INV-23 | human Task 创建即 `waiting`（`wait_reason=human_assigned`），`running` 对 human 不可达（Scheduler/Claim 不领取）；仅 `task complete` 严格 `waiting → completed`，同事务写 `closed_at`、清 `wait_reason`、`evidence_type=human_confirm` 且 `head_sha` 为空；human `task wake` 返回 `INVALID_STATE`；legacy queued human 无自动迁移，complete 稳定拒绝（core.md §4.2/§5.1；合同：`internal/core/rp07_task_complete_contract_test.go` RP-07、`rp08_dispatch_contract_test.go` RP-08） |
+| INV-24 | capability 是静态注册代码事实（非动态 registry），role 是数据（`roles` 表）且只在项目绑定内生效（`participant_project_role`）；每次 operation 在 service 入口统一做认证→身份→项目（或 global）作用域→角色→capability 解析，缺失返回 `SCOPE_DENIED` 且零副作用；全局管理能力只经 `project_id=global` 作用域授予，项目级角色即使全能力也不含全局能力（core.md §3/§9；合同：`internal/core/participant_roles_contract_test.go` RP-01/RP-01b/RP-02/RP-03/RP-04/RP-06） |
+| INV-25 | 人类凭据（`credentials` 表）只存 hash（operator_token），不存明文；吊销后该 participant 的 operator 操作立即被拒、轮换后旧凭据失效且吊销在 Daemon 重启后保持；删除/降级最后一个持有 `participant.manage` 的 participant 被系统拒绝且状态零变化（core.md §3/§9；合同：`internal/core/rp05_credential_contract_test.go` RP-05、`participant_roles_contract_test.go` RP-06） |
 
 ## 6. Core 合同场景
 
@@ -171,7 +180,7 @@ Boundary：真实 file-backed SQLite + Daemon启动入口。
 
 - 空库 migration成功并只产生允许的表。
 - 二次 migration幂等。
-- 创建 Project/Agent/Task/Message后重启，行、version和Event保持。
+- 创建 Project/Participant/Task/Message后重启，行、version和Event保持。
 - migration中断不会产生部分可用 schema或开始调度。
 - 数据库损坏/不可写时 Daemon拒绝 ready。
 
@@ -306,10 +315,31 @@ Boundary：真实 file-backed SQLite v6→v7 + Daemon 启动入口 + 纯函数�
 
 - 迁移加列成功：`agents`/`participants` 五列默认空，`runs.config_fingerprint` 默认空；对 `kind='cli_agent'` 且与 `agents.id` 相同的 participants 行回填五字段，human 行保持空。
 - 旧 terminal Run 若已有 `adapter_id/image/instructions_hash`，按同一 canonical fingerprint 规则回填；启动中或 hash 为空留空（视为不可 resume）；迁移只写派生指纹、不额外造 Event，失败整体回滚。
-- 存在旧 v6 `codex` 行时 Daemon 拒绝启动并返回 `LEGACY_SCHEMA_REBUILD_REQUIRED`（E3 fail-closed），不导入旧 session。
+- 迁移版本 <7 且存在旧 `codex` 行（`agents.adapter_id='codex'` 或 `runs.adapter_id='codex'`）时 Daemon 启动预检拒绝并返回 `LEGACY_SCHEMA_REBUILD_REQUIRED`（E3 fail-closed），不导入旧 session；v7 起 Codex 才是受支持 adapter。
 - `RuntimeConfigFingerprint` 对 trim/normalize 幂等；不含 provider secret；同配置同指纹、不同配置不同指纹。
 - `BeginRunLaunch` 同事务写 fingerprint；`selectLaunchMode`：同 adapter/Agent/Task/workspace + 旧指纹非空且相等 + adapter `ResumeCompatible` 才 resume，否则 fresh start。
 - Daemon SIGKILL 重启后配置与 fingerprint 从 SQLite 恢复；旧 Agent 不改配置时行为不变。
+
+### CT-12 统一参与者框架（Participant/Role/Credential）
+
+Boundary：真实 file-backed SQLite + Service 入口 + Store/Service 重启。
+覆盖：INV-02、INV-23、INV-24、INV-25。
+
+必须断言：
+
+- 空库 migration 后恰好产生 12 张允许表（exact-set：`projects`/`agents`/`tasks`/`runs`/`messages`/`events`/`schema_migrations`/`request_dedupes`/`participants`/`roles`/`participant_project_role`/`credentials`），无多余业务表（`internal/store/store_test.go` `TestCT01FileMigrationIsExactAndIdempotent`）。
+- v3 seed 精确存在且唯一：`participant-owner`（human）、`role-owner`、`role-agent`、`participant-owner ↔ global ↔ role-owner` binding；v4 从 `agents` 回填既有 cli_agent participant，镜像行与 `participants` 同事务一致（`internal/store/store.go` migrate、`internal/store/schema.go` v4）。
+- RP-01…RP-08 全部映射到本场景（`internal/core/*`）：
+  - RP-01/RP-01b：capability registry 完整封闭；`role-owner` 携带全部 capability、`role-agent` 只携带最小 CLI agent 集合（`participant_roles_contract_test.go`）。
+  - RP-02：role CRUD 与 binding 删除 guard（仍被绑定的 role 不得删除）。
+  - RP-03：项目级 scope 只解析项目 + global 绑定，其他项目绑定不泄漏。
+  - RP-04：global scope 与项目级隔离；项目级全能力角色不含全局能力。
+  - RP-05：credentials 只存 hash；错误/缺失 secret 拒绝；轮换后旧凭据立即失效；吊销后 Store/Service 重启仍拒绝（`rp05_credential_contract_test.go`）。
+  - RP-06：最后 `participant.manage` 持有者不可被剥离；失败 unbind 后 `participant_project_role` 与 `events` 表零变化（直接回读两张表）。
+  - RP-07：human task 创建即 `waiting`、`running` 不可达、仅 `waiting → completed` 收敛且 `evidence_type=human_confirm`（`rp07_task_complete_contract_test.go`）。
+  - RP-08：Agent 可向 human participant 显式派发 child Task（`rp08_dispatch_contract_test.go`）。
+
+禁止副作用：任何失败操作不得留下部分绑定、变更行或新 Event。
 
 ## 7. Runtime 场景
 
@@ -613,7 +643,7 @@ RMA-01 继续要求至少一个 production adapter 的两个真实实例完成�
    `E2E_RUNTIME_IMAGE="$digest" E2E_DOCKER_NETWORK=host|bridge ./scripts/e2e-real-cli.sh`
    (网络能直连 provider 时用 bridge;需经本机代理时用 host)。
 
-覆盖:RMA-01 adapter smoke、RMA-02 双 Agent 收敛、RMA-03 统一参与者双项目真实协作(人类 owner/developer 双角色、agent→human review 派发与 human_confirm 证据、凭据认证、Daemon 重启)。SKIP 语义同上。
+覆盖:RMA-01 adapter smoke、RMA-02 双 Agent 收敛。SKIP 语义同上。
 
 ## 11. 第一版真实多 Agent 可靠性验收
 
@@ -731,7 +761,7 @@ Production和Tests新增空间先以透明、未分配的重基线reserve列入�
 | --- | ---: | ---: | ---: |
 | `cmd`：coordplane/coordlink参数解析和渲染 | 700 | 900 | 1,100 |
 | `transport`：operator/per-Run socket、JSON、scope/token middleware | 650 | 850 | 1,000 |
-| `core`：六对象、FSM、operations、scheduler/notifier/status | 2,300 | 2,700 | 3,100 |
+| `core`：九类业务对象、FSM、operations、scheduler/notifier/status | 2,300 | 2,700 | 3,100 |
 | `store`：SQLite transaction/CAS/dedupe/migration | 1,500 | 1,800 | 2,100 |
 | `runtime`：Docker、launch、supervisor、resume、stop/cleanup/reconcile/log | 2,200 | 2,500 | 2,900 |
 | `git`：Project、private clone、capture、task ref、CAS、integration/GC | 1,900 | 2,250 | 2,600 |
@@ -822,6 +852,8 @@ go test ./... -count=1
 go test -race ./... -count=1
 go vet ./...
 go test -tags=docker ./... -count=1
+go test ./internal/store -run '^TestCT01' -count=1
+go test ./internal/core -run '^TestRP0[1-8]' -count=1
 scripts/e2e-deterministic.sh
 scripts/loc-budget.sh --check --output loc-budget.json
 scripts/e2e-real-cli.sh
