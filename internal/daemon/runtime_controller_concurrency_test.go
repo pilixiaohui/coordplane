@@ -181,7 +181,7 @@ func TestReconcileSkipsRunOwnedBetweenClaimAndMonitorRegistration(t *testing.T) 
 	root := t.TempDir()
 	coordlink := filepath.Join(root, "coordlink")
 	requireNoError(t, os.WriteFile(coordlink, []byte("#!/bin/sh\nexit 0\n"), 0o700))
-	agent, project := addRuntimeTestProject(service, "Run only the assigned conversation.")
+	agent, project := addRuntimeTestProject(service, runtimeTestInstructionsText)
 	if _, err := service.Chat(context.Background(), core.ChatInput{ProjectID: project.ID, AgentID: agent.ID, Body: "exercise launch ownership", Wake: true, RequestID: "wake-launch-race"}); err != nil {
 		t.Fatal(err)
 	}
@@ -533,6 +533,7 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 					}
 				}
 			}
+			populateRuntimeTestControl(t, controller, active)
 			executor.payload = frame
 			if test.exitFirst {
 				executor.releaseWait = make(chan struct{}, 1)
@@ -627,6 +628,7 @@ func TestShutdownReplaysTailLogsBeforeTerminalConvergence(t *testing.T) {
 	controller := newRuntimeTestController(t, service, executor)
 	controller.config = config.Config{MaxParallelRuns: 1, Runtime: config.RuntimeConfig{ShutdownGrace: 275 * time.Millisecond}}
 	controller.ctx, controller.cancel = context.WithCancel(context.Background())
+	populateRuntimeTestControl(t, controller, active)
 	entry, ok := controller.adapters.Lookup(active.AdapterID)
 	if !ok {
 		t.Fatalf("lookup shutdown replay adapter %q", active.AdapterID)
@@ -1109,7 +1111,7 @@ func newRuntimeTestService(t *testing.T) *core.Service {
 func claimRuntimeTestRun(t *testing.T) (*core.Service, core.Claim) {
 	t.Helper()
 	service := newRuntimeTestService(t)
-	agent, project := addRuntimeTestProject(service, "Run only the assigned conversation.")
+	agent, project := addRuntimeTestProject(service, runtimeTestInstructionsText)
 	task := requireRuntimeValue(service.CreateTask(context.Background(), core.CreateTaskInput{ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork, Title: "Runtime task", RequestID: "add-runtime-task"}))
 	claim, ok, err := service.ClaimNext(context.Background(), "")
 	if err != nil || !ok || claim.Task.ID != task.ID {
@@ -1121,6 +1123,35 @@ func claimRuntimeTestRun(t *testing.T) (*core.Service, core.Claim) {
 func newRuntimeTestController(t *testing.T, service *core.Service, executor containerruntime.Executor) *runtimeController {
 	return &runtimeController{service: service, executor: executor, adapters: adapter.Production(), controlRoot: t.TempDir(), monitors: make(map[string]*runMonitor), controls: make(map[string]*runControl), runOperations: make(map[string]*runOperation)}
 }
+
+// populateRuntimeTestControl writes the control files the launch path would
+// have produced (identity, token, launch, secrets, instructions) so a test that
+// skips the real container launch still satisfies the redaction lineage
+// precondition and the cleanup-time ownership validation. The secrets file
+// mirrors the controller's provider allowlist env, and the instructions file
+// must byte-match the Agent text behind the run's InstructionsHash exactly or
+// redaction fails closed.
+func populateRuntimeTestControl(t *testing.T, controller *runtimeController, run core.Run) {
+	t.Helper()
+	controlPath := filepath.Join(controller.controlRoot, run.ID)
+	requireNoError(t, os.MkdirAll(controlPath, runControlDirectoryMode))
+	requireNoError(t, os.Chmod(controlPath, runControlDirectoryMode))
+	requireNoError(t, writeRunControlMarker(controlPath, run))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, "token"), []byte("test-run-token\n"), runControlFileMode))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeLaunchFile), []byte(runtimeLaunchScript), 0o550))
+	secrets := map[string]string{}
+	for _, name := range controller.config.Runtime.ProviderEnvAllowlist {
+		if value, ok := os.LookupEnv(name); ok {
+			secrets[name] = value
+		}
+	}
+	raw, err := serializeRunSecretsFile(secrets)
+	requireNoError(t, err)
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeSecretsFile), raw, runControlFileMode))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeInstructionsFile), []byte(runtimeTestInstructionsText), runControlFileMode))
+}
+
+const runtimeTestInstructionsText = "Run only the assigned conversation."
 
 func addRuntimeTestProject(service *core.Service, instructionsText string) (core.Agent, core.Project) {
 	ctx := context.Background()

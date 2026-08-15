@@ -17,9 +17,7 @@ const (
 	redactedSecret   = "[REDACTED_SECRET]"
 
 	runtimeSecretsFile         = "secrets"
-	runtimeBootstrapFile       = "bootstrap"
 	runtimeInstructionsFile    = "instructions"
-	runContextSeparator        = "\n\nCoordPlane Run context\n"
 	shellSingleQuoteEscape     = "'\\''"
 	redactionUnavailableMarker = "[coordplane: redaction unavailable; content suppressed]"
 )
@@ -75,32 +73,15 @@ func (c *runtimeController) runtimeRedaction(run core.Run, extraPaths ...string)
 }
 
 // runtimeRunSecrets returns the run-scoped provider secrets and whether they are
-// trustworthy. A new-run lineage (its control directory carries the launch file)
-// must carry a valid secrets file: a missing or malformed file reports ok=false
-// so the caller fails closed instead of falling back to unredacted host env.
-// Legacy adopted runs never wrote the file and fall back to the host provider
-// allowlist env on a best-effort basis, always reporting ok=true because the
-// env values themselves are the redaction source. It never re-reads the mutable
-// Agent.
+// trustworthy. Every adopted container is launcher-lineage (ValidateAdoption
+// enforces the exact launch entrypoint), so a missing or malformed secrets file
+// reports ok=false and the caller fails closed instead of falling back to the
+// unredacted host provider allowlist env. It never re-reads the mutable Agent.
 func (c *runtimeController) runtimeRunSecrets(run core.Run) ([]string, bool) {
-	controlPath := filepath.Join(c.controlRoot, run.ID)
-	if c.controlRoot != "" && strings.TrimSpace(run.ID) != "" && hasRuntimeLineage(controlPath) {
-		values, ok := c.readRunSecretsFile(run.ID)
-		if !ok {
-			return nil, false
-		}
-		return values, true
+	if c == nil || c.controlRoot == "" || strings.TrimSpace(run.ID) == "" {
+		return nil, true
 	}
-	if values, ok := c.readRunSecretsFile(run.ID); ok {
-		return values, true
-	}
-	secrets := make([]string, 0, len(c.config.Runtime.ProviderEnvAllowlist))
-	for _, name := range c.config.Runtime.ProviderEnvAllowlist {
-		if value, ok := os.LookupEnv(name); ok {
-			secrets = append(secrets, value)
-		}
-	}
-	return secrets, true
+	return c.readRunSecretsFile(run.ID)
 }
 
 // readRunSecretsFile parses the run's secrets file (shell-sourceable
@@ -120,66 +101,31 @@ func (c *runtimeController) readRunSecretsFile(runID string) ([]string, bool) {
 
 // runtimeRunInstructions returns the Agent instructions text captured for the
 // run so provider output that echoes the prompt is redacted from run logs. The
-// lookup never re-reads the mutable Agent.
-//
-// New-run lineages write a dedicated instructions file during prepare; that
-// file is read whole (construction-based, no separator parsing) and reconciled
-// against the run's immutable InstructionsHash. A missing or hash-mismatched
-// file fails closed (ok=false) so no unredacted content can be persisted.
-// Legacy adopted runs never wrote the file and fall back to extracting the
-// instructions prefix from the run's bootstrap file on a best-effort basis.
+// lookup never re-reads the mutable Agent. Every adopted container is
+// launcher-lineage and writes a dedicated instructions file during prepare;
+// that file is read whole (construction-based, no separator parsing) and
+// reconciled against the run's immutable InstructionsHash. A missing or
+// hash-mismatched file fails closed (ok=false) so no unredacted content can be
+// persisted.
 func (c *runtimeController) runtimeRunInstructions(run core.Run) ([]string, bool) {
 	if c == nil || c.controlRoot == "" || strings.TrimSpace(run.ID) == "" {
 		return nil, true
 	}
-	controlPath := filepath.Join(c.controlRoot, run.ID)
-	if hasRuntimeLineage(controlPath) {
-		raw, err := os.ReadFile(filepath.Join(controlPath, runtimeInstructionsFile))
-		if err != nil {
+	raw, err := os.ReadFile(filepath.Join(c.controlRoot, run.ID, runtimeInstructionsFile))
+	if err != nil {
+		return nil, false
+	}
+	if run.InstructionsHash != "" {
+		sum := sha256.Sum256(raw)
+		if hex.EncodeToString(sum[:]) != run.InstructionsHash {
 			return nil, false
 		}
-		if run.InstructionsHash != "" {
-			sum := sha256.Sum256(raw)
-			if hex.EncodeToString(sum[:]) != run.InstructionsHash {
-				return nil, false
-			}
-		}
-		text := strings.TrimSpace(string(raw))
-		if text == "" {
-			return nil, true
-		}
-		return []string{text}, true
 	}
-	raw, err := os.ReadFile(filepath.Join(controlPath, runtimeBootstrapFile))
-	if err != nil {
-		return nil, true
-	}
-	text := strings.TrimSpace(bootstrapInstructionsPrefix(string(raw)))
+	text := strings.TrimSpace(string(raw))
 	if text == "" {
 		return nil, true
 	}
 	return []string{text}, true
-}
-
-// hasRuntimeLineage reports whether the run's control directory carries the
-// launch file that the launch path always writes. Containers adopted before
-// the file existed never wrote it, so its presence cleanly distinguishes
-// new-run lineages from adopted ones.
-func hasRuntimeLineage(controlPath string) bool {
-	if controlPath == "" {
-		return false
-	}
-	info, err := os.Lstat(filepath.Join(controlPath, runtimeLaunchFile))
-	return err == nil && info.Mode()&os.ModeSymlink == 0
-}
-
-// bootstrapInstructionsPrefix extracts the instructions text that buildBootstrap
-// placed before the run-context separator.
-func bootstrapInstructionsPrefix(bootstrap string) string {
-	if index := strings.Index(bootstrap, runContextSeparator); index >= 0 {
-		return bootstrap[:index]
-	}
-	return bootstrap
 }
 
 // parseRunSecretsFile decodes the shell-sourceable secrets file written by the

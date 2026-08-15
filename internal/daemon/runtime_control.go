@@ -141,7 +141,11 @@ func readOwnedRunControlFile(path string) ([]byte, error) {
 }
 
 func validateOwnedRunControlFile(path string) error {
-	file, err := openOwnedRunControlFile(path)
+	return validateOwnedRunControlFileMode(path, runControlFileMode)
+}
+
+func validateOwnedRunControlFileMode(path string, mode os.FileMode) error {
+	file, err := openOwnedRunControlFileMode(path, mode)
 	if err != nil {
 		return err
 	}
@@ -154,6 +158,10 @@ func validateOwnedRunControlFile(path string) error {
 }
 
 func openOwnedRunControlFile(path string) (*os.File, error) {
+	return openOwnedRunControlFileMode(path, runControlFileMode)
+}
+
+func openOwnedRunControlFileMode(path string, mode os.FileMode) (*os.File, error) {
 	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, errors.New("run control file is missing or indirect")
@@ -178,7 +186,7 @@ func openOwnedRunControlFile(path string) (*os.File, error) {
 		_ = file.Close()
 		return nil, errors.New("run control file has invalid ownership")
 	}
-	if !opened.Mode().IsRegular() || opened.Mode().Perm() != runControlFileMode {
+	if !opened.Mode().IsRegular() || opened.Mode().Perm() != mode {
 		_ = file.Close()
 		return nil, errors.New("run control file has invalid type or mode")
 	}

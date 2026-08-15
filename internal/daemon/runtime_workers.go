@@ -226,11 +226,9 @@ func (c *runtimeController) reconcileRun(ctx context.Context, run core.Run) erro
 			terminalState, reason := reconcileIntentTerminal(run, task)
 			return c.finishMissingReconciledRun(ctx, run, ref, terminalState, reason)
 		}
-		terminalState := core.RunFailed
-		reason := "container was not created"
+		terminalState, reason := core.RunFailed, "container was not created"
 		if run.LaunchPhase == core.LaunchStartIssued || run.LaunchPhase == core.LaunchProcessObserved || run.State == core.RunActive {
-			terminalState = core.RunInterrupted
-			reason = "owned container is missing after start was issued"
+			terminalState, reason = core.RunInterrupted, "owned container is missing after start was issued"
 		}
 		return c.finishMissingReconciledRun(ctx, run, ref, terminalState, reason)
 	}
@@ -247,6 +245,9 @@ func (c *runtimeController) reconcileRun(ctx context.Context, run core.Run) erro
 	}
 	if err := c.validateAdoptedContainer(ctx, run, state); err != nil {
 		return err
+	}
+	if err := c.validateRunControlLineage(filepath.Join(c.controlRoot, run.ID)); err != nil {
+		return c.failSecretsUnavailable(ctx, run, ref, nil)
 	}
 	entry, ok := c.adapters.Lookup(run.AdapterID)
 	if !ok {

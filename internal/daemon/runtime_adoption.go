@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -75,6 +76,27 @@ func validateAdoptionBootstrap(controlRoot, controlPath string, run core.Run) er
 	}
 	if err := validateOwnedRunControlFile(filepath.Join(controlPath, "bootstrap")); err != nil {
 		return controlOwnershipError(errors.New("run control bootstrap is missing or invalid"))
+	}
+	return nil
+}
+
+// validateRunControlLineage verifies the three control files the launch path
+// always writes (launch, secrets, instructions) are present, owned by the
+// daemon, and carry their expected modes. It is the monitor precondition: a
+// missing or corrupt file means the run's redaction cannot be trusted, so the
+// caller fails closed rather than persisting unredacted content.
+func (c *runtimeController) validateRunControlLineage(controlPath string) error {
+	for _, file := range []struct {
+		name string
+		mode os.FileMode
+	}{
+		{runtimeLaunchFile, 0o550},
+		{runtimeSecretsFile, runControlFileMode},
+		{runtimeInstructionsFile, runControlFileMode},
+	} {
+		if err := validateOwnedRunControlFileMode(filepath.Join(controlPath, file.name), file.mode); err != nil {
+			return controlOwnershipError(fmt.Errorf("run control %s is missing or invalid", file.name))
+		}
 	}
 	return nil
 }

@@ -65,8 +65,9 @@ func TestRuntimeRedactionDoesNotRereadAgentInstructions(t *testing.T) {
 	service := newRuntimeTestService(t)
 	canary := "REDACT-CANARY-INSTRUCTIONS"
 	agent := requireRuntimeValue(service.AddAgent(context.Background(), core.AddAgentInput{DisplayName: "Redaction Agent", AdapterID: "claude", Image: "agent:test", InstructionsText: canary, RequestID: "redaction-instructions-agent"}))
-	controller := &runtimeController{service: service, controlRoot: t.TempDir()}
 	run := core.Run{ID: "run-redaction", AgentID: agent.ID}
+	controlRoot := newRunControlDir(t, run.ID, map[string]string{runtimeSecretsFile: "", runtimeInstructionsFile: "unrelated instructions"})
+	controller := &runtimeController{service: service, controlRoot: controlRoot}
 
 	text := controller.runtimeRedaction(run).Text("provider echoed " + canary)
 	if !strings.Contains(text, canary) {
@@ -74,27 +75,26 @@ func TestRuntimeRedactionDoesNotRereadAgentInstructions(t *testing.T) {
 	}
 }
 
-func TestRuntimeRedactionLegacyBootstrapRedactsInstructions(t *testing.T) {
+// A run whose control directory carries only a legacy bootstrap file has no
+// trusted instructions lineage and must fail closed instead of extracting the
+// instructions prefix from the bootstrap.
+func TestRuntimeRedactionLegacyBootstrapRunFailsClosed(t *testing.T) {
 	canary := "LEGACY-CANARY"
 	bootstrap := "agent prompt\n" + canary + "\n\nCoordPlane Run context\nProject: p\nAgent: a\n"
-	controlRoot := newRunControlDir(t, "run-legacy", map[string]string{runtimeBootstrapFile: bootstrap})
+	controlRoot := newRunControlDir(t, "run-legacy", map[string]string{"bootstrap": bootstrap})
 	controller := &runtimeController{controlRoot: controlRoot}
 	run := core.Run{ID: "run-legacy"}
 
-	values, ok := controller.runtimeRunInstructions(run)
-	if !ok || len(values) != 1 || values[0] != "agent prompt\n"+canary {
-		t.Fatalf("legacy runtimeRunInstructions = %#v ok=%t, want the bootstrap instructions prefix", values, ok)
+	if _, ok := controller.runtimeRunInstructions(run); ok {
+		t.Fatal("legacy bootstrap-only run did not fail closed")
 	}
 	redact := controller.runtimeRedaction(run)
-	if redact.failClosed {
-		t.Fatal("legacy run failed closed")
+	if !redact.failClosed {
+		t.Fatal("legacy bootstrap-only run did not fail closed")
 	}
-	text := redact.Text("provider echoed " + values[0])
-	if strings.Contains(text, canary) {
-		t.Fatalf("legacy bootstrap fallback leaked instructions: %q", text)
-	}
-	if !strings.Contains(text, redactedSecret) {
-		t.Fatalf("legacy bootstrap fallback did not redact instructions: %q", text)
+	text := redact.Text("provider echoed " + canary)
+	if strings.Contains(text, canary) || !strings.Contains(text, redactionUnavailableMarker) {
+		t.Fatalf("legacy bootstrap run leaked instructions or missed the marker: %q", text)
 	}
 }
 
@@ -120,24 +120,6 @@ func TestRuntimeRedactionInstructionsFileIsCollisionSafe(t *testing.T) {
 	}
 	if !strings.Contains(text, redactedSecret) {
 		t.Fatalf("runtime redaction did not replace the echoed instructions: %q", text)
-	}
-}
-
-func TestRuntimeRedactionInstructionsFileMatchesLegacyBootstrap(t *testing.T) {
-	instructions := "system prompt with a normal body\nno separator line here\nkeep this whole text"
-	controlRoot := filepath.Join(t.TempDir(), "run-control")
-	writeRunControl(t, controlRoot, "run-parity", map[string]string{runtimeInstructionsFile: instructions, runtimeLaunchFile: "#!/bin/sh\n", runtimeSecretsFile: ""})
-	writeRunControl(t, controlRoot, "run-legacy-parity", map[string]string{runtimeBootstrapFile: instructions + "\n\nCoordPlane Run context\nProject: p\n"})
-	sum := sha256.Sum256([]byte(instructions))
-	controller := &runtimeController{controlRoot: controlRoot}
-	newLineage := controller.runtimeRedaction(core.Run{ID: "run-parity", InstructionsHash: hex.EncodeToString(sum[:])})
-	legacy := controller.runtimeRedaction(core.Run{ID: "run-legacy-parity"})
-	if newLineage.failClosed || legacy.failClosed {
-		t.Fatal("parity redaction failed closed")
-	}
-	input := "provider echoed " + instructions
-	if got, want := newLineage.Text(input), legacy.Text(input); got != want {
-		t.Fatalf("new-lineage redaction %q differs from legacy bootstrap redaction %q", got, want)
 	}
 }
 
@@ -292,7 +274,7 @@ func TestRuntimeSecretsFileShellSourceSafety(t *testing.T) {
 func TestRuntimeRedactionLoadsSecretsFile(t *testing.T) {
 	canary := "REDACT-SECRET-FILE-VALUE $(with shell metachars)"
 	raw := "ANTHROPIC_AUTH_TOKEN='" + strings.ReplaceAll(canary, "'", "'\\''") + "'\n"
-	controlRoot := newRunControlDir(t, "run-redaction-file", map[string]string{runtimeSecretsFile: raw})
+	controlRoot := newRunControlDir(t, "run-redaction-file", map[string]string{runtimeSecretsFile: raw, runtimeInstructionsFile: "unrelated instructions"})
 	controller := &runtimeController{
 		controlRoot: controlRoot,
 		config:      config.Config{Runtime: config.RuntimeConfig{ProviderEnvAllowlist: []string{"UNRELATED_ENV"}}},
@@ -346,9 +328,10 @@ func TestRuntimeRedactionNewLineageFailsClosedWithoutTrustedSecrets(t *testing.T
 	}
 }
 
-// R10: a legacy adopted run (no launch file) keeps the host provider allowlist
-// env fallback, so its redaction remains available and redacts provider values.
-func TestRuntimeRedactionLegacyRunFallsBackToHostProviderEnv(t *testing.T) {
+// R10: a run without a trusted secrets file fails closed even when the host
+// provider allowlist env is set. The host-env fallback is removed, so no
+// unredacted content can persist.
+func TestRuntimeRedactionLegacyRunFailsClosedWithoutTrustedSecrets(t *testing.T) {
 	canary := "HOST-PROVIDER-ENV-CANARY"
 	controlRoot := newRunControlDir(t, "run-legacy-env", nil)
 	t.Setenv("HOST_PROVIDER_TOKEN", canary)
@@ -358,20 +341,16 @@ func TestRuntimeRedactionLegacyRunFallsBackToHostProviderEnv(t *testing.T) {
 	}
 	run := core.Run{ID: "run-legacy-env"}
 
-	values, ok := controller.runtimeRunSecrets(run)
-	if !ok || len(values) != 1 || values[0] != canary {
-		t.Fatalf("legacy runtimeRunSecrets = %#v ok=%t, want the host provider env canary", values, ok)
+	if _, ok := controller.runtimeRunSecrets(run); ok {
+		t.Fatal("legacy runtimeRunSecrets did not fail closed")
 	}
 	redact := controller.runtimeRedaction(run)
-	if redact.failClosed {
-		t.Fatal("legacy run failed closed")
+	if !redact.failClosed {
+		t.Fatal("legacy run did not fail closed")
 	}
 	text := redact.Text("provider echoed " + canary)
-	if strings.Contains(text, canary) {
-		t.Fatalf("legacy host env fallback did not redact the provider value: %q", text)
-	}
-	if !strings.Contains(text, redactedSecret) {
-		t.Fatalf("legacy host env fallback did not replace the provider value: %q", text)
+	if strings.Contains(text, canary) || !strings.Contains(text, redactionUnavailableMarker) {
+		t.Fatalf("legacy run leaked host env canary or missed the marker: %q", text)
 	}
 }
 
@@ -389,6 +368,10 @@ func TestRuntimeLogBoundaryRedactsBoundsAndReplaysFromZero(t *testing.T) {
 	controlPath := filepath.Join(controlRoot, run.ID)
 	requireNoError(t, os.MkdirAll(controlPath, 0o700))
 	requireNoError(t, os.WriteFile(filepath.Join(controlPath, "token"), []byte(runToken+"\n"), 0o400))
+	secretsRaw, err := serializeRunSecretsFile(map[string]string{providerName: secretLineA + "\n" + secretLineB})
+	requireNoError(t, err)
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeSecretsFile), secretsRaw, 0o440))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeInstructionsFile), []byte("unrelated instructions"), 0o440))
 	requireNoError(t, os.MkdirAll(filepath.Dir(run.LogPath), 0o700))
 	firstLine := `{"type":"assistant","message":"canary ` + secretLineA + " " + secretLineB + " " + runToken + " " + root + `"}` + "\n"
 	filler := `{"type":"assistant","message":"` + strings.Repeat("log-data-", 128) + `"}` + "\n"
