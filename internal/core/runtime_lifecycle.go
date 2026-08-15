@@ -224,6 +224,9 @@ func (s *Service) BeginRunLaunch(ctx context.Context, input RunLaunchInput) (Run
 		if fingerprint != input.ConfigFingerprint {
 			return Conflict(CodeStaleRun, "run launch config snapshot changed", string(run.State), run.Version)
 		}
+		if input.InstructionsHash != instructionsHash {
+			return Conflict(CodeStaleRun, "run launch instructions hash changed", string(run.State), run.Version)
+		}
 		if task.Kind == TaskConversation && input.WorkspacePath != "" {
 			return NewError(CodeInvalidArgument, "conversation Run cannot have a workspace", false)
 		}

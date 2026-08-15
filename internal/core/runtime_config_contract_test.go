@@ -55,6 +55,29 @@ func TestBeginRunLaunchPersistsFingerprintAndIncludesItInLaunchIntent(t *testing
 	})
 }
 
+// L4: BeginRunLaunch must bind the persisted InstructionsHash to the Agent's
+// immutable instructions, not trust the caller's field. A fresh run launched
+// with the correct config fingerprint but a mismatched hash must fail closed
+// with no durable writes.
+func TestBeginRunLaunchRejectsMismatchedInstructionsHash(t *testing.T) {
+	h := newHarness(t)
+	project, claim := createClaimedWorkRun(t, h, "instructions-hash-mismatch", 0)
+	root := t.TempDir()
+	_, fingerprint := launchFingerprint(t, h, claim.Run.ID)
+	input := core.RunLaunchInput{
+		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: "nonce-instructions-hash",
+		WorkspacePath: filepath.Join(root, "workspace"), HomePath: filepath.Join(root, "home"),
+		LogPath: filepath.Join(root, "run.log"), InstructionsHash: strings.Repeat("a", 64),
+		ConfigFingerprint: fingerprint, LaunchMode: "start",
+		CleanupOperationID: "cleanup-instructions-hash", RequestID: "prepare-instructions-hash",
+	}
+	before := durableSignature(t, h.database, project.ID)
+	if _, err := h.service.BeginRunLaunch(context.Background(), input); !core.IsCode(err, core.CodeStaleRun) {
+		t.Fatalf("mismatched instructions hash error = %v, want %s", err, core.CodeStaleRun)
+	}
+	h.requireDurableSignature(t, project.ID, before)
+}
+
 func TestBeginRunLaunchRejectsInvalidFingerprintWithoutWrites(t *testing.T) {
 	h := newHarness(t)
 	project, claim := createClaimedWorkRun(t, h, "invalid-fingerprint-launch", 0)
