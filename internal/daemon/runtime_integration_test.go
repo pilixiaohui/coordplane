@@ -456,13 +456,13 @@ func TestCT04RealDockerExitZeroAndDoneTextCannotCompleteTask(t *testing.T) {
 	var run core.Run
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		persistedTask := requireRuntimeValue(components.store.Task(ctx, task.ID))
+		persistedTask = requireRuntimeValue(components.store.Task(ctx, task.ID))
 		runs, readErr := components.store.Runs(ctx, core.RunFilter{TaskID: task.ID, Limit: 10})
 		if readErr != nil {
 			t.Fatal(readErr)
 		}
 		if len(runs.Items) == 1 {
-			run := requireRuntimeValue(components.store.Run(ctx, runs.Items[0].ID))
+			run = requireRuntimeValue(components.store.Run(ctx, runs.Items[0].ID))
 			if persistedTask.Status == core.TaskFailed && core.IsRunTerminal(run.State) && run.CleanupState == core.CleanupRemoved {
 				break
 			}
@@ -873,7 +873,7 @@ func waitForRun(
 		task := requireRuntimeValue(fixture.components.store.Task(fixture.ctx, taskID))
 		runs := requireRuntimeValue(fixture.components.store.Runs(fixture.ctx, core.RunFilter{TaskID: taskID, Limit: 20}))
 		if len(runs.Items) > 0 {
-			latest := requireRuntimeValue(fixture.components.store.Run(fixture.ctx, runs.Items[len(runs.Items)-1].ID))
+			latest = requireRuntimeValue(fixture.components.store.Run(fixture.ctx, runs.Items[len(runs.Items)-1].ID))
 			if predicate(latest, task) {
 				return latest
 			}

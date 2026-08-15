@@ -242,6 +242,9 @@ func serializeRunSecretsFile(secrets map[string]string) ([]byte, error) {
 	}
 	sort.Strings(names)
 	var builder strings.Builder
+	// A no-secret run is legitimate, but the reconcile lineage gate treats an
+	// empty control file as corrupt, so the file always carries a header line.
+	builder.WriteString("# coordplane-managed run secrets\n")
 	for _, name := range names {
 		if !validRunSecretKey(name) {
 			return nil, fmt.Errorf("run secret key %q is not a valid environment name", name)
