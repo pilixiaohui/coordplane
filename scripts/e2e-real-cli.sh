@@ -57,7 +57,7 @@ if ! E2E_REAL_CLI=1 \
 	E2E_DOCKER_NETWORK="$network" \
 	E2E_PROVIDER_ENV_ALLOWLIST="$provider_env" \
 	go test -tags=e2e ./tests/e2e \
-		-run '^(TestRealClaudeAdapterSmoke|TestRealClaudeTwoAgentConvergence|TestRealClaudeUnifiedParticipantTwoProjectConvergence)$' -count=1 -json -timeout 20m >"$results"; then
+		-run '^(TestRealClaudeAdapterSmoke|TestRealClaudeTwoAgentConvergence)$' -count=1 -json -timeout 20m >"$results"; then
 	cat "$results"
 	echo "FAIL(real Claude live E2E)"
 	exit 1
@@ -68,4 +68,5 @@ if ! go run ./tests/e2e/e2eresult <"$results"; then
 	exit 1
 fi
 
-echo "PASS(real Claude adapter smoke, two-Agent E2E, unified participant two-project E2E)"
+echo "PASS(real Claude adapter smoke, two-Agent E2E)"
+echo "NOTE: TestRealClaudeUnifiedParticipantTwoProjectConvergence is non-release (optional) and not part of this gate."

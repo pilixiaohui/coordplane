@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"coordplane/internal/core"
+	"coordplane/internal/store"
 	_ "modernc.org/sqlite"
 )
 
@@ -75,4 +76,17 @@ func TestRP05CredentialLifecycleHashesAndRevokes(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireDenied(t, h.service.AuthenticateOperator(context.Background(), "second-secret-0123456789"))
+
+	// The revocation must persist across a Daemon restart: re-open the same
+	// SQLite file and a fresh Service, then the revoked secret is still rejected.
+	requireNoError(t, h.database.Close())
+	reopened, err := store.Open(context.Background(), h.path)
+	requireNoError(t, err)
+	t.Cleanup(func() { _ = reopened.Close() })
+	restarted, err := core.NewService(reopened, h.git, core.ServiceOptions{
+		Now: h.clock.Now, NewID: h.ids.New, MaxParallelRuns: 4, AdapterIDs: []string{"one-shot"},
+	})
+	requireNoError(t, err)
+	restarted.SetReady(true, "")
+	requireDenied(t, restarted.AuthenticateOperator(context.Background(), "second-secret-0123456789"))
 }

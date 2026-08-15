@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"testing"
 	"time"
 
@@ -50,6 +52,63 @@ func TestCT01FileMigrationIsExactAndIdempotent(t *testing.T) {
 	requireNoError(t, err)
 	if info.JournalMode != "wal" || !info.ForeignKeys || info.BusyTimeout != busyTimeoutMillis {
 		t.Fatalf("SQLite pragmas = %#v", info)
+	}
+	wantTables := []string{
+		"projects", "agents", "tasks", "runs", "messages", "events",
+		"schema_migrations", "request_dedupes", "participants", "roles",
+		"participant_project_role", "credentials",
+	}
+	sort.Strings(wantTables)
+	got := append([]string(nil), info.Tables...)
+	sort.Strings(got)
+	if len(got) != len(wantTables) {
+		t.Fatalf("migration produced %d tables: %v, want exact %d: %v", len(got), got, len(wantTables), wantTables)
+	}
+	for i := range wantTables {
+		if got[i] != wantTables[i] {
+			t.Fatalf("migration table set mismatch: got %v, want %v", got, wantTables)
+		}
+	}
+	// v3 seed exact-set: a fresh database carries exactly the four deterministic
+	// seed rows and no extras (acceptance.md CT-12). The counts pin that no
+	// additional seed row drifts in; the row checks pin the exact identities.
+	var participantCount int
+	requireNoError(t, store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM participants`).Scan(&participantCount))
+	if participantCount != 1 {
+		t.Fatalf("participants seed count = %d, want exactly 1", participantCount)
+	}
+	var participantKind string
+	requireNoError(t, store.db.QueryRowContext(ctx, `SELECT kind FROM participants WHERE id=?`, core.DefaultHumanParticipantID).Scan(&participantKind))
+	if participantKind != string(core.ParticipantKindHuman) {
+		t.Fatalf("participant-owner kind = %q, want human", participantKind)
+	}
+	var roleIDs []string
+	roleRows, err := store.db.QueryContext(ctx, `SELECT id FROM roles ORDER BY id`)
+	requireNoError(t, err)
+	for roleRows.Next() {
+		var id string
+		if err := roleRows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		roleIDs = append(roleIDs, id)
+	}
+	requireNoError(t, roleRows.Err())
+	roleRows.Close()
+	wantRoles := []string{core.DefaultOwnerRoleID, core.DefaultAgentRoleID}
+	sort.Strings(wantRoles)
+	sort.Strings(roleIDs)
+	if !slices.Equal(roleIDs, wantRoles) {
+		t.Fatalf("roles seed set = %v, want exactly %v", roleIDs, wantRoles)
+	}
+	var bindingCount int
+	requireNoError(t, store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM participant_project_role`).Scan(&bindingCount))
+	if bindingCount != 1 {
+		t.Fatalf("binding seed count = %d, want exactly 1", bindingCount)
+	}
+	var boundParticipant, boundProject, boundRole string
+	requireNoError(t, store.db.QueryRowContext(ctx, `SELECT participant_id, project_id, role_id FROM participant_project_role`).Scan(&boundParticipant, &boundProject, &boundRole))
+	if boundParticipant != core.DefaultHumanParticipantID || boundProject != core.GlobalProjectID || boundRole != core.DefaultOwnerRoleID {
+		t.Fatalf("binding seed = %s|%s|%s, want %s|%s|%s", boundParticipant, boundProject, boundRole, core.DefaultHumanParticipantID, core.GlobalProjectID, core.DefaultOwnerRoleID)
 	}
 	result, err := store.Migrate(ctx)
 	requireNoError(t, err)

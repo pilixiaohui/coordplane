@@ -1,8 +1,9 @@
 # CoordPlane 轻量需求基线
 
 状态：Draft for owner review
-版本：0.1
-日期：2026-07-11
+版本：0.2
+日期：2026-08-15
+（本版并入统一参与者框架修订：v1 正式纳入 participant、可配置 role、项目级权限绑定与人类凭据生命周期，见 core.md/acceptance.md 相应条款）
 
 ## 1. 文档权威
 
@@ -49,7 +50,7 @@ Boss
 
 | 事实 | 权威来源 | CoordPlane 数据库保存什么 |
 | --- | --- | --- |
-| 项目目标、任务责任、运行、消息和关键状态变化 | CoordPlane SQLite | `Project`、`Agent`、`Task`、`Run`、`Message`、`Event` |
+| 项目目标、任务责任、运行、消息、角色权限、身份凭据和关键状态变化 | CoordPlane SQLite | `Project`、`Participant`、`Task`、`Run`、`Message`、`Event`、`Role`、`ParticipantProjectRole`、`Credential` |
 | 文件内容、历史、提交和分支 | Git objects 和 refs | 精确 `base_sha`、`head_sha`、canonical ref 和 task ref 的索引 |
 
 约束：
@@ -64,16 +65,20 @@ Boss
 
 | 名称 | 类型 | 职责 |
 | --- | --- | --- |
-| Boss | 人类操作者，不建业务对象 | 对话、派发、查看进度、接受、返工、取消、唤醒和最终控制 |
+| Boss | 默认人类 owner participant 的显示别名 | 对话、派发、查看进度、接受、返工、取消、唤醒和最终控制 |
+| Participant | 统一参与者身份行（kind：`human` 或 `cli_agent`） | 人类与 CLI Agent 共享同一身份、Task/Message 与权限框架，生命周期按 kind 分支；在项目内能做什么由该项目下的角色绑定决定 |
 | Daemon | 常驻进程，不建业务对象 | SQLite、调度、Run supervisor、消息递送、Git ref 管理和恢复 |
-| Operator CLI | `coordplane` 命令 | Boss 的唯一正式入口；可有交互模式，但必须复用同一操作函数 |
+| Operator CLI | `coordplane` 命令 | 人类参与者的正式入口；经凭据认证后按项目角色限权执行 |
 | coordlink | Agent 环境内的薄客户端 | 只暴露固定 Task、Message、progress 操作并转发给 Daemon |
-| Agent | 持久配置身份 | 绑定一个静态注册的 CLI adapter（claude/codex）、运行配置（model/subagent_model/base_url/effort）和提示词（instructions_file/text 二选一） |
+| Agent | `cli_agent` 类型的 participant | 绑定一个静态注册的 CLI adapter（claude/codex）、运行配置（model/subagent_model/base_url/effort）和提示词（instructions_file/text 二选一） |
 | CLI adapter | 静态注册组件 | 生成 provider 启动/恢复命令、解析协议、判断 resume 兼容性；可选支持运行中输入，容器生命周期仍由 Runtime executor 统一拥有 |
+| Role | 可配置数据（`roles` 表） | capability 集合；只在项目绑定（`participant_project_role`）内生效，全局能力经 `project_id=global` 作用域 |
+| Capability | 静态注册权限点 | 每个可调用 operation 一个权限点；代码事实，不是数据，不提供动态 registry |
+| Credential | 人类身份凭据（`credentials` 表） | v1 只签发 `operator_token`，保存 SHA-256 hash；支持轮换与吊销，吊销后该 participant 的 operator 操作立即被拒 |
 | Runtime | 第一版为 Docker | 为每次 Run 提供隔离进程、workspace 和 Agent 私有 home |
 | Git | 成熟代码协作机制 | commit、branch、merge、冲突检测、对象保存和 ref CAS |
 
-Manager、Developer、Reviewer、Integrator 只是 Agent 指令或显示标签。Daemon 不理解这些角色名，也不根据角色名写业务分支。
+Manager、Developer、Reviewer、Integrator 只是 Agent 指令或显示标签，不是内置角色。内置种子角色只有 owner 与 agent 两个（`role-owner`/`role-agent`），由 v3 迁移 seed 写入，是权限集合而非业务语义；Daemon 不理解角色名，也不根据角色名写业务分支。
 
 ## 5. 第一版必须完成的能力
 
@@ -125,7 +130,7 @@ Manager、Developer、Reviewer、Integrator 只是 Agent 指令或显示标签�
 
 第一版明确不建设以下能力，需求、代码、表结构和验收不得为其预留平台化框架：
 
-- 多用户账号、组织、tenant、完整 RBAC 或通用 policy engine。
+- 多用户账号、组织、tenant、完整 RBAC 或通用 policy engine（capability 静态注册、role 可配置与项目级绑定是产品内权限实现，不是通用 RBAC/policy 平台）。
 - 动态 capability registry、机器 schema discovery、通用 `/call` 路由或由 schema 派生工具。
 - Skill registry、skill version store、skill binding 或 progressive disclosure 服务。
 - TeamConfig DSL、角色策略语言、通信策略语言、终止验收策略或配置版本服务。
@@ -152,7 +157,7 @@ Manager、Developer、Reviewer、Integrator 只是 Agent 指令或显示标签�
 
 1. **ACP（Agent Client Protocol，协调者 ↔ CLI agent）是 adapter 层的演进目标，不是第一版合同**。第一版 adapter 仍是静态注册的 provider 私有协议（Claude 与 Codex CLI）；当 ACP 达到 1.0 稳定且目标 agent（Claude Code）提供原生或成熟 bridge 支持后，应当实现 ACP client adapter 替换私有事件解析。`runtime.md` §7.1 的 adapter 接口（BuildStartCommand/BuildResumeCommand/BuildInjectInput/ParseEvent/ResumeCompatible）与 ACP 方法（session/new、session/prompt、session/cancel、session/update、session/request_permission）的映射见 `docs/protocols.md`。**第一版不得**预埋 ACP 半成品接口或按协议名写主循环特判；adapter 注册列表保持静态。
 2. **A2A（Agent2Agent，agent↔agent）只作为未来对外互操作出口**。Boss 面未来可把 Project/Task 暴露为 A2A 端点 + 静态 AgentCard（能力/技能/安全声明，`/.well-known/agent-card.json`），用于与其他 agent 平台互派任务；但**内部多 Agent 协作必须保持 Daemon 单一协调，禁止 agent↔agent 点对点直连**（见 §6 非目标）。A2A 出口属于未来能力，必须先修改本需求基线。
-3. **AG-UI（agent↔UI）作为 Web 前端事件流参考**。实时展示 Run 进度/工具调用时应当映射 AG-UI 事件词汇（RunStart/TextMessage/ToolCall/RunComplete 等，SSE + JSON Patch），不得为前端自造第二套事件协议。
+3. **AG-UI（agent↔UI）作为 Web 前端事件词汇参考，不是传输合同**。实时展示 Run 进度/工具调用时可参考 AG-UI 事件词汇（RunStart/TextMessage/ToolCall/RunComplete 等）；事件传输与增量格式由前端实现选择，不与 AG-UI 规范固定传输绑定。
 4. **MCP（Model Context Protocol）不建设平台**。见 §6 非目标（通用 tool adapter、MCP server、plugin 平台）；agent 在容器内自行连接 MCP server 属 agent 自身行为，CoordPlane 不提供平台化支持。
 5. **AGNTCY/ANP 等发现/身份/传输基础设施不进第一版**。单 Daemon、本地优先定位不匹配；仅当未来演进为多 Daemon 或对外可发现 agent 时再评估。
 
@@ -163,7 +168,7 @@ Manager、Developer、Reviewer、Integrator 只是 Agent 指令或显示标签�
 任何需要理解内容的动作都由 Boss 或 CLI Agent显式发起。Daemon 只做以下机械判断：
 
 - 状态转移是否合法。
-- 调用者是否与当前 Run scope 一致。
+- 调用者是否与当前 Run scope 一致，并持有操作所属项目/global 作用域下的 capability。
 - Git commit/ref/祖先关系是否真实。
 - expected version 或 expected SHA 是否仍匹配。
 - 进程、容器和 session 是否真实存在。
@@ -260,7 +265,11 @@ runtime:
 | 术语 | 定义 |
 | --- | --- |
 | Project | 一个 daemon-owned Git repo 和其 canonical ref 的协调范围 |
-| Agent | 一个持久 CLI 员工身份及其 adapter/runtime 配置 |
+| Participant | 统一参与者身份行（kind：`human` 或 `cli_agent`）；人类与 CLI Agent 共享同一身份、Task/Message 与权限框架，生命周期按 kind 分支 |
+| Agent | 一个 `cli_agent` 类型的 participant 及其 adapter/runtime 配置 |
+| Role | 可配置的 capability 集合（`roles` 表），只在项目绑定（`participant_project_role`）内生效；全局能力经 `project_id=global` 作用域 |
+| Capability | 每个可调用 operation 的静态注册权限点；代码事实，不是数据，不提供动态 registry |
+| Credential | 人类身份凭据（`credentials` 表）；v1 只签发 `operator_token`（保存 SHA-256 hash），支持轮换与吊销 |
 | Task | 明确目标、责任人和结果状态的工作或对话单元 |
 | Run | 针对一个 Task 启动的一次真实 CLI 进程执行；resume 也创建新 Run |
 | Message | 绑定 Task 的 Boss/Agent 持久消息和唤醒单元 |
@@ -280,6 +289,7 @@ runtime:
 
 - 五份需求文档描述同一组对象、状态和命令，不存在第二套真相或旧协议。
 - Boss 能与 Agent 对话、派发、查看进度、收取结果、返工、取消和唤醒。
+- 人类与 CLI Agent 作为统一 participant 协作：可互相派发 Task、发送 Message、按项目角色执行；人类任务以 `human_confirm` 证据收敛，凭据轮换/吊销立即生效，最后管理员保护生效。
 - 两个 CLI Agent 能在隔离容器和私有 workspace 中真实并发。
 - 消息在 Run/Daemon 失败和 resume 后不丢失。
 - 两个 Agent 的提交都被 task ref 保存，并通过 Git CAS/integration Task 收敛到 canonical ref。

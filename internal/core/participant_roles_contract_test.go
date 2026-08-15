@@ -2,9 +2,13 @@ package core_test
 
 import (
 	"context"
+	"database/sql"
+	"strconv"
+	"strings"
 	"testing"
 
 	"coordplane/internal/core"
+	_ "modernc.org/sqlite"
 )
 
 // RP-01: the static capability registry is complete and closed: every
@@ -260,15 +264,20 @@ func TestRP04GlobalScopeIsolation(t *testing.T) {
 }
 
 // RP-06: the last participant.manage holder cannot be stripped, so the system
-// never loses its administrator.
+// never loses its administrator. A failed unbind must leave the binding rows
+// and the events table untouched.
 func TestRP06LastManageHolderIsProtected(t *testing.T) {
 	h := newHarness(t)
+	before := rp06BindingEventsSignature(t, h.path)
 	err := h.service.UnbindParticipantRole(context.Background(), core.BindRoleInput{
 		ParticipantID: core.DefaultHumanParticipantID, ProjectID: core.GlobalProjectID, RoleID: core.DefaultOwnerRoleID,
 		RequestID: "rp06-last-manage",
 	})
 	if !core.IsCode(err, core.CodeInUse) {
 		t.Fatalf("unbind last manage holder error = %v, want IN_USE", err)
+	}
+	if after := rp06BindingEventsSignature(t, h.path); after != before {
+		t.Fatalf("failed unbind of last manage holder changed durable state\nbefore=%s\nafter=%s", before, after)
 	}
 	second, err := h.service.CreateRole(context.Background(), core.RoleInput{
 		Name: "rp06-coowner", Capabilities: core.CapabilityNames(core.AllCapabilities()), RequestID: "rp06-role",
@@ -320,4 +329,40 @@ func TestRP00ParticipantCapabilitiesScopeResolution(t *testing.T) {
 	if core.HasCapability(effectiveA, core.CapabilityGCDiscard) {
 		t.Fatalf("project B capability leaked into project A: %v", effectiveA)
 	}
+}
+
+// rp06BindingEventsSignature re-reads the role-binding rows and the events
+// table directly from SQLite so a failed mutation can be proven side-effect
+// free (no binding removed, no Event appended).
+func rp06BindingEventsSignature(t *testing.T, path string) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	requireNoError(t, err)
+	defer func() { _ = db.Close() }()
+	rows, err := db.QueryContext(context.Background(), `SELECT participant_id, project_id, role_id FROM participant_project_role ORDER BY participant_id, project_id, role_id`)
+	requireNoError(t, err)
+	defer rows.Close()
+	var bindings []string
+	for rows.Next() {
+		var participantID, projectID, roleID string
+		if err := rows.Scan(&participantID, &projectID, &roleID); err != nil {
+			t.Fatal(err)
+		}
+		bindings = append(bindings, participantID+"|"+projectID+"|"+roleID)
+	}
+	requireNoError(t, rows.Err())
+	eventRows, err := db.QueryContext(context.Background(), `SELECT id, entity_type, entity_id, kind, actor_kind, actor_id, request_id, created_at FROM events ORDER BY id`)
+	requireNoError(t, err)
+	defer eventRows.Close()
+	var events []string
+	for eventRows.Next() {
+		var id int64
+		var entityType, entityID, kind, actorKind, actorID, requestID, createdAt string
+		if err := eventRows.Scan(&id, &entityType, &entityID, &kind, &actorKind, &actorID, &requestID, &createdAt); err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, strings.Join([]string{strconv.FormatInt(id, 10), entityType, entityID, kind, actorKind, actorID, requestID, createdAt}, "|"))
+	}
+	requireNoError(t, eventRows.Err())
+	return strings.Join(bindings, "\n") + "\n==EVENTS==\n" + strings.Join(events, "\n")
 }

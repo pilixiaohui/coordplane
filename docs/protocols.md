@@ -86,7 +86,7 @@ Web 前端（`web_addr` SPA）实时展示 Run 进度时，事件词汇映射：
 | ToolCallStart/Result | run 日志（stdout 轮转文件） | 工具调用展示（受 redaction 边界约束） |
 | RunComplete / Error | run.exited / task.failed | Run 终态 |
 
-传输：SSE + JSON Patch（AG-UI 规范）；由前端适配层将 `events tail` 投影为 AG-UI 事件，不改变后端事件模型。
+事件传输与增量格式由前端实现选择，不与 AG-UI 规范固定绑定：后端 `events tail` 是事实源，前端适配层负责投影；若前端需要增量，可参考 JSON Patch 编码 `STATE_DELTA.delta` 作为可选增量格式，不是对 AG-UI 传输合同的强制兼容，也不改变后端事件模型。
 
 ## 5. 明确不采用
 
@@ -105,7 +105,7 @@ Web 前端（`web_addr` SPA）实时展示 Run 进度时，事件词汇映射：
 | Claude Code 原生 ACP | 非原生（Zed bridge） | 原生/稳定 bridge 后评估 |
 | A2A 1.x | v1.0（LF，150+ 组织） | 用户确认对外互操作需求后走需求修订 |
 | MCP 大版本 | 2026-07-28 无状态化 | 仅生态参照，无动作 |
-| AG-UI | 发展中（官方 Claude SDK 集成已发布） | 前端实时流改造时采用 |
+| AG-UI | 发展中 | 前端实时流事件词汇参考；传输与增量格式由前端实现选择，不绑定 AG-UI 传输 |
 
 ## 7. 与现有文档的引用关系
 
