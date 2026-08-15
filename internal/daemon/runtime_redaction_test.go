@@ -155,6 +155,40 @@ func TestRuntimeRedactionNewLineageFailsClosedWithoutTrustedInstructions(t *test
 	}
 }
 
+// R5: an in-place rewrite of the instructions_file between launch and monitor
+// changes the file's hash, so the run's immutable InstructionsHash no longer
+// reconciles and the redaction must fail closed instead of trusting the new
+// content.
+func TestRuntimeRedactionInstructionsFileInPlaceRewriteFailsClosed(t *testing.T) {
+	canary := "IN-PLACE-REWRITE-CANARY"
+	original := "original prompt"
+	replaced := "replacement prompt " + canary
+	runID := "run-in-place"
+	controlRoot := newRunControlDir(t, runID, map[string]string{runtimeInstructionsFile: original, runtimeLaunchFile: "#!/bin/sh\n", runtimeSecretsFile: ""})
+	sum := sha256.Sum256([]byte(original))
+	controller := &runtimeController{controlRoot: controlRoot}
+	run := core.Run{ID: runID, InstructionsHash: hex.EncodeToString(sum[:])}
+
+	values, ok := controller.runtimeRunInstructions(run)
+	if !ok || len(values) != 1 || values[0] != original {
+		t.Fatalf("baseline instructions = %#v ok=%t, want %q", values, ok, original)
+	}
+	requireNoError(t, os.Chmod(filepath.Join(controlRoot, runID, runtimeInstructionsFile), 0o640))
+	requireNoError(t, os.WriteFile(filepath.Join(controlRoot, runID, runtimeInstructionsFile), []byte(replaced), 0o440))
+	requireNoError(t, os.Chmod(filepath.Join(controlRoot, runID, runtimeInstructionsFile), 0o440))
+	if _, ok := controller.runtimeRunInstructions(run); ok {
+		t.Fatal("in-place rewritten instructions file did not fail closed")
+	}
+	redact := controller.runtimeRedaction(run)
+	if !redact.failClosed {
+		t.Fatal("in-place rewritten instructions file did not fail closed")
+	}
+	text := redact.Text("provider echoed " + canary)
+	if strings.Contains(text, canary) || !strings.Contains(text, redactionUnavailableMarker) {
+		t.Fatalf("in-place rewrite leaked content or missed the marker: %q", text)
+	}
+}
+
 func TestParseRunSecretsFile(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -219,8 +253,7 @@ func TestSerializeRunSecretsFileRoundTrips(t *testing.T) {
 		"PLAIN":                "simple",
 		"EMPTY":                "",
 	}
-	raw, err := serializeRunSecretsFile(values)
-	requireNoError(t, err)
+	raw := requireRuntimeValue(serializeRunSecretsFile(values))
 	parsed, ok := parseRunSecretsFile(string(raw))
 	if !ok {
 		t.Fatalf("serialized secrets file did not parse back: %q", raw)
@@ -249,8 +282,7 @@ func TestSerializeRunSecretsFileRejectsUnsafe(t *testing.T) {
 func TestRuntimeSecretsFileShellSourceSafety(t *testing.T) {
 	payload := filepath.Join(t.TempDir(), "pwned")
 	canary := "sk-ant-'$(touch " + payload + ")' ; | & > *\nsecond line"
-	raw, err := serializeRunSecretsFile(map[string]string{"ANTHROPIC_AUTH_TOKEN": canary})
-	requireNoError(t, err)
+	raw := requireRuntimeValue(serializeRunSecretsFile(map[string]string{"ANTHROPIC_AUTH_TOKEN": canary}))
 	secretsPath := filepath.Join(t.TempDir(), runtimeSecretsFile)
 	requireNoError(t, os.WriteFile(secretsPath, raw, 0o440))
 
@@ -261,8 +293,7 @@ func TestRuntimeSecretsFileShellSourceSafety(t *testing.T) {
 	requireNoError(t, os.WriteFile(launcherPath, []byte(launcher), 0o550))
 	cmd := exec.Command(launcherPath, "sh", "-c", `printf %s "$ANTHROPIC_AUTH_TOKEN"`)
 	cmd.Env = append(os.Environ(), "COORDPLANE_SECRETS_FILE="+secretsPath)
-	out, err := cmd.Output()
-	requireNoError(t, err)
+	out := requireRuntimeValue(cmd.Output())
 	if string(out) != canary {
 		t.Fatalf("launcher sourced secret = %q, want %q (file: %q)", out, canary, raw)
 	}
@@ -368,8 +399,7 @@ func TestRuntimeLogBoundaryRedactsBoundsAndReplaysFromZero(t *testing.T) {
 	controlPath := filepath.Join(controlRoot, run.ID)
 	requireNoError(t, os.MkdirAll(controlPath, 0o700))
 	requireNoError(t, os.WriteFile(filepath.Join(controlPath, "token"), []byte(runToken+"\n"), 0o400))
-	secretsRaw, err := serializeRunSecretsFile(map[string]string{providerName: secretLineA + "\n" + secretLineB})
-	requireNoError(t, err)
+	secretsRaw := requireRuntimeValue(serializeRunSecretsFile(map[string]string{providerName: secretLineA + "\n" + secretLineB}))
 	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeSecretsFile), secretsRaw, 0o440))
 	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeInstructionsFile), []byte("unrelated instructions"), 0o440))
 	requireNoError(t, os.MkdirAll(filepath.Dir(run.LogPath), 0o700))
@@ -393,8 +423,7 @@ func TestRuntimeLogBoundaryRedactsBoundsAndReplaysFromZero(t *testing.T) {
 	for attempt := 0; attempt < 2; attempt++ {
 		requireNoError(t, controller.streamLogs(context.Background(), run, containerruntime.RuntimeRef{}, entry, monitor))
 	}
-	raw, err := os.ReadFile(run.LogPath)
-	requireNoError(t, err)
+	raw := requireRuntimeValue(os.ReadFile(run.LogPath))
 	text := string(raw)
 	if len(raw) > runtimeLogLimit {
 		t.Fatalf("runtime log bytes = %d, limit = %d", len(raw), runtimeLogLimit)

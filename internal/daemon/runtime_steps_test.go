@@ -123,8 +123,7 @@ func TestContainerSpecExcludesProviderSecretsFromEnvironment(t *testing.T) {
 	for _, name := range append(providerEnv, "ANTHROPIC_API_KEY", "HOME", "COORDPLANE_RUN_SOCKET", "COORDPLANE_RUN_TOKEN_FILE") {
 		t.Setenv(name, "/untrusted/provider-value")
 	}
-	coordlink, err := os.Executable()
-	requireNoError(t, err)
+	coordlink := requireRuntimeValue(os.Executable())
 	controller := &runtimeController{
 		config: config.Config{Runtime: config.RuntimeConfig{
 			DockerNetwork:        "none",
@@ -137,11 +136,10 @@ func TestContainerSpecExcludesProviderSecretsFromEnvironment(t *testing.T) {
 		Generation: 1, LaunchNonce: "nonce-env", ContainerName: "coordplane-run-env",
 		Image: "agent:test", HomePath: "/runtime/agent-home",
 	}
-	spec, err := controller.containerSpec(run, core.TaskConversation, adapter.CommandSpec{
+	spec := requireRuntimeValue(controller.containerSpec(run, core.TaskConversation, adapter.CommandSpec{
 		Executable: "claude",
 		Env:        map[string]string{"HOME": "/home/agent"},
-	}, "/runtime/run-control/run-env")
-	requireNoError(t, err)
+	}, "/runtime/run-control/run-env"))
 	if !reflect.DeepEqual(spec.SensitiveEnvKeys, controller.config.Runtime.ProviderEnvAllowlist) {
 		t.Fatalf("sensitive environment keys = %v", spec.SensitiveEnvKeys)
 	}

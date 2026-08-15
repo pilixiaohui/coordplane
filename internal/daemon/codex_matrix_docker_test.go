@@ -43,18 +43,15 @@ func TestCodexScriptedDockerResumeFreshFallbackMatrix(t *testing.T) {
 		task := fixture.addTask(t, project.ID, agent.ID, "codex fresh matrix", 0)
 		first := waitForActiveProviderRun(t, fixture, task.ID)
 
-		current, err := fixture.components.service.Agent(fixture.ctx, agent.ID)
-		requireNoError(t, err)
-		if _, err := fixture.components.service.UpdateAgent(fixture.ctx, core.UpdateAgentInput{
+		current := requireRuntimeValue(fixture.components.service.Agent(fixture.ctx, agent.ID))
+		requireRuntimeValue(fixture.components.service.UpdateAgent(fixture.ctx, core.UpdateAgentInput{
 			ID: current.ID, Version: current.Version,
 			AgentConfigInput: core.AgentConfigInput{
 				DisplayName: current.DisplayName, AdapterID: current.AdapterID, Image: current.Image,
 				InstructionsText: current.InstructionsText, Effort: "low",
 			},
 			RequestID: "codex-fresh-update-" + current.ID,
-		}); err != nil {
-			t.Fatal(err)
-		}
+		}))
 		interruptProviderRun(t, fixture, task.ID, first.ID, "codex-fresh-stop")
 
 		second := waitForActiveProviderRun(t, fixture, task.ID)
@@ -78,13 +75,11 @@ func TestCodexScriptedDockerResumeFreshFallbackMatrix(t *testing.T) {
 				run.ResumedFromRunID != "" && run.ResumeNativeSessionID == "" &&
 				run.NativeSessionID != "" && run.ID != first.ID
 		})
-		events, err := fixture.components.store.Events(fixture.ctx, core.EventFilter{ProjectID: project.ID, RunID: fallback.ID})
-		requireNoError(t, err)
+		events := requireRuntimeValue(fixture.components.store.Events(fixture.ctx, core.EventFilter{ProjectID: project.ID, RunID: fallback.ID}))
 		if countDaemonEvent(events, "run.resume_fallback") != 1 {
 			t.Fatalf("Codex fallback Events = %#v", events)
 		}
-		runs, err := fixture.components.store.Runs(fixture.ctx, core.RunFilter{TaskID: task.ID, Limit: 20})
-		requireNoError(t, err)
+		runs := requireRuntimeValue(fixture.components.store.Runs(fixture.ctx, core.RunFilter{TaskID: task.ID, Limit: 20}))
 		var failedResume core.Run
 		for _, summary := range runs.Items {
 			run, readErr := fixture.components.store.Run(fixture.ctx, summary.ID)
@@ -104,28 +99,25 @@ func TestCodexScriptedDockerResumeFreshFallbackMatrix(t *testing.T) {
 
 func addProviderInstructionsAgent(t *testing.T, fixture *p3DockerFixture, name, instructionsText string) core.Agent {
 	t.Helper()
-	agent, err := fixture.components.service.AddAgent(fixture.ctx, core.AddAgentInput{
+	agent := requireRuntimeValue(fixture.components.service.AddAgent(fixture.ctx, core.AddAgentInput{
 		DisplayName: name, AdapterID: fixture.adapterID, Image: fixture.image,
 		InstructionsText: instructionsText, RequestID: "provider-agent-" + strings.ReplaceAll(name, " ", "-"),
-	})
-	requireNoError(t, err)
+	}))
 	return agent
 }
 
 func waitForActiveProviderRun(t *testing.T, fixture *p3DockerFixture, taskID string) core.Run {
 	t.Helper()
 	return waitForRun(t, fixture, taskID, func(run core.Run, task core.Task) bool {
-		return run.State == core.RunActive && task.Status == core.TaskRunning
+		return run.State == core.RunActive && run.NativeSessionID != "" && task.Status == core.TaskRunning
 	})
 }
 
 func interruptProviderRun(t *testing.T, fixture *p3DockerFixture, taskID, runID, requestID string) {
 	t.Helper()
-	if _, err := fixture.components.service.RequestRunStop(fixture.ctx, core.RunStopInput{
+	requireRuntimeValue(fixture.components.service.RequestRunStop(fixture.ctx, core.RunStopInput{
 		RunID: runID, Reason: "provider matrix interrupt", RequestID: requestID,
-	}); err != nil {
-		t.Fatal(err)
-	}
+	}))
 	waitForInterruptedRemoved(t, fixture, taskID, runID)
 }
 
@@ -139,11 +131,9 @@ func waitForInterruptedRemoved(t *testing.T, fixture *p3DockerFixture, taskID, r
 
 func cancelProviderTask(t *testing.T, fixture *p3DockerFixture, taskID string) {
 	t.Helper()
-	if _, err := fixture.components.service.CancelTask(fixture.ctx, core.TaskActionInput{
+	requireRuntimeValue(fixture.components.service.CancelTask(fixture.ctx, core.TaskActionInput{
 		TaskID: taskID, Reason: "provider matrix complete", RequestID: "provider-cancel-" + taskID,
-	}); err != nil {
-		t.Fatal(err)
-	}
+	}))
 	waitForRun(t, fixture, taskID, func(run core.Run, task core.Task) bool {
 		return task.Status == core.TaskCancelled
 	})
@@ -151,8 +141,7 @@ func cancelProviderTask(t *testing.T, fixture *p3DockerFixture, taskID string) {
 
 func inspectProviderRun(t *testing.T, fixture *p3DockerFixture, run core.Run) containerruntime.LiveState {
 	t.Helper()
-	state, err := fixture.executor.Inspect(fixture.ctx, runtimeRef(run))
-	requireNoError(t, err)
+	state := requireRuntimeValue(fixture.executor.Inspect(fixture.ctx, runtimeRef(run)))
 	return state
 }
 

@@ -110,15 +110,11 @@ func TestInspectHelperDiscardRetryReinspectsMutatedWorkspace(t *testing.T) {
 	executable := filepath.Join(root, "coordplane-git-helper")
 	requireNoError(t, os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o700))
 	executor := &staleInspectExecutor{head: head}
-	helper, err := newDockerCaptureHelper(executor, config.GitConfig{CaptureHelperImage: "helper", CaptureTimeout: 20 * time.Millisecond, MaximumObjects: 100, MaximumBundleBytes: 1 << 20, MaximumHandoffBytes: 2 << 20}, filepath.Join(root, "handoff"), executable)
-	requireNoError(t, err)
-	manager, err := gitrepo.NewWorkspaceManager(fixture.initializer, filepath.Join(root, "retry-workspaces"), helper)
-	requireNoError(t, err)
+	helper := requireRuntimeValue(newDockerCaptureHelper(executor, config.GitConfig{CaptureHelperImage: "helper", CaptureTimeout: 20 * time.Millisecond, MaximumObjects: 100, MaximumBundleBytes: 1 << 20, MaximumHandoffBytes: 2 << 20}, filepath.Join(root, "handoff"), executable))
+	manager := requireRuntimeValue(gitrepo.NewWorkspaceManager(fixture.initializer, filepath.Join(root, "retry-workspaces"), helper))
 	spec := gitrepo.WorkspaceSpec{ProjectID: fixture.project.ID, TaskID: "task-inspect-retry", BaseSHA: head}
-	workspace, err := manager.Materialize(ctx, spec)
-	requireNoError(t, err)
-	preview, err := manager.State(ctx, spec, workspace.HeadSHA, 1)
-	requireNoError(t, err)
+	workspace := requireRuntimeValue(manager.Materialize(ctx, spec))
+	preview := requireRuntimeValue(manager.State(ctx, spec, workspace.HeadSHA, 1))
 	if discarded, err := manager.Discard(ctx, spec, workspace.HeadSHA, 1, preview.Fingerprint, func() (bool, error) { return true, nil }); discarded || err == nil {
 		t.Fatalf("first discard discarded=%t err=%v", discarded, err)
 	}
@@ -1145,8 +1141,7 @@ func populateRuntimeTestControl(t *testing.T, controller *runtimeController, run
 			secrets[name] = value
 		}
 	}
-	raw, err := serializeRunSecretsFile(secrets)
-	requireNoError(t, err)
+	raw := requireRuntimeValue(serializeRunSecretsFile(secrets))
 	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeSecretsFile), raw, runControlFileMode))
 	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeInstructionsFile), []byte(runtimeTestInstructionsText), runControlFileMode))
 }
