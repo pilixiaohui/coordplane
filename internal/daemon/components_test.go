@@ -44,8 +44,7 @@ func TestGT00CompositionQuarantinesRepositoryWithoutProjectRow(t *testing.T) {
 		t.Fatalf("restart after quarantine: %v", err)
 	}
 	defer components.Close()
-	snapshot, err := components.store.Snapshot(context.Background(), "")
-	requireNoError(t, err)
+	snapshot := requireRuntimeValue(components.store.Snapshot(context.Background(), ""))
 	if len(snapshot.Projects) != 0 {
 		t.Fatalf("unowned repository was adopted: %#v", snapshot.Projects)
 	}
@@ -72,10 +71,9 @@ func TestCompositionRejectsUnsafeDataDirectoriesBeforeStoreOpen(t *testing.T) {
 				outside := filepath.Join(root, "outside-"+test.path)
 				requireNoError(t, os.MkdirAll(outside, 0o700))
 				requireNoError(t, os.Symlink(outside, path))
-			} else if err := os.Mkdir(path, 0o700); err != nil {
-				t.Fatal(err)
-			} else if err := os.Chmod(path, test.mode); err != nil {
-				t.Fatal(err)
+			} else {
+				requireNoError(t, os.Mkdir(path, 0o700))
+				requireNoError(t, os.Chmod(path, test.mode))
 			}
 			components, err := buildComponents(context.Background(), configPath)
 			if components != nil {

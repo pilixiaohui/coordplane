@@ -85,6 +85,11 @@ type Agent struct {
 	AdapterID        string      `json:"adapter_id"`
 	Image            string      `json:"image"`
 	InstructionsFile string      `json:"instructions_file"`
+	InstructionsText string      `json:"instructions_text,omitempty"`
+	Model            string      `json:"model,omitempty"`
+	SubagentModel    string      `json:"subagent_model,omitempty"`
+	BaseURL          string      `json:"base_url,omitempty"`
+	Effort           string      `json:"effort,omitempty"`
 	Status           AgentStatus `json:"status"`
 	Version          int64       `json:"version"`
 	CreatedAt        string      `json:"created_at"`
@@ -110,6 +115,7 @@ type Task struct {
 	NextRunAt                  string     `json:"next_run_at"`
 	RetryCount                 int        `json:"retry_count"`
 	MaxRetries                 int        `json:"max_retries"`
+	BudgetSeconds              int64      `json:"budget_seconds,omitempty"`
 	WaitReason                 string     `json:"wait_reason,omitempty"`
 	ResultSummary              string     `json:"result_summary,omitempty"`
 	FailureReason              string     `json:"failure_reason,omitempty"`
@@ -156,6 +162,7 @@ type Run struct {
 	AdapterID             string   `json:"adapter_id"`
 	Image                 string   `json:"image"`
 	InstructionsHash      string   `json:"instructions_hash"`
+	ConfigFingerprint     string   `json:"config_fingerprint,omitempty"`
 	State                 RunState `json:"state"`
 	WorkspacePath         string   `json:"-"`
 	ContainerID           string   `json:"container_id,omitempty"`
@@ -361,6 +368,7 @@ type TaskSummary struct {
 	NextRunAt                  string     `json:"next_run_at"`
 	RetryCount                 int        `json:"retry_count"`
 	MaxRetries                 int        `json:"max_retries"`
+	BudgetSeconds              int64      `json:"budget_seconds,omitempty"`
 	WaitReason                 string     `json:"wait_reason,omitempty"`
 	ResultSummary              string     `json:"result_summary,omitempty"`
 	FailureReason              string     `json:"failure_reason,omitempty"`

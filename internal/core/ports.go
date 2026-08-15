@@ -72,6 +72,18 @@ type Transaction interface {
 	InsertMessage(Message) error
 	UpdateMessage(Message, int64, MessageState) error
 
+	DeleteRunsByTask(string) ([]Run, error)
+	DeleteMessagesByTask(string) error
+	DeleteEventsByTask(string) error
+	DeleteTask(string) error
+
+	DeleteMessagesByProject(string) error
+	DeleteRunsByProject(string) ([]Run, error)
+	DeleteTasksByProject(string) error
+	DeleteEventsByProject(string) error
+	DeleteProjectBindings(string) error
+	DeleteProject(string) error
+
 	Role(string) (Role, error)
 	Roles() ([]Role, error)
 	InsertRole(Role) error
@@ -82,6 +94,7 @@ type Transaction interface {
 	Participant(string) (Participant, error)
 	Participants() ([]Participant, error)
 	InsertParticipant(Participant) error
+	UpdateParticipant(Participant, int64) error
 	ParticipantRoles(string) ([]ParticipantRoleBinding, error)
 	InsertParticipantRole(ParticipantRoleBinding) error
 	DeleteParticipantRole(string, string, string) error
@@ -189,6 +202,7 @@ type AgentHomeStateFact struct {
 // not need to implement result mutation behavior.
 type TaskGit interface {
 	Capture(context.Context, GitCaptureIntent) (GitCaptureFact, error)
+	ExpandHead(context.Context, GitExpandHeadIntent) (string, error)
 	CleanupCapture(context.Context, GitCaptureIntent) error
 	Advance(context.Context, GitAdvanceIntent) (GitAdvanceFact, error)
 	ResolveTaskRef(context.Context, GitTaskRefIntent) (string, error)
@@ -199,6 +213,12 @@ type TaskGit interface {
 	TaskRefState(context.Context, GitDeleteRefIntent) (GitTaskRefStateFact, error)
 	DeleteTaskRefAndPrune(context.Context, GitDeleteRefIntent, func() (bool, error)) (bool, error)
 	DeleteWorkspace(context.Context, GitDeleteWorkspaceIntent, func() (bool, error)) (bool, error)
+}
+
+// ProjectGitDispose is the optional post-delete disk boundary. Core supplies
+// the final durable authorization immediately before deletion.
+type ProjectGitDispose interface {
+	Dispose(context.Context, string) error
 }
 
 type GitSource struct {
@@ -218,6 +238,20 @@ type GitCaptureIntent struct {
 	ExpectedHead  string
 	Source        *GitSource
 	OperationID   string
+}
+
+// GitExpandHeadIntent resolves a caller-supplied short hash prefix (or other
+// ref) to a full commit object ID in the Run's private workspace. WorkspacePath
+// is daemon-internal and is validated by the executor against the deterministic
+// Task path before any Git command runs inside it.
+type GitExpandHeadIntent struct {
+	ProjectID     string
+	TaskID        string
+	RunID         string
+	WorkspacePath string
+	BaseSHA       string
+	ExpectedHead  string
+	Source        *GitSource
 }
 
 type GitCaptureFact struct {

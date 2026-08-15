@@ -14,7 +14,14 @@ import (
 	"coordplane/internal/core"
 )
 
-const maxRequestBytes = 1 << 20
+// requestEnvelopeAllowanceBytes is the room kept above the worst-case encoded
+// instructions text for the JSON envelope and the other fixed config fields.
+// The transport limits the encoded HTTP body, while core enforces the decoded
+// 1 MiB text limit; a NUL byte expands to the six-byte \u0000 escape, so six
+// times MaximumInstructionsBytes is the encoded worst case.
+const requestEnvelopeAllowanceBytes = 64 << 10
+
+const maxRequestBytes = core.MaximumInstructionsBytes*6 + requestEnvelopeAllowanceBytes
 
 type actionRequest struct {
 	RequestID string `json:"request_id"`
@@ -106,6 +113,10 @@ func registerProjectAgentRoutes(mux *http.ServeMux, operations OperatorOperation
 	mux.HandleFunc("/v1/projects/{id}/archive", requireMethod(http.MethodPost, actionCall(func(ctx requestContext, id, requestID string) (any, error) {
 		return operations.ArchiveProject(ctx.Context, id, requestID)
 	})))
+	mux.HandleFunc("/v1/projects/{id}/delete", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.ProjectDeleteInput) (any, error) {
+		input.ProjectID = strings.TrimSpace(ctx.PathValue("id"))
+		return nil, operations.DeleteProject(ctx.Context, input)
+	})))
 	addAgent := decodeCall(func(ctx requestContext, input core.AddAgentInput) (any, error) {
 		return operations.AddAgent(ctx.Context, input)
 	})
@@ -125,8 +136,24 @@ func registerProjectAgentRoutes(mux *http.ServeMux, operations OperatorOperation
 			methodNotAllowed(w, "GET, POST")
 		}
 	})
-	mux.HandleFunc("/v1/agents/{id}", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
-		result, err := operations.Agent(r.Context(), strings.TrimSpace(r.PathValue("id")))
+	mux.HandleFunc("/v1/agents/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimSpace(r.PathValue("id"))
+		switch r.Method {
+		case http.MethodGet:
+			result, err := operations.Agent(r.Context(), id)
+			writeResult(w, result, err)
+		case http.MethodPut:
+			updateAgent := decodeCall(func(ctx requestContext, input core.UpdateAgentInput) (any, error) {
+				input.ID = id
+				return operations.UpdateAgent(ctx.Context, input)
+			})
+			updateAgent(w, r)
+		default:
+			methodNotAllowed(w, "GET, PUT")
+		}
+	})
+	mux.HandleFunc("/v1/adapters", requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		result, err := operations.ListAdapters(r.Context())
 		writeResult(w, result, err)
 	}))
 	mux.HandleFunc("/v1/agents/{id}/pause", requireMethod(http.MethodPost, actionCall(func(ctx requestContext, id, requestID string) (any, error) {
@@ -192,6 +219,10 @@ func registerTaskRoutes(mux *http.ServeMux, operations OperatorOperations) {
 	mux.HandleFunc("/v1/tasks/{id}/cancel", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.TaskActionInput) (any, error) {
 		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
 		return operations.CancelTask(ctx.Context, input)
+	})))
+	mux.HandleFunc("/v1/tasks/{id}/delete", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.TaskActionInput) (any, error) {
+		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
+		return nil, operations.DeleteTask(ctx.Context, input)
 	})))
 	mux.HandleFunc("/v1/tasks/{id}/accept", requireMethod(http.MethodPost, decodeCall(func(ctx requestContext, input core.AcceptInput) (any, error) {
 		input.TaskID = strings.TrimSpace(ctx.PathValue("id"))
@@ -505,7 +536,7 @@ func NewScopedRunHandler(operations ScopedRunOperations, expected core.RunScope)
 
 func fenceMutations(readiness Readiness, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
+		if r.Method == http.MethodPost || r.Method == http.MethodPut {
 			if err := readiness.RequireReady(); err != nil {
 				writeError(w, err)
 				return

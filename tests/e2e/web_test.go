@@ -46,8 +46,19 @@ func TestWebSurfaceServesSPAAndFencesOperatorAPI(t *testing.T) {
 		t.Fatalf("SPA page missing markers: %.300s", page)
 	}
 	app := httpGet(t, ctx, base+"/app.js")
-	if !strings.Contains(app, "/v1/") || !strings.Contains(app, "X-Coordplane-Credential") {
+	if !strings.Contains(app, "/v1/") || !strings.Contains(app, "X-Coordplane-Credential") ||
+		!strings.Contains(app, "/v1/adapters") || !strings.Contains(app, "data-agent-action") {
 		t.Fatalf("app.js missing API surface: %.300s", app)
+	}
+	for _, forbidden := range []string{
+		`onclick="editAgentForm('${`,
+		`onclick="updateAgent('${`,
+		`onclick="openAgent('${`,
+		`onclick="agentAction('${`,
+	} {
+		if strings.Contains(app, forbidden) {
+			t.Fatalf("app.js still interpolates an agent ID into inline JavaScript: %q", forbidden)
+		}
 	}
 	// Fresh install keeps the bootstrap trust boundary: status without a
 	// credential is reachable.

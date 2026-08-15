@@ -19,11 +19,13 @@ const (
 	DefaultCaptureBundleSize = int64(64 << 20)
 	DefaultCaptureObjects    = 250_000
 	DefaultHandoffSize       = int64(256 << 20)
-	claudeProviderEnvNames   = "ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL,ANTHROPIC_MODEL,ANTHROPIC_DEFAULT_OPUS_MODEL,ANTHROPIC_DEFAULT_SONNET_MODEL,ANTHROPIC_DEFAULT_HAIKU_MODEL,CLAUDE_CODE_SUBAGENT_MODEL,CLAUDE_CODE_EFFORT_LEVEL"
+	providerEnvNames         = "ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL,ANTHROPIC_MODEL,ANTHROPIC_DEFAULT_OPUS_MODEL,ANTHROPIC_DEFAULT_SONNET_MODEL,ANTHROPIC_DEFAULT_HAIKU_MODEL,CLAUDE_CODE_SUBAGENT_MODEL,CLAUDE_CODE_EFFORT_LEVEL,OPENAI_API_KEY,OPENAI_BASE_URL"
 )
 
-// ClaudeProviderEnvCatalog is the only provider environment admitted by v1 configuration.
-func ClaudeProviderEnvCatalog() []string { return strings.Split(claudeProviderEnvNames, ",") }
+// ProviderEnvCatalog is the only provider environment admitted by v1
+// configuration. It covers Claude Code and Codex while still preventing
+// arbitrary environment injection into Agent containers.
+func ProviderEnvCatalog() []string { return strings.Split(providerEnvNames, ",") }
 
 // Config is the complete v1 daemon configuration surface.
 type Config struct {
@@ -58,6 +60,7 @@ type RuntimeConfig struct {
 	DefaultImage         string        `yaml:"default_image"`
 	ProviderEnvAllowlist []string      `yaml:"provider_env_allowlist"`
 	RunTimeout           time.Duration `yaml:"-"`
+	StallTimeout         time.Duration `yaml:"-"`
 	ShutdownGrace        time.Duration `yaml:"-"`
 }
 
@@ -93,6 +96,7 @@ type fileRuntimeConfig struct {
 	DefaultImage         string        `yaml:"default_image"`
 	ProviderEnvAllowlist []string      `yaml:"provider_env_allowlist"`
 	RunTimeout           *yamlDuration `yaml:"run_timeout,omitempty"`
+	StallTimeout         *yamlDuration `yaml:"stall_timeout,omitempty"`
 	ShutdownGrace        *yamlDuration `yaml:"shutdown_grace,omitempty"`
 }
 
@@ -166,6 +170,9 @@ func Load(path string) (Config, error) {
 	}
 	if raw.Runtime.RunTimeout != nil {
 		cfg.Runtime.RunTimeout = time.Duration(*raw.Runtime.RunTimeout)
+	}
+	if raw.Runtime.StallTimeout != nil {
+		cfg.Runtime.StallTimeout = time.Duration(*raw.Runtime.StallTimeout)
 	}
 	if raw.Runtime.ShutdownGrace != nil {
 		cfg.Runtime.ShutdownGrace = time.Duration(*raw.Runtime.ShutdownGrace)
@@ -256,6 +263,9 @@ func (c *Config) Validate() error {
 	if c.Runtime.RunTimeout < 0 {
 		return errors.New("validate config: runtime.run_timeout must be a positive duration or 0")
 	}
+	if c.Runtime.StallTimeout < 0 {
+		return errors.New("validate config: runtime.stall_timeout must be a positive duration or 0")
+	}
 	if c.Runtime.ShutdownGrace <= 0 {
 		return errors.New("validate config: runtime.shutdown_grace must be a positive duration")
 	}
@@ -276,7 +286,7 @@ func (c *Config) Validate() error {
 		return errors.New("validate config: git.maximum_handoff_bytes must be at least maximum_bundle_bytes")
 	}
 
-	catalog := ClaudeProviderEnvCatalog()
+	catalog := ProviderEnvCatalog()
 	seenEnv := make(map[string]struct{}, len(c.Runtime.ProviderEnvAllowlist))
 	for i, name := range c.Runtime.ProviderEnvAllowlist {
 		name = strings.TrimSpace(name)
@@ -287,7 +297,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("validate config: runtime.provider_env_allowlist[%d] cannot override reserved environment variable %q", i, name)
 		}
 		if !slices.Contains(catalog, name) {
-			return fmt.Errorf("validate config: runtime.provider_env_allowlist[%d] is outside the Claude provider environment catalog: %q", i, name)
+			return fmt.Errorf("validate config: runtime.provider_env_allowlist[%d] is outside the provider environment catalog: %q", i, name)
 		}
 		if _, exists := seenEnv[name]; exists {
 			return fmt.Errorf("validate config: runtime.provider_env_allowlist contains duplicate %q", name)

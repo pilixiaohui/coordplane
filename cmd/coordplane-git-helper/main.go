@@ -38,7 +38,7 @@ func capture(ctx context.Context, args []string) error {
 	request := gitcapture.Request{}
 	flags.StringVar(&request.Workspace, "workspace", "", "read-only workspace path")
 	flags.StringVar(&request.Handoff, "handoff", "", "writable handoff path")
-	flags.StringVar(&request.ExpectedHead, "expected-head", "", "expected workspace HEAD")
+	flags.StringVar(&request.ExpectedHead, "expected-head", "", "expected workspace HEAD (post-commit HEAD, not task base SHA)")
 	flags.StringVar(&request.BaseSHA, "base", "", "immutable task base")
 	flags.StringVar(&request.SourceSHA, "source", "", "optional immutable source head")
 	flags.Int64Var(&request.MaximumBundleBytes, "max-bundle-bytes", 0, "maximum bundle bytes")

@@ -19,7 +19,7 @@ Runtime 必须：
 
 Runtime 不决定 Task 是否正确、不执行 Git 集成、不提供 external runtime 等价合同、不建设 tool adapter/skill 平台，也不把容器或 transcript 作为状态真相。
 
-Owner批准的预算重基线不改变本文件的Docker-only隔离、resume、stop、cleanup、reconcile或fencing合同。全库production/tests/infra/total envelope固定为`20,000/21,000/22,600`、`21,000/22,000/23,700`、`250/400/600`和`41,250/43,400/47,000`；统计仍按`acceptance.md`的非空、非纯注释物理行口径。Runtime模块实际SLOC、质量blocker和diff必须进入clean候选revision的LOC JSON，并通过真实四Agent场景中的一次Daemon重启验证接管和清理；不得把observer/failpoint搬出其真实bucket或用重基线reserve弱化恢复证据。
+Owner已批准 Agent 可配置 CLI/模型/提示词 v1（D1–D7/E1–E5，2026-08-13）；本文件的Docker-only隔离、resume、stop、cleanup、reconcile或fencing合同不变，预算按 E1 重基线。全库production/tests/infra/total envelope固定为`24,000/24,500/25,000`、`25,500/26,200/27,000`、`250/500/700`和`49,750/51,200/52,700`（E1 暂定上限，最终以 clean revision 实测锁表）；统计仍按`acceptance.md`的非空、非纯注释物理行口径。Runtime模块实际SLOC、质量blocker和diff必须进入clean候选revision的LOC JSON，并通过真实四Agent场景中的一次Daemon重启验证接管和清理；不得把observer/failpoint搬出其真实bucket或用重基线reserve弱化恢复证据。
 
 ## 2. 受信边界
 
@@ -145,6 +145,8 @@ conversation Run 不挂载项目 workspace，以 `/home/agent` 作为工作目�
 
 Bootstrap 是一次性投影，不是持久状态。不得把全部团队任务、其他 Agent 私有状态、secret 或宿主路径塞入 prompt。不得覆盖项目自己的 `AGENTS.md`/`CLAUDE.md`；CoordPlane 指令使用独立只读文件或启动 prompt。
 
+有效提示词来自 `instructions_file`（daemon 宿主绝对路径，1 MiB/SHA-256）或 `instructions_text`（UTF-8，同一 1 MiB/SHA-256 语义）恰一来源；两者同时非空时准备阶段仍 fail-closed（`INSTRUCTIONS_UNAVAILABLE`），作为写入期校验的纵深防御。文件路径与提示词全文不得进入 Event/错误信息/run.log，只允许 hash 与大小进入诊断。
+
 ## 6. Run 扩展字段
 
 除 `core.md` 定义的字段外，Run 必须保存以下 runtime 字段；它们仍属于 Run，不形成新对象：
@@ -185,7 +187,7 @@ Remove(ctx, RuntimeRef) -> RemoveResult
 
 `RuntimeRef`至少由container ID/name、Run ID、generation和launch nonce组成。Daemon重启后必须能用它Attach/Wait/Logs/Stop，不依赖旧内存channel。
 
-CLI adapter只拥有provider命令和协议解析，使用编译期静态注册列表：
+CLI adapter只拥有provider命令和协议解析，使用编译期静态注册列表（第一版恰好 `[Claude{}, Codex{}]`，不暴露注册方法）：
 
 ```text
 Name() -> string
@@ -202,13 +204,17 @@ Adapter 注册项声明：
 execution_model: one_shot | live
 supports_resume: true | false
 supports_inject: true | false
+AllowedEfforts: 只读允许值集合
 ```
 
-这只是 adapter 本身的静态元数据，不是动态 capability registry。
+`Metadata` 的只读 descriptor 为 `Name/ExecutionModel/SupportsResume/SupportsInject/AllowedEfforts`；core 用 `AllowedEfforts` 在写入期校验 per-agent `effort`（E2）。`GET /v1/adapters` 只返回这些只读字段，绝不返回 executable、argv 模板、宿主路径或 secret。这只是 adapter 本身的静态元数据，不是动态 capability registry。
 
 ### 7.2 Executor/Adapter 约束
 
 - Adapter生成结构化argv；不得用`sh -c`拼接Boss/Agent输入。
+- `LaunchSpec` 携带一份不含 secret 的 `ProviderConfig{Model, SubagentModel, BaseURL, Effort}`：Claude 映射为 `ANTHROPIC_MODEL/CLAUDE_CODE_SUBAGENT_MODEL/ANTHROPIC_BASE_URL/CLAUDE_CODE_EFFORT_LEVEL` 的 env 覆盖，未设置时不覆盖全局 env；Codex 映射为结构化 argv/`-c` config override，未设置时不传。
+- Codex Start/Resume argv 按固定模板生成（基线 Codex CLI 0.146.0）：`codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --ignore-user-config -C <container workdir> [-m model] [-c default_subagent_model=...] [-c model_reasoning_effort=...] [-c model_providers.codex.base_url=...] -- <bootstrap 引用>`；Resume 用 `codex exec resume` + native session/thread id + 同一 `-c` 配置。env 固定 `HOME=/home/agent`、`CODEX_HOME=/home/agent/.codex`；凭据只由 daemon 全局 `provider_env_allowlist` 注入；不得接受任意命令字符串或 shell 拼接。镜像必须由 per-agent `image` 提供且包含所选 CLI；镜像缺 codex 时 Run 以可诊断错误失败，不得静默换用 claude。
+- Codex 事件解析只处理 stdout 的 JSONL：每行必须恰好一个 JSON 对象，坏帧按 monitor 既有 fail-closed 路径处理；表驱动白名单映射可见事件（thread/turn/item 生命周期、可见 agent text、tool call delta），reasoning/signature/encrypted_content/usage 等私密字段一律丢弃；第一个稳定 thread/session ID 映射 `NativeSessionID`，同一 Run 出现冲突 ID 视为协议错误；`error` 或非成功 terminal 状态映射 `PROVIDER_ERROR`，明确 session/thread not found 才映射 `RESUME_UNAVAILABLE`（匹配词必须由 golden fixture 固定）；未知但语法合法的事件类型默认忽略，未知字段不进入 `Event.Raw`。精确 JSONL schema 必须用真实 CLI 采集一次 golden transcript 后固化，不得以记忆中的事件 schema 为权威。
 - Executor统一create/start/attach/inject/inspect/wait/stop/remove容器和进程I/O；Adapter不得形成第二套Docker生命周期。
 - Adapter 只报告运行事实，不直接更新 Task、Message 或 Git。
 - native session ID 一旦从 provider 事件流获得，必须立即写 Run 和 `run.session_recorded` Event，不能等 CLI 退出。
@@ -294,6 +300,7 @@ Agent成功调用wait/submit/fail时，Core在同一事务把Task转finishing、
 - 新 Run 记录 `resumed_from_run_id` 和 `resume_native_session_id`；work/integration 使用相同 Task workspace，所有 kind 使用相同 Agent home、新 token 和新 container。
 - Daemon只选择同Agent/Task中按`ended_at,id`排序的最新terminal Run作为resume来源；不得静默跳回更旧session。Boss显式指定旧Run属于未来能力。
 - 只有相同Agent、相同Task、相同workspace语义、相同adapter ID且`ResumeCompatible`通过时可resume；不能把Codex session交给Claude或把旧Task session恢复到新Task branch。
+- daemon 在调用 adapter `ResumeCompatible` 之前先比较上一 Run 的 `config_fingerprint` 与当前配置指纹；不同或上一指纹为空直接 `launch_mode=start`（fresh start）。配置变化（model/subagent_model/base_url/effort 或有效提示词变化）不得 resume。
 - Adapter静态不支持resume或兼容检查失败时，新Run从一开始使用launch_mode=start，不先创建失败resume进程。
 - 实际Resume CLI返回session-not-found时，该Resume Run以failed/exited + `RESUME_UNAVAILABLE`终结，Message回pending；Scheduler随后创建另一个generation更高的fresh Start Run并写`run.resume_fallback` Event。一个Run内不得启动第二个CLI进程。
 - Fresh fallback 必须标记 `RESUME_UNAVAILABLE` 和来源 Run，不能伪称恢复了模型上下文。
@@ -317,7 +324,7 @@ Inject 失败、turn mismatch 或 adapter unsupported 时，Message 保持 pendi
 - Agent `coordlink progress` 产生小型 Event，用于 Boss 看进度；不延长 deadline，不改变 Task状态，也不作为完成证据。
 - CLI stdout/stderr 写普通轮转文件；日志可跟随，但不解析成 Task状态。
 - 第一版不要求保存 chain-of-thought、每个 tool call、provider 原始完整事件或永久 transcript。
-- Redaction 必须在日志写入边界处理已知 token/credential；事件和错误不得包含 secret、prompt 全文或宿主路径。
+- Redaction 必须在日志写入边界处理已知 token/credential；事件和错误不得包含 secret、prompt 全文或宿主路径。`provider_env_allowlist` 统一 catalog 扩展为 Claude 配置变量 + `OPENAI_API_KEY/OPENAI_BASE_URL`；allowlist 值继续作为 `SensitiveEnvKeys`，日志/Docker inspect/Event 只允许 hash。per-agent `base_url` 写入前拒绝 userinfo 且不进入 Event；model/subagent_model/effort 是非 secret 配置，但错误信息仍走 redaction 管道。Codex JSONL 白名单解析是第一层脱敏，monitor 的 `sanitizeJSONValue` 是第二层，双保险。
 
 ## 11. 取消和超时
 
@@ -419,7 +426,7 @@ Cancelled Task的workspace被显式discard后不可原地retry；需要继续时
 
 ## 14. Provider secret
 
-- Provider token/key 只从 Daemon 配置的环境变量或只读 secret file allowlist注入。
+- Provider token/key 只从 Daemon 配置的环境变量或只读 secret file allowlist注入；v1 覆盖 Claude 与 Codex（`OPENAI_API_KEY` 等），凭据保持全局粒度，不做 per-agent secret（D3）。
 - Secret不得出现在 argv、SQLite、Event、bootstrap、普通日志、Agent-facing error 或 `docker inspect` 可读 label。
 - 若 provider CLI 必须把认证缓存写入 home，该 home 仅属于该 Agent且权限受限。
 - 第一版不建设 SecretProvider/Vault；缺少 secret 是明确 runtime error，由 Boss修正配置后 retry。

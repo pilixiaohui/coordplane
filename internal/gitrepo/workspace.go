@@ -782,3 +782,59 @@ func (m *WorkspaceManager) workspaceRef(ctx context.Context, path, ref string) (
 	}
 	return sha, nil
 }
+
+// ExpandHead resolves a caller-supplied short hash prefix or ref to the full
+// commit object ID in the given private workspace. The workspace is untrusted
+// input, so its path and ownership marker must match the deterministic Task
+// path before any Git command runs inside it. Expansion only reads; a missing
+// or non-unique prefix fails loudly instead of resolving a guess, and the
+// returned error is deliberately not an InvariantError so callers can retry
+// with a corrected prefix.
+func (m *WorkspaceManager) ExpandHead(ctx context.Context, spec WorkspaceSpec, path, ref string) (string, error) {
+	if err := m.validateSpec(ctx, spec); err != nil {
+		return "", m.publicError("expand head", err)
+	}
+	if err := m.validateFinalWorkspacePath(path, spec); err != nil {
+		return "", m.publicError("expand head", err)
+	}
+	sha, err := m.expandHeadRef(ctx, path, ref)
+	if err != nil {
+		return "", m.publicError("expand head", err)
+	}
+	return sha, nil
+}
+
+func (m *WorkspaceManager) expandHeadRef(ctx context.Context, path, ref string) (string, error) {
+	if strings.TrimSpace(ref) == "" {
+		return "", errors.New("expected head is empty")
+	}
+	output, err := m.initializer.git(ctx,
+		"-C", path, "rev-parse", "--verify", "--end-of-options", ref+"^{commit}",
+	)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		var commandError *gitCommandError
+		if errors.As(err, &commandError) {
+			message := strings.TrimSpace(commandError.stderr)
+			if strings.Contains(message, "short object ID") && strings.Contains(message, "is ambiguous") {
+				return "", fmt.Errorf("expected head %q is ambiguous; provide a longer unique prefix", ref)
+			}
+			return "", fmt.Errorf("expected head %q does not resolve to a commit in the workspace", ref)
+		}
+		return "", fmt.Errorf("resolve expected head %q: %w", ref, err)
+	}
+	sha := strings.TrimSpace(output)
+	if err := validateObjectID(sha); err != nil {
+		return "", fmt.Errorf("expected head resolved invalid commit: %w", err)
+	}
+	typeName, err := m.initializer.git(ctx, "-C", path, "cat-file", "-t", sha)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(typeName) != "commit" {
+		return "", fmt.Errorf("expected head %q does not point to a commit", ref)
+	}
+	return sha, nil
+}

@@ -48,15 +48,80 @@ func TestP3LaunchContextIncludesEveryEligibleMessage(t *testing.T) {
 	}
 }
 
+func TestP3LaunchContextFencesAgentRuntimeConfigChange(t *testing.T) {
+	h := newHarness(t)
+	project, claim := createClaimedWorkRun(t, h, "p3-config-fence", 0)
+	if claim.Run.AdapterID != "one-shot" || claim.Run.Image != "agent:latest" {
+		t.Fatalf("claim pinned adapter/image = %q/%q", claim.Run.AdapterID, claim.Run.Image)
+	}
+	var err error
+	h.service, err = core.NewService(h.database, h.git, core.ServiceOptions{
+		Now: h.clock.Now, NewID: h.ids.New, MaxParallelRuns: 4, AdapterIDs: []string{"one-shot", "claude"},
+	})
+	requireNoError(t, err)
+	h.service.SetReady(true, "")
+	agent, err := h.service.Agent(context.Background(), claim.Run.AgentID)
+	requireNoError(t, err)
+	for name, mutate := range map[string]func(core.AgentConfigInput) core.AgentConfigInput{
+		"adapter": func(input core.AgentConfigInput) core.AgentConfigInput {
+			input.AdapterID = "claude"
+			return input
+		},
+		"image": func(input core.AgentConfigInput) core.AgentConfigInput {
+			input.Image = "agent:changed"
+			return input
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := mutate(core.AgentConfigInput{
+				DisplayName: agent.DisplayName, AdapterID: agent.AdapterID, Image: agent.Image,
+				InstructionsFile: agent.InstructionsFile, InstructionsText: agent.InstructionsText,
+			})
+			current, err := h.service.Agent(context.Background(), claim.Run.AgentID)
+			requireNoError(t, err)
+			if _, err := h.service.UpdateAgent(context.Background(), core.UpdateAgentInput{
+				ID: current.ID, Version: current.Version, AgentConfigInput: changed,
+				RequestID: "config-fence-" + name,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			before := durableSignature(t, h.database, project.ID)
+			if _, err := h.service.RuntimeLaunchContext(context.Background(), claim.Run.ID); !core.IsCode(err, core.CodeStaleRun) {
+				t.Fatalf("%s drift error = %v, want %s", name, err, core.CodeStaleRun)
+			}
+			h.requireDurableSignature(t, project.ID, before)
+			restore, err := h.service.Agent(context.Background(), claim.Run.AgentID)
+			requireNoError(t, err)
+			if _, err := h.service.UpdateAgent(context.Background(), core.UpdateAgentInput{
+				ID: restore.ID, Version: restore.Version,
+				AgentConfigInput: core.AgentConfigInput{
+					DisplayName: agent.DisplayName, AdapterID: agent.AdapterID, Image: agent.Image,
+					InstructionsFile: agent.InstructionsFile, InstructionsText: agent.InstructionsText,
+				},
+				RequestID: "config-fence-restore-" + name,
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	launch, err := h.service.RuntimeLaunchContext(context.Background(), claim.Run.ID)
+	requireNoError(t, err)
+	if launch.Agent.ID != agent.ID {
+		t.Fatalf("restored launch Agent = %#v", launch.Agent)
+	}
+}
+
 func TestP3RuntimeFactsAdvanceMonotonicallyAndFenceEveryExternalFact(t *testing.T) {
 	h := newHarness(t)
 	project, claim := createClaimedWorkRun(t, h, "p3-runtime-facts", 0)
 	root := t.TempDir()
+	instructionsHash, fingerprint := launchFingerprint(t, h, claim.Run.ID)
 	prepared, err := h.service.BeginRunLaunch(context.Background(), core.RunLaunchInput{
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: "nonce-runtime-facts",
 		WorkspacePath: filepath.Join(root, "workspace"), HomePath: filepath.Join(root, "home"),
-		LogPath: filepath.Join(root, "logs", "run.log"), InstructionsHash: "sha256-instructions",
-		LaunchMode: "start", CleanupOperationID: "cleanup-runtime-facts",
+		LogPath: filepath.Join(root, "logs", "run.log"), InstructionsHash: instructionsHash,
+		ConfigFingerprint: fingerprint,
+		LaunchMode:        "start", CleanupOperationID: "cleanup-runtime-facts",
 		RequestID: "prepare-runtime-facts",
 	})
 	requireNoError(t, err)
@@ -375,11 +440,13 @@ func prepareAndActivateRuntimeRun(t *testing.T, h *harness, claim core.Claim, ro
 
 func prepareRuntimeRun(t *testing.T, h *harness, claim core.Claim, root, prefix string) core.Run {
 	t.Helper()
+	instructionsHash, fingerprint := launchFingerprint(t, h, claim.Run.ID)
 	prepared, err := h.service.BeginRunLaunch(context.Background(), core.RunLaunchInput{
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: prefix + "-nonce",
 		WorkspacePath: filepath.Join(root, "workspace"), HomePath: filepath.Join(root, "home"),
-		LogPath: filepath.Join(root, "run.log"), InstructionsHash: prefix + "-instructions",
-		LaunchMode: "start", CleanupOperationID: prefix + "-cleanup", RequestID: prefix + "-prepare",
+		LogPath: filepath.Join(root, "run.log"), InstructionsHash: instructionsHash,
+		ConfigFingerprint: fingerprint,
+		LaunchMode:        "start", CleanupOperationID: prefix + "-cleanup", RequestID: prefix + "-prepare",
 	})
 	requireNoError(t, err)
 	return prepared

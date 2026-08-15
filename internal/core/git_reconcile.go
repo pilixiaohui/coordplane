@@ -205,6 +205,7 @@ func (s *Service) finalizeCapture(ctx context.Context, intent Task, intentRun Ru
 		task.HeadSHA = fact.HeadSHA
 		task.HeadRunID = run.ID
 		task.TaskRef = fact.TaskRef
+		task.EvidenceType = string(EvidenceCaptured)
 		task.ResultSummary = run.RequestedSummary
 		task.CurrentRunID = ""
 		task.Status = TaskSubmitted
@@ -257,7 +258,7 @@ func (s *Service) finalizeCapture(ctx context.Context, intent Task, intentRun Ru
 			_, err = tx.AppendEvent(event(task.ProjectID, "task", task.ID, "git.canonical_advance_requested", "system", "", run.ID, "", task.PendingActionID, advancePayload, now))
 			return err
 		}
-		return nil
+		return s.notifyParentOfChild(tx, task, "daemon", "", run.ID, "", now)
 	})
 }
 
@@ -328,7 +329,10 @@ func (s *Service) projectCaptureFailure(ctx context.Context, intent Task, intent
 			return err
 		}
 		if task.Status == TaskFailed {
-			return s.disposeUnresolvedMessages(tx, task, "daemon", "", run.ID, "", now)
+			if err := s.disposeUnresolvedMessages(tx, task, "daemon", "", run.ID, "", now); err != nil {
+				return err
+			}
+			return s.notifyParentOfChild(tx, task, "daemon", "", run.ID, "", now)
 		}
 		return nil
 	})
@@ -622,7 +626,10 @@ func (s *Service) projectAdvanceInvariantFailure(ctx context.Context, intent Tas
 		if _, err := tx.AppendEvent(event(task.ProjectID, "task", task.ID, "task.failed", "daemon", "", task.HeadRunID, "", intent.PendingActionID, eventPayload(map[string]any{"reason": reason}), now)); err != nil {
 			return err
 		}
-		return s.disposeUnresolvedMessages(tx, task, "daemon", "", task.HeadRunID, "", now)
+		if err := s.disposeUnresolvedMessages(tx, task, "daemon", "", task.HeadRunID, "", now); err != nil {
+			return err
+		}
+		return s.notifyParentOfChild(tx, task, "daemon", "", task.HeadRunID, "", now)
 	})
 }
 

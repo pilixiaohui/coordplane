@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"path/filepath"
 	"strings"
 	"time"
@@ -27,6 +29,7 @@ type RunLaunchInput struct {
 	HomePath              string
 	LogPath               string
 	InstructionsHash      string
+	ConfigFingerprint     string
 	LaunchMode            string
 	ResumedFromRunID      string
 	ResumeNativeSessionID string
@@ -63,11 +66,14 @@ type RunCleanupInput struct {
 }
 
 type RunLaunchContext struct {
-	Project  Project
-	Agent    Agent
-	Task     Task
-	Run      Run
-	Messages []Message
+	Project           Project
+	Agent             Agent
+	Task              Task
+	Run               Run
+	Messages          []Message
+	Instructions      string
+	InstructionsHash  string
+	ConfigFingerprint string
 }
 
 func (s *Service) RuntimeLaunchContext(ctx context.Context, runID string) (RunLaunchContext, error) {
@@ -94,6 +100,25 @@ func (s *Service) RuntimeLaunchContext(ctx context.Context, runID string) (RunLa
 			result.Task.CurrentRunID != result.Run.ID || result.Task.Generation != result.Run.Generation ||
 			result.Task.AssigneeAgentID != result.Run.AgentID {
 			return Conflict(CodeStaleRun, "runtime launch context fence changed", string(result.Run.State), result.Run.Version)
+		}
+		if result.Agent.AdapterID != result.Run.AdapterID || result.Agent.Image != result.Run.Image {
+			return Conflict(CodeStaleRun, "agent runtime config fence changed", string(result.Run.State), result.Run.Version)
+		}
+		result.Instructions, result.InstructionsHash, err = ReadAgentInstructions(result.Agent)
+		if err != nil {
+			return err
+		}
+		result.ConfigFingerprint, err = RuntimeConfigFingerprint(RuntimeConfigFingerprintInput{
+			AdapterID:        result.Agent.AdapterID,
+			Image:            result.Agent.Image,
+			Model:            result.Agent.Model,
+			SubagentModel:    result.Agent.SubagentModel,
+			BaseURL:          result.Agent.BaseURL,
+			Effort:           result.Agent.Effort,
+			InstructionsHash: result.InstructionsHash,
+		})
+		if err != nil {
+			return err
 		}
 		messages, err := tx.MessagesForRecipient("agent", result.Run.AgentID)
 		if err != nil {
@@ -127,6 +152,7 @@ func (s *Service) BeginRunLaunch(ctx context.Context, input RunLaunchInput) (Run
 	input.LaunchNonce = strings.TrimSpace(input.LaunchNonce)
 	input.CleanupOperationID = strings.TrimSpace(input.CleanupOperationID)
 	input.InstructionsHash = strings.TrimSpace(input.InstructionsHash)
+	input.ConfigFingerprint = canonicalFingerprint(input.ConfigFingerprint)
 	input.ResumedFromRunID = strings.TrimSpace(input.ResumedFromRunID)
 	input.ResumeNativeSessionID = strings.TrimSpace(input.ResumeNativeSessionID)
 	if input.IsolationSpecVersion == 0 {
@@ -150,6 +176,9 @@ func (s *Service) BeginRunLaunch(ctx context.Context, input RunLaunchInput) (Run
 	}
 	if input.LaunchMode == "resume" && (input.ResumedFromRunID == "" || input.ResumeNativeSessionID == "") {
 		return Run{}, NewError(CodeInvalidArgument, "resume launch requires source Run and native session", false)
+	}
+	if err := validateConfigFingerprint(input.ConfigFingerprint); err != nil {
+		return Run{}, err
 	}
 	for name, path := range map[string]string{"home_path": input.HomePath, "log_path": input.LogPath} {
 		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
@@ -180,6 +209,24 @@ func (s *Service) BeginRunLaunch(ctx context.Context, input RunLaunchInput) (Run
 			run.Generation != input.Generation {
 			return Conflict(CodeStaleRun, "run launch fence changed", string(run.State), run.Version)
 		}
+		agent, err := tx.Agent(run.AgentID)
+		if err != nil {
+			return err
+		}
+		_, instructionsHash, err := ReadAgentInstructions(agent)
+		if err != nil {
+			return err
+		}
+		fingerprint, err := RuntimeConfigFingerprint(RuntimeConfigFingerprintInput{AdapterID: agent.AdapterID, Image: agent.Image, Model: agent.Model, SubagentModel: agent.SubagentModel, BaseURL: agent.BaseURL, Effort: agent.Effort, InstructionsHash: instructionsHash})
+		if err != nil {
+			return err
+		}
+		if fingerprint != input.ConfigFingerprint {
+			return Conflict(CodeStaleRun, "run launch config snapshot changed", string(run.State), run.Version)
+		}
+		if input.InstructionsHash != instructionsHash {
+			return Conflict(CodeStaleRun, "run launch instructions hash changed", string(run.State), run.Version)
+		}
 		if task.Kind == TaskConversation && input.WorkspacePath != "" {
 			return NewError(CodeInvalidArgument, "conversation Run cannot have a workspace", false)
 		}
@@ -196,6 +243,9 @@ func (s *Service) BeginRunLaunch(ctx context.Context, input RunLaunchInput) (Run
 				!IsRunTerminal(previous.State) || previous.RuntimeErrorCode != string(CodeResumeUnavailable) {
 				return Conflict(CodeResumeUnavailable, "fresh start fallback source is not a failed resume Run", string(previous.State), previous.Version)
 			}
+			if previous.ConfigFingerprint != input.ConfigFingerprint {
+				return Conflict(CodeResumeUnavailable, "fresh start fallback source config fingerprint changed", string(previous.State), previous.Version)
+			}
 			resumeFallback = true
 		}
 		if run.LaunchNonce != "" {
@@ -210,6 +260,7 @@ func (s *Service) BeginRunLaunch(ctx context.Context, input RunLaunchInput) (Run
 		run.HomePath = input.HomePath
 		run.LogPath = input.LogPath
 		run.InstructionsHash = input.InstructionsHash
+		run.ConfigFingerprint = input.ConfigFingerprint
 		run.LaunchMode = input.LaunchMode
 		run.ResumedFromRunID = input.ResumedFromRunID
 		run.ResumeNativeSessionID = input.ResumeNativeSessionID
@@ -237,10 +288,28 @@ func (s *Service) BeginRunLaunch(ctx context.Context, input RunLaunchInput) (Run
 func sameLaunchIntent(run Run, input RunLaunchInput) bool {
 	return run.Generation == input.Generation && run.LaunchNonce == input.LaunchNonce &&
 		run.WorkspacePath == input.WorkspacePath && run.HomePath == input.HomePath && run.LogPath == input.LogPath &&
-		run.InstructionsHash == input.InstructionsHash && run.LaunchMode == input.LaunchMode &&
+		run.InstructionsHash == input.InstructionsHash && run.ConfigFingerprint == input.ConfigFingerprint &&
+		run.LaunchMode == input.LaunchMode &&
 		run.ResumedFromRunID == input.ResumedFromRunID && run.ResumeNativeSessionID == input.ResumeNativeSessionID &&
 		run.CleanupOperationID == input.CleanupOperationID && run.DeadlineAt == input.DeadlineAt &&
 		run.IsolationSpecVersion == input.IsolationSpecVersion
+}
+
+func canonicalFingerprint(value string) string {
+	value = strings.TrimSpace(value)
+	raw, err := hex.DecodeString(value)
+	if err != nil || len(raw) != sha256.Size {
+		return value
+	}
+	return hex.EncodeToString(raw)
+}
+
+func validateConfigFingerprint(value string) error {
+	raw, err := hex.DecodeString(value)
+	if err != nil || len(raw) != sha256.Size {
+		return NewError(CodeInvalidArgument, "config_fingerprint must be a 64-character SHA-256 hex digest", false)
+	}
+	return nil
 }
 
 func (s *Service) RecordContainerCreated(ctx context.Context, input RunRuntimeFactInput) (Run, error) {

@@ -9,24 +9,42 @@ import (
 	"coordplane/tests/testsupport"
 )
 
-func TestProductionRegistryContainsOnlyClaude(t *testing.T) {
-	requireClaude(t, reflect.DeepEqual(Production().Names(), []string{"claude"}), "production adapters = ", Production().Names())
-	entry, ok := Production().Lookup("claude")
-	requireClaude(t, ok, "Claude adapter is not registered")
-	requireClaude(t, entry.Metadata().ExecutionModel == ExecutionOneShot && entry.Metadata().SupportsResume && !entry.Metadata().SupportsInject, "Claude metadata = ", entry.Metadata())
-	_, err := entry.BuildInjectInput(MessageInput{})
+func TestProductionRegistryContainsClaudeAndCodex(t *testing.T) {
+	requireClaude(t, reflect.DeepEqual(Production().Names(), []string{"claude", "codex"}), "production adapters = ", Production().Names())
+	for _, name := range []string{"claude", "codex"} {
+		entry, ok := Production().Lookup(name)
+		requireClaude(t, ok, name, " adapter is not registered")
+		requireClaude(t, entry.Metadata().Name == name && entry.Metadata().ExecutionModel == ExecutionOneShot && entry.Metadata().SupportsResume && !entry.Metadata().SupportsInject, name, " metadata = ", entry.Metadata())
+	}
+	claude, _ := Production().Lookup("claude")
+	_, err := claude.BuildInjectInput(MessageInput{})
 	requireClaude(t, errors.Is(err, ErrInjectUnsupported), "Claude inject error = ", err)
 }
 
 func TestClaudeBuildsExactStartAndResumeCommands(t *testing.T) {
-	launch := LaunchSpec{BootstrapPath: ContainerBootstrapPath, ContainerHome: "/home/agent", ContainerWork: "/workspace/project"}
+	launch := LaunchSpec{
+		BootstrapPath: ContainerBootstrapPath, ContainerHome: "/home/agent", ContainerWork: "/workspace/project",
+		Provider: ProviderConfig{
+			Model: "claude-model", SubagentModel: "subagent", BaseURL: "https://example.invalid", Effort: "high",
+		},
+	}
 	start, err := (Claude{}).BuildStartCommand(launch)
 	testsupport.RequireNoError(t, err)
 	common := []string{"-p", "--bare", "--verbose", "--output-format", "stream-json", "--dangerously-skip-permissions"}
-	requireClaude(t, start.Executable == "claude" && reflect.DeepEqual(start.Args, append(append([]string(nil), common...), "--", bootstrapReferencePrompt())) && reflect.DeepEqual(start.Env, map[string]string{"HOME": "/home/agent"}), "start command = ", start)
+	wantEnv := map[string]string{
+		"HOME":                       "/home/agent",
+		"ANTHROPIC_MODEL":            "claude-model",
+		"CLAUDE_CODE_SUBAGENT_MODEL": "subagent",
+		"ANTHROPIC_BASE_URL":         "https://example.invalid",
+		"CLAUDE_CODE_EFFORT_LEVEL":   "high",
+	}
+	requireClaude(t, start.Executable == "claude" && reflect.DeepEqual(start.Args, append(append([]string(nil), common...), "--", bootstrapReferencePrompt())) && reflect.DeepEqual(start.Env, wantEnv), "start command = ", start)
 	resume, err := (Claude{}).BuildResumeCommand(ResumeSpec{LaunchSpec: launch, NativeSessionID: "0190a1b2-session"})
 	testsupport.RequireNoError(t, err)
 	requireClaude(t, resume.Executable == "claude" && reflect.DeepEqual(resume.Args, append(append([]string(nil), common...), "--resume", "0190a1b2-session", "--", bootstrapReferencePrompt())) && reflect.DeepEqual(resume.Env, start.Env), "resume command = ", resume)
+	empty, err := (Claude{}).BuildStartCommand(LaunchSpec{BootstrapPath: ContainerBootstrapPath, ContainerHome: "/home/agent", ContainerWork: "/workspace/project"})
+	testsupport.RequireNoError(t, err)
+	requireClaude(t, reflect.DeepEqual(empty.Env, map[string]string{"HOME": "/home/agent"}), "empty provider env = ", empty.Env)
 	for _, command := range []CommandSpec{start, resume} {
 		for _, forbidden := range []string{"--continue", "--fork-session", "--session-id", "--no-session-persistence", "sh -c"} {
 			requireClaude(t, !strings.Contains(strings.Join(command.Args, " "), forbidden), "provider command contains ", forbidden, ": ", command)

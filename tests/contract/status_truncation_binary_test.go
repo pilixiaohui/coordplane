@@ -79,6 +79,7 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 	source := testsupport.CreateGitRepository(t, root, "CoordPlane Contract", "contract@coordplane.local")
 	daemon := startDaemon(t, configPath, socket)
 	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
+	requireNoError(t, os.WriteFile(filepath.Join(root, "agent.md"), []byte("Work only on the assigned Task."), 0o600))
 
 	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"agent", "add", "--socket", socket,
@@ -242,9 +243,12 @@ func TestStatusAndRunListBinariesDiscloseFieldTruncationAndRecoverExactDetails(t
 		"task", "show", task.ID, "--socket", socket, "--output", "json")
 	var taskDetail core.TaskDetail
 	decodeJSON(t, taskDetailRaw, &taskDetail)
-	if taskDetail.Task.Status != core.TaskFailed || taskDetail.Task.Title != longTitle || taskDetail.Task.FailureReason != wantFailure {
-		t.Fatalf("task show did not recover full fields: title=%d/%d failure=%d/%d",
-			len(taskDetail.Task.Title), len(longTitle), len(taskDetail.Task.FailureReason), len(wantFailure))
+	// Interruption is a resume point: the task returns to the queue with the
+	// interrupted run's failure reason preserved for the resumed session, and
+	// both the title and the failure reason recover their exact full length.
+	if taskDetail.Task.Status != core.TaskQueued || taskDetail.Task.Title != longTitle || taskDetail.Task.FailureReason != wantFailure {
+		t.Fatalf("task show did not recover full fields: status=%s title=%d/%d failure=%d/%d",
+			taskDetail.Task.Status, len(taskDetail.Task.Title), len(longTitle), len(taskDetail.Task.FailureReason), len(wantFailure))
 	}
 	runDetailRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"run", "show", claim.Run.ID, "--socket", socket, "--output", "json")

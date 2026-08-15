@@ -14,7 +14,35 @@ type AddAgentInput struct {
 	AdapterID        string `json:"adapter_id"`
 	Image            string `json:"image"`
 	InstructionsFile string `json:"instructions_file"`
+	InstructionsText string `json:"instructions_text,omitempty"`
+	Model            string `json:"model,omitempty"`
+	SubagentModel    string `json:"subagent_model,omitempty"`
+	BaseURL          string `json:"base_url,omitempty"`
+	Effort           string `json:"effort,omitempty"`
 	RequestID        string `json:"request_id"`
+}
+
+// AgentConfigInput is the single config-field shape shared by the HTTP, CLI,
+// and frontend Agent entry points. UpdateAgent adds ID/version/request_id.
+type AgentConfigInput struct {
+	DisplayName      string `json:"display_name"`
+	AdapterID        string `json:"adapter_id"`
+	Image            string `json:"image"`
+	InstructionsFile string `json:"instructions_file"`
+	InstructionsText string `json:"instructions_text,omitempty"`
+	Model            string `json:"model,omitempty"`
+	SubagentModel    string `json:"subagent_model,omitempty"`
+	BaseURL          string `json:"base_url,omitempty"`
+	Effort           string `json:"effort,omitempty"`
+}
+
+// UpdateAgentInput is a full Agent configuration replacement guarded by the
+// current version. It intentionally carries no partial-field semantics.
+type UpdateAgentInput struct {
+	ID      string `json:"-"`
+	Version int64  `json:"version"`
+	AgentConfigInput
+	RequestID string `json:"request_id"`
 }
 
 type ChatInput struct {
@@ -54,6 +82,7 @@ type CreateTaskInput struct {
 	Description           string   `json:"description"`
 	Priority              int      `json:"priority"`
 	MaxRetries            int      `json:"max_retries"`
+	BudgetSeconds         int64    `json:"budget_seconds,omitempty"`
 	SourceTaskID          string   `json:"source_task_id,omitempty"`
 	RetryOfTaskID         string   `json:"retry_of_task_id,omitempty"`
 	AckMessageIDs         []string `json:"ack_message_ids,omitempty"`
@@ -68,6 +97,7 @@ type CreateChildTaskInput struct {
 	Description           string   `json:"description"`
 	Priority              int      `json:"priority"`
 	MaxRetries            int      `json:"max_retries"`
+	BudgetSeconds         int64    `json:"budget_seconds,omitempty"`
 	SourceTaskID          string   `json:"source_task_id,omitempty"`
 	AckMessageIDs         []string `json:"ack_message_ids,omitempty"`
 	RequestID             string   `json:"request_id"`
@@ -186,6 +216,12 @@ type TaskActionInput struct {
 	Reason        string   `json:"reason,omitempty"`
 	AckMessageIDs []string `json:"ack_message_ids,omitempty"`
 	RequestID     string   `json:"request_id"`
+}
+
+type ProjectDeleteInput struct {
+	ProjectID string `json:"-"`
+	Reason    string `json:"reason,omitempty"`
+	RequestID string `json:"request_id"`
 }
 
 type RunStopInput struct {

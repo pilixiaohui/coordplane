@@ -17,7 +17,16 @@ import (
 	containerruntime "coordplane/internal/runtime"
 )
 
-func (c *runtimeController) newMonitor(run core.Run, ref containerruntime.RuntimeRef, entry adapter.CLI, control *runControl) *runMonitor {
+// newMonitor constructs a run monitor whose log redaction is derived from the
+// run's immutable snapshot. A run whose redaction cannot be trusted (for
+// example a new-lineage run with a missing or corrupt secrets file) fails
+// closed: no monitor is created and no log streaming or replay is started, so
+// no unredacted content can be persisted.
+func (c *runtimeController) newMonitor(run core.Run, ref containerruntime.RuntimeRef, entry adapter.CLI, control *runControl) (*runMonitor, error) {
+	redact := c.runtimeRedaction(run)
+	if redact.failClosed {
+		return nil, fmt.Errorf("%w: Run %s redaction is unavailable", errRuntimeSecretsUnavailable, run.ID)
+	}
 	c.mu.Lock()
 	parent := c.ctx
 	c.mu.Unlock()
@@ -27,7 +36,7 @@ func (c *runtimeController) newMonitor(run core.Run, ref containerruntime.Runtim
 	waitCtx, cancel := context.WithCancel(parent)
 	monitor := &runMonitor{
 		runID: run.ID, ref: ref, entry: entry, control: control,
-		redact: c.runtimeRedaction(run), waitCancel: cancel,
+		redact: redact, waitCancel: cancel,
 		wait: make(chan waitResult, 1), logs: make(chan error, 1),
 	}
 	go func() {
@@ -38,7 +47,7 @@ func (c *runtimeController) newMonitor(run core.Run, ref containerruntime.Runtim
 		}
 	}()
 	go func() { monitor.logs <- c.streamLogs(waitCtx, run, ref, entry, monitor) }()
-	return monitor
+	return monitor, nil
 }
 
 func (c *runtimeController) streamLogs(ctx context.Context, run core.Run, ref containerruntime.RuntimeRef, entry adapter.CLI, monitor *runMonitor) error {

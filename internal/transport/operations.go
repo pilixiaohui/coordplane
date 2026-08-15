@@ -22,7 +22,10 @@ type OperatorOperations interface {
 	AddProject(context.Context, core.AddProjectInput) (core.Project, error)
 	RepairProject(context.Context, string, string) (core.Project, error)
 	ArchiveProject(context.Context, string, string) (core.Project, error)
+	DeleteProject(context.Context, core.ProjectDeleteInput) error
 	AddAgent(context.Context, core.AddAgentInput) (core.Agent, error)
+	UpdateAgent(context.Context, core.UpdateAgentInput) (core.Agent, error)
+	ListAdapters(context.Context) ([]core.AdapterDescriptor, error)
 	SetAgentStatus(context.Context, string, core.AgentStatus, string) (core.Agent, error)
 	ArchiveAgent(context.Context, string, string) (core.Agent, error)
 	Chat(context.Context, core.ChatInput) (core.ChatResult, error)
@@ -35,6 +38,7 @@ type OperatorOperations interface {
 	WakeTask(context.Context, core.TaskActionInput) (core.Task, error)
 	RetryTask(context.Context, core.TaskActionInput) (core.Task, error)
 	CancelTask(context.Context, core.TaskActionInput) (core.Task, error)
+	DeleteTask(context.Context, core.TaskActionInput) error
 	RequestAccept(context.Context, core.AcceptInput) (core.Task, error)
 	ReworkTask(context.Context, core.TaskActionInput) (core.Task, error)
 	RequestRunStop(context.Context, core.RunStopInput) (core.Run, error)

@@ -34,8 +34,7 @@ func TestRunControlValidationRequiresOwnedIdentityAndTokenHash(t *testing.T) {
 
 func TestCloseControlIsIdempotentAcrossConcurrentConvergence(t *testing.T) {
 	root := t.TempDir()
-	server, err := transport.NewUnixServer(root, filepath.Join(root, "api.sock"), http.NotFoundHandler())
-	requireNoError(t, err)
+	server := requireRuntimeValue(transport.NewUnixServer(root, filepath.Join(root, "api.sock"), http.NotFoundHandler()))
 	control := &runControl{
 		server: server, done: make(chan error, 1), outcome: make(chan struct{}, 1),
 		closed: make(chan struct{}),
@@ -94,8 +93,7 @@ func TestRunControlValidationRejectsFilesystemAndScopeDrift(t *testing.T) {
 		"marker trailing content": func(t *testing.T, _, path string, run core.Run) {
 			requireNoError(t, writeRunControlMarker(path, run))
 			markerPath := filepath.Join(path, runControlMarkerName)
-			raw, err := os.ReadFile(markerPath)
-			requireNoError(t, err)
+			raw := requireRuntimeValue(os.ReadFile(markerPath))
 			requireNoError(t, writeRuntimeFile(markerPath, append(raw, []byte("{}")...), runControlFileMode))
 		},
 	}
@@ -127,6 +125,55 @@ func TestRunControlValidationRejectsFilesystemAndScopeDrift(t *testing.T) {
 			t.Fatalf("token hash mismatch error = %v", err)
 		}
 	})
+}
+
+func TestRunControlLineageRejectsDrift(t *testing.T) {
+	files := []struct {
+		name string
+		mode os.FileMode
+	}{
+		{runtimeLaunchFile, 0o550},
+		{runtimeSecretsFile, runControlFileMode},
+		{runtimeInstructionsFile, runControlFileMode},
+	}
+	_, path, _ := newRunControlFixture(t)
+	for _, f := range files {
+		requireNoError(t, writeRuntimeFile(filepath.Join(path, f.name), []byte("lineage content"), f.mode))
+	}
+	if err := new(runtimeController).validateRunControlLineage(path); err != nil {
+		t.Fatalf("valid lineage rejected: %v", err)
+	}
+	mutations := map[string]func(*testing.T, string, string, string){
+		"symlink": func(t *testing.T, _, path, name string) {
+			requireNoError(t, os.Remove(filepath.Join(path, name)))
+			requireNoError(t, os.Symlink(runControlMarkerName, filepath.Join(path, name)))
+		},
+		"mode mismatch": func(t *testing.T, _, path, name string) {
+			requireNoError(t, os.Chmod(filepath.Join(path, name), 0o644))
+		},
+		"hardlink": func(t *testing.T, _, path, name string) {
+			requireNoError(t, os.Link(filepath.Join(path, name), filepath.Join(path, name+"-copy")))
+		},
+		"owner": func(t *testing.T, _, path, name string) {
+			if err := os.Chown(filepath.Join(path, name), 1, 1); err != nil {
+				t.Skipf("chown unavailable: %v", err)
+			}
+		},
+	}
+	for _, file := range files {
+		for name, mutate := range mutations {
+			t.Run(file.name+"/"+name, func(t *testing.T) {
+				_, path, _ := newRunControlFixture(t)
+				for _, f := range files {
+					requireNoError(t, writeRuntimeFile(filepath.Join(path, f.name), []byte("lineage content"), f.mode))
+				}
+				mutate(t, "", path, file.name)
+				if err := new(runtimeController).validateRunControlLineage(path); !errors.Is(err, containerruntime.ErrOwnership) {
+					t.Fatalf("%s %s error = %v, want ownership failure", file.name, name, err)
+				}
+			})
+		}
+	}
 }
 
 func TestRunControlRemovalRevalidatesDurableIdentity(t *testing.T) {

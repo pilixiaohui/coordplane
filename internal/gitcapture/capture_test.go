@@ -103,6 +103,69 @@ func TestInspectIgnoresRepositoryConfigAndReportsDirtyAndUnfinishedState(t *test
 	}
 }
 
+func TestCaptureIgnoresBuildCacheResidue(t *testing.T) {
+	workspace, head := newCaptureRepository(t)
+	for _, dir := range []string{
+		".gocache/go-build", ".gotmp", "node_modules/pkg", "__pycache__",
+	} {
+		testsupport.RequireNoError(t, os.MkdirAll(filepath.Join(workspace, dir), 0o700))
+	}
+	for _, file := range []string{
+		".gocache/go-build/x.o", ".gotmp/x.go", "node_modules/pkg/index.js", "__pycache__/x.pyc",
+	} {
+		testsupport.RequireNoError(t, os.WriteFile(filepath.Join(workspace, file), []byte("x\n"), 0o600))
+	}
+	fact, err := Capture(context.Background(), Request{
+		Workspace: workspace, Handoff: t.TempDir(), ExpectedHead: head,
+		BaseSHA: head, MaximumBundleBytes: 8 << 20, MaximumObjects: 100,
+	})
+	testsupport.RequireNoError(t, err)
+	if !fact.Clean {
+		t.Fatalf("capture with only cache residue: fact = %#v", fact)
+	}
+
+	inspect, err := Inspect(context.Background(), InspectRequest{
+		Workspace: workspace, Handoff: t.TempDir(), MaximumObjects: 100,
+	})
+	testsupport.RequireNoError(t, err)
+	if !inspect.Clean || inspect.StatusDigest != emptyStatusDigest() {
+		t.Fatalf("inspect with only cache residue: fact = %#v", inspect)
+	}
+}
+
+func TestCaptureFailsOnRealUntrackedResidue(t *testing.T) {
+	workspace, head := newCaptureRepository(t)
+	testsupport.RequireNoError(t, os.WriteFile(filepath.Join(workspace, "dirty.txt"), []byte("dirty\n"), 0o600))
+	_, err := Capture(context.Background(), Request{
+		Workspace: workspace, Handoff: t.TempDir(), ExpectedHead: head,
+		BaseSHA: head, MaximumBundleBytes: 8 << 20, MaximumObjects: 100,
+	})
+	if err == nil || !strings.Contains(err.Error(), "workspace must be clean") {
+		t.Fatalf("Capture() error = %v, want clean-tree failure", err)
+	}
+}
+
+func TestCaptureExpectedHeadMismatchNamesBothHeads(t *testing.T) {
+	workspace, head := newCaptureRepository(t)
+	other := testsupport.Git(t, workspace, "hash-object", "-t", "tree", "/dev/null")
+	_, err := Capture(context.Background(), Request{
+		Workspace: workspace, Handoff: t.TempDir(), ExpectedHead: other,
+		BaseSHA: head, MaximumBundleBytes: 8 << 20, MaximumObjects: 100,
+	})
+	if err == nil || !strings.Contains(err.Error(), head) || !strings.Contains(err.Error(), other) {
+		t.Fatalf("Capture() error = %v, want actual=%s and expected=%s in message", err, head, other)
+	}
+}
+
+func TestFilterIgnoredStatusPreservesRealChanges(t *testing.T) {
+	input := "?? .gocache/a.o\n M tracked.go\n?? dirty.txt\n?? node_modules/b\n"
+	got := filterIgnoredStatus(input)
+	want := " M tracked.go\n?? dirty.txt\n"
+	if got != want {
+		t.Fatalf("filterIgnoredStatus() = %q, want %q", got, want)
+	}
+}
+
 func newCaptureRepository(t *testing.T) (string, string) {
 	t.Helper()
 	root := t.TempDir()

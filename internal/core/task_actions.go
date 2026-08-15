@@ -24,6 +24,9 @@ func (s *Service) WakeTask(ctx context.Context, input TaskActionInput) (Task, er
 		if err := ValidateTaskOperation(task.Kind, "wake"); err != nil {
 			return err
 		}
+		if task.AssigneeAgentID == "" {
+			return Conflict(CodeInvalidState, "human-assigned task cannot be woken", string(task.Status), task.Version)
+		}
 		if task.Status != TaskWaiting {
 			return Conflict(CodeInvalidState, "only a waiting task can be woken", string(task.Status), task.Version)
 		}

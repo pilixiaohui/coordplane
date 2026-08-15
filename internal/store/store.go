@@ -121,12 +121,21 @@ func preflightLegacyAdapterState(ctx context.Context, path string) error {
 	if tables != 2 {
 		return nil
 	}
+	// Codex is a supported adapter from schema v7 onward. Only pre-v7 durable
+	// Codex state is unprovable legacy state and must remain fail-closed.
+	var version int
+	if err := db.QueryRowContext(ctx, `SELECT COALESCE((SELECT MAX(version) FROM schema_migrations),0)`).Scan(&version); err != nil {
+		return core.WrapError(core.CodeInternal, "inspect SQLite startup migration version", false, err)
+	}
+	if version >= schemaVersion {
+		return nil
+	}
 	var legacy int
 	if err := db.QueryRowContext(ctx, `SELECT CASE WHEN EXISTS(SELECT 1 FROM agents WHERE adapter_id='codex') OR EXISTS(SELECT 1 FROM runs WHERE adapter_id='codex') THEN 1 ELSE 0 END`).Scan(&legacy); err != nil {
-		return core.WrapError(core.CodeInternal, "inspect retired adapter state", false, err)
+		return core.WrapError(core.CodeInternal, "inspect legacy adapter state", false, err)
 	}
 	if legacy != 0 {
-		return core.NewError(core.CodeLegacySchemaRebuildRequired, "retired Codex durable state requires backup and a fresh data_dir; stop live resources with the old environment", false)
+		return core.NewError(core.CodeLegacySchemaRebuildRequired, "pre-v7 Codex durable state requires backup and a fresh data_dir; stop live resources with the old environment", false)
 	}
 	return nil
 }
@@ -223,6 +232,36 @@ func (s *Store) Migrate(ctx context.Context) (MigrationResult, error) {
 		if err := s.applyHumanTaskLifecycleMigration(ctx); err != nil {
 			return MigrationResult{}, err
 		}
+		result.Applied = append(result.Applied, 4)
+		version = 4
+	}
+	if version == 4 {
+		if err := s.validateCanonicalDatabase(ctx, 4); err != nil {
+			return MigrationResult{}, err
+		}
+		if err := s.applyTaskBudgetMigration(ctx); err != nil {
+			return MigrationResult{}, err
+		}
+		result.Applied = append(result.Applied, 5)
+		version = 5
+	}
+	if version == 5 {
+		if err := s.validateCanonicalDatabase(ctx, 5); err != nil {
+			return MigrationResult{}, err
+		}
+		if err := s.applyProjectDeleteCapabilityMigration(ctx); err != nil {
+			return MigrationResult{}, err
+		}
+		result.Applied = append(result.Applied, 6)
+		version = 6
+	}
+	if version == 6 {
+		if err := s.validateCanonicalDatabase(ctx, 6); err != nil {
+			return MigrationResult{}, err
+		}
+		if err := s.applyAgentRuntimeConfigMigration(ctx); err != nil {
+			return MigrationResult{}, err
+		}
 		result.Applied = append(result.Applied, schemaVersion)
 	}
 	if err := s.validateCanonicalDatabase(ctx, schemaVersion); err != nil {
@@ -311,7 +350,7 @@ func (s *Store) applyHumanTaskLifecycleMigration(ctx context.Context) error {
 		}
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, schemaVersion, schemaName, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, 4, schemaName, now); err != nil {
 		return core.WrapError(core.CodeInternal, "record human task lifecycle migration", false, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -337,12 +376,122 @@ func (s *Store) applyHumanTaskLifecycleMigration(ctx context.Context) error {
 	return nil
 }
 
+func (s *Store) applyTaskBudgetMigration(ctx context.Context) error {
+	// The task self-declared budget column is additive: the v4 rebuild finished
+	// tasks_v4 without it, so existing v4 databases and fresh databases both
+	// reach the same final schema by applying this ALTER.
+	if _, err := s.db.ExecContext(ctx, budgetSecondsMigrationSQL); err != nil {
+		return core.WrapError(core.CodeInternal, "apply task budget seconds schema migration", false, err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, 5, budgetSecondsMigrationName, now); err != nil {
+		return core.WrapError(core.CodeInternal, "record task budget seconds migration", false, err)
+	}
+	return nil
+}
+
+func (s *Store) applyProjectDeleteCapabilityMigration(ctx context.Context) error {
+	// Data-only migration: the owner role was seeded at migration v3 from the
+	// capability registry of that time, so databases created before
+	// project.delete was added keep a stale capability list and would be denied
+	// scope. Re-serialize the current canonical owner capability set from the
+	// core registry so existing databases match a fresh one.
+	ownerCapabilities, err := json.Marshal(core.CapabilityNames(core.AllCapabilities()))
+	if err != nil {
+		return core.WrapError(core.CodeInternal, "serialize owner role capabilities", false, err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(ctx, `UPDATE roles SET capabilities=?, version=version+1, updated_at=? WHERE id=?`,
+		string(ownerCapabilities), now, core.DefaultOwnerRoleID); err != nil {
+		return core.WrapError(core.CodeInternal, "grant project delete capability to owner role", false, err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, 6, projectDeleteCapabilityMigrationName, now); err != nil {
+		return core.WrapError(core.CodeInternal, "record project delete capability migration", false, err)
+	}
+	return nil
+}
+
+// applyAgentRuntimeConfigMigration upgrades the configuration domain to v7
+// with additive columns and derived backfill only. All DDL, derived updates,
+// and the migration record commit together, so any failure leaves the v6
+// schema untouched.
+func (s *Store) applyAgentRuntimeConfigMigration(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return core.WrapError(core.CodeInternal, "begin agent runtime config migration", false, err)
+	}
+	defer tx.Rollback()
+	for _, statement := range splitStatements(agentRuntimeConfigMigrationSQL) {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return core.WrapError(core.CodeInternal, "apply agent runtime config schema migration", false, err)
+		}
+	}
+	// The CLI-agent participant is an exact mirror of its agents row. Human
+	// participants are intentionally not touched and keep the default values.
+	if _, err := tx.ExecContext(ctx, `
+UPDATE participants SET
+  model=COALESCE((SELECT model FROM agents WHERE agents.id=participants.id),''),
+  subagent_model=COALESCE((SELECT subagent_model FROM agents WHERE agents.id=participants.id),''),
+  base_url=COALESCE((SELECT base_url FROM agents WHERE agents.id=participants.id),''),
+  effort=COALESCE((SELECT effort FROM agents WHERE agents.id=participants.id),''),
+  instructions_text=COALESCE((SELECT instructions_text FROM agents WHERE agents.id=participants.id),'')
+WHERE kind='cli_agent'`); err != nil {
+		return core.WrapError(core.CodeInternal, "backfill participant agent runtime config", false, err)
+	}
+	rows, err := tx.QueryContext(ctx, `
+SELECT id,adapter_id,image,instructions_hash
+FROM runs
+WHERE state IN ('exited','failed','interrupted','cancelled','timed_out')
+  AND instructions_hash <> ''
+ORDER BY id`)
+	if err != nil {
+		return core.WrapError(core.CodeInternal, "read terminal runs for fingerprint backfill", false, err)
+	}
+	type legacyRun struct {
+		id, adapter, image, hash string
+	}
+	var runs []legacyRun
+	for rows.Next() {
+		var run legacyRun
+		if err := rows.Scan(&run.id, &run.adapter, &run.image, &run.hash); err != nil {
+			rows.Close()
+			return core.WrapError(core.CodeInternal, "scan terminal run for fingerprint backfill", false, err)
+		}
+		runs = append(runs, run)
+	}
+	if err := rows.Close(); err != nil {
+		return core.WrapError(core.CodeInternal, "close terminal run fingerprint scan", false, err)
+	}
+	if err := rows.Err(); err != nil {
+		return core.WrapError(core.CodeInternal, "read terminal run fingerprint scan", false, err)
+	}
+	for _, run := range runs {
+		fingerprint, err := core.RuntimeConfigFingerprint(core.RuntimeConfigFingerprintInput{
+			AdapterID: run.adapter, Image: run.image, InstructionsHash: run.hash,
+		})
+		if err != nil {
+			return core.WrapError(core.CodeLegacySchemaRebuildRequired, "backfill legacy Run config fingerprint", false, err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE runs SET config_fingerprint=? WHERE id=?`, fingerprint, run.id); err != nil {
+			return core.WrapError(core.CodeInternal, "backfill terminal Run config fingerprint", false, err)
+		}
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)`, schemaVersion, agentRuntimeConfigMigrationName, now); err != nil {
+		return core.WrapError(core.CodeInternal, "record agent runtime config migration", false, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return core.WrapError(core.CodeInternal, "commit agent runtime config migration", false, err)
+	}
+	return nil
+}
+
 func (s *Store) migrationVersion(ctx context.Context) (int, error) {
 	var version int
 	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil {
 		return 0, legacySchemaError("read SQLite migration version", err)
 	}
-	if version != 1 && version != 2 && version != 3 && version != schemaVersion {
+	if version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != 6 && version != schemaVersion {
 		return 0, legacySchemaError("legacy database migration history requires backup and a new data_dir", nil)
 	}
 	return version, nil

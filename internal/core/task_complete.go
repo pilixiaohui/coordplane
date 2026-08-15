@@ -18,9 +18,10 @@ const (
 
 // CompleteTask converges a human-assigned task with explicit confirmation.
 // Per the unified participant framework a human executes without a workspace:
-// the task must not be bound to a CLI agent and must not have a live run; the
-// terminal result is recorded with evidence_type=human_confirm and an empty
-// head_sha. The capability gate is task.complete in the task's project scope.
+// the task must not be bound to a CLI agent, must be waiting, and must not
+// have a live run; the terminal result is recorded with evidence_type=
+// human_confirm and an empty captured head. The capability gate is
+// task.complete in the task's project scope.
 func (s *Service) CompleteTask(ctx context.Context, input CompleteTaskInput) (Task, error) {
 	taskID := strings.TrimSpace(input.TaskID)
 	if _, err := requireText("task_id", taskID); err != nil {
@@ -80,7 +81,7 @@ func (s *Service) CompleteTask(ctx context.Context, input CompleteTaskInput) (Ta
 		if task.AssigneeParticipantID == "" {
 			return Conflict(CodeInvalidState, "task has no human assignee participant", string(task.Status), task.Version)
 		}
-		if task.Status != TaskQueued && task.Status != TaskWaiting {
+		if task.Status != TaskWaiting {
 			return Conflict(CodeInvalidState, "task cannot be completed from this status", string(task.Status), task.Version)
 		}
 		if task.PendingAction != "" {
@@ -91,7 +92,12 @@ func (s *Service) CompleteTask(ctx context.Context, input CompleteTaskInput) (Ta
 		task.Status = TaskCompleted
 		task.ResultSummary = summary
 		task.EvidenceType = string(EvidenceHumanConfirm)
+		task.HeadSHA = ""
+		task.HeadRunID = ""
+		task.TaskRef = ""
+		task.WaitReason = ""
 		task.CompletedAt = now
+		task.ClosedAt = now
 		task.Version++
 		task.UpdatedAt = now
 		if err := tx.UpdateTask(task, expectedVersion, expectedStatus); err != nil {

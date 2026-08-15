@@ -215,7 +215,7 @@ func TestGT00ProductionBinaryHasNoContractFaultControl(t *testing.T) {
 	}
 }
 
-func TestP3ProductionBinaryRejectsRetiredCodexWithoutDurableWrites(t *testing.T) {
+func TestP3ProductionBinaryAcceptsCodexAdapter(t *testing.T) {
 	root, dataDir, socket, configPath := contractConfigPaths(t, "")
 	daemon := startDaemon(t, configPath, socket)
 	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
@@ -224,22 +224,23 @@ func TestP3ProductionBinaryRejectsRetiredCodexWithoutDurableWrites(t *testing.T)
 	defer database.Close()
 	before := durableSignature(t, database, "")
 
-	command := exec.Command(testBinaries.coordplane,
+	raw := runBinaryJSON(t, testBinaries.coordplane,
 		"agent", "add", "--socket", socket, "--display-name", "Retired Adapter",
 		"--adapter", "codex", "--image", "agent:latest",
 		"--instructions-file", filepath.Join(root, "agent.md"),
-		"--request-id", "retired-adapter", "--output", "json")
-	raw, err := command.CombinedOutput()
-	if err == nil || !bytes.Contains(raw, []byte("adapter_id is not registered")) {
-		t.Fatalf("retired adapter err=%v output=%s", err, raw)
+		"--request-id", "codex-adapter", "--output", "json")
+	var agent core.Agent
+	decodeJSON(t, raw, &agent)
+	if agent.AdapterID != "codex" {
+		t.Fatalf("accepted Codex agent = %#v", agent)
 	}
 	snapshot, err := database.Snapshot(context.Background(), "")
 	requireNoError(t, err)
 	events, err := database.Events(context.Background(), core.EventFilter{EntityType: "agent"})
 	requireNoError(t, err)
 	after := durableSignature(t, database, "")
-	if len(snapshot.Agents) != 0 || len(events) != 0 || after != before {
-		t.Fatalf("retired adapter wrote durable state: agents=%#v events=%#v signature_changed=%t", snapshot.Agents, events, after != before)
+	if len(snapshot.Agents) != 1 || len(events) != 1 || after == before {
+		t.Fatalf("Codex adapter durable state: agents=%#v events=%#v signature_changed=%t", snapshot.Agents, events, after == before)
 	}
 }
 
@@ -797,6 +798,7 @@ func TestP1BinaryReadSurfacesStayBoundedPastTwoMiBLedger(t *testing.T) {
 	source := testsupport.CreateGitRepository(t, root, "CoordPlane Contract", "contract@coordplane.local")
 	daemon := startDaemon(t, configPath, socket)
 	t.Cleanup(func() { stopDaemon(t, daemon, socket) })
+	requireNoError(t, os.WriteFile(filepath.Join(root, "agent.md"), []byte("Work only on the assigned Task."), 0o600))
 
 	agentRaw := runBinaryJSON(t, testBinaries.coordplane,
 		"agent", "add", "--socket", socket, "--display-name", "Bounded Agent",
@@ -1013,7 +1015,7 @@ func TestCT03CoordlinkBinaryRejectsStaleRunWithoutSideEffects(t *testing.T) {
 		MaxParallelRuns: 2, AdapterIDs: []string{"one-shot"},
 		Now: func() time.Time { return now },
 	})
-	agent, err := service.AddAgent(ctx, core.AddAgentInput{DisplayName: "Agent", AdapterID: "one-shot", Image: "agent:latest", InstructionsFile: "/instructions", RequestID: "agent"})
+	agent, err := service.AddAgent(ctx, core.AddAgentInput{DisplayName: "Agent", AdapterID: "one-shot", Image: "agent:latest", InstructionsText: "Work only on the assigned Task.", RequestID: "agent"})
 	requireNoError(t, err)
 	project, err := service.AddProject(ctx, core.AddProjectInput{Name: "Project", Source: "/source", SourceRef: "refs/heads/main", RequestID: "project"})
 	requireNoError(t, err)
@@ -1102,7 +1104,7 @@ func TestP2CoordlinkBinaryPersistsOutcomeIntentBeforeTerminalFact(t *testing.T) 
 			ctx, _, database, gitFacts, service := newContractServiceFixture(t, core.ServiceOptions{MaxParallelRuns: 1, AdapterIDs: []string{"one-shot"}})
 			agent, err := service.AddAgent(ctx, core.AddAgentInput{
 				DisplayName: "Agent", AdapterID: "one-shot", Image: "agent:latest",
-				InstructionsFile: "/instructions", RequestID: "agent-" + test.name,
+				InstructionsText: "Work only on the assigned Task.", RequestID: "agent-" + test.name,
 			})
 			requireNoError(t, err)
 			project, err := service.AddProject(ctx, core.AddProjectInput{
@@ -1469,6 +1471,17 @@ func (g *contractGit) Capture(_ context.Context, intent core.GitCaptureIntent) (
 }
 
 func (g *contractGit) CleanupCapture(context.Context, core.GitCaptureIntent) error { return nil }
+
+func (g *contractGit) ExpandHead(_ context.Context, intent core.GitExpandHeadIntent) (string, error) {
+	ref := intent.ExpectedHead
+	if len(ref) == 40 || len(ref) == 64 {
+		return ref, nil
+	}
+	if ref != "" && strings.HasPrefix(g.sha, ref) {
+		return g.sha, nil
+	}
+	return "", fmt.Errorf("expected head %q does not resolve to a commit in the workspace", ref)
+}
 
 func (g *contractGit) Advance(_ context.Context, intent core.GitAdvanceIntent) (core.GitAdvanceFact, error) {
 	return core.GitAdvanceFact{Outcome: core.GitAdvanceUpdated, ActualSHA: intent.TargetSHA}, nil

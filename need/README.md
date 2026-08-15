@@ -68,7 +68,7 @@ Boss
 | Daemon | 常驻进程，不建业务对象 | SQLite、调度、Run supervisor、消息递送、Git ref 管理和恢复 |
 | Operator CLI | `coordplane` 命令 | Boss 的唯一正式入口；可有交互模式，但必须复用同一操作函数 |
 | coordlink | Agent 环境内的薄客户端 | 只暴露固定 Task、Message、progress 操作并转发给 Daemon |
-| Agent | 持久配置身份 | 绑定一个 CLI adapter、运行配置和指令文件 |
+| Agent | 持久配置身份 | 绑定一个静态注册的 CLI adapter（claude/codex）、运行配置（model/subagent_model/base_url/effort）和提示词（instructions_file/text 二选一） |
 | CLI adapter | 静态注册组件 | 生成 provider 启动/恢复命令、解析协议、判断 resume 兼容性；可选支持运行中输入，容器生命周期仍由 Runtime executor 统一拥有 |
 | Runtime | 第一版为 Docker | 为每次 Run 提供隔离进程、workspace 和 Agent 私有 home |
 | Git | 成熟代码协作机制 | commit、branch、merge、冲突检测、对象保存和 ref CAS |
@@ -80,6 +80,7 @@ Manager、Developer、Reviewer、Integrator 只是 Agent 指令或显示标签�
 ### 5.1 Boss 控制面
 
 - 以一个 CLI 入口注册项目和 Agent。
+- 创建和编辑 Agent 配置：静态 adapter 列表（`GET /v1/adapters`）、模型/effort/base_url、提示词（file/text 互斥）；API PUT、operator CLI、前端编辑三面同一字段模型。
 - 与指定 Agent 进行持久对话；Daemon 只保存和递送文本，不解释自然语言。
 - 显式创建、查看、检出未集成结果、接受、返工、重试、取消和唤醒 Task。
 - 查看每个 Agent 当前 Task、Run、最近进度、未读消息、错误和 Git base/head。
@@ -138,7 +139,7 @@ Manager、Developer、Reviewer、Integrator 只是 Agent 指令或显示标签�
 - 代理 `git status/diff/add/commit/rebase/merge` 的通用 Git API；Agent 在私有 workspace 直接使用 Git。
 - 自建 Git hosting、PR 网站、CI 平台、发布平台、远端 push 自动化或跨仓库原子事务。
 - 分布式队列、远程 runner 集群、Kubernetes、HA、多 Daemon 并行写同一 data directory。
-- Web UI、复杂 Dashboard、Autopilot、定时任务、模型成本平台、长期语义记忆或向量数据库。
+- 复杂 Dashboard、Autopilot、定时任务、模型成本平台、长期语义记忆或向量数据库；Web UI 只作为轻量 Agent 配置/查看面（有独立前端预算），不做平台化。
 - CoordPlane 内置 LLM、阅读自然语言后自动拆任务、自动选择角色、自动验收代码或自动解决冲突。
 - 内部 agent↔agent 点对点直连（A2A 或其他任何直连协议）；多 Agent 协作只经 Daemon 的 Task/Message 机制。
 - AGNTCY/ANP 等跨组织发现/身份/传输基础设施；第一版是单 Daemon、本地优先，不需要 agent 目录/去中心化身份/加密传输网络。
@@ -149,7 +150,7 @@ Manager、Developer、Reviewer、Integrator 只是 Agent 指令或显示标签�
 
 本小节固化第一版边界内对行业标准协议的定位，防止实现漂移。详细设计见 `docs/protocols.md`；对象/状态/Run 事实仍只由 `core.md`/`runtime.md` 定义，本小节不新增任何持久对象或状态。
 
-1. **ACP（Agent Client Protocol，协调者 ↔ CLI agent）是 adapter 层的演进目标，不是第一版合同**。第一版 adapter 仍是静态注册的 provider 私有协议（Claude CLI）；当 ACP 达到 1.0 稳定且目标 agent（Claude Code）提供原生或成熟 bridge 支持后，应当实现 ACP client adapter 替换私有事件解析。`runtime.md` §7.1 的 adapter 接口（BuildStartCommand/BuildResumeCommand/BuildInjectInput/ParseEvent/ResumeCompatible）与 ACP 方法（session/new、session/prompt、session/cancel、session/update、session/request_permission）的映射见 `docs/protocols.md`。**第一版不得**预埋 ACP 半成品接口或按协议名写主循环特判；adapter 注册列表保持静态。
+1. **ACP（Agent Client Protocol，协调者 ↔ CLI agent）是 adapter 层的演进目标，不是第一版合同**。第一版 adapter 仍是静态注册的 provider 私有协议（Claude 与 Codex CLI）；当 ACP 达到 1.0 稳定且目标 agent（Claude Code）提供原生或成熟 bridge 支持后，应当实现 ACP client adapter 替换私有事件解析。`runtime.md` §7.1 的 adapter 接口（BuildStartCommand/BuildResumeCommand/BuildInjectInput/ParseEvent/ResumeCompatible）与 ACP 方法（session/new、session/prompt、session/cancel、session/update、session/request_permission）的映射见 `docs/protocols.md`。**第一版不得**预埋 ACP 半成品接口或按协议名写主循环特判；adapter 注册列表保持静态。
 2. **A2A（Agent2Agent，agent↔agent）只作为未来对外互操作出口**。Boss 面未来可把 Project/Task 暴露为 A2A 端点 + 静态 AgentCard（能力/技能/安全声明，`/.well-known/agent-card.json`），用于与其他 agent 平台互派任务；但**内部多 Agent 协作必须保持 Daemon 单一协调，禁止 agent↔agent 点对点直连**（见 §6 非目标）。A2A 出口属于未来能力，必须先修改本需求基线。
 3. **AG-UI（agent↔UI）作为 Web 前端事件流参考**。实时展示 Run 进度/工具调用时应当映射 AG-UI 事件词汇（RunStart/TextMessage/ToolCall/RunComplete 等，SSE + JSON Patch），不得为前端自造第二套事件协议。
 4. **MCP（Model Context Protocol）不建设平台**。见 §6 非目标（通用 tool adapter、MCP server、plugin 平台）；agent 在容器内自行连接 MCP server 属 agent 自身行为，CoordPlane 不提供平台化支持。
@@ -193,10 +194,10 @@ Manager、Developer、Reviewer、Integrator 只是 Agent 指令或显示标签�
 
 代码预算是范围漂移告警，不是用短代码替代正确性的目标：
 
-- 第一版以一个production one-shot CLI adapter为基线；scripted adapter只属于测试。第二个provider adapter必须单独增加预算，不能挤占Core、Runtime或Git恢复逻辑。
-- Owner已批准统一参与者框架(v0.2-delta)需求范围对应的重基线：Budgeted maintained production SLOC目标/软阈值/发布阈值为`20,000 / 21,000 / 22,600`；tests为`21,000 / 22,000 / 23,700`；build/test infrastructure仍为`250 / 400 / 600`；三类合计为`41,250 / 43,400 / 47,000`。总量合格不能覆盖production超限。
-- 前端(web 面 SPA 与 web e2e)单独配置预算,不与后端核心功能共享:`handwritten_frontend` 上限 `3,000` 物理行(非空非纯注释口径,JS/CSS 沿用同一计数器);前端 Go 服务层(`internal/webserver/*`)亦计入 frontend,不计入 production。后端 production/tests/infra/total 预算不受前端影响。
-- 上述envelope替换旧`10,500 / 12,550 / 14,650`、`12,300 / 15,450 / 19,000`和总计`23,050 / 28,400 / 34,250`，只改变预算，不删除或降级任何Core、Runtime、Git、CLI或真实多Agent边界合同。
+- 第一版以两个production one-shot CLI adapter（Claude + Codex）为基线；scripted adapter只属于测试。新增第三个provider adapter必须单独增加预算，不能挤占Core、Runtime或Git恢复逻辑。
+- Owner已批准 Agent 可配置 CLI/模型/提示词 v1（D1–D7/E1–E5，2026-08-13）对应的重基线：Budgeted maintained production SLOC目标/软阈值/发布阈值为`24,000 / 24,500 / 25,000`；tests为`25,500 / 26,200 / 27,000`；build/test infrastructure为`250 / 500 / 700`；三类合计为`49,750 / 51,200 / 52,700`（E1 暂定上限，最终以 clean revision 实测锁表）。总量合格不能覆盖production超限。
+- 前端(web 面 SPA 与 web e2e)单独配置预算,不与后端核心功能共享:`handwritten_frontend` 目标/软阈值/发布阈值为 `2,000 / 2,500 / 3,000` 物理行(非空非纯注释口径,JS/CSS 沿用同一计数器);前端 Go 服务层(`internal/webserver/*`)亦计入 frontend,不计入 production。后端 production/tests/infra/total 预算不受前端影响。
+- 上述envelope替换统一参与者框架重基线的`20,000 / 21,000 / 22,600`、`21,000 / 22,000 / 23,700`和总计`41,250 / 43,400 / 47,000`，只改变预算，不删除或降级任何Core、Runtime、Git、CLI、adapter或真实多Agent边界合同。
 - 第一版候选必须在clean revision生成LOC JSON，并完成`acceptance.md`定义的真实双Agent和四Agent可靠性场景。固定硬件性能baseline、reference manifest和长时间soak不属于第一版完成条件；真实live证据能否复用按受影响文件的精确diff判断，不能因纯文档变更重复消耗provider调用。
 - LOC低于预算不代表完成；所有状态、隔离、recovery、Git CAS和真实Docker/Git验收仍必须通过。
 - 不允许通过压缩语句、超长函数、把逻辑搬进generated code/脚本/test helper或保留第二套隐藏路径规避预算。
@@ -234,6 +235,8 @@ runtime:
     - ANTHROPIC_DEFAULT_HAIKU_MODEL
     - CLAUDE_CODE_SUBAGENT_MODEL
     - CLAUDE_CODE_EFFORT_LEVEL
+    - OPENAI_API_KEY
+    - OPENAI_BASE_URL
 ```
 
 规则：
@@ -241,10 +244,12 @@ runtime:
 - 未知字段必须报错，不能静默忽略。
 - Boss CLI只连接本机operator Unix socket；Agent容器通过`runtime.md`定义的per-Run Unix socket连接，不要求暴露宿主TCP监听端口。
 - 配置只保存 Daemon/runtime 设置。Agent 由 `coordplane agent add/update` 写入 SQLite，不能同时由 YAML 和数据库维护。
+- per-agent 配置（adapter/image/model/subagent_model/base_url/effort/instructions_file/instructions_text）由 `coordplane agent add/update`、`PUT /v1/agents/{id}` 与前端编辑表单写入 SQLite，不进入 YAML；`adapter_id` 静态列表来自只读 `GET /v1/adapters`；`instructions_file` 与 `instructions_text` 互斥（恰有其一）；PUT 为全量替换（E5），CLI 与前端发送全量字段。
 - Adapter/image等Runtime配置修改只影响新 Run；Run 必须保存本次解析后的 adapter、image 和 instructions hash。Retention是当前GC策略，每次preview/run都用当前值计算既有closed Task/terminal Run，不改写其`closed_at/ended_at`。
 - Agent 指令可以描述 Manager/Developer/Integrator 工作方式，但 Daemon 不解析其语义。
 - Provider credentials 只通过 runtime 明确 allowlist 注入，不写入配置快照、数据库、事件或日志。
 - Claude provider 固定使用 `--bare`，并只透传上述 Claude 配置环境变量；不读取 OAuth/keychain/Boss HOME，不挂载或复制宿主 `~/.claude`。
+- Codex provider 按固定 argv 模板启动（`codex exec`/`codex exec resume`，见 `runtime.md` §7.2），容器内固定 `HOME=/home/agent`、`CODEX_HOME=/home/agent/.codex`；只透传 allowlist 凭据，不读取或挂载宿主 `~/.codex`。
 - `runtime.run_timeout` 可省略或设为 `0` 以禁用自动 deadline；正 duration 会在新 Run 启动时固化为 `deadline_at`，不追溯修改既有 Run。
 - `runtime.shutdown_grace` 可省略（默认 `5s`），显式值必须为正 duration；SIGTERM、stop/cancel/timeout 与重启对账统一使用该 grace。
 - Project 通过 Boss 命令注册，不要求写进配置文件。
@@ -280,5 +285,5 @@ runtime:
 - 两个 Agent 的提交都被 task ref 保存，并通过 Git CAS/integration Task 收敛到 canonical ref。
 - Daemon 重启不会产生重复 active Run、伪完成、丢提交或错误覆盖 canonical ref。
 - 两个真实CLI Agent完成端到端闭环；另有一个fresh四Agent真实场景证明4个source Run并发、Message、task ref、integration和canonical CAS能够在一次Daemon重启后继续收敛。
-- Budgeted maintained production/tests/infra/total分别不超过`22,600 / 23,700 / 600 / 47,000`，质量blocker清零；没有为省LOC弱化测试或关键恢复合同。
+- Budgeted maintained production/tests/infra/total分别不超过`25,000 / 27,000 / 700 / 52,700`，质量blocker清零；没有为省LOC弱化测试或关键恢复合同。
 - `acceptance.md` 的静态约束、合同测试、真实 Docker/Git gate 和真实 CLI gate全部通过。

@@ -24,6 +24,7 @@ func TestRuntimeBuildToDeleteStepsComeFromStaticLists(t *testing.T) {
 	}
 	wantPrepare := []string{
 		"prepareWorkspace", "prepareAgentHome", "writeRunToken", "writeBootstrap",
+		"writeInstructions", "writeSecrets", "writeLaunch",
 		"openRunAPISocket", "createContainer", "attachStreams", "startCLI", "verifyLive",
 	}
 	if !reflect.DeepEqual(prepareNames, wantPrepare) {
@@ -117,13 +118,12 @@ func TestBootstrapAdvertisesTheImportedSourceConvenienceRef(t *testing.T) {
 	}
 }
 
-func TestContainerSpecKeepsTrustedRuntimeEnvironmentOverProviderAllowlist(t *testing.T) {
-	providerEnv := config.ClaudeProviderEnvCatalog()
+func TestContainerSpecExcludesProviderSecretsFromEnvironment(t *testing.T) {
+	providerEnv := config.ProviderEnvCatalog()
 	for _, name := range append(providerEnv, "ANTHROPIC_API_KEY", "HOME", "COORDPLANE_RUN_SOCKET", "COORDPLANE_RUN_TOKEN_FILE") {
 		t.Setenv(name, "/untrusted/provider-value")
 	}
-	coordlink, err := os.Executable()
-	requireNoError(t, err)
+	coordlink := requireRuntimeValue(os.Executable())
 	controller := &runtimeController{
 		config: config.Config{Runtime: config.RuntimeConfig{
 			DockerNetwork:        "none",
@@ -136,23 +136,25 @@ func TestContainerSpecKeepsTrustedRuntimeEnvironmentOverProviderAllowlist(t *tes
 		Generation: 1, LaunchNonce: "nonce-env", ContainerName: "coordplane-run-env",
 		Image: "agent:test", HomePath: "/runtime/agent-home",
 	}
-	spec, err := controller.containerSpec(run, core.TaskConversation, adapter.CommandSpec{
+	spec := requireRuntimeValue(controller.containerSpec(run, core.TaskConversation, adapter.CommandSpec{
 		Executable: "claude",
 		Env:        map[string]string{"HOME": "/home/agent"},
-	}, "/runtime/run-control/run-env")
-	requireNoError(t, err)
+	}, "/runtime/run-control/run-env"))
 	if !reflect.DeepEqual(spec.SensitiveEnvKeys, controller.config.Runtime.ProviderEnvAllowlist) {
 		t.Fatalf("sensitive environment keys = %v", spec.SensitiveEnvKeys)
 	}
-	for _, name := range providerEnv {
-		if spec.Command.Env[name] != "/untrusted/provider-value" {
-			t.Errorf("container %s = %q, want provider value", name, spec.Command.Env[name])
+	if spec.Command.Executable != runtimeLaunchExecutable {
+		t.Fatalf("container executable = %q, want launcher %q", spec.Command.Executable, runtimeLaunchExecutable)
+	}
+	for _, name := range append(providerEnv, "ANTHROPIC_API_KEY") {
+		if _, exists := spec.Command.Env[name]; exists {
+			t.Errorf("container env leaked allowlist value for %s", name)
 		}
 	}
-	if _, exists := spec.Command.Env["ANTHROPIC_API_KEY"]; exists {
-		t.Fatal("ContainerSpec admitted retired ANTHROPIC_API_KEY")
-	}
-	for name, value := range map[string]string{"HOME": "/home/agent", "COORDPLANE_RUN_SOCKET": "/run/coordplane/api.sock", "COORDPLANE_RUN_TOKEN_FILE": "/run/coordplane/token"} {
+	for name, value := range map[string]string{
+		"HOME": "/home/agent", "COORDPLANE_RUN_SOCKET": "/run/coordplane/api.sock",
+		"COORDPLANE_RUN_TOKEN_FILE": "/run/coordplane/token", "COORDPLANE_SECRETS_FILE": "/run/coordplane/secrets",
+	} {
 		if spec.Command.Env[name] != value {
 			t.Errorf("container %s = %q, want trusted %q", name, spec.Command.Env[name], value)
 		}

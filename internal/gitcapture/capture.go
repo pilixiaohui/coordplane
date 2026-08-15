@@ -90,7 +90,9 @@ func Capture(ctx context.Context, request Request) (Fact, error) {
 		return Fact{}, err
 	}
 	if head != request.ExpectedHead {
-		return Fact{}, errors.New("capture helper: actual workspace HEAD does not match expected head")
+		return Fact{}, fmt.Errorf(
+			"capture helper: workspace HEAD %s does not match expected head %s (expected-head must be the post-commit workspace HEAD, i.e. `git rev-parse HEAD`, not the task base SHA)",
+			head, request.ExpectedHead)
 	}
 	trustedRoot, err := os.MkdirTemp("", "coordplane-git-capture-")
 	if err != nil {
@@ -109,7 +111,7 @@ func Capture(ctx context.Context, request Request) (Fact, error) {
 	if err != nil {
 		return Fact{}, fmt.Errorf("capture helper: inspect clean workspace: %w", err)
 	}
-	if strings.TrimSpace(status) != "" {
+	if strings.TrimSpace(filterIgnoredStatus(status)) != "" {
 		return Fact{}, errors.New("capture helper: workspace must be clean before capture")
 	}
 	for name, ancestor := range map[string]string{"base": request.BaseSHA, "source": request.SourceSHA} {
@@ -207,6 +209,7 @@ func Inspect(ctx context.Context, request InspectRequest) (Fact, error) {
 	if err != nil {
 		return Fact{}, fmt.Errorf("capture helper: inspect workspace status: %w", err)
 	}
+	status = filterIgnoredStatus(status)
 	count, err := countObjects(ctx, env, trustedGitDir, request.MaximumObjects)
 	if err != nil {
 		return Fact{}, err
@@ -590,6 +593,41 @@ func readSmallRegular(path string, maximum int64) ([]byte, error) {
 		return nil, errors.New("file is not a bounded direct regular file")
 	}
 	return os.ReadFile(path)
+}
+
+// captureIgnoredUntrackedDirs are workspace-local build cache directories
+// whose residue (untracked files) must not fail capture. Restricted runtimes
+// (noexec /tmp, no module network) force agents to place GOCACHE/GOTMPDIR
+// inside the project tree; requiring a byte-for-byte clean tree then turns
+// cache residue into a spurious capture failure (CP-NOV-01).
+var captureIgnoredUntrackedDirs = []string{
+	".gocache/", ".gotmp/", ".tmp/", "node_modules/", "__pycache__/",
+}
+
+// filterIgnoredStatus drops porcelain-v1 untracked entries ("?? ") that live
+// inside a capture-ignored build cache directory, so cache residue alone does
+// not make a workspace appear dirty. Tracked-file changes and untracked files
+// outside the ignored directories are preserved.
+func filterIgnoredStatus(status string) string {
+	var kept []string
+	for _, line := range strings.Split(status, "\n") {
+		path, isUntracked := strings.CutPrefix(line, "?? ")
+		if !isUntracked {
+			kept = append(kept, line)
+			continue
+		}
+		ignored := false
+		for _, dir := range captureIgnoredUntrackedDirs {
+			if strings.HasPrefix(path, dir) {
+				ignored = true
+				break
+			}
+		}
+		if !ignored {
+			kept = append(kept, line)
+		}
+	}
+	return strings.Join(kept, "\n")
 }
 
 func runGit(ctx context.Context, env []string, args ...string) (string, error) {

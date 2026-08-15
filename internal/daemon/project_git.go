@@ -77,6 +77,29 @@ func (a projectGitAdapter) Capture(ctx context.Context, intent core.GitCaptureIn
 	return core.GitCaptureFact{HeadSHA: fact.HeadSHA, TaskRef: fact.TaskRef}, err
 }
 
+func (a projectGitAdapter) ExpandHead(ctx context.Context, intent core.GitExpandHeadIntent) (string, error) {
+	if a.workspaces == nil {
+		return "", fmt.Errorf("workspace manager is not configured")
+	}
+	wantPath, err := a.workspaces.Path(intent.ProjectID, intent.TaskID)
+	if err != nil {
+		return "", err
+	}
+	if intent.WorkspacePath != wantPath {
+		return "", fmt.Errorf("workspace path does not match task identity")
+	}
+	workspace := gitrepo.WorkspaceSpec{
+		ProjectID: intent.ProjectID, TaskID: intent.TaskID, BaseSHA: intent.BaseSHA,
+	}
+	if intent.Source != nil {
+		workspace.Source = &gitrepo.WorkspaceSource{
+			TaskID: intent.Source.TaskID, RunID: intent.Source.RunID,
+			TaskRef: intent.Source.TaskRef, HeadSHA: intent.Source.HeadSHA,
+		}
+	}
+	return a.workspaces.ExpandHead(ctx, workspace, intent.WorkspacePath, intent.ExpectedHead)
+}
+
 func (a projectGitAdapter) CleanupCapture(ctx context.Context, intent core.GitCaptureIntent) error {
 	if a.workspaces == nil {
 		return fmt.Errorf("workspace manager is not configured")

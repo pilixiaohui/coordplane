@@ -31,11 +31,16 @@ const (
 	runtimeLogFailureReason   = "runtime log monitoring failed"
 	runtimeLogFailureCode     = "LOG_STREAM_FAILED"
 	runtimeSessionFailureCode = "SESSION_PERSIST_FAILED"
+	runtimeSecretsFailureCode = "SECRETS_UNAVAILABLE"
+	runtimeLaunchFile         = "launch"
+	runtimeLaunchExecutable   = "/run/coordplane/launch"
+	runtimeLaunchScript       = "#!/bin/sh\nset -a\n. \"$COORDPLANE_SECRETS_FILE\"\nset +a\nexec \"$@\"\n"
 )
 
 var (
-	errRuntimeLogDrainTimeout = errors.New("runtime log stream did not finish")
-	errRuntimeSessionPersist  = errors.New("runtime session event was not persisted")
+	errRuntimeLogDrainTimeout    = errors.New("runtime log stream did not finish")
+	errRuntimeSessionPersist     = errors.New("runtime session event was not persisted")
+	errRuntimeSecretsUnavailable = errors.New("runtime run secrets are unavailable")
 )
 
 type runtimeController struct {
@@ -101,23 +106,25 @@ type waitResult struct {
 }
 
 type runtimePrepareState struct {
-	controller    *runtimeController
-	ctx           context.Context
-	claim         core.Claim
-	launch        core.RunLaunchContext
-	entry         adapter.CLI
-	workspaceSpec gitrepo.WorkspaceSpec
-	run           core.Run
-	workspacePath string
-	homePath      string
-	logPath       string
-	controlPath   string
-	bootstrap     string
-	ref           containerruntime.RuntimeRef
-	control       *runControl
-	quickExit     bool
-	complete      bool
-	completionErr error
+	controller       *runtimeController
+	ctx              context.Context
+	claim            core.Claim
+	launch           core.RunLaunchContext
+	entry            adapter.CLI
+	workspaceSpec    gitrepo.WorkspaceSpec
+	run              core.Run
+	workspacePath    string
+	homePath         string
+	logPath          string
+	controlPath      string
+	bootstrap        string
+	instructions     string
+	instructionsHash string
+	ref              containerruntime.RuntimeRef
+	control          *runControl
+	quickExit        bool
+	complete         bool
+	completionErr    error
 }
 
 type runtimePrepareStep struct {
@@ -131,6 +138,9 @@ var runtimePrepareSteps = []runtimePrepareStep{
 	{name: "prepareAgentHome", failureCode: "RUNTIME_DIRECTORY_PREPARE_FAILED", run: prepareRuntimeDirectories},
 	{name: "writeRunToken", failureCode: "TOKEN_PREPARE_FAILED", run: writeRuntimeToken},
 	{name: "writeBootstrap", failureCode: "BOOTSTRAP_PREPARE_FAILED", run: writeRuntimeBootstrap},
+	{name: "writeInstructions", failureCode: "INSTRUCTIONS_PREPARE_FAILED", run: writeRuntimeInstructions},
+	{name: "writeSecrets", failureCode: "SECRETS_PREPARE_FAILED", run: writeRuntimeSecrets},
+	{name: "writeLaunch", failureCode: "LAUNCH_PREPARE_FAILED", run: writeRuntimeLaunch},
 	{name: "openRunAPISocket", failureCode: "RUN_SOCKET_PREPARE_FAILED", run: openRuntimeControl},
 	{name: "createContainer", failureCode: "CONTAINER_CREATE_FAILED", run: createRuntimeContainer},
 	{name: "attachStreams", failureCode: "CONTAINER_ATTACH_FAILED", run: attachRuntimeStreams},
@@ -273,11 +283,9 @@ func (c *runtimeController) launchOwned(ctx context.Context, claim core.Claim, o
 	if !ok {
 		return c.failUnpreparedRun(ctx, launch.Run, "ADAPTER_NOT_REGISTERED", "adapter is not registered")
 	}
-	instructions, instructionsHash, err := readInstructions(launch.Agent.InstructionsFile)
-	if err != nil {
-		message := c.runtimeRedaction(launch.Run, launch.Agent.InstructionsFile).Text(err.Error())
-		return c.failUnpreparedRun(ctx, launch.Run, "INSTRUCTIONS_UNAVAILABLE", message)
-	}
+	instructions := launch.Instructions
+	instructionsHash := launch.InstructionsHash
+	fingerprint := launch.ConfigFingerprint
 
 	workspacePath := ""
 	workspaceSpec := gitrepo.WorkspaceSpec{}
@@ -295,11 +303,8 @@ func (c *runtimeController) launchOwned(ctx context.Context, claim core.Claim, o
 	logPath := filepath.Join(c.config.Runtime.LogRoot, launch.Run.ID, "run.log")
 	controlPath := filepath.Join(c.controlRoot, launch.Run.ID)
 
-	mode, resumedFrom, resumeSession := c.selectLaunchMode(ctx, launch, entry, workspacePath)
-	deadline := ""
-	if c.config.Runtime.RunTimeout > 0 {
-		deadline = time.Now().UTC().Add(c.config.Runtime.RunTimeout).Format(time.RFC3339Nano)
-	}
+	selection := c.selectLaunchMode(ctx, launch, entry, workspacePath, fingerprint)
+	deadline := runDeadlineAt(launch.Task.BudgetSeconds, c.config.Runtime.RunTimeout, time.Now())
 	nonce, err := randomRuntimeID("nonce")
 	if err != nil {
 		return err
@@ -311,8 +316,8 @@ func (c *runtimeController) launchOwned(ctx context.Context, claim core.Claim, o
 	prepared, err := c.service.BeginRunLaunch(ctx, core.RunLaunchInput{
 		RunID: launch.Run.ID, Generation: launch.Run.Generation, LaunchNonce: nonce,
 		WorkspacePath: workspacePath, HomePath: homePath, LogPath: logPath,
-		InstructionsHash: instructionsHash, LaunchMode: mode,
-		ResumedFromRunID: resumedFrom, ResumeNativeSessionID: resumeSession,
+		InstructionsHash: instructionsHash, ConfigFingerprint: fingerprint, LaunchMode: selection.Mode,
+		ResumedFromRunID: selection.ResumedFromRunID, ResumeNativeSessionID: selection.ResumeNativeSessionID,
 		CleanupOperationID: cleanupOperation, IsolationSpecVersion: runtimeIsolationSpecVersion(), DeadlineAt: deadline,
 		RequestID: runtimeRequest(launch.Run, "prepare"),
 	})
@@ -324,12 +329,17 @@ func (c *runtimeController) launchOwned(ctx context.Context, claim core.Claim, o
 		controller: c, ctx: ctx, claim: claim, launch: launch, entry: entry,
 		workspaceSpec: workspaceSpec, run: prepared, workspacePath: workspacePath,
 		homePath: homePath, logPath: logPath, controlPath: controlPath,
-		bootstrap: buildBootstrap(launch, prepared, instructions, workspacePath, workspaceSpec),
+		bootstrap:        buildBootstrap(launch, prepared, instructions, workspacePath, workspaceSpec),
+		instructions:     instructions,
+		instructionsHash: instructionsHash,
 	}
 	fail := func(cause error, code string) error {
 		if errors.Is(cause, containerruntime.ErrUnavailable) {
 			c.setDegraded(cause.Error())
 			return cause
+		}
+		if errors.Is(cause, errRuntimeSecretsUnavailable) {
+			code = runtimeSecretsFailureCode
 		}
 		return c.failPreparedRun(context.Background(), state.run, state.ref, state.control, code, cause)
 	}
@@ -389,6 +399,41 @@ func writeRuntimeBootstrap(state *runtimePrepareState) error {
 	return writeRuntimeFile(filepath.Join(state.controlPath, "bootstrap"), []byte(state.bootstrap), 0o440)
 }
 
+// writeRuntimeInstructions snapshots the exact Agent instructions text into the
+// run's immutable control directory so redaction can read it whole (never
+// reconstructing it from the bootstrap separator) and reconcile it against the
+// launch snapshot hash. It runs before writeLaunch, so a new-lineage run
+// always carries both the instructions file and the lineage launch file.
+func writeRuntimeInstructions(state *runtimePrepareState) error {
+	return writeRuntimeFile(filepath.Join(state.controlPath, runtimeInstructionsFile), []byte(state.instructions), 0o440)
+}
+
+// writeRuntimeSecrets snapshots the daemon's provider allowlist env into the
+// run's immutable secrets file so the launcher can expose them inside the
+// container without the daemon ever serializing them into the container
+// environment (which `docker inspect` would reveal).
+func writeRuntimeSecrets(state *runtimePrepareState) error {
+	secrets := make(map[string]string, len(state.controller.config.Runtime.ProviderEnvAllowlist))
+	for _, name := range state.controller.config.Runtime.ProviderEnvAllowlist {
+		if value, ok := os.LookupEnv(name); ok {
+			secrets[name] = value
+		}
+	}
+	raw, err := serializeRunSecretsFile(secrets)
+	if err != nil {
+		return err
+	}
+	return writeRuntimeFile(filepath.Join(state.controlPath, runtimeSecretsFile), raw, 0o440)
+}
+
+// writeRuntimeLaunch installs the entrypoint that sources the run's secrets
+// file (auto-exporting its validated variables) and then execs the adapter's
+// real command, so the container entrypoint stays under CoordPlane control
+// and adoption can verify it.
+func writeRuntimeLaunch(state *runtimePrepareState) error {
+	return writeRuntimeFile(filepath.Join(state.controlPath, runtimeLaunchFile), []byte(runtimeLaunchScript), 0o550)
+}
+
 func openRuntimeControl(state *runtimePrepareState) error {
 	control, err := state.controller.openRunControl(state.run, state.controlPath)
 	if err != nil {
@@ -403,6 +448,12 @@ func createRuntimeContainer(state *runtimePrepareState) error {
 	launchSpec := adapter.LaunchSpec{
 		BootstrapPath: adapter.ContainerBootstrapPath, Conversation: state.launch.Task.Kind == core.TaskConversation,
 		ContainerHome: "/home/agent", ContainerWork: containerWorkingDirectory(state.launch.Task.Kind),
+		Provider: adapter.ProviderConfig{
+			Model:         state.launch.Agent.Model,
+			SubagentModel: state.launch.Agent.SubagentModel,
+			BaseURL:       state.launch.Agent.BaseURL,
+			Effort:        state.launch.Agent.Effort,
+		},
 	}
 	var command adapter.CommandSpec
 	var err error
@@ -461,7 +512,10 @@ func startRuntimeCLI(state *runtimePrepareState) error {
 }
 
 func verifyRuntimeLive(state *runtimePrepareState) error {
-	monitor := state.controller.newMonitor(state.run, state.ref, state.entry, state.control)
+	monitor, err := state.controller.newMonitor(state.run, state.ref, state.entry, state.control)
+	if err != nil {
+		return err
+	}
 	if err := state.controller.registerMonitor(monitor); err != nil {
 		_ = monitor.cancelAndCollectLogs(time.Second)
 		return err
@@ -551,19 +605,11 @@ func (c *runtimeController) selectLaunchMode(
 	launch core.RunLaunchContext,
 	entry adapter.CLI,
 	workspacePath string,
-) (mode, resumedFrom, session string) {
-	if !entry.Metadata().SupportsResume {
-		return "start", "", ""
-	}
+	currentFingerprint string,
+) core.LaunchModeSelection {
 	previous, err := c.service.LatestTerminalRun(ctx, launch.Task.ID, launch.Agent.ID)
-	if err != nil || previous.AdapterID != launch.Run.AdapterID {
-		return "start", "", ""
-	}
-	if previous.RuntimeErrorCode == string(core.CodeResumeUnavailable) {
-		return "start", previous.ID, ""
-	}
-	if previous.NativeSessionID == "" {
-		return "start", "", ""
+	if err != nil {
+		previous = core.Run{}
 	}
 	workspaceID := workspacePath
 	if launch.Task.Kind == core.TaskConversation {
@@ -573,14 +619,21 @@ func (c *runtimeController) selectLaunchMode(
 	if launch.Task.Kind == core.TaskConversation {
 		previousWorkspace = "conversation"
 	}
-	compatible := entry.ResumeCompatible(
-		adapter.SessionContext{AdapterID: previous.AdapterID, AgentID: previous.AgentID, TaskID: previous.TaskID, WorkspaceID: previousWorkspace},
-		adapter.SessionContext{AdapterID: launch.Run.AdapterID, AgentID: launch.Run.AgentID, TaskID: launch.Run.TaskID, WorkspaceID: workspaceID},
-	)
-	if !compatible {
-		return "start", "", ""
-	}
-	return "resume", previous.ID, previous.NativeSessionID
+	return core.SelectLaunchMode(core.ResumePolicy{
+		SupportsResume: entry.Metadata().SupportsResume,
+		Compatible: func(previous, next core.LaunchSessionContext) bool {
+			return entry.ResumeCompatible(
+				adapter.SessionContext{AdapterID: previous.AdapterID, AgentID: previous.AgentID, TaskID: previous.TaskID, WorkspaceID: previous.WorkspaceID},
+				adapter.SessionContext{AdapterID: next.AdapterID, AgentID: next.AgentID, TaskID: next.TaskID, WorkspaceID: next.WorkspaceID},
+			)
+		},
+	}, previous, core.LaunchSessionContext{
+		AdapterID: previous.AdapterID, AgentID: previous.AgentID,
+		TaskID: previous.TaskID, WorkspaceID: previousWorkspace,
+	}, core.LaunchSessionContext{
+		AdapterID: launch.Run.AdapterID, AgentID: launch.Run.AgentID,
+		TaskID: launch.Run.TaskID, WorkspaceID: workspaceID,
+	}, currentFingerprint)
 }
 
 func (c *runtimeController) containerSpec(
@@ -601,17 +654,13 @@ func (c *runtimeController) containerSpec(
 	if err != nil {
 		return containerruntime.ContainerSpec{}, err
 	}
-	env := make(map[string]string, len(command.Env)+2+len(c.config.Runtime.ProviderEnvAllowlist))
-	for _, key := range c.config.Runtime.ProviderEnvAllowlist {
-		if value, ok := os.LookupEnv(key); ok {
-			env[key] = value
-		}
-	}
+	env := make(map[string]string, len(command.Env)+3)
 	for key, value := range command.Env {
 		env[key] = value
 	}
 	env["COORDPLANE_RUN_SOCKET"] = "/run/coordplane/api.sock"
 	env["COORDPLANE_RUN_TOKEN_FILE"] = "/run/coordplane/token"
+	env["COORDPLANE_SECRETS_FILE"] = "/run/coordplane/secrets"
 	mounts := []containerruntime.Mount{
 		{Source: run.HomePath, Target: "/home/agent"},
 		{Source: coordlink, Target: "/usr/local/bin/coordlink", ReadOnly: true},
@@ -623,7 +672,11 @@ func (c *runtimeController) containerSpec(
 	gid := strconv.Itoa(os.Getgid())
 	return containerruntime.ContainerSpec{
 		Ref: runtimeRef(run), Image: run.Image,
-		Command:          containerruntime.CommandSpec{Executable: command.Executable, Args: command.Args, Env: env},
+		Command: containerruntime.CommandSpec{
+			Executable: runtimeLaunchExecutable,
+			Args:       append([]string{command.Executable}, command.Args...),
+			Env:        env,
+		},
 		SensitiveEnvKeys: append([]string(nil), c.config.Runtime.ProviderEnvAllowlist...),
 		WorkingDir:       containerWorkingDirectory(kind), User: strconv.Itoa(runtimeContainerUID) + ":" + gid,
 		GroupAdd: []string{gid}, Network: c.config.Runtime.DockerNetwork,

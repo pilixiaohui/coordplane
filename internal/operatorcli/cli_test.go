@@ -61,10 +61,21 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 			input: actionRequest{RequestID: "req-project-archive"}, outputHas: `"id":"project-1"`,
 		},
 		{
+			name:   "project delete",
+			args:   []string{"project", "delete", "project-1", "--reason", "retired", "--request-id", "req-project-delete", "--output", "json"},
+			method: http.MethodPost, path: "/v1/projects/project-1/delete",
+			input:     core.ProjectDeleteInput{Reason: "retired", RequestID: "req-project-delete"},
+			outputHas: `"ok":true`,
+		},
+		{
 			name:   "agent add",
-			args:   []string{"agent", "add", "--id", "agent-1", "--display-name", "Agent One", "--adapter", "claude", "--image", "coordplane:test", "--instructions-file", "/instructions/one.md", "--request-id", "req-agent-add", "--output", "json"},
+			args:   []string{"agent", "add", "--id", "agent-1", "--display-name", "Agent One", "--adapter", "claude", "--image", "coordplane:test", "--instructions-text", "inline prompt", "--model", "model-a", "--subagent-model", "subagent-a", "--base-url", "https://example.invalid/v1", "--effort", "medium", "--request-id", "req-agent-add", "--output", "json"},
 			method: http.MethodPost, path: "/v1/agents",
-			input:     core.AddAgentInput{ID: "agent-1", DisplayName: "Agent One", AdapterID: "claude", Image: "coordplane:test", InstructionsFile: "/instructions/one.md", RequestID: "req-agent-add"},
+			input: core.AddAgentInput{
+				ID: "agent-1", DisplayName: "Agent One", AdapterID: "claude", Image: "coordplane:test",
+				InstructionsText: "inline prompt", Model: "model-a", SubagentModel: "subagent-a",
+				BaseURL: "https://example.invalid/v1", Effort: "medium", RequestID: "req-agent-add",
+			},
 			outputHas: `"id":"agent-1"`,
 		},
 		{
@@ -144,9 +155,9 @@ func TestFixedClientCommandsUseOperatorRoutes(t *testing.T) {
 		},
 		{
 			name:   "task create",
-			args:   []string{"task", "create", "--project", "project-1", "--kind", "work", "--agent", "agent-1", "--title", "Implement", "--description", "Do the work", "--priority", "7", "--max-retries", "3", "--source-task", "task-source", "--retry-of", "task-closed", "--ack-message", "message-1", "--request-id", "req-task-create", "--output", "json"},
+			args:   []string{"task", "create", "--project", "project-1", "--kind", "work", "--agent", "agent-1", "--title", "Implement", "--description", "Do the work", "--priority", "7", "--max-retries", "3", "--budget", "3600", "--source-task", "task-source", "--retry-of", "task-closed", "--ack-message", "message-1", "--request-id", "req-task-create", "--output", "json"},
 			method: http.MethodPost, path: "/v1/tasks",
-			input:     core.CreateTaskInput{ProjectID: "project-1", Kind: core.TaskWork, AssigneeAgentID: "agent-1", Title: "Implement", Description: "Do the work", Priority: 7, MaxRetries: 3, SourceTaskID: "task-source", RetryOfTaskID: "task-closed", AckMessageIDs: []string{"message-1"}, RequestID: "req-task-create"},
+			input:     core.CreateTaskInput{ProjectID: "project-1", Kind: core.TaskWork, AssigneeAgentID: "agent-1", Title: "Implement", Description: "Do the work", Priority: 7, MaxRetries: 3, BudgetSeconds: 3600, SourceTaskID: "task-source", RetryOfTaskID: "task-closed", AckMessageIDs: []string{"message-1"}, RequestID: "req-task-create"},
 			outputHas: `"id":"task-1"`,
 		},
 		{
@@ -480,6 +491,118 @@ func TestStatusAndShowCommandsKeepActualTruthProjection(t *testing.T) {
 		})
 	}
 }
+
+func TestAgentUpdateFetchesCurrentAndOverlaysOnlyExplicitFlags(t *testing.T) {
+	current := core.Agent{
+		ID: "agent-1", DisplayName: "Agent One", AdapterID: "claude", Image: "agent:latest",
+		InstructionsFile: "/instructions/one.md", Model: "model-current",
+		SubagentModel: "subagent-current", BaseURL: "https://example.invalid/v1",
+		Effort: "medium", Status: core.AgentActive, Version: 12,
+	}
+	tests := []struct {
+		name       string
+		args       []string
+		wantInput  core.UpdateAgentInput
+		wantMethod []string
+		wantPath   []string
+	}{
+		{
+			name: "omitted flags preserve current configuration",
+			args: []string{"agent", "update", "agent-1", "--request-id", "req-update", "--output", "json"},
+			wantInput: core.UpdateAgentInput{
+				ID: "agent-1", Version: 12, RequestID: "req-update",
+				AgentConfigInput: core.AgentConfigInput{
+					DisplayName: "Agent One", AdapterID: "claude", Image: "agent:latest",
+					InstructionsFile: "/instructions/one.md", Model: "model-current",
+					SubagentModel: "subagent-current", BaseURL: "https://example.invalid/v1", Effort: "medium",
+				},
+			},
+		},
+		{
+			name: "explicit empty value clears a nullable field",
+			args: []string{"agent", "update", "agent-1", "--model=", "--request-id", "req-clear", "--output", "json"},
+			wantInput: core.UpdateAgentInput{
+				ID: "agent-1", Version: 12, RequestID: "req-clear",
+				AgentConfigInput: core.AgentConfigInput{
+					DisplayName: "Agent One", AdapterID: "claude", Image: "agent:latest",
+					InstructionsFile: "/instructions/one.md", SubagentModel: "subagent-current",
+					BaseURL: "https://example.invalid/v1", Effort: "medium",
+				},
+			},
+		},
+		{
+			name: "explicit flags overlay all config fields and version",
+			args: []string{
+				"agent", "update", "agent-1", "--display-name", "Renamed", "--adapter", "codex",
+				"--image", "codex:latest", "--instructions-file=", "--instructions-text", "inline prompt",
+				"--model", "gpt-5", "--subagent-model", "gpt-5-mini", "--base-url", "https://codex.invalid",
+				"--effort", "high", "--version", "99", "--request-id", "req-full", "--output", "json",
+			},
+			wantInput: core.UpdateAgentInput{
+				ID: "agent-1", Version: 99, RequestID: "req-full",
+				AgentConfigInput: core.AgentConfigInput{
+					DisplayName: "Renamed", AdapterID: "codex", Image: "codex:latest",
+					InstructionsFile: "", InstructionsText: "inline prompt", Model: "gpt-5",
+					SubagentModel: "gpt-5-mini", BaseURL: "https://codex.invalid", Effort: "high",
+				},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &agentUpdateClient{current: current, updated: current}
+			var stdout, stderr bytes.Buffer
+			code := run(context.Background(), test.args, socketEnv("/tmp/operator.sock"), &stdout, &stderr, func(string, string) (jsonClient, error) {
+				return client, nil
+			}, nil)
+			if code != 0 {
+				t.Fatalf("code=%d stderr=%s", code, stderr.String())
+			}
+			if len(client.calls) != 2 ||
+				client.calls[0].method != http.MethodGet || client.calls[0].path != "/v1/agents/agent-1" ||
+				client.calls[1].method != http.MethodPut || client.calls[1].path != "/v1/agents/agent-1" {
+				t.Fatalf("update calls = %+v", client.calls)
+			}
+			if input, ok := client.calls[1].input.(core.UpdateAgentInput); !ok || !reflect.DeepEqual(input, test.wantInput) {
+				t.Fatalf("PUT input = %#v, want %#v", client.calls[1].input, test.wantInput)
+			}
+			if !strings.Contains(stdout.String(), `"id":"agent-1"`) {
+				t.Fatalf("stdout = %s", stdout.String())
+			}
+		})
+	}
+}
+
+type agentUpdateClient struct {
+	calls []struct {
+		method string
+		path   string
+		input  any
+	}
+	current core.Agent
+	updated core.Agent
+	closed  int
+}
+
+func (c *agentUpdateClient) JSON(_ context.Context, method, path string, input, output any) error {
+	c.calls = append(c.calls, struct {
+		method string
+		path   string
+		input  any
+	}{method: method, path: path, input: input})
+	if method == http.MethodGet {
+		if target, ok := output.(*core.Agent); ok {
+			*target = c.current
+		}
+		return nil
+	}
+	if target, ok := output.(*core.Agent); ok {
+		*target = c.updated
+	}
+	return nil
+}
+
+func (c *agentUpdateClient) CloseIdleConnections() { c.closed++ }
 
 func TestVersionDoesNotInitializeDaemonOrClient(t *testing.T) {
 	var stdout, stderr bytes.Buffer

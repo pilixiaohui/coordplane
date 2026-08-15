@@ -70,6 +70,18 @@ func canonicalSchemaObjects(ctx context.Context, version int) (map[string]schema
 			}
 		}
 	}
+	if version >= 5 {
+		if _, err := db.ExecContext(ctx, budgetSecondsMigrationSQL); err != nil {
+			return nil, err
+		}
+	}
+	if version >= 7 {
+		for _, statement := range splitStatements(agentRuntimeConfigMigrationSQL) {
+			if _, err := db.ExecContext(ctx, statement); err != nil {
+				return nil, err
+			}
+		}
+	}
 	return readSchemaObjects(ctx, db)
 }
 
@@ -168,7 +180,25 @@ func (s *Store) validateMigrationHistory(ctx context.Context, version int) error
 		want = append(want, struct {
 			version int
 			name    string
-		}{schemaVersion, schemaName})
+		}{4, schemaName})
+	}
+	if version >= 5 {
+		want = append(want, struct {
+			version int
+			name    string
+		}{5, budgetSecondsMigrationName})
+	}
+	if version >= 6 {
+		want = append(want, struct {
+			version int
+			name    string
+		}{6, projectDeleteCapabilityMigrationName})
+	}
+	if version >= 7 {
+		want = append(want, struct {
+			version int
+			name    string
+		}{7, agentRuntimeConfigMigrationName})
 	}
 	if len(history) != len(want) {
 		return legacySchemaError("legacy database migration history requires backup and a new data_dir", nil)

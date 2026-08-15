@@ -25,9 +25,7 @@ func TestCT03StaleRunCannotWriteThroughAgentEntry(t *testing.T) {
 	h := newHarness(t)
 	agent := h.addAgent(t, "fenced-agent")
 	project := h.addProject(t, "fenced-project", "")
-	if _, err := h.service.Chat(context.Background(), core.ChatInput{
-		ProjectID: project.ID, AgentID: agent.ID, Body: "run", Wake: true, RequestID: "fence-chat",
-	}); err != nil {
+	if _, err := h.service.Chat(context.Background(), core.ChatInput{ProjectID: project.ID, AgentID: agent.ID, Body: "run", Wake: true, RequestID: "fence-chat"}); err != nil {
 		t.Fatal(err)
 	}
 	run1, ok, err := h.service.ClaimNext(context.Background(), project.ID)
@@ -94,15 +92,9 @@ func TestAgentMessageReplyCannotCrossProject(t *testing.T) {
 	agent := h.addAgent(t, "reply-agent")
 	firstProject := h.addProject(t, "reply-project-one", "")
 	secondProject := h.addProject(t, "reply-project-two", "")
-	foreign, err := h.service.Chat(context.Background(), core.ChatInput{
-		ProjectID: secondProject.ID, AgentID: agent.ID, Body: "foreign",
-		Wake: false, RequestID: "foreign-message",
-	})
+	foreign, err := h.service.Chat(context.Background(), core.ChatInput{ProjectID: secondProject.ID, AgentID: agent.ID, Body: "foreign", Wake: false, RequestID: "foreign-message"})
 	requireNoError(t, err)
-	if _, err := h.service.Chat(context.Background(), core.ChatInput{
-		ProjectID: firstProject.ID, AgentID: agent.ID, Body: "current",
-		Wake: true, RequestID: "current-message",
-	}); err != nil {
+	if _, err := h.service.Chat(context.Background(), core.ChatInput{ProjectID: firstProject.ID, AgentID: agent.ID, Body: "current", Wake: true, RequestID: "current-message"}); err != nil {
 		t.Fatal(err)
 	}
 	claim, ok, err := h.service.ClaimNext(context.Background(), firstProject.ID)
@@ -114,10 +106,7 @@ func TestAgentMessageReplyCannotCrossProject(t *testing.T) {
 	}
 	beforeFirst := durableSignature(t, h.database, firstProject.ID)
 	beforeSecond := durableSignature(t, h.database, secondProject.ID)
-	_, err = h.service.SendAgentMessage(context.Background(), core.SendMessageInput{
-		Token: claim.Token, RecipientKind: "boss", Body: "invalid reply", ReplyTo: foreign.Message.ID,
-		RequestID: "cross-project-reply",
-	})
+	_, err = h.service.SendAgentMessage(context.Background(), core.SendMessageInput{Token: claim.Token, RecipientKind: "boss", Body: "invalid reply", ReplyTo: foreign.Message.ID, RequestID: "cross-project-reply"})
 	if !core.IsCode(err, core.CodeScopeDenied) {
 		t.Fatalf("cross-project reply error = %v, want SCOPE_DENIED", err)
 	}
@@ -131,20 +120,11 @@ func TestAgentMessageRelatedTaskCannotEscapeRunScope(t *testing.T) {
 	other := h.addAgent(t, "related-other")
 	project := h.addProject(t, "related-project", "")
 	foreignProject := h.addProject(t, "related-foreign-project", "")
-	current, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
-		ProjectID: project.ID, AssigneeAgentID: sender.ID, Kind: core.TaskWork,
-		Title: "current", Priority: 100, RequestID: "related-current",
-	})
+	current, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{ProjectID: project.ID, AssigneeAgentID: sender.ID, Kind: core.TaskWork, Title: "current", Priority: 100, RequestID: "related-current"})
 	requireNoError(t, err)
-	unrelated, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
-		ProjectID: project.ID, AssigneeAgentID: other.ID, Kind: core.TaskWork,
-		Title: "unrelated", RequestID: "related-unrelated",
-	})
+	unrelated, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{ProjectID: project.ID, AssigneeAgentID: other.ID, Kind: core.TaskWork, Title: "unrelated", RequestID: "related-unrelated"})
 	requireNoError(t, err)
-	foreign, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
-		ProjectID: foreignProject.ID, AssigneeAgentID: other.ID, Kind: core.TaskWork,
-		Title: "foreign", RequestID: "related-foreign",
-	})
+	foreign, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{ProjectID: foreignProject.ID, AssigneeAgentID: other.ID, Kind: core.TaskWork, Title: "foreign", RequestID: "related-foreign"})
 	requireNoError(t, err)
 	claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 	if err != nil || !ok || claim.Task.ID != current.ID {
@@ -157,10 +137,7 @@ func TestAgentMessageRelatedTaskCannotEscapeRunScope(t *testing.T) {
 	for _, candidate := range []core.Task{unrelated, foreign} {
 		beforeProject := durableSignature(t, h.database, project.ID)
 		beforeForeign := durableSignature(t, h.database, foreignProject.ID)
-		_, err := h.service.SendAgentMessage(context.Background(), core.SendMessageInput{
-			Token: claim.Token, RecipientKind: "boss", RelatedTaskID: candidate.ID,
-			Body: "out-of-scope association", RequestID: "related-denied-" + candidate.ID,
-		})
+		_, err := h.service.SendAgentMessage(context.Background(), core.SendMessageInput{Token: claim.Token, RecipientKind: "boss", RelatedTaskID: candidate.ID, Body: "out-of-scope association", RequestID: "related-denied-" + candidate.ID})
 		if !core.IsCode(err, core.CodeScopeDenied) {
 			t.Fatalf("related task %s error = %v, want SCOPE_DENIED", candidate.ID, err)
 		}
@@ -168,16 +145,10 @@ func TestAgentMessageRelatedTaskCannotEscapeRunScope(t *testing.T) {
 		h.requireDurableSignature(t, foreignProject.ID, beforeForeign)
 	}
 
-	privateMessage, err := h.service.SendBossMessage(context.Background(), core.BossMessageInput{
-		ProjectID: project.ID, AgentID: other.ID, TaskID: unrelated.ID,
-		Body: "private context", RequestID: "related-private-message",
-	})
+	privateMessage, err := h.service.SendBossMessage(context.Background(), core.BossMessageInput{ProjectID: project.ID, AgentID: other.ID, TaskID: unrelated.ID, Body: "private context", RequestID: "related-private-message"})
 	requireNoError(t, err)
 	beforeProject := durableSignature(t, h.database, project.ID)
-	_, err = h.service.SendAgentMessage(context.Background(), core.SendMessageInput{
-		Token: claim.Token, RecipientKind: "boss", ReplyTo: privateMessage.ID,
-		Body: "out-of-scope reply", RequestID: "related-private-reply-denied",
-	})
+	_, err = h.service.SendAgentMessage(context.Background(), core.SendMessageInput{Token: claim.Token, RecipientKind: "boss", ReplyTo: privateMessage.ID, Body: "out-of-scope reply", RequestID: "related-private-reply-denied"})
 	if !core.IsCode(err, core.CodeScopeDenied) {
 		t.Fatalf("private reply error = %v, want SCOPE_DENIED", err)
 	}
@@ -188,13 +159,9 @@ func TestCT07ConversationIsDurableReusedAndKindSafe(t *testing.T) {
 	h := newHarness(t)
 	agent := h.addAgent(t, "chat-agent")
 	project := h.addProject(t, "chat-project", "")
-	first, err := h.service.Chat(context.Background(), core.ChatInput{
-		ProjectID: project.ID, AgentID: agent.ID, Body: "first", Wake: false, RequestID: "chat-first",
-	})
+	first, err := h.service.Chat(context.Background(), core.ChatInput{ProjectID: project.ID, AgentID: agent.ID, Body: "first", Wake: false, RequestID: "chat-first"})
 	requireNoError(t, err)
-	second, err := h.service.Chat(context.Background(), core.ChatInput{
-		ProjectID: project.ID, AgentID: agent.ID, Body: "second", Wake: false, RequestID: "chat-second",
-	})
+	second, err := h.service.Chat(context.Background(), core.ChatInput{ProjectID: project.ID, AgentID: agent.ID, Body: "second", Wake: false, RequestID: "chat-second"})
 	requireNoError(t, err)
 	if first.Task.ID != second.Task.ID || first.Task.Kind != core.TaskConversation {
 		t.Fatalf("conversation was not reused: first=%#v second=%#v", first.Task, second.Task)
@@ -203,9 +170,7 @@ func TestCT07ConversationIsDurableReusedAndKindSafe(t *testing.T) {
 		t.Fatalf("wake=false conversation status = %s", first.Task.Status)
 	}
 	eventsBefore, _ := h.database.Events(context.Background(), core.EventFilter{ProjectID: project.ID})
-	replayed, err := h.service.Chat(context.Background(), core.ChatInput{
-		ProjectID: project.ID, AgentID: agent.ID, Body: "second", Wake: false, RequestID: "chat-second",
-	})
+	replayed, err := h.service.Chat(context.Background(), core.ChatInput{ProjectID: project.ID, AgentID: agent.ID, Body: "second", Wake: false, RequestID: "chat-second"})
 	requireNoError(t, err)
 	if replayed.Message.ID != second.Message.ID {
 		t.Fatalf("idempotent replay returned message %s, want %s", replayed.Message.ID, second.Message.ID)
@@ -215,15 +180,11 @@ func TestCT07ConversationIsDurableReusedAndKindSafe(t *testing.T) {
 		t.Fatal("idempotent chat replay emitted another event")
 	}
 	beforeConflict := durableSignature(t, h.database, project.ID)
-	if _, err := h.service.Chat(context.Background(), core.ChatInput{
-		ProjectID: project.ID, AgentID: agent.ID, Body: "different body", Wake: true, RequestID: "chat-second",
-	}); !core.IsCode(err, core.CodeVersionConflict) {
+	if _, err := h.service.Chat(context.Background(), core.ChatInput{ProjectID: project.ID, AgentID: agent.ID, Body: "different body", Wake: true, RequestID: "chat-second"}); !core.IsCode(err, core.CodeVersionConflict) {
 		t.Fatalf("conflicting idempotency replay error = %v, want VERSION_CONFLICT", err)
 	}
 	h.requireDurableSignature(t, project.ID, beforeConflict)
-	work, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
-		ProjectID: project.ID, AssigneeAgentID: agent.ID, Title: "work", Kind: core.TaskWork, RequestID: "chat-work",
-	})
+	work, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{ProjectID: project.ID, AssigneeAgentID: agent.ID, Title: "work", Kind: core.TaskWork, RequestID: "chat-work"})
 	requireNoError(t, err)
 	before := durableSignature(t, h.database, project.ID)
 	if _, err := h.service.CloseConversation(context.Background(), work.ID, "close-work"); !core.IsCode(err, core.CodeInvalidState) {
@@ -255,10 +216,7 @@ func TestCT07LegacyBossMessageDedupesSurviveSQLiteReopen(t *testing.T) {
 		{
 			name: "chat", operation: "chat.send",
 			setup: func(t *testing.T, h *harness, project core.Project, agent core.Agent) (core.Task, core.Message) {
-				result, err := h.service.Chat(context.Background(), core.ChatInput{
-					ProjectID: project.ID, AgentID: agent.ID, Body: "legacy chat", Wake: true,
-					RequestID: "legacy-chat-setup",
-				})
+				result, err := h.service.Chat(context.Background(), core.ChatInput{ProjectID: project.ID, AgentID: agent.ID, Body: "legacy chat", Wake: true, RequestID: "legacy-chat-setup"})
 				requireNoError(t, err)
 				return result.Task, result.Message
 			},
@@ -269,24 +227,16 @@ func TestCT07LegacyBossMessageDedupesSurviveSQLiteReopen(t *testing.T) {
 				}{project.ID, agent.ID, "legacy chat", "", "", "", true})
 			},
 			replay: func(ctx context.Context, service *core.Service, project core.Project, agent core.Agent, _ core.Task, requestID, body string) (core.Task, core.Message, error) {
-				result, err := service.Chat(ctx, core.ChatInput{
-					ProjectID: project.ID, AgentID: agent.ID, Body: body, Wake: true, RequestID: requestID,
-				})
+				result, err := service.Chat(ctx, core.ChatInput{ProjectID: project.ID, AgentID: agent.ID, Body: body, Wake: true, RequestID: requestID})
 				return result.Task, result.Message, err
 			},
 		},
 		{
 			name: "message", operation: "message.send",
 			setup: func(t *testing.T, h *harness, project core.Project, agent core.Agent) (core.Task, core.Message) {
-				task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
-					ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
-					Title: "legacy message task", RequestID: "legacy-message-task",
-				})
+				task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork, Title: "legacy message task", RequestID: "legacy-message-task"})
 				requireNoError(t, err)
-				message, err := h.service.SendBossMessage(context.Background(), core.BossMessageInput{
-					ProjectID: project.ID, AgentID: agent.ID, TaskID: task.ID, Body: "legacy message",
-					Wake: true, RequestID: "legacy-message-setup",
-				})
+				message, err := h.service.SendBossMessage(context.Background(), core.BossMessageInput{ProjectID: project.ID, AgentID: agent.ID, TaskID: task.ID, Body: "legacy message", Wake: true, RequestID: "legacy-message-setup"})
 				requireNoError(t, err)
 				return task, message
 			},
@@ -297,10 +247,7 @@ func TestCT07LegacyBossMessageDedupesSurviveSQLiteReopen(t *testing.T) {
 				}{project.ID, agent.ID, task.ID, "", "legacy message", "", "", true})
 			},
 			replay: func(ctx context.Context, service *core.Service, project core.Project, agent core.Agent, task core.Task, requestID, body string) (core.Task, core.Message, error) {
-				message, err := service.SendBossMessage(ctx, core.BossMessageInput{
-					ProjectID: project.ID, AgentID: agent.ID, TaskID: task.ID, Body: body,
-					Wake: true, RequestID: requestID,
-				})
+				message, err := service.SendBossMessage(ctx, core.BossMessageInput{ProjectID: project.ID, AgentID: agent.ID, TaskID: task.ID, Body: body, Wake: true, RequestID: requestID})
 				return task, message, err
 			},
 		},
@@ -331,9 +278,7 @@ func TestCT07LegacyBossMessageDedupesSurviveSQLiteReopen(t *testing.T) {
 			requireNoError(t, h.database.Close())
 			h.database, err = store.Open(context.Background(), h.path)
 			requireNoError(t, err)
-			h.service, err = core.NewService(h.database, h.git, core.ServiceOptions{
-				Now: h.clock.Now, NewID: h.ids.New, MaxParallelRuns: 4, AdapterIDs: []string{"one-shot"},
-			})
+			h.service, err = core.NewService(h.database, h.git, core.ServiceOptions{Now: h.clock.Now, NewID: h.ids.New, MaxParallelRuns: 4, AdapterIDs: []string{"one-shot"}})
 			requireNoError(t, err)
 			before := durableSignature(t, h.database, project.ID)
 			replayedTask, replayedMessage, err := test.replay(context.Background(), h.service, project, agent, task, requestID, message.Body)
@@ -364,10 +309,7 @@ func TestCT07KindErrorsRemainStableWhileTaskIsFinishing(t *testing.T) {
 		agent := h.addAgent(t, "finishing-work-kind-agent")
 		project := h.addProject(t, "finishing-work-kind-project", "")
 		claim := createActiveWorkClaim(t, h, project, agent, "finishing-work-kind")
-		if _, err := h.service.RequestOutcome(context.Background(), core.OutcomeInput{
-			Token: claim.Token, Outcome: core.OutcomeWait, Reason: "finishing",
-			RequestID: "finishing-work-kind-wait",
-		}); err != nil {
+		if _, err := h.service.RequestOutcome(context.Background(), core.OutcomeInput{Token: claim.Token, Outcome: core.OutcomeWait, Reason: "finishing", RequestID: "finishing-work-kind-wait"}); err != nil {
 			t.Fatal(err)
 		}
 		before := durableSignature(t, h.database, project.ID)
@@ -381,10 +323,7 @@ func TestCT07KindErrorsRemainStableWhileTaskIsFinishing(t *testing.T) {
 		h := newHarness(t)
 		agent := h.addAgent(t, "finishing-conversation-kind-agent")
 		project := h.addProject(t, "finishing-conversation-kind-project", "")
-		chat, err := h.service.Chat(context.Background(), core.ChatInput{
-			ProjectID: project.ID, AgentID: agent.ID, Body: "start", Wake: true,
-			RequestID: "finishing-conversation-kind-chat",
-		})
+		chat, err := h.service.Chat(context.Background(), core.ChatInput{ProjectID: project.ID, AgentID: agent.ID, Body: "start", Wake: true, RequestID: "finishing-conversation-kind-chat"})
 		requireNoError(t, err)
 		claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 		if err != nil || !ok || claim.Task.ID != chat.Task.ID {
@@ -393,10 +332,7 @@ func TestCT07KindErrorsRemainStableWhileTaskIsFinishing(t *testing.T) {
 		if _, err := activateRun(t, h, context.Background(), claim.Run.ID, "finishing-conversation-kind-active"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := h.service.RequestOutcome(context.Background(), core.OutcomeInput{
-			Token: claim.Token, Outcome: core.OutcomeWait, Reason: "finishing",
-			RequestID: "finishing-conversation-kind-wait",
-		}); err != nil {
+		if _, err := h.service.RequestOutcome(context.Background(), core.OutcomeInput{Token: claim.Token, Outcome: core.OutcomeWait, Reason: "finishing", RequestID: "finishing-conversation-kind-wait"}); err != nil {
 			t.Fatal(err)
 		}
 		for _, action := range []struct {
@@ -425,9 +361,7 @@ func TestCT09ConversationCloseDisposesMessagesBeforeArchive(t *testing.T) {
 	h := newHarness(t)
 	agent := h.addAgent(t, "closing-agent")
 	project := h.addProject(t, "closing-project", agent.ID)
-	chat, err := h.service.Chat(context.Background(), core.ChatInput{
-		ProjectID: project.ID, AgentID: agent.ID, Body: "do not orphan me", Wake: false, RequestID: "closing-chat",
-	})
+	chat, err := h.service.Chat(context.Background(), core.ChatInput{ProjectID: project.ID, AgentID: agent.ID, Body: "do not orphan me", Wake: false, RequestID: "closing-chat"})
 	requireNoError(t, err)
 	if _, err := h.service.CloseConversation(context.Background(), chat.Task.ID, "close-conversation"); err != nil {
 		t.Fatal(err)
@@ -531,9 +465,7 @@ func TestCT09LifecycleGuardsAndRepair(t *testing.T) {
 	t.Run("failed repair replay remains a stable failure", func(t *testing.T) {
 		h := newHarness(t)
 		h.git.initializeErr = errors.New("initial registration failure")
-		project, err := h.service.AddProject(context.Background(), core.AddProjectInput{
-			Name: "repair-failure", Source: "/source", SourceRef: "refs/heads/main", RequestID: "repair-failure-add",
-		})
+		project, err := h.service.AddProject(context.Background(), core.AddProjectInput{Name: "repair-failure", Source: "/source", SourceRef: "refs/heads/main", RequestID: "repair-failure-add"})
 		if !core.IsCode(err, core.CodeGitInvariantViolation) {
 			t.Fatalf("registration error = %v", err)
 		}
@@ -553,10 +485,7 @@ func TestP1MutationsEmitCanonicalEvents(t *testing.T) {
 	h := newHarness(t)
 	agent := h.addAgent(t, "event-agent")
 	project := h.addProject(t, "event-project", agent.ID)
-	chat, err := h.service.Chat(context.Background(), core.ChatInput{
-		ProjectID: project.ID, AgentID: agent.ID, Body: "event coverage",
-		Wake: false, RequestID: "event-chat",
-	})
+	chat, err := h.service.Chat(context.Background(), core.ChatInput{ProjectID: project.ID, AgentID: agent.ID, Body: "event coverage", Wake: false, RequestID: "event-chat"})
 	requireNoError(t, err)
 	if _, err := h.service.SetAgentStatus(context.Background(), agent.ID, core.AgentPaused, "event-pause"); err != nil {
 		t.Fatal(err)
@@ -609,10 +538,7 @@ func TestStatusPropagatesPerItemTextTruncationFromSQLite(t *testing.T) {
 		{
 			name: "task title",
 			setup: func(t *testing.T, h *harness, project core.Project, agent core.Agent) string {
-				task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
-					ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
-					Title: strings.Repeat("title", 60), RequestID: "long-title-task",
-				})
+				task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork, Title: strings.Repeat("title", 60), RequestID: "long-title-task"})
 				requireNoError(t, err)
 				return task.ID
 			},
@@ -625,10 +551,7 @@ func TestStatusPropagatesPerItemTextTruncationFromSQLite(t *testing.T) {
 		{
 			name: "task failure",
 			setup: func(t *testing.T, h *harness, project core.Project, agent core.Agent) string {
-				task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
-					ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
-					Title: "failure task", RequestID: "long-failure-task",
-				})
+				task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork, Title: "failure task", RequestID: "long-failure-task"})
 				requireNoError(t, err)
 				claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 				if err != nil || !ok || claim.Task.ID != task.ID {
@@ -648,10 +571,7 @@ func TestStatusPropagatesPerItemTextTruncationFromSQLite(t *testing.T) {
 		{
 			name: "current run error",
 			setup: func(t *testing.T, h *harness, project core.Project, agent core.Agent) string {
-				task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
-					ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
-					Title: "current run task", RequestID: "long-current-run-task",
-				})
+				task, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork, Title: "current run task", RequestID: "long-current-run-task"})
 				requireNoError(t, err)
 				claim, ok, err := h.service.ClaimNext(context.Background(), project.ID)
 				if err != nil || !ok || claim.Task.ID != task.ID {
@@ -719,15 +639,10 @@ func TestQueuedTaskWithUnknownPersistedAdapterFailsClosed(t *testing.T) {
 	h := newHarness(t)
 	agent := h.addAgent(t, "persisted-adapter-agent")
 	project := h.addProject(t, "persisted-adapter-project", "")
-	if _, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{
-		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
-		Title: "must not be silently skipped", RequestID: "persisted-adapter-task",
-	}); err != nil {
+	if _, err := h.service.CreateTask(context.Background(), core.CreateTaskInput{ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork, Title: "must not be silently skipped", RequestID: "persisted-adapter-task"}); err != nil {
 		t.Fatal(err)
 	}
-	service, err := core.NewService(h.database, h.git, core.ServiceOptions{
-		Now: h.clock.Now, NewID: h.ids.New, MaxParallelRuns: 4, AdapterIDs: []string{"different-adapter"},
-	})
+	service, err := core.NewService(h.database, h.git, core.ServiceOptions{Now: h.clock.Now, NewID: h.ids.New, MaxParallelRuns: 4, AdapterIDs: []string{"different-adapter"}})
 	requireNoError(t, err)
 	before := durableSignature(t, h.database, project.ID)
 	if _, ok, err := service.ClaimNext(context.Background(), project.ID); ok || !core.IsCode(err, core.CodeRuntimeInvariantViolation) {
@@ -737,6 +652,10 @@ func TestQueuedTaskWithUnknownPersistedAdapterFailsClosed(t *testing.T) {
 }
 
 func newHarness(t *testing.T) *harness {
+	return newAdapterHarness(t, []string{"one-shot"})
+}
+
+func newAdapterHarness(t *testing.T, adapterIDs []string, adapters ...core.AdapterDescriptor) *harness {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "coordplane.db")
 	database, err := store.Open(context.Background(), path)
@@ -744,7 +663,7 @@ func newHarness(t *testing.T) *harness {
 	clock := &testClock{value: time.Date(2026, 7, 12, 1, 2, 3, 0, time.UTC)}
 	idSource := &testIDs{}
 	git := &fakeGit{sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
-	service, err := core.NewService(database, git, core.ServiceOptions{Now: clock.Now, NewID: idSource.New, MaxParallelRuns: 4, AdapterIDs: []string{"one-shot"}})
+	service, err := core.NewService(database, git, core.ServiceOptions{Now: clock.Now, NewID: idSource.New, MaxParallelRuns: 4, AdapterIDs: adapterIDs, Adapters: adapters})
 	requireNoError(t, err)
 	service.SetReady(true, "")
 	h := &harness{t: t, path: path, database: database, service: service, git: git, clock: clock, ids: idSource}
@@ -754,20 +673,14 @@ func newHarness(t *testing.T) *harness {
 
 func (h *harness) addAgent(t *testing.T, name string) core.Agent {
 	t.Helper()
-	agent, err := h.service.AddAgent(context.Background(), core.AddAgentInput{
-		DisplayName: name, AdapterID: "one-shot", Image: "agent:latest",
-		InstructionsFile: "/instructions/agent.md", RequestID: "add-agent-" + name,
-	})
+	agent, err := h.service.AddAgent(context.Background(), core.AddAgentInput{DisplayName: name, AdapterID: "one-shot", Image: "agent:latest", InstructionsText: "Work only on the assigned Task.", RequestID: "add-agent-" + name})
 	requireNoError(t, err)
 	return agent
 }
 
 func (h *harness) addProject(t *testing.T, name, integrator string) core.Project {
 	t.Helper()
-	project, err := h.service.AddProject(context.Background(), core.AddProjectInput{
-		Name: name, Source: "/source", SourceRef: "refs/heads/main",
-		IntegrationAgentID: integrator, RequestID: "add-project-" + name,
-	})
+	project, err := h.service.AddProject(context.Background(), core.AddProjectInput{Name: name, Source: "/source", SourceRef: "refs/heads/main", IntegrationAgentID: integrator, RequestID: "add-project-" + name})
 	requireNoError(t, err)
 	return project
 }
@@ -794,13 +707,29 @@ func prepareTestRun(t *testing.T, h *harness, ctx context.Context, runID, reques
 	if task.Kind != core.TaskConversation {
 		workspace = filepath.Join(root, "workspace")
 	}
+	launch, err := h.service.RuntimeLaunchContext(ctx, runID)
+	if err != nil {
+		return core.Run{}, err
+	}
 	return h.service.BeginRunLaunch(ctx, core.RunLaunchInput{
 		RunID: run.ID, Generation: run.Generation, LaunchNonce: "nonce-" + run.ID,
 		WorkspacePath: workspace, HomePath: filepath.Join(root, "home"),
-		LogPath: filepath.Join(root, "run.log"), InstructionsHash: "test-instructions",
-		LaunchMode: "start", CleanupOperationID: "cleanup-" + run.ID,
+		LogPath: filepath.Join(root, "run.log"), InstructionsHash: launch.InstructionsHash,
+		ConfigFingerprint: launch.ConfigFingerprint,
+		LaunchMode:        "start", CleanupOperationID: "cleanup-" + run.ID,
 		RequestID: requestID + "-prepare",
 	})
+}
+
+// launchFingerprint returns the claim-time InstructionsHash and
+// ConfigFingerprint that RuntimeLaunchContext computes for the Run, so
+// BeginRunLaunch callers can pass the exact snapshot the re-verification
+// expects instead of a placeholder.
+func launchFingerprint(t *testing.T, h *harness, runID string) (instructionsHash, fingerprint string) {
+	t.Helper()
+	launch, err := h.service.RuntimeLaunchContext(context.Background(), runID)
+	requireNoError(t, err)
+	return launch.InstructionsHash, launch.ConfigFingerprint
 }
 
 func activateRun(t *testing.T, h *harness, ctx context.Context, runID, requestID string) (core.Run, error) {
@@ -940,10 +869,20 @@ func (g *fakeGit) Capture(_ context.Context, intent core.GitCaptureIntent) (core
 	if g.captureErr != nil {
 		return core.GitCaptureFact{}, g.captureErr
 	}
-	return core.GitCaptureFact{
-		HeadSHA: intent.ExpectedHead,
-		TaskRef: "refs/coordplane/tasks/" + intent.TaskID + "/runs/" + intent.RunID,
-	}, nil
+	return core.GitCaptureFact{HeadSHA: intent.ExpectedHead, TaskRef: "refs/coordplane/tasks/" + intent.TaskID + "/runs/" + intent.RunID}, nil
+}
+
+func (g *fakeGit) ExpandHead(_ context.Context, intent core.GitExpandHeadIntent) (string, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	ref := intent.ExpectedHead
+	if _, err := hex.DecodeString(ref); err == nil && len(ref) == 40 {
+		return ref, nil
+	}
+	if ref != "" && strings.HasPrefix(g.sha, ref) {
+		return g.sha, nil
+	}
+	return "", fmt.Errorf("expected head %q does not resolve to a commit in the workspace", ref)
 }
 
 func (g *fakeGit) CleanupCapture(context.Context, core.GitCaptureIntent) error { return nil }
@@ -981,9 +920,7 @@ func (g *fakeGit) Checkout(_ context.Context, intent core.GitCheckoutIntent) (co
 }
 
 func (g *fakeGit) WorkspaceState(_ context.Context, intent core.GitWorkspaceStateIntent) (core.GitWorkspaceStateFact, error) {
-	return core.GitWorkspaceStateFact{
-		Exists: true, Fingerprint: "workspace-fingerprint", HeadSHA: intent.ExpectedHead, Clean: true,
-	}, nil
+	return core.GitWorkspaceStateFact{Exists: true, Fingerprint: "workspace-fingerprint", HeadSHA: intent.ExpectedHead, Clean: true}, nil
 }
 
 func (g *fakeGit) DiscardWorkspace(_ context.Context, intent core.GitDiscardWorkspaceIntent, authorize func() (bool, error)) (bool, error) {

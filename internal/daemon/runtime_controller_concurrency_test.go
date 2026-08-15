@@ -27,10 +27,7 @@ import (
 )
 
 func TestRunOperationOwnershipSerializesRuntimeSideEffects(t *testing.T) {
-	controller := &runtimeController{
-		monitors:      make(map[string]*runMonitor),
-		runOperations: make(map[string]*runOperation),
-	}
+	controller := &runtimeController{monitors: make(map[string]*runMonitor), runOperations: make(map[string]*runOperation)}
 	const contenders = 32
 	start := make(chan struct{})
 	winners := make(chan *runOperation, contenders)
@@ -113,16 +110,11 @@ func TestInspectHelperDiscardRetryReinspectsMutatedWorkspace(t *testing.T) {
 	executable := filepath.Join(root, "coordplane-git-helper")
 	requireNoError(t, os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o700))
 	executor := &staleInspectExecutor{head: head}
-	helper, err := newDockerCaptureHelper(executor, config.GitConfig{CaptureHelperImage: "helper", CaptureTimeout: 20 * time.Millisecond,
-		MaximumObjects: 100, MaximumBundleBytes: 1 << 20, MaximumHandoffBytes: 2 << 20}, filepath.Join(root, "handoff"), executable)
-	requireNoError(t, err)
-	manager, err := gitrepo.NewWorkspaceManager(fixture.initializer, filepath.Join(root, "retry-workspaces"), helper)
-	requireNoError(t, err)
+	helper := requireRuntimeValue(newDockerCaptureHelper(executor, config.GitConfig{CaptureHelperImage: "helper", CaptureTimeout: 20 * time.Millisecond, MaximumObjects: 100, MaximumBundleBytes: 1 << 20, MaximumHandoffBytes: 2 << 20}, filepath.Join(root, "handoff"), executable))
+	manager := requireRuntimeValue(gitrepo.NewWorkspaceManager(fixture.initializer, filepath.Join(root, "retry-workspaces"), helper))
 	spec := gitrepo.WorkspaceSpec{ProjectID: fixture.project.ID, TaskID: "task-inspect-retry", BaseSHA: head}
-	workspace, err := manager.Materialize(ctx, spec)
-	requireNoError(t, err)
-	preview, err := manager.State(ctx, spec, workspace.HeadSHA, 1)
-	requireNoError(t, err)
+	workspace := requireRuntimeValue(manager.Materialize(ctx, spec))
+	preview := requireRuntimeValue(manager.State(ctx, spec, workspace.HeadSHA, 1))
 	if discarded, err := manager.Discard(ctx, spec, workspace.HeadSHA, 1, preview.Fingerprint, func() (bool, error) { return true, nil }); discarded || err == nil {
 		t.Fatalf("first discard discarded=%t err=%v", discarded, err)
 	}
@@ -183,22 +175,14 @@ func TestRunLogRetentionTreatsPreLaunchEmptyPathAsAbsentAndLeavesGCReady(t *test
 func TestReconcileSkipsRunOwnedBetweenClaimAndMonitorRegistration(t *testing.T) {
 	service := newRuntimeTestService(t)
 	root := t.TempDir()
-	instructions := filepath.Join(root, "instructions.md")
-	requireNoError(t, os.WriteFile(instructions, []byte("Run only the assigned conversation."), 0o600))
 	coordlink := filepath.Join(root, "coordlink")
 	requireNoError(t, os.WriteFile(coordlink, []byte("#!/bin/sh\nexit 0\n"), 0o700))
-	agent, project := addRuntimeTestProject(service, instructions)
-	if _, err := service.Chat(context.Background(), core.ChatInput{
-		ProjectID: project.ID, AgentID: agent.ID, Body: "exercise launch ownership",
-		Wake: true, RequestID: "wake-launch-race",
-	}); err != nil {
+	agent, project := addRuntimeTestProject(service, runtimeTestInstructionsText)
+	if _, err := service.Chat(context.Background(), core.ChatInput{ProjectID: project.ID, AgentID: agent.ID, Body: "exercise launch ownership", Wake: true, RequestID: "wake-launch-race"}); err != nil {
 		t.Fatal(err)
 	}
 	executor := newBlockingLaunchExecutor()
-	cfg := config.Config{DataDir: root, Runtime: config.RuntimeConfig{
-		DockerNetwork: "none", WorkspaceRoot: filepath.Join(root, "workspaces"),
-		AgentHomeRoot: filepath.Join(root, "homes"), LogRoot: filepath.Join(root, "logs"),
-	}}
+	cfg := config.Config{DataDir: root, Runtime: config.RuntimeConfig{DockerNetwork: "none", WorkspaceRoot: filepath.Join(root, "workspaces"), AgentHomeRoot: filepath.Join(root, "homes"), LogRoot: filepath.Join(root, "logs")}}
 	controller := newRuntimeController(cfg, service, executor, adapter.Production(), nil, coordlink)
 	controller.ctx, controller.cancel = context.WithCancel(context.Background())
 	t.Cleanup(func() { _ = controller.Close() })
@@ -230,16 +214,12 @@ func TestReconcileSkipsRunOwnedBetweenClaimAndMonitorRegistration(t *testing.T) 
 	})
 	if executor.createCalls.Load() != 1 || executor.startCalls.Load() != 1 ||
 		executor.waitCalls.Load() != 1 || executor.logCalls.Load() != 1 {
-		t.Fatalf("launch/reconcile duplicated runtime side effects: create=%d start=%d wait=%d logs=%d",
-			executor.createCalls.Load(), executor.startCalls.Load(), executor.waitCalls.Load(), executor.logCalls.Load())
+		t.Fatalf("launch/reconcile duplicated runtime side effects: create=%d start=%d wait=%d logs=%d", executor.createCalls.Load(), executor.startCalls.Load(), executor.waitCalls.Load(), executor.logCalls.Load())
 	}
 	if controller.monitor(active.ID) == nil {
 		t.Fatal("active Run has no registered monitor")
 	}
-	if _, err := service.RequestRuntimeStop(context.Background(), core.RunStopInput{
-		RunID: active.ID, Reason: "race assertion complete", OperationID: "stop-launch-race",
-		RequestID: "stop-launch-race-request",
-	}); err != nil {
+	if _, err := service.RequestRuntimeStop(context.Background(), core.RunStopInput{RunID: active.ID, Reason: "race assertion complete", OperationID: "stop-launch-race", RequestID: "stop-launch-race-request"}); err != nil {
 		t.Fatal(err)
 	}
 	terminal := waitForRuntimeTestRun(t, service, active.ID, func(run core.Run) bool {
@@ -276,70 +256,48 @@ func TestReconcileRefreshesCanonicalRunAfterOwnershipHandoff(t *testing.T) {
 }
 
 func TestReconcileRejectsSensitiveEnvironmentMismatchBeforeMonitor(t *testing.T) {
-	const providerName, currentValue, staleValue = "ANTHROPIC_AUTH_TOKEN", "current-auth-canary", "stale-auth-canary"
-	tests := []struct {
-		name, actualValue string
-		expectedPresent   bool
-	}{{name: "rotated", expectedPresent: true, actualValue: staleValue}, {name: "removed", actualValue: staleValue}, {name: "missing", expectedPresent: true}}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if test.expectedPresent {
-				t.Setenv(providerName, currentValue)
-			} else {
-				previous, present := os.LookupEnv(providerName)
-				requireNoError(t, os.Unsetenv(providerName))
-				t.Cleanup(func() {
-					if present {
-						_ = os.Setenv(providerName, previous)
-					}
-				})
-			}
-			service, claim := claimRuntimeTestRun(t)
-			active, _ := activateRuntimeTestRun(t, service, claim)
-			requireRuntimeValue(service.SendBossMessage(context.Background(), core.BossMessageInput{ProjectID: active.ProjectID, AgentID: active.AgentID, TaskID: active.TaskID, Body: "remain pending across rejected adoption", RequestID: "adoption-message-" + test.name}))
-			executor := &runtimeTestExecutor{}
-			controller := newRuntimeTestController(t, service, executor)
-			controller.config.Runtime = config.RuntimeConfig{DockerNetwork: "none", ProviderEnvAllowlist: []string{providerName}}
-			controller.coordlink = requireRuntimeValue(os.Executable())
-			controlPath := filepath.Join(controller.controlRoot, active.ID)
-			requireNoError(t, os.Mkdir(controlPath, runControlDirectoryMode))
-			requireNoError(t, writeRunControlMarker(controlPath, active))
-			requireNoError(t, writeRuntimeFile(filepath.Join(controlPath, "bootstrap"), []byte("adoption bootstrap"), runControlFileMode))
-			command := requireRuntimeValue((adapter.Claude{}).BuildStartCommand(adapter.LaunchSpec{BootstrapPath: adapter.ContainerBootstrapPath, ContainerHome: "/home/agent", ContainerWork: "/workspace/project"}))
-			spec := requireRuntimeValue(controller.containerSpec(active, claim.Task.Kind, command, controlPath))
-			state := containerruntime.LiveState{Ref: spec.Ref, Image: spec.Image, Entrypoint: []string{spec.Command.Executable}, CommandArgs: spec.Command.Args, Status: containerruntime.StatusRunning, Running: true}
-			for name, value := range spec.Command.Env {
-				if name == providerName {
-					value = test.actualValue
-					if value == "" {
-						continue
-					}
-				}
-				state.Environment = append(state.Environment, containerruntime.EnvironmentFact{Name: name, ValueDigest: fmt.Sprintf("%x", sha256.Sum256([]byte(value)))})
-			}
-			if !test.expectedPresent {
-				state.Environment = append(state.Environment, containerruntime.EnvironmentFact{Name: providerName, ValueDigest: fmt.Sprintf("%x", sha256.Sum256([]byte(test.actualValue)))})
-			}
-			executor.state = &state
-			before := requireRuntimeValue(json.Marshal(requireRuntimeValue(service.Snapshot(context.Background(), active.ProjectID))))
-			requireNoError(t, controller.Reconcile(context.Background()))
-			after := requireRuntimeValue(json.Marshal(requireRuntimeValue(service.Snapshot(context.Background(), active.ProjectID))))
-			if string(before) != string(after) {
-				t.Fatal("rejected adoption advanced durable Task, Run, session, outcome, Message, or Event state")
-			}
-			time.Sleep(10 * time.Millisecond)
-			if executor.logCalls.Load() != 0 || executor.waitCalls.Load() != 0 || controller.monitor(active.ID) != nil {
-				t.Fatalf("rejected adoption side effects: Logs=%d Wait=%d monitor=%v", executor.logCalls.Load(), executor.waitCalls.Load(), controller.monitor(active.ID) != nil)
-			}
-			if _, err := os.Stat(active.LogPath); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("rejected adoption created a runtime log: %v", err)
-			}
-			healthy, reason := controller.Healthy()
-			wantReason := fmt.Sprintf("reconcile Run %s: %s: container isolation environment mismatch", active.ID, containerruntime.ErrOwnership)
-			if healthy || reason != wantReason {
-				t.Fatal("rejected adoption did not degrade with only the generic ownership error")
-			}
-		})
+	const providerName = "ANTHROPIC_AUTH_TOKEN"
+	t.Setenv(providerName, "current-auth-canary")
+	service, claim := claimRuntimeTestRun(t)
+	active, _ := activateRuntimeTestRun(t, service, claim)
+	requireRuntimeValue(service.SendBossMessage(context.Background(), core.BossMessageInput{ProjectID: active.ProjectID, AgentID: active.AgentID, TaskID: active.TaskID, Body: "remain pending across rejected adoption", RequestID: "adoption-message-rogue-env"}))
+	executor := &runtimeTestExecutor{}
+	controller := newRuntimeTestController(t, service, executor)
+	controller.config.Runtime = config.RuntimeConfig{DockerNetwork: "none", ProviderEnvAllowlist: []string{providerName}}
+	controller.coordlink = requireRuntimeValue(os.Executable())
+	controlPath := filepath.Join(controller.controlRoot, active.ID)
+	requireNoError(t, os.Mkdir(controlPath, runControlDirectoryMode))
+	requireNoError(t, writeRunControlMarker(controlPath, active))
+	requireNoError(t, writeRuntimeFile(filepath.Join(controlPath, "bootstrap"), []byte("adoption bootstrap"), runControlFileMode))
+	command := requireRuntimeValue((adapter.Claude{}).BuildStartCommand(adapter.LaunchSpec{BootstrapPath: adapter.ContainerBootstrapPath, ContainerHome: "/home/agent", ContainerWork: "/workspace/project"}))
+	spec := requireRuntimeValue(controller.containerSpec(active, claim.Task.Kind, command, controlPath))
+	state := containerruntime.LiveState{Ref: spec.Ref, Image: spec.Image, Entrypoint: []string{spec.Command.Executable}, CommandArgs: spec.Command.Args, Status: containerruntime.StatusRunning, Running: true}
+	for name, value := range spec.Command.Env {
+		state.Environment = append(state.Environment, containerruntime.EnvironmentFact{Name: name, ValueDigest: fmt.Sprintf("%x", sha256.Sum256([]byte(value)))})
+	}
+	// The spec no longer carries provider secrets in the container environment,
+	// so the only sensitive-key mismatch that remains is a rogue container that
+	// smuggled an allowlisted secret into its environment. Adoption must refuse
+	// to start it.
+	state.Environment = append(state.Environment, containerruntime.EnvironmentFact{Name: providerName, ValueDigest: fmt.Sprintf("%x", sha256.Sum256([]byte("leaked-auth-canary")))})
+	executor.state = &state
+	before := requireRuntimeValue(json.Marshal(requireRuntimeValue(service.Snapshot(context.Background(), active.ProjectID))))
+	requireNoError(t, controller.Reconcile(context.Background()))
+	after := requireRuntimeValue(json.Marshal(requireRuntimeValue(service.Snapshot(context.Background(), active.ProjectID))))
+	if string(before) != string(after) {
+		t.Fatal("rejected adoption advanced durable Task, Run, session, outcome, Message, or Event state")
+	}
+	time.Sleep(10 * time.Millisecond)
+	if executor.logCalls.Load() != 0 || executor.waitCalls.Load() != 0 || controller.monitor(active.ID) != nil {
+		t.Fatalf("rejected adoption side effects: Logs=%d Wait=%d monitor=%v", executor.logCalls.Load(), executor.waitCalls.Load(), controller.monitor(active.ID) != nil)
+	}
+	if _, err := os.Stat(active.LogPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected adoption created a runtime log: %v", err)
+	}
+	healthy, reason := controller.Healthy()
+	wantReason := fmt.Sprintf("reconcile Run %s: %s: container isolation environment mismatch", active.ID, containerruntime.ErrOwnership)
+	if healthy || reason != wantReason {
+		t.Fatal("rejected adoption did not degrade with only the generic ownership error")
 	}
 }
 
@@ -470,9 +428,7 @@ func TestSupervisorAbandonmentCancelsAndCollectsMonitor(t *testing.T) {
 			})
 		},
 	}
-	controller := &runtimeController{
-		service: service, monitors: map[string]*runMonitor{monitor.runID: monitor},
-	}
+	controller := &runtimeController{service: service, monitors: map[string]*runMonitor{monitor.runID: monitor}}
 	controller.supervise(monitor)
 	select {
 	case <-cancelled:
@@ -491,10 +447,7 @@ func TestSupervisorStopsRunAfterSessionPersistenceFailure(t *testing.T) {
 	service, claim := claimRuntimeTestRun(t)
 	active, ref := activateRuntimeTestRun(t, service, claim)
 	executor := &monitorFailureExecutor{stopped: make(chan struct{})}
-	monitor := &runMonitor{
-		runID: active.ID, ref: ref,
-		wait: make(chan waitResult, 1), logs: make(chan error, 1),
-	}
+	monitor := &runMonitor{runID: active.ID, ref: ref, wait: make(chan waitResult, 1), logs: make(chan error, 1)}
 	controller := newRuntimeTestController(t, service, executor)
 	controller.monitors[active.ID] = monitor
 	monitor.logs <- errors.Join(errRuntimeSessionPersist, errors.New("injected persistence failure"))
@@ -531,10 +484,7 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			service, claim := claimRuntimeTestRun(t)
-			message := requireRuntimeValue(service.SendBossMessage(context.Background(), core.BossMessageInput{
-				ProjectID: claim.Task.ProjectID, AgentID: claim.Task.AssigneeAgentID, TaskID: claim.Task.ID,
-				Body: "must remain pending", RequestID: "protocol-message-" + test.name,
-			}))
+			message := requireRuntimeValue(service.SendBossMessage(context.Background(), core.BossMessageInput{ProjectID: claim.Task.ProjectID, AgentID: claim.Task.AssigneeAgentID, TaskID: claim.Task.ID, Body: "must remain pending", RequestID: "protocol-message-" + test.name}))
 			active, ref := activateRuntimeTestRun(t, service, claim)
 			frame, ordinary, accepted := test.frame, "", []byte(nil)
 			secret, lowerDigest, upperDigest := "", "", ""
@@ -579,6 +529,7 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 					}
 				}
 			}
+			populateRuntimeTestControl(t, controller, active)
 			executor.payload = frame
 			if test.exitFirst {
 				executor.releaseWait = make(chan struct{}, 1)
@@ -586,7 +537,7 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 			}
 			if test.waitFirst {
 				executor.releaseWait, executor.releaseLogs = make(chan struct{}), make(chan struct{})
-				monitor := controller.newMonitor(active, ref, adapter.Claude{}, nil)
+				monitor := requireRuntimeValue(controller.newMonitor(active, ref, adapter.Claude{}, nil))
 				monitor.wait, monitor.waitDelivered = make(chan waitResult), make(chan struct{})
 				done := make(chan struct{})
 				go func() {
@@ -598,7 +549,7 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 				close(executor.releaseLogs)
 				waitRuntimeSignal(t, done, time.Second, "Wait-first supervisor did not converge")
 			} else {
-				monitor := controller.newMonitor(active, ref, adapter.Claude{}, nil)
+				monitor := requireRuntimeValue(controller.newMonitor(active, ref, adapter.Claude{}, nil))
 				controller.supervise(monitor)
 			}
 			if test.evidence != "" {
@@ -640,17 +591,13 @@ func TestSupervisorFailsClosedOnJSONLookingClaudeFrames(t *testing.T) {
 					requireRuntimeCondition(t, len(raw) <= runtimeLogLimit && strings.Count(string(raw), runtimeLogTruncatedMarker) == 1 && savedFrame == fmt.Sprintf(`{"bytes":%d,"sanitized":false}`, len(strings.Split(frame, "\n")[len(strings.Split(frame, "\n"))-1])), "reserved rejected-frame boundary: bytes=", len(raw), " evidence=", evidence)
 				}
 				if test.evidence != "metadata" && !test.exitFirst {
-					requireRuntimeCondition(t, !core.IsRunTerminal(beforeFailure.State) && beforeFailure.CleanupState != core.CleanupRemoved && beforeFailure.NativeSessionID == test.session &&
-						beforeFailure.RequestedOutcome == "" && beforeTask.LatestProgress == nil && beforeTask.Task.Status == core.TaskRunning &&
-						beforeTask.Task.HeadSHA == "" && beforeTask.Task.IntegrationTaskID == "" && beforeTask.Task.FinalCanonicalSHA == "" && beforeCleanup.Projects[0].CanonicalSHA == canonical, "protocol diagnostic advanced state before failure/cleanup: Run=", beforeFailure, " Task=", beforeTask, " Project=", beforeCleanup.Projects[0])
+					requireRuntimeCondition(t, !core.IsRunTerminal(beforeFailure.State) && beforeFailure.CleanupState != core.CleanupRemoved && beforeFailure.NativeSessionID == test.session && beforeFailure.RequestedOutcome == "" && beforeTask.LatestProgress == nil && beforeTask.Task.Status == core.TaskRunning && beforeTask.Task.HeadSHA == "" && beforeTask.Task.IntegrationTaskID == "" && beforeTask.Task.FinalCanonicalSHA == "" && beforeCleanup.Projects[0].CanonicalSHA == canonical, "protocol diagnostic advanced state before failure/cleanup: Run=", beforeFailure, " Task=", beforeTask, " Project=", beforeCleanup.Projects[0])
 				}
 			}
 			requireRuntimeCondition(t, executor.stopCalls.Load() > 0 && executor.removeCalls.Load() > 0, "protocol failure cleanup calls stop=", executor.stopCalls.Load(), " remove=", executor.removeCalls.Load())
 			persisted := requireRuntimeValue(service.Run(context.Background(), active.ID))
 			task := requireRuntimeValue(service.Task(context.Background(), claim.Task.ID)).Task
-			requireRuntimeCondition(t, persisted.State == core.RunInterrupted && persisted.RuntimeErrorCode == runtimeLogFailureCode &&
-				persisted.NativeSessionID == test.session && persisted.RequestedOutcome == "" && persisted.CleanupState == core.CleanupRemoved && persisted.LastError != "" &&
-				task.Status == core.TaskFailed && task.CurrentRunID == "", "protocol frame did not fail closed: Run=", persisted, " Task=", task)
+			requireRuntimeCondition(t, persisted.State == core.RunInterrupted && persisted.RuntimeErrorCode == runtimeLogFailureCode && persisted.NativeSessionID == test.session && persisted.RequestedOutcome == "" && persisted.CleanupState == core.CleanupRemoved && persisted.LastError != "" && task.Status == core.TaskQueued && task.CurrentRunID == "", "protocol frame did not fail closed: Run=", persisted, " Task=", task)
 			messages := requireRuntimeValue(service.ListMessages(context.Background(), core.MessageFilter{TaskID: claim.Task.ID}))
 			requireRuntimeCondition(t, len(messages.Items) == 1 && messages.Items[0].ID == message.ID && messages.Items[0].State != core.MessageAcknowledged, "protocol frame acknowledged a Message: ", messages.Items)
 		})
@@ -677,11 +624,12 @@ func TestShutdownReplaysTailLogsBeforeTerminalConvergence(t *testing.T) {
 	controller := newRuntimeTestController(t, service, executor)
 	controller.config = config.Config{MaxParallelRuns: 1, Runtime: config.RuntimeConfig{ShutdownGrace: 275 * time.Millisecond}}
 	controller.ctx, controller.cancel = context.WithCancel(context.Background())
+	populateRuntimeTestControl(t, controller, active)
 	entry, ok := controller.adapters.Lookup(active.AdapterID)
 	if !ok {
 		t.Fatalf("lookup shutdown replay adapter %q", active.AdapterID)
 	}
-	monitor := controller.newMonitor(active, ref, entry, nil)
+	monitor := requireRuntimeValue(controller.newMonitor(active, ref, entry, nil))
 	controller.monitors[active.ID] = monitor
 	controller.wg.Add(1)
 	go func() {
@@ -753,10 +701,7 @@ func TestUnavailableContainerRemovalKeepsTerminalCleanupBlocked(t *testing.T) {
 	service, claim := claimRuntimeTestRun(t)
 	active, ref := activateRuntimeTestRun(t, service, claim)
 	exitCode := 1
-	terminal := requireRuntimeValue(service.RecordRuntimeRunTerminal(context.Background(), runtimeTerminalInput(active, core.RunTerminalInput{
-		State: core.RunExited, ExitCode: &exitCode, TerminalReason: "provider exited",
-		RequestID: "terminal-before-cleanup-outage", OperationID: active.LaunchOperationID,
-	})))
+	terminal := requireRuntimeValue(service.RecordRuntimeRunTerminal(context.Background(), runtimeTerminalInput(active, core.RunTerminalInput{State: core.RunExited, ExitCode: &exitCode, TerminalReason: "provider exited", RequestID: "terminal-before-cleanup-outage", OperationID: active.LaunchOperationID})))
 	executor := &cleanupBlockingExecutor{}
 	controller := &runtimeController{service: service, executor: executor, controlRoot: t.TempDir()}
 	if err := controller.cleanupRun(context.Background(), terminal.Run, ref, nil, nil); !errors.Is(err, containerruntime.ErrUnavailable) {
@@ -1162,11 +1107,8 @@ func newRuntimeTestService(t *testing.T) *core.Service {
 func claimRuntimeTestRun(t *testing.T) (*core.Service, core.Claim) {
 	t.Helper()
 	service := newRuntimeTestService(t)
-	agent, project := addRuntimeTestProject(service, "/instructions/runtime.md")
-	task := requireRuntimeValue(service.CreateTask(context.Background(), core.CreateTaskInput{
-		ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork,
-		Title: "Runtime task", RequestID: "add-runtime-task",
-	}))
+	agent, project := addRuntimeTestProject(service, runtimeTestInstructionsText)
+	task := requireRuntimeValue(service.CreateTask(context.Background(), core.CreateTaskInput{ProjectID: project.ID, AssigneeAgentID: agent.ID, Kind: core.TaskWork, Title: "Runtime task", RequestID: "add-runtime-task"}))
 	claim, ok, err := service.ClaimNext(context.Background(), "")
 	if err != nil || !ok || claim.Task.ID != task.ID {
 		t.Fatalf("claim runtime test Run: claim=%#v ok=%t err=%v", claim, ok, err)
@@ -1175,31 +1117,54 @@ func claimRuntimeTestRun(t *testing.T) (*core.Service, core.Claim) {
 }
 
 func newRuntimeTestController(t *testing.T, service *core.Service, executor containerruntime.Executor) *runtimeController {
-	return &runtimeController{
-		service: service, executor: executor, adapters: adapter.Production(), controlRoot: t.TempDir(),
-		monitors: make(map[string]*runMonitor), controls: make(map[string]*runControl), runOperations: make(map[string]*runOperation),
-	}
+	return &runtimeController{service: service, executor: executor, adapters: adapter.Production(), controlRoot: t.TempDir(), monitors: make(map[string]*runMonitor), controls: make(map[string]*runControl), runOperations: make(map[string]*runOperation)}
 }
 
-func addRuntimeTestProject(service *core.Service, instructions string) (core.Agent, core.Project) {
+// populateRuntimeTestControl writes the control files the launch path would
+// have produced (identity, token, launch, secrets, instructions) so a test that
+// skips the real container launch still satisfies the redaction lineage
+// precondition and the cleanup-time ownership validation. The secrets file
+// mirrors the controller's provider allowlist env, and the instructions file
+// must byte-match the Agent text behind the run's InstructionsHash exactly or
+// redaction fails closed.
+func populateRuntimeTestControl(t *testing.T, controller *runtimeController, run core.Run) {
+	t.Helper()
+	controlPath := filepath.Join(controller.controlRoot, run.ID)
+	requireNoError(t, os.MkdirAll(controlPath, runControlDirectoryMode))
+	requireNoError(t, os.Chmod(controlPath, runControlDirectoryMode))
+	requireNoError(t, writeRunControlMarker(controlPath, run))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, "token"), []byte("test-run-token\n"), runControlFileMode))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeLaunchFile), []byte(runtimeLaunchScript), 0o550))
+	secrets := map[string]string{}
+	for _, name := range controller.config.Runtime.ProviderEnvAllowlist {
+		if value, ok := os.LookupEnv(name); ok {
+			secrets[name] = value
+		}
+	}
+	raw := requireRuntimeValue(serializeRunSecretsFile(secrets))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeSecretsFile), raw, runControlFileMode))
+	requireNoError(t, os.WriteFile(filepath.Join(controlPath, runtimeInstructionsFile), []byte(runtimeTestInstructionsText), runControlFileMode))
+}
+
+const runtimeTestInstructionsText = "Run only the assigned conversation."
+
+func addRuntimeTestProject(service *core.Service, instructionsText string) (core.Agent, core.Project) {
 	ctx := context.Background()
-	agent := requireRuntimeValue(service.AddAgent(ctx, core.AddAgentInput{
-		DisplayName: "Runtime Agent", AdapterID: "claude", Image: "agent:test", InstructionsFile: instructions, RequestID: "add-runtime-agent",
-	}))
-	project := requireRuntimeValue(service.AddProject(ctx, core.AddProjectInput{
-		Name: "Runtime Project", Source: "/source", SourceRef: "refs/heads/main", IntegrationAgentID: agent.ID, RequestID: "add-runtime-project",
-	}))
+	agent := requireRuntimeValue(service.AddAgent(ctx, core.AddAgentInput{DisplayName: "Runtime Agent", AdapterID: "claude", Image: "agent:test", InstructionsText: instructionsText, RequestID: "add-runtime-agent"}))
+	project := requireRuntimeValue(service.AddProject(ctx, core.AddProjectInput{Name: "Runtime Project", Source: "/source", SourceRef: "refs/heads/main", IntegrationAgentID: agent.ID, RequestID: "add-runtime-project"}))
 	return agent, project
 }
 
 func activateRuntimeTestRun(t *testing.T, service *core.Service, claim core.Claim) (core.Run, containerruntime.RuntimeRef) {
 	t.Helper()
 	root := t.TempDir()
+	launch := requireRuntimeValue(service.RuntimeLaunchContext(context.Background(), claim.Run.ID))
 	prepared := requireRuntimeValue(service.BeginRunLaunch(context.Background(), core.RunLaunchInput{
 		RunID: claim.Run.ID, Generation: claim.Run.Generation, LaunchNonce: "active-nonce",
 		WorkspacePath: filepath.Join(root, "workspace"), HomePath: filepath.Join(root, "home"),
-		LogPath: filepath.Join(root, "run.log"), InstructionsHash: "instructions-hash",
-		LaunchMode: "start", CleanupOperationID: "active-cleanup", RequestID: "prepare-active-run",
+		LogPath: filepath.Join(root, "run.log"), InstructionsHash: launch.InstructionsHash,
+		ConfigFingerprint: launch.ConfigFingerprint,
+		LaunchMode:        "start", CleanupOperationID: "active-cleanup", RequestID: "prepare-active-run",
 	}))
 	ref := runtimeRef(prepared)
 	ref.ContainerID = "container-active"

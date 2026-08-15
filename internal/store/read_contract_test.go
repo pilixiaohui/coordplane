@@ -15,15 +15,24 @@ import (
 )
 
 func TestSnapshotUsesOneFileBackedSQLiteReadTransaction(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// Opening a file-backed store now runs the full schema migration chain and
+	// builds canonical schemas for validation. Keep that setup off the short
+	// snapshot barrier so a loaded parallel test runner cannot time out while
+	// opening the store. The five-second timeout remains scoped to proving the
+	// transaction barrier itself.
+	setupCtx, cancelSetup := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelSetup()
+
 	path := filepath.Join(t.TempDir(), "snapshot.db")
-	reader, err := Open(ctx, path)
+	reader, err := Open(setupCtx, path)
 	requireNoError(t, err)
 	defer reader.Close()
-	writer, err := Open(ctx, path)
+	writer, err := Open(setupCtx, path)
 	requireNoError(t, err)
 	defer writer.Close()
+
+	barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelBarrier()
 
 	reachedBarrier := make(chan struct{})
 	releaseReader := make(chan struct{})
@@ -33,7 +42,7 @@ func TestSnapshotUsesOneFileBackedSQLiteReadTransaction(t *testing.T) {
 	}
 	resultCh := make(chan result, 1)
 	go func() {
-		snapshot, err := reader.snapshot(ctx, "", func() {
+		snapshot, err := reader.snapshot(barrierCtx, "", func() {
 			close(reachedBarrier)
 			<-releaseReader
 		})
@@ -42,10 +51,10 @@ func TestSnapshotUsesOneFileBackedSQLiteReadTransaction(t *testing.T) {
 
 	select {
 	case <-reachedBarrier:
-	case <-ctx.Done():
+	case <-barrierCtx.Done():
 		t.Fatal("snapshot did not reach the post-project barrier")
 	}
-	writeErr := insertReadFixture(ctx, writer, "after", core.TaskQueued, core.RunStarting, core.MessagePending, true)
+	writeErr := insertReadFixture(setupCtx, writer, "after", core.TaskQueued, core.RunStarting, core.MessagePending, true)
 	close(releaseReader)
 	if writeErr != nil {
 		t.Fatal(writeErr)
@@ -54,7 +63,7 @@ func TestSnapshotUsesOneFileBackedSQLiteReadTransaction(t *testing.T) {
 	var during result
 	select {
 	case during = <-resultCh:
-	case <-ctx.Done():
+	case <-barrierCtx.Done():
 		t.Fatal("snapshot did not return after the writer committed")
 	}
 	if during.err != nil {
@@ -63,7 +72,7 @@ func TestSnapshotUsesOneFileBackedSQLiteReadTransaction(t *testing.T) {
 	if got := snapshotFamilySizes(during.snapshot); got != [6]int{} {
 		t.Fatalf("snapshot mixed a post-barrier commit into the old view: %v", got)
 	}
-	after, err := reader.Snapshot(ctx, "")
+	after, err := reader.Snapshot(setupCtx, "")
 	requireNoError(t, err)
 	if got := snapshotFamilySizes(after); got != [6]int{1, 1, 1, 1, 1, 2} {
 		t.Fatalf("next snapshot did not see the complete committed view: %v", got)
@@ -118,6 +127,75 @@ func TestTaskRunAndMessageHistoryUseStableOpaqueCursorPages(t *testing.T) {
 	}
 }
 
+func TestLegacyCapturedTasksProjectEvidenceType(t *testing.T) {
+	ctx := context.Background()
+	database := openTestStore(t, ctx, "legacy-evidence.db")
+	requireNoError(t, insertReadFixture(ctx, database, "captured", core.TaskRunning, core.RunActive, core.MessagePending, false))
+	requireNoError(t, insertReadFixture(ctx, database, "partial", core.TaskRunning, core.RunActive, core.MessagePending, false))
+
+	headSHA := strings.Repeat("b", 40)
+	execTestSQL(t, ctx, database.db, `
+UPDATE tasks
+SET status='submitted', head_sha=?, head_run_id='run_captured', task_ref='refs/coordplane/tasks/tsk_captured/runs/run_captured'
+WHERE id='tsk_captured'`, headSHA)
+	execTestSQL(t, ctx, database.db, `
+UPDATE tasks
+SET status='submitted', head_sha=?, head_run_id='run_partial'
+WHERE id='tsk_partial'`, headSHA)
+
+	tasks, err := database.Tasks(ctx, core.TaskFilter{ProjectID: "prj_captured"})
+	requireNoError(t, err)
+	if len(tasks.Items) != 1 || tasks.Items[0].EvidenceType != string(core.EvidenceCaptured) {
+		t.Fatalf("legacy captured list projection = %#v", tasks.Items)
+	}
+	detail, err := database.TaskProjection(ctx, "tsk_captured")
+	requireNoError(t, err)
+	if detail.Task.Task.EvidenceType != string(core.EvidenceCaptured) {
+		t.Fatalf("legacy captured detail evidence_type = %q", detail.Task.Task.EvidenceType)
+	}
+
+	partial, err := database.TaskProjection(ctx, "tsk_partial")
+	requireNoError(t, err)
+	if partial.Task.Task.EvidenceType != "" {
+		t.Fatalf("partial capture was misclassified as %q", partial.Task.Task.EvidenceType)
+	}
+	partialTasks, err := database.Tasks(ctx, core.TaskFilter{ProjectID: "prj_partial"})
+	requireNoError(t, err)
+	if len(partialTasks.Items) != 1 || partialTasks.Items[0].EvidenceType != "" {
+		t.Fatalf("legacy partial list projection = %#v, want one row with empty evidence_type", partialTasks.Items)
+	}
+}
+
+func TestLegacyHumanConfirmEvidenceProjectionStaysEmpty(t *testing.T) {
+	ctx := context.Background()
+	database := openTestStore(t, ctx, "legacy-human-confirm.db")
+	requireNoError(t, insertReadFixture(ctx, database, "human_legacy", core.TaskCompleted, core.RunExited, core.MessageAcknowledged, false))
+
+	// Emulate a row written before evidence_type existed: human-assigned,
+	// completed, and with no captured head. It must never be derived as captured
+	// in either the list or detail projection.
+	execTestSQL(t, ctx, database.db, `
+UPDATE tasks
+SET assignee_agent_id='', assignee_participant_id='participant-human',
+    head_sha='', head_run_id='', task_ref=''
+WHERE id='tsk_human_legacy'`)
+
+	tasks, err := database.Tasks(ctx, core.TaskFilter{ProjectID: "prj_human_legacy"})
+	requireNoError(t, err)
+	if len(tasks.Items) != 1 {
+		t.Fatalf("legacy human_confirm list = %#v, want one row", tasks.Items)
+	}
+	if tasks.Items[0].EvidenceType != "" || tasks.Items[0].HeadSHA != "" {
+		t.Fatalf("legacy human_confirm list projection = %#v, want empty evidence_type and head_sha", tasks.Items[0])
+	}
+
+	detail, err := database.TaskProjection(ctx, "tsk_human_legacy")
+	requireNoError(t, err)
+	if detail.Task.Task.EvidenceType != "" || detail.Task.Task.HeadSHA != "" || detail.Task.Task.AssigneeAgentID != "" {
+		t.Fatalf("legacy human_confirm detail projection = %#v, want empty evidence_type/head_sha/assignee_agent_id", detail.Task.Task)
+	}
+}
+
 func TestTaskHasStartedRunSearchesBeyondTheFirstHundredHistoryRows(t *testing.T) {
 	ctx := context.Background()
 	database := openTestStore(t, ctx, "run-history.db")
@@ -137,19 +215,11 @@ func TestTaskHasStartedRunSearchesBeyondTheFirstHundredHistoryRows(t *testing.T)
 		}); err != nil {
 			return err
 		}
-		if err := tx.InsertAgent(core.Agent{
-			ID: agentID, DisplayName: "Run history", AdapterID: "test", Image: "test:latest",
-			InstructionsFile: "/instructions", Status: core.AgentActive,
-			Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime,
-		}); err != nil {
+		if err := tx.InsertAgent(core.Agent{ID: agentID, DisplayName: "Run history", AdapterID: "test", Image: "test:latest", InstructionsFile: "/instructions", Status: core.AgentActive, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime}); err != nil {
 			return err
 		}
 		for _, id := range []string{taskID, otherTask} {
-			if err := tx.InsertTask(core.Task{
-				ID: id, ProjectID: projectID, Kind: core.TaskWork, CreatedByKind: "boss",
-				AssigneeAgentID: agentID, Title: id, Status: core.TaskFailed, NextRunAt: readTestTime,
-				Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime,
-			}); err != nil {
+			if err := tx.InsertTask(core.Task{ID: id, ProjectID: projectID, Kind: core.TaskWork, CreatedByKind: "boss", AssigneeAgentID: agentID, Title: id, Status: core.TaskFailed, NextRunAt: readTestTime, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime}); err != nil {
 				return err
 			}
 		}
@@ -207,11 +277,7 @@ func TestEventHistoryUsesOpaqueIDCursorWithoutGapsOrDuplicates(t *testing.T) {
 	const eventCount = 47
 	if err := database.Transact(ctx, func(tx core.Transaction) error {
 		for index := 1; index <= eventCount; index++ {
-			if _, err := tx.AppendEvent(core.Event{
-				ProjectID: "prj_events", EntityType: "daemon", EntityID: "daemon",
-				Kind: fmt.Sprintf("test.event.%02d", index), ActorKind: "daemon",
-				PayloadJSON: string(payload), CreatedAt: readTestTime,
-			}); err != nil {
+			if _, err := tx.AppendEvent(core.Event{ProjectID: "prj_events", EntityType: "daemon", EntityID: "daemon", Kind: fmt.Sprintf("test.event.%02d", index), ActorKind: "daemon", PayloadJSON: string(payload), CreatedAt: readTestTime}); err != nil {
 				return err
 			}
 		}
@@ -224,9 +290,7 @@ func TestEventHistoryUsesOpaqueIDCursorWithoutGapsOrDuplicates(t *testing.T) {
 	seen := make(map[int64]bool, eventCount)
 	var previousOldest int64
 	for pageNumber := 0; pageNumber < eventCount; pageNumber++ {
-		page, err := database.EventsPage(ctx, core.EventFilter{
-			ProjectID: "prj_events", Cursor: cursor, Limit: core.MaximumEventPageLimit,
-		})
+		page, err := database.EventsPage(ctx, core.EventFilter{ProjectID: "prj_events", Cursor: cursor, Limit: core.MaximumEventPageLimit})
 		requireNoError(t, err)
 		if len(page.Items) == 0 {
 			t.Fatalf("event page %d made no cursor progress", pageNumber)
@@ -284,11 +348,7 @@ func TestStatusProjectionIsBoundedAndOmitsHistoricalPayloads(t *testing.T) {
 	err := database.Transact(ctx, func(tx core.Transaction) error {
 		for index := 0; index < core.StatusSnapshotLimit; index++ {
 			id := fmt.Sprintf("tsk_%03d", index)
-			if err := tx.InsertTask(core.Task{
-				ID: id, ProjectID: "prj_zzzz", Kind: core.TaskWork, CreatedByKind: "boss",
-				AssigneeAgentID: "agt_zzzz", Title: id, Status: core.TaskWaiting,
-				NextRunAt: readTestTime, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime,
-			}); err != nil {
+			if err := tx.InsertTask(core.Task{ID: id, ProjectID: "prj_zzzz", Kind: core.TaskWork, CreatedByKind: "boss", AssigneeAgentID: "agt_zzzz", Title: id, Status: core.TaskWaiting, NextRunAt: readTestTime, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime}); err != nil {
 				return err
 			}
 		}
@@ -394,11 +454,7 @@ func TestStatusProjectionMarksAgentsOmittedAfterRequiredSlotsFillTheBound(t *tes
 	err := database.Transact(ctx, func(tx core.Transaction) error {
 		for index := 0; index < core.StatusSnapshotLimit; index++ {
 			id := fmt.Sprintf("agt_required_%02d", index)
-			if err := tx.InsertAgent(core.Agent{
-				ID: id, DisplayName: id, AdapterID: "test", Image: "test:latest",
-				InstructionsFile: "/instructions", Status: core.AgentActive,
-				Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime,
-			}); err != nil {
+			if err := tx.InsertAgent(core.Agent{ID: id, DisplayName: id, AdapterID: "test", Image: "test:latest", InstructionsFile: "/instructions", Status: core.AgentActive, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime}); err != nil {
 				return err
 			}
 			if err := tx.InsertTask(core.Task{
@@ -410,11 +466,7 @@ func TestStatusProjectionMarksAgentsOmittedAfterRequiredSlotsFillTheBound(t *tes
 				return err
 			}
 		}
-		return tx.InsertAgent(core.Agent{
-			ID: "agt_omitted", DisplayName: "omitted", AdapterID: "test", Image: "test:latest",
-			InstructionsFile: "/instructions", Status: core.AgentActive,
-			Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime,
-		})
+		return tx.InsertAgent(core.Agent{ID: "agt_omitted", DisplayName: "omitted", AdapterID: "test", Image: "test:latest", InstructionsFile: "/instructions", Status: core.AgentActive, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime})
 	})
 	requireNoError(t, err)
 
@@ -451,18 +503,10 @@ func insertReadFixture(ctx context.Context, database *Store, suffix string, task
 		}); err != nil {
 			return err
 		}
-		if err := tx.InsertAgent(core.Agent{
-			ID: agentID, DisplayName: agentID, AdapterID: "test", Image: "test:latest",
-			InstructionsFile: "/instructions", Status: core.AgentActive,
-			Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime,
-		}); err != nil {
+		if err := tx.InsertAgent(core.Agent{ID: agentID, DisplayName: agentID, AdapterID: "test", Image: "test:latest", InstructionsFile: "/instructions", Status: core.AgentActive, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime}); err != nil {
 			return err
 		}
-		if err := tx.InsertTask(core.Task{
-			ID: taskID, ProjectID: projectID, Kind: core.TaskWork, CreatedByKind: "boss",
-			AssigneeAgentID: agentID, Title: taskID, Status: taskStatus, CurrentRunID: currentRunID,
-			NextRunAt: readTestTime, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime,
-		}); err != nil {
+		if err := tx.InsertTask(core.Task{ID: taskID, ProjectID: projectID, Kind: core.TaskWork, CreatedByKind: "boss", AssigneeAgentID: agentID, Title: taskID, Status: taskStatus, CurrentRunID: currentRunID, NextRunAt: readTestTime, Version: 1, CreatedAt: readTestTime, UpdatedAt: readTestTime}); err != nil {
 			return err
 		}
 		if err := tx.InsertRun(core.Run{
@@ -481,18 +525,11 @@ func insertReadFixture(ctx context.Context, database *Store, suffix string, task
 		}); err != nil {
 			return err
 		}
-		if _, err := tx.AppendEvent(core.Event{
-			ProjectID: projectID, EntityType: "task", EntityID: taskID, Kind: "task.created",
-			ActorKind: "boss", RequestID: "request-" + suffix, PayloadJSON: "{}", CreatedAt: readTestTime,
-		}); err != nil {
+		if _, err := tx.AppendEvent(core.Event{ProjectID: projectID, EntityType: "task", EntityID: taskID, Kind: "task.created", ActorKind: "boss", RequestID: "request-" + suffix, PayloadJSON: "{}", CreatedAt: readTestTime}); err != nil {
 			return err
 		}
 		if progress {
-			_, err := tx.AppendEvent(core.Event{
-				ProjectID: projectID, EntityType: "task", EntityID: taskID, Kind: "task.progress",
-				ActorKind: "agent", ActorID: agentID, RunID: runID,
-				RequestID: "progress-" + suffix, PayloadJSON: `{"summary":"ready"}`, CreatedAt: readTestTime,
-			})
+			_, err := tx.AppendEvent(core.Event{ProjectID: projectID, EntityType: "task", EntityID: taskID, Kind: "task.progress", ActorKind: "agent", ActorID: agentID, RunID: runID, RequestID: "progress-" + suffix, PayloadJSON: `{"summary":"ready"}`, CreatedAt: readTestTime})
 			return err
 		}
 		return nil

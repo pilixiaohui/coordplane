@@ -20,6 +20,7 @@ type ServiceOptions struct {
 	NewID                       func(string) (string, error)
 	MaxParallelRuns             int
 	AdapterIDs                  []string
+	Adapters                    []AdapterDescriptor
 	CompletedWorkspaceRetention time.Duration
 	TerminalTaskRefRetention    time.Duration
 	AgentHomes                  AgentHomeGC
@@ -31,7 +32,7 @@ type Service struct {
 	now                         func() time.Time
 	newID                       func(string) (string, error)
 	maxRuns                     int
-	adapters                    map[string]struct{}
+	adapters                    map[string]AdapterDescriptor
 	completedWorkspaceRetention time.Duration
 	terminalTaskRefRetention    time.Duration
 	agentHomes                  AgentHomeGC
@@ -62,7 +63,7 @@ func NewService(repository Repository, projectGit ProjectGit, options ServiceOpt
 	if options.CompletedWorkspaceRetention < 0 || options.TerminalTaskRefRetention < 0 {
 		return nil, NewError(CodeInvalidArgument, "GC retention durations cannot be negative", false)
 	}
-	adapters := make(map[string]struct{}, len(options.AdapterIDs))
+	adapters := make(map[string]AdapterDescriptor, len(options.AdapterIDs))
 	for _, adapterID := range options.AdapterIDs {
 		if adapterID == "" || strings.TrimSpace(adapterID) != adapterID {
 			return nil, NewError(CodeInvalidArgument, "adapter IDs must be non-empty and canonical", false)
@@ -70,10 +71,42 @@ func NewService(repository Repository, projectGit ProjectGit, options ServiceOpt
 		if _, duplicate := adapters[adapterID]; duplicate {
 			return nil, NewError(CodeInvalidArgument, "adapter IDs must be unique", false)
 		}
-		adapters[adapterID] = struct{}{}
+		adapters[adapterID] = AdapterDescriptor{ID: adapterID, Name: adapterID}
+	}
+	if len(adapters) == 0 {
+		// AdapterIDs is retained as the compact legacy constructor; when only
+		// descriptors are supplied they become the registry themselves.
+		for _, descriptor := range options.Adapters {
+			adapterID := strings.TrimSpace(descriptor.ID)
+			if adapterID == "" || adapterID != descriptor.ID {
+				return nil, NewError(CodeInvalidArgument, "adapter descriptors must have a canonical ID", false)
+			}
+			normalized, err := normalizeAdapterDescriptor(descriptor)
+			if err != nil {
+				return nil, err
+			}
+			if _, duplicate := adapters[adapterID]; duplicate {
+				return nil, NewError(CodeInvalidArgument, "adapter IDs must be unique", false)
+			}
+			adapters[adapterID] = normalized
+		}
 	}
 	if len(adapters) == 0 {
 		return nil, NewError(CodeInvalidArgument, "at least one adapter ID is required", false)
+	}
+	for _, descriptor := range options.Adapters {
+		adapterID := strings.TrimSpace(descriptor.ID)
+		if adapterID == "" || adapterID != descriptor.ID {
+			return nil, NewError(CodeInvalidArgument, "adapter descriptors must have a canonical ID", false)
+		}
+		if _, registered := adapters[adapterID]; !registered {
+			return nil, NewError(CodeInvalidArgument, "adapter descriptor is not in the adapter ID registry", false)
+		}
+		normalized, err := normalizeAdapterDescriptor(descriptor)
+		if err != nil {
+			return nil, err
+		}
+		adapters[adapterID] = normalized
 	}
 	return &Service{
 		repository:                  repository,
@@ -86,6 +119,48 @@ func NewService(repository Repository, projectGit ProjectGit, options ServiceOpt
 		terminalTaskRefRetention:    options.TerminalTaskRefRetention,
 		agentHomes:                  options.AgentHomes,
 	}, nil
+}
+
+func normalizeAdapterDescriptor(descriptor AdapterDescriptor) (AdapterDescriptor, error) {
+	if descriptor.Name == "" {
+		descriptor.Name = descriptor.ID
+	}
+	if descriptor.Name != descriptor.ID {
+		return AdapterDescriptor{}, NewError(CodeInvalidArgument, "adapter descriptor name must match its ID", false)
+	}
+	seen := make(map[string]struct{}, len(descriptor.AllowedEfforts))
+	efforts := make([]string, 0, len(descriptor.AllowedEfforts))
+	for _, effort := range descriptor.AllowedEfforts {
+		if effort == "" || strings.TrimSpace(effort) != effort {
+			return AdapterDescriptor{}, NewError(CodeInvalidArgument, "adapter allowed efforts must be non-empty and canonical", false)
+		}
+		if _, duplicate := seen[effort]; duplicate {
+			return AdapterDescriptor{}, NewError(CodeInvalidArgument, "adapter allowed efforts must be unique", false)
+		}
+		seen[effort] = struct{}{}
+		efforts = append(efforts, effort)
+	}
+	descriptor.AllowedEfforts = efforts
+	return descriptor, nil
+}
+
+// ListAdapters returns a sorted, detached copy of the read-only adapter
+// descriptors injected at service construction. It exposes only public
+// metadata and never executable names, argv templates, host paths, or
+// credentials.
+func (s *Service) ListAdapters(context.Context) ([]AdapterDescriptor, error) {
+	names := make([]string, 0, len(s.adapters))
+	for name := range s.adapters {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	descriptors := make([]AdapterDescriptor, 0, len(names))
+	for _, name := range names {
+		descriptor := s.adapters[name]
+		descriptor.AllowedEfforts = append([]string{}, descriptor.AllowedEfforts...)
+		descriptors = append(descriptors, descriptor)
+	}
+	return descriptors, nil
 }
 
 func (s *Service) SetReady(ready bool, reason string) {

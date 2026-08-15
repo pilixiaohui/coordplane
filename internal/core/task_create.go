@@ -10,6 +10,7 @@ type workTaskRequest struct {
 	title, description                               string
 	sourceTaskID, retryOfTaskID                      string
 	priority, maxRetries                             int
+	budgetSeconds                                    int64
 	ackIDs                                           []string
 	requestID                                        string
 	dedupe                                           requestDedupe
@@ -25,7 +26,7 @@ type taskCreationSnapshot struct {
 
 func (s *Service) normalizeWorkTask(
 	agentID, assigneeParticipantID, title, description, sourceTaskID string,
-	priority, maxRetries int, ackMessageIDs []string, requestID string,
+	priority, maxRetries int, budgetSeconds int64, ackMessageIDs []string, requestID string,
 ) (workTaskRequest, error) {
 	var input workTaskRequest
 	var err error
@@ -51,6 +52,9 @@ func (s *Service) normalizeWorkTask(
 	if maxRetries < 0 {
 		return input, NewError(CodeInvalidArgument, "max_retries cannot be negative", false)
 	}
+	if budgetSeconds < 0 {
+		return input, NewError(CodeInvalidArgument, "budget_seconds cannot be negative", false)
+	}
 	if input.ackIDs, err = canonicalMessageIDs(ackMessageIDs); err != nil {
 		return input, err
 	}
@@ -59,6 +63,7 @@ func (s *Service) normalizeWorkTask(
 	}
 	input.sourceTaskID = strings.TrimSpace(sourceTaskID)
 	input.priority, input.maxRetries = priority, maxRetries
+	input.budgetSeconds = budgetSeconds
 	return input, nil
 }
 
@@ -247,12 +252,19 @@ func (s *Service) insertWorkTask(
 	if err != nil {
 		return Task{}, err
 	}
+	status, waitReason := TaskQueued, ""
+	if input.agentID == "" {
+		// Human assignees have no Run: waiting is their initial executable
+		// state and complete is the only convergence path.
+		status, waitReason = TaskWaiting, "human_assigned"
+	}
 	task := Task{
 		ID: id, ProjectID: input.projectID, Kind: TaskWork, ParentTaskID: parent.ID,
 		CreatedByKind: actor.kind, CreatedByID: actor.id, AssigneeAgentID: input.agentID,
 		AssigneeParticipantID: assigneeParticipantID,
 		Title:                 input.title, Description: input.description, Priority: input.priority,
-		Status: TaskQueued, NextRunAt: now, MaxRetries: input.maxRetries, BaseSHA: baseSHA,
+		Status: status, WaitReason: waitReason, NextRunAt: now, MaxRetries: input.maxRetries, BaseSHA: baseSHA,
+		BudgetSeconds: input.budgetSeconds,
 		RetryOfTaskID: retry.ID, Version: 1, CreatedAt: now, UpdatedAt: now,
 	}
 	if source.ID != "" {

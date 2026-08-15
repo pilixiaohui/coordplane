@@ -226,11 +226,9 @@ func (c *runtimeController) reconcileRun(ctx context.Context, run core.Run) erro
 			terminalState, reason := reconcileIntentTerminal(run, task)
 			return c.finishMissingReconciledRun(ctx, run, ref, terminalState, reason)
 		}
-		terminalState := core.RunFailed
-		reason := "container was not created"
+		terminalState, reason := core.RunFailed, "container was not created"
 		if run.LaunchPhase == core.LaunchStartIssued || run.LaunchPhase == core.LaunchProcessObserved || run.State == core.RunActive {
-			terminalState = core.RunInterrupted
-			reason = "owned container is missing after start was issued"
+			terminalState, reason = core.RunInterrupted, "owned container is missing after start was issued"
 		}
 		return c.finishMissingReconciledRun(ctx, run, ref, terminalState, reason)
 	}
@@ -247,6 +245,9 @@ func (c *runtimeController) reconcileRun(ctx context.Context, run core.Run) erro
 	}
 	if err := c.validateAdoptedContainer(ctx, run, state); err != nil {
 		return err
+	}
+	if err := c.validateRunControlLineage(filepath.Join(c.controlRoot, run.ID)); err != nil {
+		return c.failSecretsUnavailable(ctx, run, ref, nil)
 	}
 	entry, ok := c.adapters.Lookup(run.AdapterID)
 	if !ok {
@@ -265,7 +266,10 @@ func (c *runtimeController) reconcileRun(ctx context.Context, run core.Run) erro
 	}
 	switch state.Status {
 	case containerruntime.StatusExited:
-		monitor := c.newMonitor(run, ref, entry, control)
+		monitor, err := c.newMonitor(run, ref, entry, control)
+		if err != nil {
+			return c.failSecretsUnavailable(ctx, run, ref, control)
+		}
 		result := <-monitor.wait
 		return c.finishObservedRun(run, monitor, result)
 	case containerruntime.StatusCreated:
@@ -300,7 +304,7 @@ func (c *runtimeController) reconcileDurableIntent(ctx context.Context, run core
 	}
 	task := projection.Task
 	hasIntent := run.StopRequestedAt != "" || run.RequestedOutcome != "" ||
-		task.Status == core.TaskCancelled || deadlineReached(run.DeadlineAt)
+		task.Status == core.TaskCancelled || deadlineReached(run.DeadlineAt) || c.runStalled(run)
 	if !hasIntent || run.StopRequestedAt != "" {
 		return run, task, hasIntent, nil
 	}
@@ -311,15 +315,14 @@ func (c *runtimeController) reconcileDurableIntent(ctx context.Context, run core
 		reason = "Task cancelled"
 	case deadlineReached(run.DeadlineAt):
 		reason = "deadline exceeded"
+	case c.runStalled(run):
+		reason = "stalled"
 	}
 	operation, err := randomRuntimeID("reconcile-stop")
 	if err != nil {
 		return core.Run{}, core.Task{}, false, err
 	}
-	updated, err := c.service.RequestRuntimeStop(ctx, core.RunStopInput{
-		RunID: run.ID, Reason: reason, OperationID: operation,
-		RequestID: runtimeRequest(run, "reconcile-stop"),
-	})
+	updated, err := c.service.RequestRuntimeStop(ctx, core.RunStopInput{RunID: run.ID, Reason: reason, OperationID: operation, RequestID: runtimeRequest(run, "reconcile-stop")})
 	if err != nil {
 		return core.Run{}, core.Task{}, false, err
 	}
@@ -330,8 +333,8 @@ func reconcileIntentTerminal(run core.Run, task core.Task) (core.RunState, strin
 	switch {
 	case task.Status == core.TaskCancelled:
 		return core.RunCancelled, "Task cancelled"
-	case run.StopReason == "deadline exceeded":
-		return core.RunTimedOut, "Run deadline exceeded"
+	case run.StopReason == "deadline exceeded" || run.StopReason == "stalled":
+		return core.RunTimedOut, "Run " + run.StopReason
 	default:
 		reason := run.StopReason
 		if reason == "" {
@@ -401,7 +404,10 @@ func (c *runtimeController) stopReconciledRun(
 		return c.cleanupRun(ctx, terminal.Run, ref, nil, nil)
 	}
 
-	monitor := c.newMonitor(run, ref, entry, nil)
+	monitor, err := c.newMonitor(run, ref, entry, nil)
+	if err != nil {
+		return c.failSecretsUnavailable(ctx, run, ref, nil)
+	}
 	if err := c.registerMonitor(monitor); err != nil {
 		_ = monitor.cancelAndCollectLogs(2 * time.Second)
 		return err
@@ -433,7 +439,10 @@ func (c *runtimeController) adoptRunning(
 	entry adapter.CLI,
 	control *runControl,
 ) error {
-	monitor := c.newMonitor(run, ref, entry, control)
+	monitor, err := c.newMonitor(run, ref, entry, control)
+	if err != nil {
+		return c.failSecretsUnavailable(ctx, run, ref, control)
+	}
 	if err := c.registerMonitor(monitor); err != nil {
 		_ = monitor.cancelAndCollectLogs(2 * time.Second)
 		return err
@@ -686,10 +695,7 @@ func (c *runtimeController) persistShutdownIntents(ctx context.Context) error {
 			result = errors.Join(result, operationErr)
 			continue
 		}
-		_, stopErr := c.service.RequestRuntimeStop(ctx, core.RunStopInput{
-			RunID: run.ID, Reason: runtimeShutdownReason, OperationID: operation,
-			RequestID: runtimeRequest(run, "shutdown"),
-		})
+		_, stopErr := c.service.RequestRuntimeStop(ctx, core.RunStopInput{RunID: run.ID, Reason: runtimeShutdownReason, OperationID: operation, RequestID: runtimeRequest(run, "shutdown")})
 		if stopErr != nil {
 			latest, latestErr := c.service.Run(ctx, run.ID)
 			if latestErr == nil && (core.IsRunTerminal(latest.State) || latest.StopRequestedAt != "") {
@@ -796,10 +802,7 @@ func (c *runtimeController) shutdownRun(ctx context.Context, run core.Run) error
 		if err != nil {
 			return err
 		}
-		updated, err := c.service.RequestRuntimeStop(ctx, core.RunStopInput{
-			RunID: run.ID, Reason: runtimeShutdownReason, OperationID: operation,
-			RequestID: runtimeRequest(run, "shutdown"),
-		})
+		updated, err := c.service.RequestRuntimeStop(ctx, core.RunStopInput{RunID: run.ID, Reason: runtimeShutdownReason, OperationID: operation, RequestID: runtimeRequest(run, "shutdown")})
 		if err != nil {
 			return err
 		}
@@ -841,11 +844,12 @@ func (c *runtimeController) shutdownRun(ctx context.Context, run core.Run) error
 	c.mu.Lock()
 	control := c.controls[run.ID]
 	c.mu.Unlock()
-	monitor := &runMonitor{
-		runID: run.ID, ref: ref, entry: entry, control: control,
-		redact: c.runtimeRedaction(run), logs: make(chan error, 1),
+	monitor := &runMonitor{runID: run.ID, ref: ref, entry: entry, control: control, redact: c.runtimeRedaction(run), logs: make(chan error, 1)}
+	if monitor.redact.failClosed {
+		monitor.logs <- nil
+	} else {
+		monitor.logs <- c.streamLogs(ctx, run, ref, entry, monitor)
 	}
-	monitor.logs <- c.streamLogs(ctx, run, ref, entry, monitor)
 	return c.finishObservedRunContext(ctx, run, monitor, waitResult{fact: exit, err: waitErr})
 }
 

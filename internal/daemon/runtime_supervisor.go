@@ -87,7 +87,7 @@ func (c *runtimeController) supervise(monitor *runMonitor) {
 				c.stopOwnedContainer(monitor.ref)
 				continue
 			}
-			if deadlineReached(run.DeadlineAt) {
+			if deadlineReached(run.DeadlineAt) || c.runStalled(run) {
 				c.stopForDurableIntent(monitor)
 				continue
 			}
@@ -254,12 +254,18 @@ func (c *runtimeController) finishObservedRunContext(
 	if taskErr == nil && task.Task.Status == core.TaskCancelled {
 		state = core.RunCancelled
 		reason = "Task cancelled"
-	} else if run.StopReason == "deadline exceeded" {
+	} else if run.StopReason == "deadline exceeded" || run.StopReason == "stalled" {
 		state = core.RunTimedOut
 		reason = "Run deadline exceeded"
+		if run.StopReason == "stalled" {
+			reason = "Run stalled"
+		}
 	} else if run.RequestedOutcome == "" && run.StopRequestedAt != "" {
 		state = core.RunInterrupted
 		reason = run.StopReason
+	}
+	if state == core.RunExited && run.RequestedOutcome == "" {
+		reason = runtimeExitedReason(reason, exitCode, run.LogPath, monitor.redact)
 	}
 	operation := run.LaunchOperationID
 	if run.StopOperationID != "" {
@@ -277,6 +283,64 @@ func (c *runtimeController) finishObservedRunContext(
 		return err
 	}
 	return c.cleanupRun(ctx, terminal.Run, monitor.ref, monitor.control, monitor)
+}
+
+// runtimeExitedReason enriches the NO_TASK_OUTCOME terminal reason with the
+// process exit code and the tail of the run log, so a CLI that exits without
+// requesting an outcome leaves a diagnosable failure instead of a bare
+// "CLI process exited". Log content is redacted; the result is bounded to a
+// fraction of MaximumTerminalTextBytes so the durable reason fits its budget.
+func runtimeExitedReason(reason string, exitCode *int, logPath string, redact runtimeRedaction) string {
+	prefix := reason
+	if exitCode != nil {
+		prefix = fmt.Sprintf("CLI process exited (exit %d)", *exitCode)
+	}
+	tail := readLogTail(logPath, 1536)
+	tail = compactLogTail(redact.Text(tail), 20)
+	if tail == "" {
+		return prefix
+	}
+	if len(prefix)+len("; last log activity: ")+len(tail) > 1800 {
+		tail = tail[:1800-len(prefix)-len("; last log activity: ")]
+	}
+	return prefix + "; last log activity: " + tail
+}
+
+func readLogTail(path string, maxBytes int) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() == 0 {
+		return ""
+	}
+	offset := st.Size() - int64(maxBytes)
+	if offset < 0 {
+		offset = 0
+	}
+	buf := make([]byte, st.Size()-offset)
+	if _, err := f.ReadAt(buf, offset); err != nil {
+		return ""
+	}
+	return string(buf)
+}
+
+func compactLogTail(text string, maxLines int) string {
+	lines := strings.Split(text, "\n")
+	var kept []string
+	for i := len(lines) - 1; i >= 0 && len(kept) < maxLines; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	for i, j := 0, len(kept)-1; i < j; i, j = i+1, j-1 {
+		kept[i], kept[j] = kept[j], kept[i]
+	}
+	return strings.Join(kept, "; ")
 }
 
 func (c *runtimeController) failUnpreparedRun(ctx context.Context, run core.Run, code, message string) error {
@@ -316,6 +380,40 @@ func (c *runtimeController) failPreparedRun(
 		return errors.Join(cause, err)
 	}
 	return cause
+}
+
+// failSecretsUnavailable terminates a run whose redaction cannot be trusted
+// because its run-scoped secrets could not be loaded (new-lineage fail-closed).
+// It must never persist unredacted content, so no log streaming or replay is
+// attempted. The terminal state follows the run: an active run is interrupted,
+// a starting run fails.
+func (c *runtimeController) failSecretsUnavailable(
+	ctx context.Context,
+	run core.Run,
+	ref containerruntime.RuntimeRef,
+	control *runControl,
+) error {
+	state := core.RunFailed
+	reason := "Run launch failed"
+	if run.State == core.RunActive {
+		state = core.RunInterrupted
+		reason = "Run interrupted: run secrets are unavailable"
+	}
+	terminal, err := c.service.RecordRuntimeRunTerminal(ctx, runtimeTerminalInput(run, core.RunTerminalInput{
+		State: state, TerminalReason: reason,
+		RuntimeErrorCode: runtimeSecretsFailureCode,
+		RequestID:        runtimeRequest(run, "secrets-unavailable"), OperationID: run.LaunchOperationID,
+	}))
+	if err == nil {
+		if ref.RunID == "" {
+			ref = runtimeRef(terminal.Run)
+		}
+		_ = c.cleanupRun(context.Background(), terminal.Run, ref, control, nil)
+	}
+	if err != nil {
+		return err
+	}
+	return errRuntimeSecretsUnavailable
 }
 
 func (c *runtimeController) cleanupRun(
@@ -456,6 +554,47 @@ func deadlineReached(value string) bool {
 	}
 	deadline, err := time.Parse(time.RFC3339Nano, value)
 	return err == nil && !time.Now().UTC().Before(deadline)
+}
+
+// runDeadlineAt returns the absolute deadline for a launch: the task's
+// self-declared budget when set, otherwise the global run_timeout backstop.
+// A zero budget and zero run_timeout mean no deadline (no wall-clock cap).
+func runDeadlineAt(budgetSeconds int64, runTimeout time.Duration, now time.Time) string {
+	budget := time.Duration(0)
+	if budgetSeconds > 0 {
+		budget = time.Duration(budgetSeconds) * time.Second
+	}
+	if runTimeout > 0 && (budget == 0 || runTimeout < budget) {
+		budget = runTimeout
+	}
+	if budget <= 0 {
+		return ""
+	}
+	return now.UTC().Add(budget).Format(time.RFC3339Nano)
+}
+
+// runStalled reports whether the run has stopped making observable progress:
+// no heartbeat or process observation for longer than runtime.stall_timeout.
+// A zero stall_timeout disables stall detection.
+func (c *runtimeController) runStalled(run core.Run) bool {
+	if c.config.Runtime.StallTimeout <= 0 {
+		return false
+	}
+	last := run.HeartbeatAt
+	if last == "" {
+		last = run.LastObservedAt
+	}
+	if last == "" {
+		last = run.StartedAt
+	}
+	if last == "" {
+		return false
+	}
+	observed, err := time.Parse(time.RFC3339Nano, last)
+	if err != nil {
+		return false
+	}
+	return time.Since(observed) > c.config.Runtime.StallTimeout
 }
 
 func (c *runtimeController) contextDone() <-chan struct{} {

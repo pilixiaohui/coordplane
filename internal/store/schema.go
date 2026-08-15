@@ -1,11 +1,32 @@
 package store
 
-const schemaVersion = 4
+const schemaVersion = 7
 const schemaName = "coordplane_v4_human_task_lifecycle"
+const budgetSecondsMigrationName = "coordplane_v5_task_budget_seconds"
+const projectDeleteCapabilityMigrationName = "coordplane_v6_project_delete_capability"
+const agentRuntimeConfigMigrationName = "coordplane_v7_agent_runtime_config"
 const participantRolesMigrationName = "coordplane_v3_participant_roles"
 const initialSchemaName = "coordplane_v1_six_objects"
 const isolationSpecMigrationName = "coordplane_v2_run_isolation_spec"
 const isolationSpecMigrationSQL = `ALTER TABLE runs ADD COLUMN isolation_spec_version INTEGER NOT NULL DEFAULT 1 CHECK (isolation_spec_version IN (1,2))`
+const budgetSecondsMigrationSQL = `ALTER TABLE tasks ADD COLUMN budget_seconds INTEGER NOT NULL DEFAULT 0 CHECK (budget_seconds >= 0);`
+
+// agentRuntimeConfigMigrationSQL is the additive v7 configuration-domain
+// migration. It only adds columns and derived backfill (the run fingerprint
+// backfill is executed in Go), never rebuilds tables or creates Events.
+const agentRuntimeConfigMigrationSQL = `
+ALTER TABLE agents ADD COLUMN model TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN subagent_model TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN base_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN effort TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN instructions_text TEXT NOT NULL DEFAULT '';
+ALTER TABLE participants ADD COLUMN model TEXT NOT NULL DEFAULT '';
+ALTER TABLE participants ADD COLUMN subagent_model TEXT NOT NULL DEFAULT '';
+ALTER TABLE participants ADD COLUMN base_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE participants ADD COLUMN effort TEXT NOT NULL DEFAULT '';
+ALTER TABLE participants ADD COLUMN instructions_text TEXT NOT NULL DEFAULT '';
+ALTER TABLE runs ADD COLUMN config_fingerprint TEXT NOT NULL DEFAULT '';
+`
 
 const schemaSQL = `
 CREATE TABLE schema_migrations (
@@ -64,6 +85,7 @@ CREATE TABLE tasks (
   next_run_at TEXT NOT NULL,
   retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
   max_retries INTEGER NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
+  budget_seconds INTEGER NOT NULL DEFAULT 0 CHECK (budget_seconds >= 0),
   wait_reason TEXT NOT NULL DEFAULT '',
   result_summary TEXT NOT NULL DEFAULT '',
   failure_reason TEXT NOT NULL DEFAULT '',

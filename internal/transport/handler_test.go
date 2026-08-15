@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"coordplane/internal/core"
@@ -29,9 +30,12 @@ func TestOperatorHandlerHasOnlyTheFixedRouteSurface(t *testing.T) {
 		{name: "show project", method: http.MethodGet, path: "/v1/projects/prj-1", call: "project"},
 		{name: "repair project", method: http.MethodPost, path: "/v1/projects/prj-1/repair", call: "repair_project"},
 		{name: "archive project", method: http.MethodPost, path: "/v1/projects/prj-1/archive", body: `{}`, call: "archive_project"},
+		{name: "delete project", method: http.MethodPost, path: "/v1/projects/prj-1/delete", body: `{}`, call: "delete_project"},
 		{name: "add agent", method: http.MethodPost, path: "/v1/agents", body: `{}`, call: "add_agent"},
 		{name: "list agents", method: http.MethodGet, path: "/v1/agents", call: "list_agents"},
 		{name: "show agent", method: http.MethodGet, path: "/v1/agents/agt-1", call: "agent"},
+		{name: "update agent", method: http.MethodPut, path: "/v1/agents/agt-1", body: `{}`, call: "update_agent"},
+		{name: "list adapters", method: http.MethodGet, path: "/v1/adapters", call: "list_adapters"},
 		{name: "pause agent", method: http.MethodPost, path: "/v1/agents/agt-1/pause", call: "set_agent_status"},
 		{name: "resume agent", method: http.MethodPost, path: "/v1/agents/agt-1/resume", body: `{}`, call: "set_agent_status"},
 		{name: "archive agent", method: http.MethodPost, path: "/v1/agents/agt-1/archive", call: "archive_agent"},
@@ -113,11 +117,45 @@ func TestOperatorHandlerMapsBodiesPathsAndQueriesWithoutGenericDispatch(t *testi
 		t.Fatalf("chat input = %+v", chat)
 	}
 
+	addAgentBody := `{"display_name":"Configured New","adapter_id":"codex","image":"codex:latest","instructions_text":"prompt body","model":"gpt-5","subagent_model":"gpt-5-mini","base_url":"https://example.invalid/v1","effort":"max","request_id":"req-agent"}`
+	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/agents", addAgentBody, ""))
+	addAgent := operations.calls[len(operations.calls)-1].value.(core.AddAgentInput)
+	if addAgent.DisplayName != "Configured New" || addAgent.AdapterID != "codex" ||
+		addAgent.Image != "codex:latest" || addAgent.InstructionsText != "prompt body" ||
+		addAgent.Model != "gpt-5" || addAgent.SubagentModel != "gpt-5-mini" ||
+		addAgent.BaseURL != "https://example.invalid/v1" || addAgent.Effort != "max" ||
+		addAgent.RequestID != "req-agent" {
+		t.Fatalf("add agent input = %+v", addAgent)
+	}
+
 	createBody := `{"project_id":"prj-1","assignee_agent_id":"agt-1","title":"follow-up","retry_of_task_id":"tsk-closed","ack_message_ids":["msg-2"],"request_id":"req-create"}`
 	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/tasks", createBody, ""))
 	create := operations.calls[len(operations.calls)-1].value.(core.CreateTaskInput)
 	if create.ProjectID != "prj-1" || create.RetryOfTaskID != "tsk-closed" || create.RequestID != "req-create" || !reflect.DeepEqual(create.AckMessageIDs, []string{"msg-2"}) {
 		t.Fatalf("create task input = %+v", create)
+	}
+
+	updateAgentBody := `{"display_name":"Configured","adapter_id":"codex","image":"codex:latest","instructions_text":"do the work","model":"gpt-5","subagent_model":"gpt-5-mini","base_url":"https://example.invalid/v1","effort":"high","version":7,"request_id":"req-update"}`
+	assertOK(t, invoke(t, handler, http.MethodPut, "/v1/agents/agt-update", updateAgentBody, ""))
+	updateAgent := operations.calls[len(operations.calls)-1].value.(core.UpdateAgentInput)
+	if updateAgent.ID != "agt-update" || updateAgent.Version != 7 || updateAgent.RequestID != "req-update" ||
+		updateAgent.DisplayName != "Configured" || updateAgent.AdapterID != "codex" || updateAgent.InstructionsText != "do the work" ||
+		updateAgent.Model != "gpt-5" || updateAgent.BaseURL != "https://example.invalid/v1" || updateAgent.Effort != "high" {
+		t.Fatalf("update agent input = %+v", updateAgent)
+	}
+
+	adapterRecorder := invoke(t, handler, http.MethodGet, "/v1/adapters", "", "")
+	adapterEnvelope := assertOK(t, adapterRecorder)
+	adapterBody := string(adapterEnvelope.Data)
+	for _, want := range []string{`"name":"claude"`, `"execution_model":"one_shot"`, `"supports_resume":true`, `"supports_inject":false`, `"allowed_efforts":["low","medium","high"]`} {
+		if !strings.Contains(adapterBody, want) {
+			t.Fatalf("adapter response %s, want substring %q", adapterBody, want)
+		}
+	}
+	for _, forbidden := range []string{"executable", "argv", "secret", "password", "/usr/bin"} {
+		if strings.Contains(adapterBody, forbidden) {
+			t.Fatalf("adapter response leaked read-only boundary %q: %s", forbidden, adapterBody)
+		}
 	}
 
 	assertOK(t, invoke(t, handler, http.MethodPost, "/v1/agents/agt-7/pause", `{"request_id":"req-pause"}`, ""))
@@ -190,6 +228,73 @@ func TestOperatorHandlerMapsBodiesPathsAndQueriesWithoutGenericDispatch(t *testi
 	if len(operations.calls) != before+1 {
 		t.Fatal("invalid query reached core operations")
 	}
+}
+
+func TestOperatorHandlerAcceptsMaximumInstructionsTextEncodingsButRejectsOverAllowance(t *testing.T) {
+	const envelopeAllowance = 64 << 10
+	const maxBodyBytes = core.MaximumInstructionsBytes*6 + envelopeAllowance
+	agentBody := func(instructionsText string) []byte {
+		body, err := json.Marshal(core.AddAgentInput{
+			DisplayName:      "Boundary Agent",
+			AdapterID:        "claude",
+			Image:            "agent:latest",
+			InstructionsFile: "",
+			InstructionsText: instructionsText,
+			RequestID:        "boundary-request",
+		})
+		if err != nil {
+			t.Fatalf("marshal boundary agent: %v", err)
+		}
+		return body
+	}
+
+	for _, form := range []struct {
+		name string
+		text string
+	}{
+		{name: "plain", text: strings.Repeat("x", core.MaximumInstructionsBytes)},
+		{name: "newline", text: strings.Repeat("\n", core.MaximumInstructionsBytes)},
+		{name: "quote", text: strings.Repeat("\"", core.MaximumInstructionsBytes)},
+		{name: "backslash", text: strings.Repeat(`\`, core.MaximumInstructionsBytes)},
+		{name: "nul", text: strings.Repeat("\x00", core.MaximumInstructionsBytes)},
+	} {
+		t.Run("exact 1 MiB "+form.name+" text", func(t *testing.T) {
+			operations := &operatorFake{}
+			handler := transport.NewOperatorHandler(operations)
+			body := agentBody(form.text)
+			if len(body) >= maxBodyBytes {
+				t.Fatalf("%s encoded body length = %d, want below %d", form.name, len(body), maxBodyBytes)
+			}
+			assertOK(t, invoke(t, handler, http.MethodPost, "/v1/agents", string(body), ""))
+			if len(operations.calls) != 2 || operations.calls[0].name != "authenticate_operator" || operations.calls[1].name != "add_agent" {
+				t.Fatalf("%s boundary request calls = %+v", form.name, operations.calls)
+			}
+			input := operations.calls[1].value.(core.AddAgentInput)
+			if len(input.InstructionsText) != core.MaximumInstructionsBytes {
+				t.Fatalf("%s instructions text length = %d, want %d", form.name, len(input.InstructionsText), core.MaximumInstructionsBytes)
+			}
+		})
+	}
+
+	t.Run("one byte over envelope allowance", func(t *testing.T) {
+		operations := &operatorFake{}
+		handler := transport.NewOperatorHandler(operations)
+		shortBody := agentBody("x")
+		envelopeOverhead := len(shortBody) - len("x")
+		textLength := maxBodyBytes + 1 - envelopeOverhead
+		body := agentBody(strings.Repeat("x", textLength))
+		if len(body) != maxBodyBytes+1 {
+			t.Fatalf("over-allowance body length = %d, want %d", len(body), maxBodyBytes+1)
+		}
+		recorder := invoke(t, handler, http.MethodPost, "/v1/agents", string(body), "")
+		envelope := decodeEnvelope(t, recorder)
+		if recorder.Code != http.StatusBadRequest || envelope.Error == nil || envelope.Error.Code != core.CodeInvalidArgument {
+			t.Fatalf("over-allowance response = status:%d envelope:%+v", recorder.Code, envelope)
+		}
+		if len(operations.calls) != 1 || operations.calls[0].name != "authenticate_operator" {
+			t.Fatalf("over-allowance request reached core: %+v", operations.calls)
+		}
+	})
 }
 
 func TestRunHandlerForwardsOnlyBearerTokenToCore(t *testing.T) {
@@ -325,7 +430,7 @@ func TestRunHandlerReturnsCoreErrorsAndRejectsMalformedJSONBeforeSideEffects(t *
 
 func TestHandlersFenceEveryMutationUntilDaemonReady(t *testing.T) {
 	operatorRoutes := []string{
-		"/v1/projects", "/v1/projects/prj-1/repair", "/v1/projects/prj-1/archive",
+		"/v1/projects", "/v1/projects/prj-1/repair", "/v1/projects/prj-1/archive", "/v1/projects/prj-1/delete",
 		"/v1/agents", "/v1/agents/agt-1/pause", "/v1/agents/agt-1/resume", "/v1/agents/agt-1/archive",
 		"/v1/chat", "/v1/tasks", "/v1/tasks/tsk-1/checkout", "/v1/tasks/tsk-1/close",
 		"/v1/tasks/tsk-1/wake", "/v1/tasks/tsk-1/retry", "/v1/tasks/tsk-1/cancel",
@@ -337,6 +442,22 @@ func TestHandlersFenceEveryMutationUntilDaemonReady(t *testing.T) {
 		t.Run("operator "+path, func(t *testing.T) {
 			operations := &operatorFake{readyErr: core.NewError(core.CodeRuntimeUnavailable, "recovering", true)}
 			recorder := invoke(t, transport.NewOperatorHandler(operations), http.MethodPost, path, `{}`, "")
+			assertNotReady(t, recorder)
+			if len(operations.calls) != 0 || operations.readyChecks != 1 {
+				t.Fatalf("calls=%+v ready checks=%d, want no operation and one readiness check", operations.calls, operations.readyChecks)
+			}
+		})
+	}
+	for _, mutation := range []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodPut, path: "/v1/agents/agt-1"},
+		{method: http.MethodPut, path: "/v1/roles/role-1"},
+	} {
+		t.Run("operator "+mutation.method+" "+mutation.path, func(t *testing.T) {
+			operations := &operatorFake{readyErr: core.NewError(core.CodeRuntimeUnavailable, "recovering", true)}
+			recorder := invoke(t, transport.NewOperatorHandler(operations), mutation.method, mutation.path, `{}`, "")
 			assertNotReady(t, recorder)
 			if len(operations.calls) != 0 || operations.readyChecks != 1 {
 				t.Fatalf("calls=%+v ready checks=%d, want no operation and one readiness check", operations.calls, operations.readyChecks)
@@ -447,6 +568,7 @@ type operatorFake struct {
 	err         error
 	readyErr    error
 	readyChecks int
+	adapters    []core.AdapterDescriptor
 }
 
 func (f *operatorFake) RequireReady() error {
@@ -499,8 +621,37 @@ func (f *operatorFake) ArchiveProject(_ context.Context, id, requestID string) (
 	return core.Project{}, f.record("archive_project", actionCall{id: id, requestID: requestID})
 }
 
+func (f *operatorFake) DeleteProject(_ context.Context, input core.ProjectDeleteInput) error {
+	return f.record("delete_project", input)
+}
+
 func (f *operatorFake) AddAgent(_ context.Context, input core.AddAgentInput) (core.Agent, error) {
 	return core.Agent{}, f.record("add_agent", input)
+}
+
+func (f *operatorFake) UpdateAgent(_ context.Context, input core.UpdateAgentInput) (core.Agent, error) {
+	return core.Agent{}, f.record("update_agent", input)
+}
+
+func (f *operatorFake) ListAdapters(_ context.Context) ([]core.AdapterDescriptor, error) {
+	if err := f.record("list_adapters", nil); err != nil {
+		return nil, err
+	}
+	if f.adapters == nil {
+		f.adapters = []core.AdapterDescriptor{
+			{
+				ID: "claude", Name: "claude", ExecutionModel: "one_shot",
+				SupportsResume: true, SupportsInject: false,
+				AllowedEfforts: []string{"low", "medium", "high"},
+			},
+			{
+				ID: "codex", Name: "codex", ExecutionModel: "one_shot",
+				SupportsResume: true, SupportsInject: false,
+				AllowedEfforts: []string{"low", "medium", "high", "xhigh", "max", "ultra"},
+			},
+		}
+	}
+	return f.adapters, nil
 }
 
 func (f *operatorFake) SetAgentStatus(_ context.Context, id string, status core.AgentStatus, requestID string) (core.Agent, error) {
@@ -624,6 +775,10 @@ func (f *operatorFake) RetryTask(_ context.Context, input core.TaskActionInput) 
 
 func (f *operatorFake) CancelTask(_ context.Context, input core.TaskActionInput) (core.Task, error) {
 	return core.Task{}, f.record("cancel_task", input)
+}
+
+func (f *operatorFake) DeleteTask(_ context.Context, input core.TaskActionInput) error {
+	return f.record("delete_task", input)
 }
 
 func (f *operatorFake) RequestAccept(_ context.Context, input core.AcceptInput) (core.Task, error) {
