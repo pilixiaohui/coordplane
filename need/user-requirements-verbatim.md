@@ -152,3 +152,14 @@
 ```text
 我改了 CoordPlane Go 收敛小队 的cli配置，然后确保每个任务要以一个完整的真实实际项目测试开始，然后进行一轮修正，确保每轮测试产生的问题在一个task内进行修正（可以派生子task），确保每个父task就是一次完整的测试迭代，重新进行当前的task设计，删除之前的杂乱task分配
 ```
+
+### UR-0012
+
+- 接收日期：2026-08-16
+- 来源：当前用户会话
+- 类型：真实 Docker CLI Agent 测试的 provider 环境与模型配置
+- 关联：适用于 `COD-105` 当前迭代及后续完整真实项目基线/复验；不改变五份 CoordPlane 产品规范
+
+```text
+Docker CLI Agent 测试的时候使用环境变量的ANTHROPIC_API_KEY 和 ANTHROPIC_BASE_URL ，模型使用deepseek-v4-flash
+```
