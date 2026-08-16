@@ -1,386 +1,298 @@
 # CoordPlane Git 协作需求
 
-状态：Draft for owner review
+状态：候选冻结基线，待需求审批人复核精确 revision
+版本：1.0-rc3
+日期：2026-08-16
 依赖：`README.md`、`core.md`、`runtime.md`
 
 ## 1. 目标和边界
 
-Git 模块只负责让多个隔离 Task 的真实 commit 安全收敛到一个 canonical ref。
+Git模块负责：
 
-它必须：
+- 从本机已有repository注册每个Project的daemon-owned control repo和canonical ref。
+- 为每个 `workspace_mode=git` Task创建私有workspace并固定base/source输入。
+- 让Human在宿主机、CLI Agent在Docker内使用同一标准Git工作模型。
+- 从actual committed HEAD捕获不可变submission ref，使用expected-old CAS推进canonical。
+- canonical stale时创建显式integration Task，支持崩溃恢复、冲突保留和安全GC。
 
-- 用 daemon-owned bare repo 保存项目代码真相。
-- 为每个代码 Task准备独立 private clone 和固定 base SHA。
-- 从实际 workspace捕获 commit 到 controller-owned task ref。
-- 用 Git 原生 ancestry 和 expected-old ref CAS 推进 canonical。
-- 把 non-fast-forward、stale 和冲突工作转成普通 integration Task交给 CLI Agent。
-- 在崩溃、清理和并发更新后保证 commit 不丢、canonical 不被覆盖。
-
-它不得代理 Agent 日常 Git命令，不建设 ChangeSet/GitOperation/ConflictSet/rollback 平台，不理解 diff，不执行后台 merge/rebase/cherry-pick，也不把 SQLite 当代码真相。
-
-Owner已批准 Agent 可配置 CLI/模型/提示词 v1（D1–D7/E1–E5，2026-08-13）；本文件的private clone、actual HEAD capture、task ref、expected-old CAS、integration、recovery或GC合同不变，预算按 E1 重基线。全库production/tests/infra/total envelope固定为`24,000/24,500/25,000`、`25,500/26,200/27,000`、`250/500/700`和`49,750/51,200/52,700`（E1 暂定上限，最终以 clean revision 实测锁表）；统计仍按`acceptance.md`的非空、非纯注释物理行口径。Git模块实际SLOC、质量blocker和diff必须进入clean候选revision的LOC JSON，并在真实多Agent场景中验证所有接受结果的lineage、task ref、integration和canonical CAS；不得用重基线reserve删除真实Git crash/fence证据。
+Git模块不判断代码正确，不代理通用Git命令，不自动发布远端，不按Participant kind或职责改变accept/integration规则。
 
 ## 2. 代码真相和仓库布局
 
-每个 Project 有一个 Daemon 私有 bare repo：
+每个Project只有一个daemon-owned bare control repo：
 
 ```text
-<data_dir>/repos/<project-id>.git
+control-repos/<project-id>.git/
+  refs/heads/<canonical>
+  refs/coordplane/tasks/<task-id>/submissions/<submission-id>
+  refs/coordplane/runs/<run-id>                         # 可选恢复/诊断ref
 ```
 
-该 bare repo 保存：
+每个git Task只有一个私有workspace：
 
 ```text
-<Project.canonical_ref>                         # 例如 refs/heads/main
-refs/coordplane/tasks/<task-id>/runs/<run-id>  # 每次捕获的不可变结果
+workspaces/<project-id>/<task-id>/
 ```
 
-规则：
+权威顺序：
 
-- canonical ref 是 Project 当前已集成代码的唯一真相。
-- Task `base_sha/head_sha/task_ref` 是精确引用；数据库不保存 patch或代码副本。
-- 每次读取状态、提交结果或集成前都必须重新解析实际 ref，不能信任缓存的 `canonical_sha`、Agent自报或可移动 branch 名。
-- Task/run ref 名由服务端 ID生成并通过 `git check-ref-format` 校验；Agent不能提供任意 ref。
-- Bare repo只允许 Daemon服务用户访问，绝不以可写方式挂载进 Agent容器。
-- Project source只允许本地Git repository并仅用于初始化；第一版不接收远端URL、不自动fetch/push。
+1. 实际Git object和ref。
+2. SQLite中固定base/head/submission/task ref和pending intent。
+3. Event与行为日志只作审计，不授权ref变化。
 
-## 3. Project 注册和导出
+约束：
+
+- `canonical_sha`是缓存；actual canonical ref不一致时先reconcile，禁止缓存覆盖actual。
+- task submission ref创建后不可移动。rework后的新结果使用新submission ID/ref，不覆盖旧ref。
+- Human与CLI Agent提交都必须有stable `submission_id`。Agent成功submit可使用capture operation ID并另记`head_run_id`；Human `head_run_id=null`。
+- Project、Task、submission ID先校验固定格式，再由服务端构造完整ref；调用者不能提供raw ref。
+
+## 3. Project注册和导出
 
 ### 3.1 注册
 
-`coordplane project add --repo SOURCE --ref REF` 必须：
+`project add` 只接受本机Git repository路径和完整branch ref：
 
-1. 校验SOURCE是可读本地Git repository，要求REF规范化为完整`refs/heads/*`并解析为精确commit。
-2. SQLite事务创建status=creating的Project，固定Project ID、source/ref、immutable initial SHA、最终control path、`pending_action=initialize`和operation ID，并写Event。
-3. 在由Project ID确定的临时目录创建bare repo并导入对象。
-4. 创建Project canonical ref指向该commit并运行最小完整性检查。
-5. 原子移动到最终control repo路径。
-6. SQLite CAS确认同一creating Project/operation/initial SHA，清除pending、转active并写terminal Event。已观察且完成必要隔离/清理的失败必须在事务中清除pending、转error并保留稳定原因；Daemon未能提交terminal事务的崩溃仍保持creating，由reconciler处理。
+1. 只读preflight解析source ref为精确commit `initial_sha`，拒绝ambiguous/revision表达式、SHA-256 object format、未初始化repo和非法ref。
+2. SQLite事务创建Project `creating`、固定source/ref/initial SHA和initialize operation。
+3. 在临时目录从source复制/拉取必要object，创建bare control repo和canonical ref；不得修改source。
+4. 核验actual ref、`git fsck`和ownership后，SQLite CAS清pending并active。
 
-注册失败不得留下active Project。重启时creating Project只按Project行保存的initial SHA、operation ID和确定性临时/最终路径继续、核验或转error；即使source ref已经移动也不得换成新commit。无Project行的未知repo目录一律quarantine，不自动采用。注册本地non-bare repo时，不得修改其ref、index、working tree、config或hooks。
+同名/同source并发注册必须通过Project identity和CAS收敛为一个结果。崩溃后reconciler根据pending和actual repo继续或error，不重新读取已移动的source ref作为新initial SHA。
 
-`project repair`对尚未完成初始化的Project沿用immutable initial SHA重新进入initialize；对已有control repo的error Project只做verify/fsck/ref核验并接受actual canonical作为事实，不得从`canonical_sha`或initial SHA回写、reset或force ref。每次repair使用新的Project pending operation ID，成功/失败都由Project行和同operation Event收敛。
+### 3.2 导出
 
-### 3.2 Boss checkout
+- `project checkout PROJECT --dest PATH` 从actual canonical创建普通checkout，确认HEAD后移除control remote。
+- `task checkout TASK --dest PATH` 从Task保存的精确submission ref/head导出，确认HEAD并移除control remote。
+- 目标必须不存在或为空，禁止覆盖已有Human工作目录。
+- 导出用于只读审查或外部工作，不是Task私有workspace，也不能直接submit回CoordPlane。
+- 远端GitHub/GitLab发布由Participant使用标准Git在CoordPlane之外执行，不是v1完成条件。
 
-`coordplane project checkout PROJECT --dest PATH` 从实际 canonical ref 创建一个新的普通 checkout：
+## 4. 私有workspace
 
-- 目标路径必须不存在或为空。
-- 命令不得覆盖 Boss已有工作区。
-- Checkout通过bundle或导出后移除/改写指向control repo的origin，只消费代码真相，不获得更新control canonical的路径或凭据。
-- 第一版向 GitHub/GitLab 发布由 Boss使用标准 Git自行完成，不是 CoordPlane完成条件。
+### 4.1 创建和ownership
 
-`coordplane task checkout TASK --dest PATH`使用同一导出边界，但目标必须是Task行保存的精确task ref/head。命令只接受已有capture结果的Task，导出后必须确认HEAD等于Task.head_sha并移除control remote；这是第一版中Boss审查未集成代码的正式入口。
+- 每个git Task一个workspace，owner marker固定Project、Task、assignee Participant、base/source SHA和创建operation。
+- 普通work Task从actual canonical的固定`base_sha`创建；带source Task时另外导入固定source ref/head。
+- integration Task首轮从不可变`integration_initial_canonical_sha`创建；后续轮从当轮`integration_expected_canonical_sha`继续，并导入source submission convenience ref。
+- Task创建事务只固定输入并写`workspace_state=pending`、稳定prepare operation ID和workspace identity。Git workspace worker是唯一preparer，核验目录、marker、HEAD、source和ownership后CAS为`ready`；任一不确定为`blocked`。
+- workspace `.git` 与其他Task完全隔离；不能共享index、worktree metadata、rebase/merge状态或锁文件。
+- workspace不能拥有更新control repo canonical/task refs的remote凭据。对象回传由Daemon受信helper完成。
 
-## 4. Private clone 隔离
+### 4.2 Human与CLI Agent访问
 
-Docker/不可信 CLI Agent必须使用完整 private clone，不得使用共享 common Git dir：
+- Human Task的workspace `ready`后，授权Human可从专用Operator CLI/Web host operation获得服务端生成的宿主路径；只有该Task assignee或同时具备`git.workspace.read`的Human可获得。路径不进入coordlink、Agent bootstrap、通用status/Event/日志/错误。
+- CLI Agent只在自己的Task Run中看到 `/workspace`，API不得暴露宿主绝对路径。
+- 两类Participant都在workspace直接使用标准Git进行status/diff/add/commit/rebase/merge。
+- CoordPlane不记录Human在宿主机的每个shell行为；只记录经Service进行的claim/submit和capture时Git前后事实。CLI Agent在Run内的可观测Git/tool行为按`runtime.md`进入行为日志。
+- Human与CLI Agent都不能用kind绕过clean、expected-head、source、capture或CAS检查。
 
-```text
-git clone --no-local <control-repo> <task-workspace>
-git checkout --detach <base_sha>
-git switch -c coordplane/task/<task-id>
-```
+### 4.3 生命周期
 
-准备后必须满足：
+- Task retry复用原workspace；rework保留旧submission ref并在同workspace继续，提交新submission。复用前必须重新核验workspace identity/marker；需要恢复准备时沿用原operation ID，不创建第二目录。
+- assignee变化前必须证明无Run、无Human active claim、无pending capture和workspace ownership可转移，并写Event；否则拒绝。
+- active/running/finishing、dirty、Git中间态、唯一未捕获commit或ownership不明的workspace不得自动删除。
 
-- HEAD 精确等于 Task.base_sha。
-- `.git` 目录完全位于该 Task workspace内。
-- `.git/objects/info/alternates` 不存在。
-- 不使用 `--shared`、`--reference`、hardlink object store或 linked worktree。
-- 删除或改写包含宿主 control repo路径的 `origin`；容器内不能访问该路径。
-- 不注入 control repo/remote 的写凭据。
-- 默认不继承 host hooks、credential helper、filter或全局 Git config。
-- 默认不递归初始化 submodule；项目确需 submodule 时另行明确 source/credential边界。
+## 5. Task基线和stale可见性
 
-带`source_task_*`输入的work/integration Task还必须通过受限bundle把保存的精确source commit导入private clone并创建本地convenience ref。该ref可被Agent移动，只用于checkout/diff；Daemon后续判断始终使用Task保存的SHA和controller bare事实。
+- git Task创建事务前在Project维护锁内读取actual canonical，事务保存不可变`base_sha`。integration Task另外保存不可变initial canonical和每轮可CAS更新的expected canonical。
+- workspace HEAD初始必须等于base，或integration Task当轮expected canonical所要求的已核验准备结果；`workspace_state=ready` 前Task不能claim/Run active。
+- canonical后续移动不自动rebase/restart已有Task。参与者通过Message/status看到base与current canonical差异。
+- 需要最新基线时，由有权限Participant显式rework/retry或创建新Task；Daemon不根据stale自动丢弃工作。
+- source Task输入在新Task创建事务复制`source_task_ref/source_head_sha`，后续source状态或ref GC前置必须尊重该持久引用。
 
-Linked worktree共享 common Git dir和 refs，不构成不可信 Agent隔离。它只能用于明确 trusted-host 的开发测试，不能作为 Docker产品实现或通过隔离验收。
+## 6. Submit与结果捕获
 
-## 5. Task 基线和 workspace
+### 6.1 共同前置条件
 
-### 5.1 Base 固定
+git Task submit必须提供`expected_head`并满足：
 
-- 创建代码 Task时，Daemon从实际 canonical ref读取 commit并写 `Task.base_sha`。
-- `base_sha` 在 Task生命周期内不可修改。
-- 两个并发 Task可以拥有相同 base SHA。
-- canonical 后续前进不静默修改 active workspace或 Task.base_sha。
+- Project active，Task running，caller是assignee且有`task.submit`。
+- HEAD解析为commit并等于expected head；commit从Task固定base/source可达，禁止无关替换历史。
+- index/worktree clean，无untracked文件，无merge/rebase/cherry-pick/bisect等中间态，无锁文件。
+- commit/object/path数量、bundle大小和Git命令时限在静态安全上限内。
+- Task无pending action或open integration授权。
 
-### 5.2 Stale 可见性
+CLI Agent必须先在同一事务写requested submit、撤销Run token并进入finishing；真实Run terminal、container writer停止后才能capture。Human没有Run：submit事务直接进入finishing并创建稳定capture operation/submission ID。
 
-- `status/task current` 必须通过actual canonical与Task base/head投影`stale=true/false`和old/new SHA。
-- 第一版不要求canonical每次前进后扫描所有Task并主动广播，避免消息风暴和第二套同步队列。
-- Daemon不自动checkout/rebase/merge/reset active workspace。Agent可以继续旧base结果，接受时由CAS/integration Task收敛。
-- 如果Agent必须基于最新代码重做，由Boss/父Agent显式rework/retry或创建新Task。
+### 6.2 Human并发快照
 
-### 5.3 Agent 原生 Git
+Daemon无法假设宿主Human进程已停止写workspace，因此Human capture必须使用稳定快照协议：
 
-Agent可在 private clone内直接运行：
+1. submit事务固定`expected_head`、submission ID、Task version和capture intent。
+2. helper获取per-Task维护锁，读取HEAD、clean/in-progress状态及workspace fingerprint F1。
+3. 只按不可变expected commit生成有界bundle/pack，不跟随之后移动的workspace HEAD。
+4. 再读取HEAD、clean/in-progress状态和fingerprint F2。
+5. F1/F2不一致、HEAD移动或workspace变脏时，隔离临时对象，清pending并回到running，返回`WORKSPACE_CHANGED`；不得捕获新HEAD或声称成功。
+6. F1/F2稳定时才导入quarantine并继续共同capture。
 
-```text
-git status / diff / log
-git add / commit
-git branch / merge / rebase / cherry-pick
-项目测试命令
-```
+Human在快照后继续产生的新commit不属于本submission，必须保留workspace并通过新rework/submit显式处理。
 
-这些命令只改变 private clone。CoordPlane不代理、不审计每一步，也不保证 Agent选择的开发方法正确。最终是否可提交只由机械 capture检查决定。
+### 6.3 受信capture
 
-审查未集成结果时，Boss使用`task checkout`；Agent Reviewer创建带`--source-task ID`的普通work Task，在其private workspace检查固定source convenience ref。Review结果仍用普通Task summary/Message表达，不创建validation对象。
+受信helper不得信任workspace配置、hook、alternates、replace refs或环境：
 
-## 6. 结果捕获
+- 使用固定Git executable、最小环境、禁用hooks/global/system config、清理危险`GIT_*`变量。
+- 按expected commit创建bundle/pack到quarantine，校验header/object count/size、commit类型和reachability。
+- 将对象导入control repo quarantine，执行fsck/connectivity后才进入主object store。
+- 以 `git update-ref <submission-ref> <head> <zero>` 或等价create-only CAS创建不可变ref。
+- 回读ref和commit后，SQLite CAS确认Task仍finishing、pending operation/version/head/submission匹配，写`head_sha/head_submission_id/task_ref`；Agent另写`head_run_id`，Human保持空；清pending并submitted。
 
-### 6.1 Submit 前置条件
+任何校验失败不得创建/移动canonical。可修复dirty/changed/expected mismatch让Task回running（Human）或queued/backoff（CLI Agent）；对象损坏、ref冲突或control repo invariant失败使Project error并保留诊断。
 
-代码Task调用`coordlink task submit --expected-head SHA`时，Core第一事务只做以下动作：
+### 6.4 Capture崩溃恢复
 
-1. CAS校验Task=running、current Run、generation和token。
-2. Task转finishing，写`pending_action=capture`、稳定operation ID、Run ID/generation、expected head和intent后的Task version。
-3. Run写requested_outcome=submit、summary/expected head并撤销token。
-4. 写使用同一operation ID的requested Event。
+reconciler按pending和actual submission ref处理：
 
-该命令只表示submit请求已durable，不得立即把Task写成submitted。Runtime在响应送达后结束Agent Run；只有Run terminal、workspace无任何writer后，受信capture helper才读取：
+- pending存在、ref不存在：只有Task仍finishing且operation/version/head匹配时重试capture；否则清pending并保留workspace。
+- ref存在、SQLite head为空：只有相同最终fence全部成立才补写submitted；Task已cancel/rework/generation变化时ref只保留诊断/GC，绝不能推进状态。
+- ref存在且SHA不等于pending target：Project error，不覆盖、不删除。
+- SQLite已submitted且ref匹配：幂等完成。
 
-```text
-git rev-parse --verify HEAD^{commit}
-git status --porcelain
-是否存在 merge/rebase/cherry-pick 中间态
-当前 private branch（仅诊断）
-```
+Event或日志不能补齐缺少的pending授权。崩溃点测试必须覆盖intent前后、object import前后、ref创建前后和SQLite terminal事务前后。
 
-capture要求：
-
-- Working tree和 index必须 clean，包括未跟踪文件。
-- 不得存在未完成 merge/rebase/cherry-pick。
-- HEAD必须是 commit，且 Task.base_sha必须是 HEAD祖先；否则返回稳定 Git错误并保持 Task可恢复。
-- 调用方给出的`expected_head`只做一致性校验；实际HEAD由受信helper读取且必须相等。
-- HEAD可以等于 base，表示无代码变化的有效结果；result summary仍必须显式说明。
-
-### 6.2 不可信 handoff
-
-Host controller不得在Agent可写workspace上做“检查后继续运行Agent”的TOCTOU capture，也不得直接信任其`.git` config。结果导入使用受限handoff：
-
-1. 确认source Run已terminal、Task仍finishing、pending action ID/version/run/generation完全匹配，且不存在其他容器/进程写该workspace。
-2. 在独立受信helper容器中把workspace只读挂载，关闭replace/graft和system/global config，再次确认clean/HEAD并生成只包含目标commit graph的Git bundle/pack。
-3. Daemon通过per-Run临时目录取得handoff文件，限制大小、对象数、处理时间和磁盘占用。
-4. 使用sanitized Git环境校验bundle完整性并导入control bare repo。
-5. 在controller bare中重新验证commit类型、base ancestry和expected head，不信任workspace的replace/graft结果。
-6. 创建不可变`refs/coordplane/tasks/<task-id>/runs/<run-id>`并重新读取确认。
-7. SQLite最终事务再次校验Task=finishing、pending action ID/version/run ID、Run generation/terminal，并要求resolved task ref、pending expected SHA、helper/controller验证的head三者完全相等；成功后写head/head Run/task ref/result summary，Task转submitted、清除current Run/pending action并写同operation ID的terminal Event。
-8. 删除临时handoff；task ref继续保护commit。
-
-Controller Git命令必须使用 argv，不拼 shell；关闭 system/global config和 hooks，路径参数使用 `--`。
-
-### 6.3 Capture 崩溃恢复
-
-Task pending action字段是未完成capture的当前权威，Event只保留同operation ID的历史。Task/run ref由确定性ID命名，因此不需要GitOperation对象：
-
-- pending capture存在、task ref不存在：只有Task仍finishing、pending action/version/run/generation匹配且workspace已静止时才重试；否则清除/失败并保留任何孤立ref供诊断。
-- task ref存在、数据库head为空：必须通过与上面相同的最终fence才可补齐submitted；Task已cancel/retry/new generation时只能保留或GC ref，不能授权状态转移。
-- task ref与 intent head不同：标记 `GIT_INVARIANT_VIOLATION`，停止该 Project集成，不任选一方覆盖。
-- Dirty/中间态/expected-head不匹配等可修复capture失败：清除pending/current Run，Task从finishing转queued并发送Message；超过retry上限转failed。Ref不一致/对象损坏等invariant失败：Project转error、Task转failed。
-- handoff `.partial` 不作为有效输入；只有原子改名后的 `.ready` 可以导入。
-- 未知 partial/ready文件必须隔离并在确认无 intent引用后清理。
-
-## 7. 显式接受和机械集成
+## 7. 显式接受和canonical CAS
 
 ### 7.1 接受责任
 
-- work Task submitted后必须由 Boss或创建它的父 Task当前 Agent显式 `task accept`。
-- Review是普通 Task：需要时，Boss/Agent创建一个引用 source task ref/head的 review Task，由 Reviewer CLI Agent判断；Core不提供 validation对象或 gate。
-- `accept`只表达智能决策已经由Boss/Agent做出。代码Task必须从命令显式`--integration-agent A`或Project默认值解析出一个active Agent，即使当前看起来可直接fast-forward；否则返回`INTEGRATION_AGENT_REQUIRED`且不写accepted/pending字段，以保证CAS竞态变stale时一定可收敛。
-- Accept开始前读取actual canonical和task ref。SQLite事务CAS校验Task=submitted/version、pending action为空、接受者scope和integration Agent仍active，然后把精确Agent ID写入`accepted_integration_agent_id`，同时写accepted by/at、`pending_action=advance`、operation ID、intent后的Task version、expected current/target head，并写同operation ID的Event。后续Project默认值变化不得改写本次选择。
-- pending advance存在期间rework/cancel/第二次accept返回`ACTION_IN_PROGRESS`，避免已撤销结果仍推进canonical。
+- submitted Task只能由具备`task.accept`和`git.accept`的Participant显式accept；creator、Human或Agent身份不产生隐式权力。
+- accept只表达Participant已作业务判断，Daemon不审查代码。review是普通Task，可引用source submission。
+- git Task accept必须从命令或Project默认值解析一个active integration Participant，并固定到`accepted_integration_participant_id`；Human和CLI Agent均可。缺失返回`INTEGRATION_PARTICIPANT_REQUIRED`且零副作用。
+- accept事务固定actual canonical expected SHA、target head、Task/ref/version、接受者和integration Participant，写advance intent和Event。
 
-### 7.2 Fast-forward CAS
+### 7.2 Fast-forward expected-old CAS
 
-Daemon唯一允许自动修改 canonical的算法：
+Daemon在Project维护锁内：
 
-```text
-current = resolve(Project.canonical_ref)
-head    = resolve(Task.task_ref)
+1. 回读actual canonical和Task submission ref，核验SHA、object和lineage。
+2. 若actual canonical等于Task base/expected且target可fast-forward，执行`git update-ref canonical target expected-old`。
+3. 回读actual canonical；只有等于target才可提交Task completed/final SHA。
+4. 若expected-old失败，读取actual。如果actual已等于target且pending匹配则幂等完成；否则标记`CANONICAL_STALE`并进入integration流程。
 
-if current == head:
-    confirm success
-else if git merge-base --is-ancestor head current:
-    confirm already integrated
-else if git merge-base --is-ancestor current head:
-    git update-ref <canonical_ref> <head> <current>
-    read back <canonical_ref> and require == head
-else:
-    create/reuse integration Task
-```
+禁止merge、reset、force、cherry-pick或用数据库缓存覆盖actual canonical。完成事务再次校验pending ID/version/target、Task accepted事实和固定integration Participant。
 
-要求：
+### 7.3 Advance崩溃恢复
 
-- Task pending action字段是当前advance intent权威；Event只保存使用同operation ID的`git.canonical_advance_requested`历史。
-- `git update-ref` 必须携带 expected-old SHA；不得无条件更新、force或 reset canonical。
-- CAS失败后重新读取actual canonical。若actual等于head或head是actual祖先，结果已包含并视为成功；若actual仍是head祖先，可以有限重试；否则进入stale。
-- 完成/转stale的SQLite事务必须再次校验pending action ID/version/target、Task仍submitted+accepted及`accepted_integration_agent_id`未变，随后清除pending字段。任何不匹配都进入Project error，不能用Git成功绕过已变化授权。
-- 只有读取actual canonical确认等于或包含head后，Task才可completed、写final canonical SHA和`git.canonical_advanced` Event。
-- 正确性依赖 Git ref CAS，不依赖进程内 integration lock。
-
-### 7.3 CAS 崩溃恢复
-
-存在未完成 advance intent时：
-
-| actual canonical | 行为 |
-| --- | --- |
-| 等于 intended head | 通过pending action fence后补齐DB completed/Event |
-| intended head是actual祖先 | 已被后续canonical包含；通过fence后补齐completed/final SHA |
-| 仍等于 expected old | 幂等重试 update-ref |
-| actual是intended head的祖先 | 使用新expected old有限重试 |
-| 其他 | work source写stale并创建/reuse integration Task；integration Task机械requeue自身，不创建嵌套integration |
-
-Reconciler必须以Task pending action为入口，并重新校验operation ID/version/accepted授权和selected integration Agent。历史Event单独存在不重放。数据库不得因intent存在就显示成功，也不得把canonical回写到旧SHA。
+- pending存在且canonical仍expected：重试同一个expected-old CAS。
+- canonical已target：核验后补写completed。
+- canonical为第三个SHA：不得回退；转stale并创建/reuse唯一integration Task。
+- target/ref/object损坏或pending授权不匹配：Project error。
 
 ## 8. Integration Task
 
 ### 8.1 创建
 
-当已接受 source Task不能 fast-forward时，Daemon幂等创建 `kind=integration` 的普通 Task。结构化上下文至少包含：
+stale事务原子创建或复用同Project/source submission唯一open integration Task，固定：
 
-- source task ID、source run ID。
-- source head SHA和不可变 task ref。
-- 创建时 actual canonical SHA。
-- Project canonical ref。
+- assignee=`accepted_integration_participant_id`，可以是Human或CLI Agent。
+- `workspace_mode=git`、source Task/run/submission/ref/head。
+- source Task/run/submission/ref/head和source当前version `source_accept_version`，之后均不可改。
+- 创建时actual canonical同时写为不可变`integration_initial_canonical_sha`、首轮`integration_expected_canonical_sha`和`integration_round=1`，并在source写`integration_task_id`。
+- workspace按第4节先进入pending，准备成功后才ready。source链路、initial canonical和已产生的integration commits在重试/后续stale轮不得改写或丢弃。
 
-Assignee必须使用source Task持久化的`accepted_integration_agent_id`，不得在stale或恢复时重新读取Project默认值/Event。相同Project + source task ref同时最多一个open integration Task；stale事务必须再次确认该Agent未archived，原子创建/reuse并指派它、写source Task.integration_task_id、把链接后的source version保存为integration Task.source_accept_version、清除source pending action并保留accepted状态。Agent此时paused可创建queued Task等待resume；若违反archive fence而已archived，Project转error而不是静默改派。
+assignee archived/paused或无Project访问时不得静默改派；保持source submitted并报告阻塞，由有权限Participant显式取消原授权后重新accept。
 
-integration Task创建是已接受 source结果的机械后续，不代表 Daemon判断代码正确。Boss若要放弃或改换方案，必须先显式cancel该integration Task；该事务在确认双方都无pending action后，取消integration、清除source的integration link、accepted字段和`accepted_integration_agent_id`，并让source保持submitted可重新accept/rework/cancel。failed integration仍是open且保持source锁定，只能retry或先cancel。
+### 8.2 执行
 
-### 8.2 Workspace
+- integration workspace首轮从initial canonical创建并导入source convenience ref；后续轮以当轮expected canonical为新集成输入，但复用同一workspace identity并保留已提交冲突修复。
+- Participant使用标准Git merge/rebase/cherry-pick或冲突修复，但最终history必须包含source head为ancestor；不支持squash后声称包含。
+- Human显式claim并在宿主workspace工作；CLI Agent由Docker Run执行。提交/capture完全复用第6节。
+- 冲突留在私有workspace，通过Task/Conversation/Message和行为日志可见，不创建ConflictSet业务对象。
 
-- Integration workspace从创建时 actual canonical SHA的private clone开始。
-- Daemon把source commit导入private clone的本地convenience ref；Agent拥有private `.git`，所以该ref不是只读或安全边界，只用于方便CLI操作。真正source身份来自Task.source SHA/ref和controller bare。
-- CLI Agent使用原生 Git merge并运行项目测试，自己理解和修复文本/语义冲突。
-- 冲突只存在于 private workspace、普通 progress/Message和日志，不创建 ConflictSet。
-- Daemon不解析冲突片段、不建议修复、不自动 abort/resolve。
+### 8.3 Integration submit与再次stale
 
-### 8.3 Integration submit
+integration结果必须同时满足：
 
-Integration head必须机械满足：
+- source head是result head ancestor。
+- 当轮integration expected canonical是result head ancestor。
+- workspace clean且capture成功。
 
-- workspace clean且无 Git中间态。
-- 创建时 canonical base是 integration head的祖先。
-- source task head是 integration head的祖先。
+accept后以当轮`integration_expected_canonical_sha`为expected-old推进actual canonical。若再次stale，静态integration handler在同一事务中机械执行submitted -> queued，把actual canonical CAS写为新`integration_expected_canonical_sha`，`integration_round += 1`，将workspace准备置pending并发送幂等Message。不变initial canonical/source字段，不得创建嵌套integration Task、自动更换assignee或静默丢失source head/已提交冲突修复。
 
-Workspace内检查只作早期反馈。Bundle导入后，Daemon必须在controller bare中关闭replace refs/grafts并重新验证：actual/创建时canonical关系、source head ancestry、commit类型和captured head。Agent移动convenience ref、写`refs/replace/*`或`.git/info/grafts`不能影响结论。
-
-这意味着第一版集成必须保留 source commit lineage；不支持 squash或仅 cherry-pick后声称包含 source结果。Agent可以创建 merge commit并在其后追加冲突修复 commit。
-
-有效integration submit同样先经历finishing、Run terminal和第6节capture。第6节capture最终事务必须同时重新校验source仍submitted、accepted字段/selected integration Agent未变、source version等于`source_accept_version`、source.integration_task_id指向当前Task且source head/ref完全匹配；随后kind handler在同一事务把integration写为submitted+accepted并启动第7节pending advance，不得留下可被cancel/rework抢占的submitted空窗。这不是新的业务验收。CAS成功后的最终SQLite事务还必须再次执行同一source fence，并同时：
-
-- integration Task completed。
-- source Task completed。
-- 记录 final canonical SHA和对应 Event。
-- 给 source Task创建者/parent发送结果 Message。
-
-CAS再次 stale时：
-
-- canonical不变更、不丢 source/integration task ref。
-- 静态integration kind handler机械清除本Task pending advance、执行submitted -> queued，并发送new canonical SHA的Message；不创建嵌套integration Task，也不要求新的智能accept。
-- 新Run启动前，Daemon从controller bare为actual canonical生成受限bundle并导入private workspace的convenience ref；不挂载control repo。Agent在同一private workspace中合并后重新提交。
-- Task.base_sha保持创建时值，历史 Event记录每次 actual canonical；不得静默改写 base。
+integration完成后同一事务完成source Task，双方保存相同`final_canonical_sha`并清链接pending。取消integration必须原子取消integration、清source授权/link，使source回submitted可重新accept/rework/cancel。
 
 ## 9. 并发和维护锁
 
-- 多个 Agent private clone可完全并发开发和 commit。
-- 多个workspace可并发生成handoff；同一control repo的bundle import/ref维护由短期per-Project维护锁串行，不同Project仍可并发。
-- canonical并发推进只靠 expected-old CAS；两个竞争更新最多一个成功，其余进入 retry/stale。
-- Repo维护操作，例如初始 import、bundle import、`git gc`、clone准备和临时 ref清理，应使用短期 per-Project进程 mutex或文件锁串行。
-- `task create --source-task`、`task checkout`和task-ref删除必须使用同一per-Project维护锁：source Task创建在锁内重新解析ref/head并提交引用字段；checkout持锁直到bundle/导出已保护对象；GC持锁在删除前重新查询SQLite source/pending引用并使用expected-old SHA删ref。
-- 该共同锁必须覆盖“GC最后一次DB检查 -> expected-old ref删除 -> reachability复查/prune”和“source ref核验 -> 新Task事务提交”两个窗口，保证二者不能交错。新Task一旦提交，其`source_task_ref`就是持久保留条件。
-- 锁顺序固定为先per-Project维护锁、再开启短SQLite事务；任何路径不得持有SQLite事务等待该锁。长时间Agent工作、测试和Docker运行绝不持锁。
-- 维护锁不是业务对象，不入 SQLite，不承担 canonical正确性；Daemon crash后不能留下“持有者仍有效”的语义。
-- 第一版单 Daemon/data root约束仍适用，不设计分布式 Git lease。
+- Project ref mutation使用per-Project维护锁；Task prepare/capture和Human快照使用per-Task锁。
+- 锁只协调进程内/单Daemon操作，不作为durable授权；崩溃恢复依赖SQLite pending和expected-old ref。
+- GC最后DB检查到expected-old ref删除、source ref核验到新Task事务提交必须受同一Project锁，避免删除刚成为source的ref。
+- 并发accept最多一个expected-old CAS成功；失败者读取actual并进入stale，不得覆盖winner。
+- 不同Task workspace无共享可写文件，可真实并行；并行上限是Runtime配置，不是Participant数量上限。
 
 ## 10. 回退和修复
 
-CoordPlane不提供 RollbackPoint或历史重写：
-
-- 未集成 Task：取消/废弃 Task，task ref按`retention.terminal_task_ref`保留，不影响 canonical。
-- 已进入 canonical的错误：创建普通 work/integration Task，CLI Agent执行 `git revert` 或修复并提交，再走相同 capture/accept/CAS。
-- Daemon不得对 canonical执行隐式 reset、force update或删除已集成 commit。
-- Boss若要执行危险历史重写，属于本产品之外的人工 Git管理行为。
+- 未集成错误结果：rework/cancel，submission ref按retention保留，不影响canonical。
+- 已集成错误：创建普通git Task，由Participant执行`git revert`或修复，再走相同capture/accept/CAS。
+- Daemon不提供隐式rollback/reset/history rewrite。
+- 危险远端或历史重写属于CoordPlane外的显式Human Git操作，不是v1自动能力。
 
 ## 11. Git Recovery
 
-Daemon启动时必须在新调度前执行：
+启动在调度前核验：
 
-1. 对creating Project继续确定性注册或转error；对active/error Project运行最小repo完整性和ref解析。
-2. 读取 actual canonical，修正数据库缓存并记录 drift Event。
-3. 核对所有open Task的task ref、head和capture intent。
-4. 核对未完成 canonical advance intent。
-5. 核对 work/integration Task引用的 source ref仍存在，integration的source accepted version/link仍匹配。
-6. 核对 workspace HEAD是否存在未捕获 commit/dirty内容。
+- control repo存在、ownership正确、canonical ref合法且object可读。
+- SQLite cache与actual ref一致或进入可解释reconcile。
+- Task base/source/head/submission ref和integration lineage一致。
+- workspace marker、HEAD、status和Git中间态与Task状态兼容。
 
-关键规则：
+恢复规则：
 
-- Git ref存在而DB投影缺失时，只有Task pending action ID/version/run/generation全部匹配才可补齐；历史Event不授权恢复。
-- DB声称submitted/completed但对应ref或canonical事实不成立时，Project转error并在重启后持续fail-closed；不得伪造ref。只有`project repair`重新核验成功才回active。
-- Workspace HEAD新于 task ref时保留 workspace并唤醒/通知原 Agent，不静默捕获或集成。
-- Active/可恢复 workspace的 source commit不得被 `git gc` prune。
+- `workspace_state=pending`时，根据稳定operation ID/identity检查预期目录；absent则继续create，matching且完整则补ready，partial或ownership冲突则blocked，不使用新目录规避。
+- `ready`但目录absent、identity/marker不匹配或HEAD违反Task状态时转blocked并停止claim；只有可证明writer从未启动且依据不变base/source可安全重建时，显式repair才能沿用原identity重试。
+- workspace HEAD新于已捕获submission时保留并通知assignee，不静默捕获或删除。
+- Task submitted/completed但ref缺失或SHA不匹配使Project error。
+- Run terminal但workspace dirty/中间态时Task回queued/failed并保留workspace；Human running workspace不由reconciler猜测完成。
+- orphan ref/object只在证明无Task/source/pending引用且达到retention后GC。
 
 ## 12. Git GC
 
-### 12.1 Workspace 删除
+### 12.1 Workspace
 
-除 `runtime.md` 条件外，还必须满足：
+自动删除必须同时满足：
 
-- 最终需要保留的 HEAD已经有不可变 task/run ref，或确认Task无代码结果。
-- 没有 capture/advance intent依赖workspace。
-- 没有 integration Task依赖workspace本地未捕获内容。
+- Task completed/cancelled且达到`retention.completed_workspace`。
+- 无active Human claim、starting/active/recoverable Run、pending action或open integration/source引用。
+- 需要保留的HEAD已有不可变submission ref或可证明从未产生代码结果。
+- workspace clean、无中间态、ownership/path/symlink检查通过。
 
-### 12.2 Task ref 删除
+dirty/untracked/唯一未捕获commit只能由具备`git.discard`的Participant使用单Task命令，携带preview得到的expected fingerprint和request ID显式放弃；不能覆盖active/pending/ownership/source fence。
 
-只有全部满足才可删除 task/run ref：
+### 12.2 Submission ref
 
-- Source Task及其存在时的integration Task都处于completed/cancelled且不可恢复。
-- 没有open Task、`source_task_ref`或未完成Task.pending_action引用该ref；已经有terminal配对的历史Event不阻止retention GC。
-- Commit已由 canonical ref包含，或Boss用`gc discard-task-ref --task T --run U --expected-sha S --request-id R`显式确认放弃该Run的未集成提交。
-- 从source和integration Task中较晚的不可变`closed_at`起已达到`retention.terminal_task_ref`；不存在integration Task时只使用source `closed_at`。
+自动删除必须同时满足：
 
-删除 ref和运行 `git gc` 必须分开；ref删除后再次检查 reachability和引用，再由维护锁保护 GC。不得为了节省空间丢失尚未集成的唯一 commit。
+- source及其integration Task均completed/cancelled且不可恢复。
+- 无open Task、source_task_ref或pending action引用。
+- commit已由canonical包含。
+- 从相关Task较晚`closed_at`起达到`retention.terminal_task_ref`。
 
-Task-ref删除属于`core.md`定义的幂等派生GC：周期worker/`gc run --confirm`只能自动删除已由canonical包含且满足全部条件的ref；未集成唯一commit必须由Boss使用上述单Task命令discard。每次在per-Project维护锁内重读Task/source引用和actual ref，以`git update-ref -d <ref> <expected-old>`或等价CAS删除；崩溃后actual absent视为幂等完成，不增加GitOperation或GC业务对象。
+未进canonical的唯一submission ref只能通过`gc discard-task-ref --task T --submission S --expected-sha H --request-id R`显式放弃。删除使用完整服务端ref和expected-old SHA；absent视为幂等完成。ref删除与`git gc`分开，prune前再次检查reachability和引用。
 
-## 13. Git 安全
+行为日志GC遵循`runtime.md`，不得因删除Git ref连带删除日志或反之；日志只引用SHA。
 
-- Agent输入不能指定宿主 repo/cache path、任意 ref、任意 executable或 shell片段。
-- 所有服务端 Git命令使用 argv和固定可执行文件；路径参数使用 `--`。
-- 禁用/隔离 Agent可控 hooks、credential helper、filters、pager、editor和 upload-pack配置。
-- Controller ancestry/fsck命令必须使用`--no-replace-objects`或等价环境，忽略Agent workspace grafts/replace refs，只在control bare中验证Task保存的精确SHA。
-- Bundle/pack设置大小、对象数、处理时间和磁盘限额。
-- Controller不向 Agent容器注入 source remote写凭据。
-- Container不能访问 control bare repo或其 filesystem path。
-- Agent-facing错误和状态不得泄露 host path。
-- Capture前必须重新检查 Task current Run/generation；旧 Run不能更新新一代Task head。
-- Cleanup、capture、resume和GC并发时，active/capture intent优先，cleanup退出。
+## 13. Git安全
 
-## 14. Remote 和多仓库非目标
+- 固定Git executable和最小环境；禁用hooks、global/system config、protocol扩展和调用者alias。
+- source/workspace视为不可信；alternates、replace refs、symlink、submodule和object format必须显式校验或拒绝。
+- bundle/object count、size、path length、命令duration和磁盘余量有上限，失败fail loud。
+- control repo、raw ref和宿主私有路径不暴露给Agent或未授权Web/API响应。
+- 每个外部Git动作记录operation ID、before/after SHA和结果Event；CLI Agent内可观测Git命令另进入行为日志。
 
-第一版不实现：
+## 14. Remote和多仓库非目标
 
-- 自动 fetch/push、Git smart HTTP/SSH server。
-- GitHub/GitLab PR、webhook、CI状态、branch protection或merge queue。
-- Remote credential托管。
-- 跨仓库Task和原子集成。
-- Submodule自动凭据和递归发布。
+v1不实现自动fetch/push、Git smart HTTP/SSH、remote credential、PR/CI状态、merge queue、跨仓库Task、submodule凭据或远端发布。Project注册仅接受本机repo，canonical仅在daemon-owned control repo。
 
-这些能力未来只能作为显式 adapter加入，不能改变本地 canonical/task ref和CAS合同。
+## 15. Git不变量
 
-## 15. Git 不变量
-
-- Git objects/refs是唯一代码真相，SQLite只保存SHA/ref索引。
-- Docker Agent使用无 alternates、无shared objects、无可写control remote的private clone。
-- Agent可直接用原生Git，但只能改变自己的private clone。
-- Task base SHA固定；Daemon从实际HEAD捕获结果，不信任文字或分支名。
-- Dirty workspace、Git中间态或base非祖先结果不能提交。
-- Submit先进入finishing并终结workspace writer；Commit再由不可变task/run ref保护，最终fence通过后才写Task submitted投影。
-- Canonical只通过“head已被包含”确认或fast-forward expected-old `git update-ref`更新。
-- Non-fast-forward/stale交给integration CLI Agent，Daemon不merge/rebase/解决冲突。
-- Integration head必须包含current canonical和source head的祖先lineage。
-- CAS/Daemon崩溃通过intent + actual ref收敛，不建设GitOperation对象。
-- Active、可恢复、未捕获或仍被integration引用的commit/workspace/ref不得GC。
-- 已集成错误通过普通revert/fix Task修复，不隐式重写canonical历史。
+1. actual Git ref/object是代码真相，SQLite/Event/日志不能覆盖。
+2. Human与CLI Agent使用同一git Task、private workspace、expected-head、capture、submission ref、accept和CAS。
+3. Human capture使用expected commit和双fingerprint稳定快照，不假设宿主writer停止。
+4. 每次成功submit有不可变submission ID/ref；rework不移动旧ref。
+5. canonical只由显式accept后的expected-old CAS推进；stale不覆盖并进入显式integration Task。
+6. integration Participant可为Human或CLI Agent，身份不改变Git合同。
+7. accepted source和open integration的授权/link不可被竞争mutation绕过。
+8. crash恢复只依据pending intent、actual ref和版本fence；Event/日志不授权补写。
+9. active、dirty、唯一未捕获结果、source引用或ownership不明的workspace/ref不得自动GC。
+10. helper、handler、recovery和GC step通过静态列表注册，替换旧run-based-only capture时同变更删除旧路径。
+11. workspace只有一个稳定identity和prepare operation；`pending/ready/blocked/removed`与实际目录可恢复对账，未ready不得启动writer。
+12. integration source/accept version/initial canonical不可变；每次stale只单调更新expected canonical和round，并保留同一Task/workspace内已有工作。

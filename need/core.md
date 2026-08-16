@@ -1,472 +1,309 @@
 # CoordPlane Core 需求
 
-状态：Draft for owner review
-版本：0.3
-日期：2026-08-15
-（本版并入统一参与者框架修订：participants 统一人类与 cli_agent 身份，role/项目级绑定/凭据生命周期纳入对象模型，人类任务严格 waiting-only 收敛，见 README.md §4/§6.1 与 acceptance.md 相应条款）
+状态：候选冻结基线，待需求审批人复核精确 revision
+版本：1.0-rc3
+日期：2026-08-16
 依赖：`README.md`
 
 ## 1. 目标和边界
 
-Core 是单用户 Daemon 的协调内核，负责：
+Core 是本机多参与者 Daemon 的协调内核，负责：
 
-- 保存 Project、Participant、Task、Run、Message、Event、Role、ParticipantProjectRole 和 Credential。
-- 为 Boss 提供固定的命令和状态视图。
-- 为 CLI Agent 提供固定的 `coordlink` 操作。
-- 调度 queued Task，限制并发，创建 Run。
-- 递送 Message，唤醒 waiting/idle Agent。
-- 在进程、Daemon 或 adapter 失败后恢复可执行状态。
+- 保存 Project、Participant、Role、Credential、Task、Conversation、Message、MessageRecipient、Run 和 Event。
+- 对 Operator CLI、Web API 和 coordlink 执行统一认证、授权、CAS、幂等和状态转移。
+- 调度 CLI Agent Task 和定向 wake Message，限制 Docker Run 并发。
+- 在 Daemon、Docker、adapter 或 Git 操作失败后恢复可执行状态。
+- 为 Runtime 行为日志保存索引、完整性和 retention 元数据。
 
-Core 不执行项目业务判断，不解析聊天文本，不保存代码，不代理 Git 开发命令，也不建设动态能力、策略、skill、验收或 artifact 平台。
-
-Owner已批准 Agent 可配置 CLI/模型/提示词 v1（D1–D7/E1–E5，2026-08-13）；本文件的对象、状态、命令或不变量不变，预算按 E1 重基线。全库production/tests/infra/total envelope固定为`24,000/24,500/25,000`、`25,500/26,200/27,000`、`250/500/700`和`49,750/51,200/52,700`（E1 暂定上限，最终以 clean revision 实测锁表）；统计仍按`acceptance.md`的非空、非纯注释物理行口径。Core模块实际SLOC、质量blocker和diff必须进入clean候选revision的LOC JSON，并通过真实多Agent可靠性场景验证状态收敛；重基线reserve不得授权删除本文件合同。
+Core 不解释 Task/Message 文本，不内置人员职责，不自动验收结果，不保存代码正文，不代理通用 Git 命令，也不把 Event/日志当成状态推进授权。
 
 ## 2. 持久化总则
 
-### 2.1 SQLite
+### 2.1 SQLite 与单一真相
 
-- 第一版必须使用 file-backed SQLite，启用 WAL、foreign keys 和 busy timeout。
-- Schema migration 必须带单调版本号，并在 Daemon 开始调度前完成。
-- 配置域采用 schema v7（`coordplane_v7_agent_runtime_config`）：`agents`/`participants` 增加 `model/subagent_model/base_url/effort/instructions_text`（`TEXT NOT NULL DEFAULT ''`），`runs` 增加 `config_fingerprint`（`TEXT NOT NULL DEFAULT ''`）；迁移只加列并做派生回填、不重建表、不额外造 Event，失败必须整体回滚。
-- 迁移到 v7 前，若数据库存在持久 Codex 状态（`agents` 或 `runs` 中 `adapter_id='codex'` 的行），Daemon 保持 fail-closed：拒绝启动并返回 `LEGACY_SCHEMA_REBUILD_REQUIRED`，不尝试导入旧 session（E3）；v7 迁移完成后 Codex 是受支持 adapter。
-- 同一 `data_dir` 同时只允许一个写 Daemon；第二个实例必须立即失败，不能共同消费 Task。
-- 数据库损坏、migration 失败或 data directory 不可写时，Daemon 必须拒绝启动。
-- 所有时间使用 UTC，持久化精度和排序规则必须统一。
+- v1 使用 file-backed SQLite，启用 WAL、foreign keys 和 busy timeout。
+- migration 带单调版本号，必须在调度、Web 服务 ready 和 mutation 开放前完成。
+- 同一 `data_dir` 同时只允许一个写 Daemon；第二个实例立即失败。
+- 数据库损坏、migration 失败、data directory 不可写或 schema 不符合 exact-set 时拒绝启动。
+- 所有时间使用 UTC，持久化精度和排序规则统一。
+- `participants` 是 Human 和 CLI Agent 身份及 Agent 静态配置的单一权威；旧 `agents` 镜像表和双写入口必须在同一迁移删除。
+- `Conversation` 是对话权威；旧 `conversation Task` 不保留兼容状态机。
+- 预冻结 schema 未对外承诺兼容。无法无歧义转换旧 Boss 枚举、Human 特殊 Task 或 conversation Task 的数据库必须 fail closed 并返回 `LEGACY_SCHEMA_REBUILD_REQUIRED`，不得同时运行新旧语义。
 
-### 2.2 事务和事件
+### 2.2 事务、外部动作和 Event
 
-- 每个业务状态变化和对应 Event 必须在同一 SQLite 事务内提交。
-- Event 是 append-only 事实记录，但不替代当前业务行。
-- 查询视图必须从九类业务对象和实际 Git/runtime 事实投影，不能从日志文本推断。
-- 跨 SQLite/Docker/Git 且会推进业务状态或创建运行资源的操作，必须先在拥有该动作的 Project/Task/Run 行写窄的 pending/intention字段，并同时写带相同`operation_id`的Event；再执行外部动作，最后以同一`operation_id`清除pending字段并写完成/失败Event。
-- 唯一例外是GC删除已由closed/terminal业务事实和当前retention完全推导出的workspace、log或Git ref：它不推进业务状态、不新增对象，无需增加GC pending字段。每次执行/重试都必须重新读取业务行并检查全部fence，按ownership marker或expected-old SHA删除；目标已absent视为幂等成功，Event不得成为删除授权。Unintegrated ref和dirty workspace仍必须由Boss显式discard。
-- Reconciler以业务行的 pending字段和外部事实恢复；Event单独存在不得授权重放。不得把 Event扩张成通用Operation/Outbox状态机。
-- 不得仅因外部命令 exit 0 就写成功；必须读取目标进程、容器或 Git ref 确认预期事实。
+- 每个业务状态变化和对应 Event 在同一 SQLite 事务提交。
+- Event 是 append-only 关键事实，不替代当前业务行，不承载 stdout chunk、tool call 大正文或 provider transcript。
+- 跨 SQLite/Docker/Git 且推进状态或创建资源的操作，先在拥有动作的对象写窄 pending/intention 字段和稳定 `operation_id`，再执行外部动作，最后以同一 ID提交完成/失败。
+- Reconciler 只依据业务行 pending 字段和实际外部事实恢复；Event 单独存在不能授权重放。
+- GC 是唯一可从 terminal/closed 状态、当前 retention 和实际 fence 推导的外部删除，不新增通用 Operation 对象；每次重试必须重新检查。
+- 外部命令 exit 0 不是成功充分条件，必须读取 SQLite、Git ref、Docker/OS 或日志文件事实确认。
 
-### 2.3 版本和 fencing
+### 2.3 版本、幂等和 fencing
 
-- Project、Agent、Task、Run 和 Message 行必须有整数 `version`；每次变更递增。
-- 状态转移使用 `WHERE id=? AND version=? AND state=?` 或等价 CAS，受影响行数不是 1 时返回 `VERSION_CONFLICT`。
-- Task 必须有单调 `generation`。每次创建新 Run 时递增，并写入 Run 和 runtime token。
-- Agent 发起的每个写操作必须同时匹配 `agent_id + task_id + run_id + generation`。
-- 旧 Run、旧 token 或旧 generation 的写入必须返回 `STALE_RUN`，且不产生任何业务副作用。
+- Project、Participant、Role、Task、Conversation、Message、MessageRecipient 和 Run 有整数 `version`，mutation 使用 expected version/CAS。
+- 创建与 mutation 接受 `request_id` 或 idempotency key；重复请求返回原结果，不创建重复对象。
+- CLI Agent Participant 有单调 `runtime_generation`，每次创建 Run 递增并写入 Run/token。
+- Task Run 同时保存 Task `generation`；Conversation Run 的 `task_id` 可空，但仍受 Participant runtime generation 和 Run ID fence。
+- Agent 写操作必须匹配 `participant_id + project_id + run_id + runtime_generation`，Task outcome 还必须匹配 `task_id + task_generation`。
+- 旧 Run、旧 token、旧 generation 或已撤销 token 返回 `STALE_RUN`，零业务副作用。
 
-## 3. 唯一持久对象
-
-下面九类是产品业务对象的完整集合。实现可以有 migration、request dedupe 等内部辅助表，但不得把辅助表暴露成第十类业务状态机。
+## 3. 持久对象
 
 ### 3.1 Project
 
-Project 表示一个协作项目和一个 daemon-owned Git repo。
+Project 表示一个协作范围和一个 daemon-owned Git repo。
 
 必须字段：
 
 | 字段 | 要求 |
 | --- | --- |
-| `id` | 稳定 ID |
-| `name` | Boss 可读名称，同一 Daemon 唯一 |
-| `source` | 注册时使用的本地 Git repository路径，仅作初始化来源 |
-| `source_ref` | 注册时规范化的完整本地 branch ref，例如 `refs/heads/main` |
-| `initial_sha` | `project add` 第一个事务固定的 source commit；后续 source ref 移动不得改变它 |
-| `control_repo_path` | Daemon 私有 bare repo；Agent 响应不得暴露宿主绝对路径 |
-| `canonical_ref` | 完整 ref，例如 `refs/heads/main` |
-| `canonical_sha` | 最近一次已核验的缓存；实际 ref 才是权威 |
-| `integration_agent_id` | 可空；stale/冲突时接收 integration Task 的 Agent |
-| `status` | `creating`、`active`、`error` 或 `archived` |
-| `pending_action` | 可空；仅 `initialize` 或 `verify` |
-| `pending_action_id/pending_started_at` | 当前注册/修复外部动作及开始时间，可空 |
-| `last_error` | error时的稳定错误码和摘要 |
-| `version` | CAS 版本 |
-| `created_at/updated_at` | 时间 |
+| `id/name` | 稳定 ID；同一 Daemon 内 name 唯一 |
+| `source/source_ref/initial_sha` | 注册时的宿主机本地 repo、完整 branch ref 和固定初始 commit |
+| `control_repo_path/canonical_ref/canonical_sha` | Daemon 私有 bare repo、实际 canonical ref 和核验缓存 |
+| `integration_participant_id` | 可空；stale 结果默认指派的 active Participant |
+| `behavior_log_retention` | 可空；空表示使用全局 168h，非空为 Project override |
+| `status` | `creating/active/error/archived` |
+| `pending_action/id/started_at` | 可空；注册或核验外部动作 |
+| `last_error/version/timestamps` | 稳定错误、CAS 版本和 UTC 时间 |
 
 规则：
 
-- `project add` 的只读 preflight 先把完整 source branch ref解析为精确commit；第一个事务必须创建status=creating的Project，固定source/ref/initial SHA和pending operation并写Event，再从source建立control repo。核验成功后清除pending并转active，失败转error。
-- 注册不得修改 source repository 的 branch、index 或 working tree。
-- creating/error Project不调度Task、不运行Git集成；Boss通过`project repair`重试确定性注册/核验后才可转active。
-- `project repair`必须以事务执行error -> creating，写`pending_action=initialize|verify`和新operation ID；不得改变initial SHA，不得把actual canonical reset到缓存值。只有外部repo/ref核验完成后才清除pending并active。
-- creating/error/archived Project不接受新Task或Agent-directed Message；archived Project不再创建Run，历史、Boss查询和Git refs保留。
-- Project archive要求无starting/active Run、无Project/Task pending action、所有Task均已closed且Agent Message已ack/cancel或转交Boss；否则必须先stop/cancel并等待收敛。
-- Project 删除第一版不提供级联物理删除；清理由显式 GC 完成。
+- 注册先从 source actual ref 固定 commit，再以 durable intent 创建 control repo；不得修改 source branch/index/worktree。
+- actual canonical ref 是代码权威；缓存不一致时 Project 进入显式 reconcile，禁止缓存覆盖实际 ref。
+- creating/error/archived Project不调度、不创建新 Task/Conversation/Message；历史和错误仍按权限可读。
+- Project 没有 Participant 数量上限。归档要求无 active Run、pending action、open Task 和未处置 MessageRecipient。
+- Project retention override 修改不改写历史 `ended_at`，下一次 preview/GC 使用当前值。
 
-### 3.2 Participant 与 Agent
+### 3.2 Participant
 
-Participant 是统一参与者身份行（kind：`human` 或 `cli_agent`），人类与 CLI Agent 共享同一身份、Task/Message 与权限框架，生命周期按 kind 分支（human 无 Run；cli_agent 走 agent 生命周期规则，见 §3.2.1）；在项目内能做什么由该项目下绑定到它的角色决定（见 §3.7/§3.8）。Agent 是 `kind=cli_agent` 的 participant 及其静态 adapter/runtime 配置。
-
-#### 3.2.1 Participant 身份行
-
-必须字段（`participants` 表）：
-
-| 字段 | 要求 |
-| --- | --- |
-| `id` | 稳定 ID；cli_agent 与 `agents.id` 相同 |
-| `kind` | `human` 或 `cli_agent` |
-| `display_name` | 可读名称 |
-| `status` | `active`、`paused` 或 `archived` |
-| `credential_id` | human：绑定的凭据行 ID；cli_agent：空 |
-| `adapter_id/image/instructions_file/instructions_text` | 仅 cli_agent；human 为空；file 与 text 恰有其一 |
-| `model/subagent_model/base_url/effort` | 仅 cli_agent；human 为空；effort 按 adapter 静态元数据写入期校验 |
-| `version` | CAS 版本 |
-| `created_at/updated_at` | 时间 |
-
-规则：
-
-- 第一个 human participant（`participant-owner`）由 v3 迁移 seed 建立并默认授予 owner 角色；"Boss" 是默认人类 owner participant 的显示别名。`created_by/sender/recipient/accepted_by` 等 `kind` 列沿用现有 `boss|agent|system` 枚举（Event 的 `actor_kind` 另含 `daemon`）；Boss 操作落在其 human participant 上，schema 有 participant 引用的位置使用 participant ID。
-- `participants` 表由 v3 迁移建立：同批（同一 SQLite 事务）建立 `roles`/`participant_project_role`/`credentials` 并写入四项 seed——`participant-owner`（human participant，`kind=human`）、`role-owner`、`role-agent`（两个 role seed）以及 owner 的 global binding（`participant-owner` ↔ `global` ↔ `role-owner`），Events 的 entity_type 扩充加入 participant/role；v4 增加人类任务/消息，并从 `agents` 回填既有 cli_agent participant；v7 为 agents/participants 增加 Agent 运行配置列并派生回填。`agents` 表保留为 cli_agent participant 的兼容镜像，同一 SQLite 事务同步写 `participants` 与镜像 `agents` 行，任何一方 CAS 失败整体回滚并返回 `VERSION_CONFLICT`（零副作用）；`SetAgentStatus`/`ArchiveAgent` 同步镜像。调度/配置读取在旧读取路径移除前仍可读 `agents`，因此不得声称 participant 是唯一权威，也不得出现 agents-only 新生产入口。
-- cli_agent 生命周期规则（单活跃 Run、paused 不领新 Task、archive 前置条件）对 human 不适用——human 无 Run。v1 不提供 human 的 pause/resume/archive 状态机或命令：participants 表虽允许 `paused`/`archived` 状态值，但没有对应 human 生命周期变更的实现，未获 owner 批准不扩展。
-- 人类身份行的凭据绑定见 §3.9；人类任务生命周期见 §4.2/§5.1。
-
-#### 3.2.2 Agent（cli_agent participant）
-
-Agent 表示一个持久 CLI 员工身份，不表示常驻进程。
-
-必须字段（`agents` 表，= cli_agent participant 的镜像行）：
-
-| 字段 | 要求 |
-| --- | --- |
-| `id` | 配置和命令使用的稳定 ID |
-| `display_name` | 可读名称 |
-| `adapter_id` | 静态注册的 CLI adapter 名 |
-| `image` | Docker image 名或 digest |
-| `instructions_file` | Boss 管理的指令文件路径；daemon 宿主绝对路径 |
-| `instructions_text` | 可编辑提示词正文（UTF-8）；与 `instructions_file` 必须恰有其一 |
-| `model/subagent_model` | 可空模型配置；非空时只接受安全 token |
-| `base_url` | 可空；非空时只接受无 userinfo/query/fragment 的 `https://` URL |
-| `effort` | 可空；取值由 adapter 静态元数据（AllowedEfforts）提供并写入期校验（E2） |
-| `status` | `active`、`paused` 或 `archived` |
-| `version` | CAS 版本 |
-| `created_at/updated_at` | 时间 |
-
-规则：
-
-- Manager、Developer、Reviewer、Integrator 只写在 display/instructions 中，不进入状态机。
-- 一个 Agent 第一版同时最多一个 `starting` 或 `active` Run。
-- paused Agent 不领取新 Task，但当前 Run 不被静默杀死；Boss 可显式 stop。
-- Agent archive要求没有starting/active Run、不存在open assigned Task，也没有open source Task把它固定为`accepted_integration_agent_id`；需要继续的工作由Boss另建引用原Task的新Task。其conversation Task必须closed，未处理Message必须ack、cancel或转交Boss；被cancel的消息仍保留为可查询历史。
-- archived Agent 不接受新Task/Message、不领取任务，历史 Task、Run 和 Message 保留。
-- Agent archive事务必须清除引用它的Project默认`integration_agent_id`并写Project Event；已接受Task保存的`accepted_integration_agent_id`不随默认值变化，且按上一条阻止archive直到收敛。
-- Agent 通过 Boss `agent add/update` 写入 SQLite；Daemon YAML 不保存第二份 Agent 列表。
-- `adapter_id` 必须来自静态注册 registry（v1 为 `claude`/`codex`）；`display_name`/`image` 非空。
-- `instructions_file` 与 `instructions_text` 必须恰有其一：file 必须为 daemon 宿主绝对路径且 `filepath.Clean` 后不变；text 不超过 1 MiB。两者同时非空在写入期稳定拒绝，启动期仍纵深防御 fail-closed（`INSTRUCTIONS_UNAVAILABLE`）；提示词全文不得进 Event/错误/日志，只允许 hash 与大小进入诊断。
-- `model`/`subagent_model` 可空；非空时只接受 `[A-Za-z0-9._:/-]` 安全 token，防止 shell/换行注入。`base_url` 可空；非空时只接受无 userinfo、无 query/fragment 的 `https://` URL，写入前规范化。`effort` 可空；允许值由 adapter 静态 descriptor 提供，core 在写入期按注入的 descriptor 校验（E2），不等 Run 启动才失败。
-- 新增 `UpdateAgent` 与 `AddAgent` 共用同一组字段校验；更新在同一 SQLite 事务内同时写 `agents` 与镜像 `participants` 行，任何一方 CAS 失败整体回滚并返回 `VERSION_CONFLICT`（零副作用）；`SetAgentStatus`/`ArchiveAgent` 同步镜像。`agent.updated` Event 只写版本和变化的字段名，不写配置值或提示词原文。
-- `UpdateAgent` 按 `agent.manage` 在 global scope 检查，`AddAgent` 在同阶段补齐同一门禁，避免三面入口出现不同权限语义。
-- 三面入口（`PUT /v1/agents/{id}`、`coordplane agent update`、前端编辑表单）共用同一 `AgentConfigInput` 写同一个 `UpdateAgent` operation；PUT 是完整配置替换（E5），CLI 先 GET 当前值再 overlay 显式 flag，前端发送全量字段。
-- Agent 字段修改只影响新 Run；已创建 Run 保存解析后的 adapter、image、instructions hash 和 config fingerprint，不受后续修改影响。
-
-### 3.3 Task
-
-Task 是唯一任务、责任和对话工作单元。
+Participant 是唯一业务身份，`kind` 不承载职责。
 
 必须字段：
 
 | 字段 | 要求 |
 | --- | --- |
-| `id` | 稳定 ID |
-| `project_id` | 所属 Project |
-| `kind` | `conversation`、`work` 或 `integration` |
-| `parent_task_id` | 可空；显式父子关系 |
-| `retry_of_task_id` | 可空；Boss 对 completed/cancelled Task 重做时创建新 Task |
-| `created_by_kind/id` | `boss`、`agent` 或 `system` 及对应 ID；Boss 操作落为默认人类 owner participant |
-| `assignee_participant_id` | 明确目标 participant（human 或 cli_agent）；不可只写角色名。cli_agent 判据为镜像列 `assignee_agent_id` 非空；human 任务该字段指向 `kind=human` 的 participant（human 判据，见 §4.2/§5.1） |
-| `title` | 简短标题 |
-| `description` | 原始目标和约束；Daemon 不解释语义 |
-| `priority` | 整数；高值优先，同值按创建顺序 |
-| `status` | `queued`、`running`、`finishing`、`waiting`、`submitted`、`completed`、`failed`、`cancelled` |
-| `current_run_id` | 可空；用于 starting/active 或 finishing收尾 Run 的唯一占用 |
-| `generation` | 每次创建新 Run 时递增 |
-| `next_run_at` | 失败退避后的最早调度时间 |
-| `retry_count/max_retries` | runtime 失败自动重试边界 |
-| `wait_reason` | waiting 时的可读原因 |
-| `result_summary` | Agent 提交的简短结果，不是代码真相 |
-| `failure_reason` | 稳定错误码和摘要 |
-| `base_sha` | 代码 Task 的不可变起始 commit；conversation 可空 |
-| `head_sha` | Daemon 捕获的实际提交；提交前为空 |
-| `head_run_id` | 产生当前head/task ref的Run，可空 |
-| `task_ref` | Daemon-owned Git ref；捕获前为空 |
-| `accepted_by_kind/id` | 显式接受者（沿用 `boss`/`agent`/`system` 枚举），可空 |
-| `accepted_at` | 接受时间，可空 |
-| `accepted_integration_agent_id` | accept时解析并固定的integration Agent；未接受时为空 |
-| `final_canonical_sha` | 成功集成后实际canonical SHA，可空 |
-| `integration_task_id` | stale后创建的integration Task，可空 |
-| `source_task_id/source_run_id` | work Task可选、integration Task必填的固定source，可空 |
-| `source_task_ref/source_head_sha` | 创建时复制的精确Git输入；后续source Task变化不得改写，可空 |
-| `source_accept_version` | integration Task链接后source Task的精确version；其他work Task为空 |
-| `observed_canonical_sha` | integration Task创建时看到的canonical，可空 |
-| `pending_action` | 可空；仅`capture`或`advance` |
-| `pending_action_id` | 外部动作的稳定operation ID，可空 |
-| `pending_action_version` | intent提交后的Task version，可空 |
-| `pending_action_run_id` | capture/advance关联Run，可空 |
-| `pending_expected_sha/pending_target_sha` | Git外部动作的精确SHA，可空 |
-| `pending_started_at` | 外部动作开始时间，可空 |
-| `version` | CAS 版本 |
-| `created_at/updated_at/submitted_at/completed_at/closed_at` | 相应时间；`closed_at`只在首次进入completed/cancelled时设置且不可改写 |
+| `id/kind/display_name` | `kind=human|cli_agent`；稳定 ID |
+| `status` | `active/paused/archived` |
+| `runtime_generation/current_run_id` | CLI Agent 使用；Human 必须为空或 0 |
+| `adapter_id/image` | 仅 CLI Agent必填；来自静态 adapter registry |
+| `instructions_file/instructions_text` | 仅 CLI Agent；恰一来源，最大 1 MiB |
+| `model/subagent_model/base_url/effort` | 仅 CLI Agent可配置；按 adapter descriptor 校验 |
+| `version/timestamps` | CAS 版本和 UTC 时间 |
 
-Task kind 规则：
+规则：
 
-- `conversation`：同一 Project 内默认人类 owner 与一个 cli_agent 之间的长期对话入口（v4 起唯一约束按 `(project_id, assignee_participant_id)` 保证每 participant 一个 open conversation）。Agent 回复后通常进入 waiting，新 Message 将其重新 queued；由责任方显式 close 为 completed。不提供任意两个 participant 之间的通用对话。
-- conversation只允许Message/progress/wait/fail和责任方 close，不允许submit/accept/rework；work/integration不允许close。非法kind操作返回`INVALID_STATE`且零副作用。
-- conversation的delivery-capable状态只有`queued/running/finishing/waiting`。failed conversation虽仍可retry/cancel，但不能接收新Message或被用作重路由目标。
-- 同一Project/assignee同时最多一个open conversation Task；Boss chat和无显式delivery Task的direct Message只复用delivery-capable conversation。若唯一open conversation已failed，调用稳定失败，Boss必须retry/cancel后再继续。
-- `work`：普通实现、调研、审查或修复任务。可通过`source_task_*`字段固定一个已capture结果作为输入，Daemon不区分其业务语义。
-- `integration`：使用上述窄字段固定 source task/run/ref/head 和 observed canonical SHA；由 CLI Agent 使用原生 Git 收敛代码。
-- 不提供通用`context_json` DSL。kind-specific机器事实必须是本文列出的窄字段；新增字段先修改需求。
-- 已被接受的integration Task在canonical再次stale时，kind handler可机械执行submitted -> queued并发送new SHA Message；这是静态注册的Git收敛规则，不授权普通work Task自动rework。
-- `completed`和`cancelled`是Task closed状态；`failed`仍可显式retry/cancel，因此是open但不可自动调度状态。`submitted`同样open，只等待accept/rework/cancel。
-- source Task一旦链接一个尚未closed的integration Task，其accepted授权由`accepted_* + integration_task_id`共同固定；source上的rework/cancel/第二次accept必须返回`ACTION_IN_PROGRESS`。取消该integration Task时必须按`git.md`原子释放这份授权。
-- Task kind 的准备/完成钩子必须通过静态 handler 列表注册，主调度循环不得按角色或项目写特判。
+- Human 和 CLI Agent 共享 Task、Conversation、Message、Role、Git 和查询模型；不设置数量上限。
+- `active` 可接收新 Task 指派和 Conversation 成员关系。`paused` 不接收两者；已有 Task、Conversation 成员关系和按权限可读历史保留，Human 可继续已有工作，CLI Agent 不创建新 Run且当前 Run不被静默杀死。`archived` 不再认证、接收指派或 Run，历史保留。
+- archive 要求没有 active Run、open assigned Task、未处置 MessageRecipient、尚未回传的open child Task result recipient引用，或被固定为 integration Participant 的 open source Task。
+- CLI Agent 配置更新只影响新 Run。Run 固定解析后的 adapter、image、instructions hash 和 config fingerprint。
+- `instructions_file` 为 daemon 宿主绝对路径；text/file 全文不得进入 Event、错误、日志或 Web 响应，只记录 hash 和大小。
+- `model/subagent_model` 只接受安全 token；`base_url` 只接受无 userinfo/query/fragment 的 `https://` URL；`effort` 来自 adapter `AllowedEfforts`。
+- Manager、Developer、Reviewer、Integrator 等只存在于 Role、Task 文本或 instructions 中；Daemon 不解释这些名称。
 
-### 3.4 Run
+### 3.3 Role、绑定与 Credential
 
-Run 表示一次真实 CLI 进程执行。恢复同一个 CLI native session 也必须创建新 Run；terminal Run 永不复活。
+Role 是 capability 名集合。`participant_project_roles` 将一个 Role 绑定到一个 Participant 的 Project 或 `global` scope。
+
+- capability 名来自静态 operation registry，未知值拒绝；Role 名没有内置含义。
+- 同一 Participant 可在不同 Project 获得不同 Role；同一 scope 多个 Role 的 capability 取并集。
+- 管理类 operation 只能由 global capability 授权。项目级 Role不能伪造 global scope。
+- 被绑定引用的 Role 不可删除；删除或降级最后一个 `participant.manage` 持有者必须拒绝且零副作用。
+- 任意 Participant 包括 CLI Agent 均可按配置获得管理 capability；执行仍受 transport、Run token和资源可达性约束。
+
+Credential 仅属于 Human：
+
+- v1 签发 `operator_token`，只保存强 hash，支持创建、轮换和吊销。
+- 吊销立即阻止新操作；Web session 每次 mutation 必须确认凭据仍 active。
+- Credential 不注入 Agent 容器。Agent 使用每个 Run 独立 token，数据库只保存 hash。
+- 空库 `coordplane bootstrap` 只能在本机、无 Participant 且 Daemon未开放 mutation 时执行一次，创建普通 Human Participant、Credential 和包含全局管理 capability 的可配置 Role。完成后所有对象走普通 Role/Participant 规则，不存在 `participant-owner` 或 Boss 特判。
+
+### 3.4 Task
+
+Task 是工作责任，不是 Conversation。
 
 必须字段：
 
 | 字段 | 要求 |
 | --- | --- |
-| `id` | 稳定 ID |
-| `project_id/task_id/agent_id` | 固定归属 |
-| `generation` | 创建时 Task generation |
-| `resumed_from_run_id` | 可空；resume 来源 |
-| `adapter_id` | 本 Run 固定 adapter |
-| `image` | 本 Run 固定 image 或 digest |
-| `instructions_hash` | 本 Run 使用的指令内容 hash |
-| `config_fingerprint` | 本 Run 使用的配置指纹：adapter/image/model/subagent_model/base_url/effort/instructions_hash 归一化稳定序列化后的 SHA-256；不含 secret |
-| `state` | `starting`、`active`、`exited`、`failed`、`interrupted`、`cancelled`、`timed_out` |
-| `workspace_path` | Daemon 内部 work/integration workspace 路径；conversation 可空 |
-| `container_id` | 创建容器后立即保存，可空 |
-| `native_session_id` | CLI 提供后立即保存，可空 |
-| `log_path` | stdout/stderr 轮转日志位置 |
-| `token_hash` | Run scope token 的 hash；不得保存明文 |
-| `token_revoked_at` | Task outcome、run stop、cancel 或 terminal 后立即填写 |
-| `requested_outcome` | 可空；`wait`、`submit` 或 `fail` |
-| `requested_summary/expected_head` | outcome输入；submit时由后续capture核验 |
-| `requested_at` | outcome 请求时间，可空 |
-| `stop_requested_at/stop_reason` | Boss `run stop` 的窄runtime intent，可空 |
-| `stop_operation_id` | stop/cancel/timeout/shutdown外部停止动作的稳定operation ID，可空 |
-| `heartbeat_at` | Supervisor 最近确认 live 的时间 |
-| `exit_code` | 进程退出码，可空 |
-| `terminal_reason/last_error` | 稳定原因和摘要 |
-| `cleanup_state` | `not_needed`、`pending`、`removed`、`blocked` |
-| `version` | CAS 版本 |
-| `created_at/started_at/ended_at` | 相应时间 |
+| `id/project_id` | 稳定 ID和所属 Project |
+| `kind` | `work/integration`；review、测试、文档等都是 work |
+| `workspace_mode` | `none/git`；integration 必须为 git |
+| `parent_task_id/retry_of_task_id` | 可空 lineage |
+| `coordination_conversation_id/result_recipient_participant_id` | root Task为空；有`parent_task_id`的子Task必填并固定结果通知路由 |
+| `created_by_participant_id/assignee_participant_id` | 统一 Participant ID |
+| `title/description/priority` | Daemon 不解释的任务内容和机械优先级 |
+| `status` | `queued/running/finishing/waiting/submitted/completed/failed/cancelled` |
+| `current_run_id/generation/next_run_at/retry_count/max_retries` | 执行与重试字段；Human current Run为空 |
+| `wait_reason/result_summary/failure_reason` | 可空；terminal 成功不得保留旧 failure_reason |
+| `base_sha/head_sha/head_run_id/head_submission_id/task_ref` | git Task 的固定输入和捕获结果；Human 的 `head_run_id` 为空，所有成功捕获都有稳定 submission ID |
+| `workspace_state/workspace_operation_id/workspace_identity/workspace_error` | `not_needed/pending/ready/blocked/removed`；identity是Project/Task/owner/base/source/创建operation的不可变指纹 |
+| `accepted_by_participant_id/accepted_at` | 显式接受事实 |
+| `accepted_integration_participant_id` | accept 时固定；可为 Human 或 CLI Agent |
+| `final_canonical_sha/integration_task_id` | 集成结果与链接 |
+| `source_task_id/source_run_id/source_task_ref/source_head_sha` | 固定 source 结果 |
+| `source_accept_version/integration_initial_canonical_sha` | integration Task创建时固定且不可改 |
+| `integration_expected_canonical_sha/integration_round` | integration Task每轮CAS预期值和单调轮次 |
+| `pending_action/id/version/expected_sha/target_sha/started_at` | capture/advance durable intent |
+| `version/timestamps` | CAS 版本；`closed_at`首次 completed/cancelled 后不可改写 |
 
 规则：
 
-- `native_session_id` 只证明未来可能 resume，不证明进程或 turn 当前存活。
-- Run 不保存 model/base_url/instructions_text 原文，只保存 `config_fingerprint` 与 `instructions_hash`，减少可审计/可泄露面。
-- stdout/stderr 日志不是 Run 状态真相。
-- Run exit 0 不自动修改 Task 为 submitted/completed。
-- `exited` 表示 CLI 进程已得到可信 exit fact，可能在Run写active之前快速退出；exit code可以为0或非0。
-- `failed` 只表示 workspace/container/CLI 准备或启动阶段失败，Run 从未 active。
-- `interrupted` 表示Run预期已有或可能已有进程，但在starting/active阶段失去它且无法取得可信exit fact。
-- Agent 成功调用 wait/submit/fail 后，Run 保存 requested outcome、立即撤销 token，并由 Runtime 收敛真实进程。
-- `run stop` 只写stop intent并停止本次Run，不取消Task；没有requested outcome时Run最终interrupted，Task按retry policy requeue/failed。
-- Run terminal 后 token 必须保持失效，所有迟到写入被 token/generation fence 拒绝。
-- terminal Run 对象永久保留；大日志按大小轮转，达到`retention.run_log`后可删除。
+- 创建时必须指定 active Participant；paused/archived assignee 拒绝。新 Conversation 成员也必须 active，不得用成员变更绕过 paused。
+- `workspace_mode=git` 创建时从 actual canonical 固定 base SHA并在事务中设置 `workspace_state=pending` 和稳定 operation ID；受信 Git worker核验实际目录/marker/HEAD后才可 `ready`。`workspace_mode=none` 为 `not_needed`。`pending/blocked/removed` Task不得 claim 或创建 Run。
+- workspace 准备崩溃后只依据 Task operation ID、workspace identity 和实际 Git/文件事实继续或置 `blocked`；不得通过重新读取已移动 canonical 改写固定基线，不得将未核验目录标记 ready。
+- Human 和 CLI Agent 使用同一 FSM。差别仅是 CLI Agent 由 Scheduler/Run claim，Human 通过公开 operation 显式 claim；Human 无 Run。
+- 所有 Task 结果先到 submitted，再由具备 `task.accept` 的 Participant 显式 accept/rework/cancel。不存在 Human `waiting -> completed`、`human_confirm` 或创建者隐式权限。
+- git Task submit 必须经过 actual HEAD capture；非 git Task submit 保存 summary 后进入 submitted。
+- completed/cancelled 是 closed；failed/submitted 仍 open。closed Task不原地重开，继续工作创建 `retry_of_task_id` 新 Task。
+- source Task 链接 open integration Task 时，rework/cancel/第二次 accept 返回 `ACTION_IN_PROGRESS`，直到显式取消或完成 integration。
+- parent Task存在尚未回传的open child且child result recipient为当前parent assignee时，禁止更换parent assignee；先让child回传或显式cancel child。更换child assignee时新assignee必须仍是固定coordination Conversation成员，不改写result recipient。
+- Task kind handler 通过静态列表注册，主流程不得按职责、Participant kind 或项目名特判。
 
-### 3.5 Message
+### 3.5 Conversation 与成员
 
-Message 是唯一对话、收件和唤醒对象，不另建 Thread、Mailbox 或 DeliveryAttempt。
-
-必须字段：
+Conversation 是 Project 内正式的一对一或群组对话。
 
 | 字段 | 要求 |
 | --- | --- |
-| `id` | 稳定 ID |
-| `project_id/task_id` | 每条消息必须绑定接收方要处理的 delivery Task |
-| `related_task_id` | 可空；消息讨论的 source/child Task，可与 delivery Task不同 |
-| `sender_kind/id` | `boss`、`agent` 或 `system` 及对应 ID；Boss 消息落为默认人类 owner participant |
-| `recipient_kind/id`、`recipient_participant_id` | `recipient_kind` 为 `boss` 或 `agent`；v4 迁移回填 `recipient_participant_id`（boss → 默认 owner participant，agent → 该 agent） |
-| `reply_to_message_id` | 可空 |
-| `system_code` | 系统消息的稳定短码；普通消息为空 |
-| `body` | UTF-8 正文；大文件不内联 |
-| `wake` | 是否要求确保接收方获得 Run |
-| `state` | `pending`、`delivered`、`acknowledged` 或 `cancelled` |
-| `delivered_run_id` | 可空；实际承载消息的 Run |
-| `delivery_count/max_deliveries` | 自动wake/redelivery上限 |
-| `next_delivery_at` | 自动重投的最早时间 |
-| `last_delivery_error` | 可空；最近递送错误 |
-| `idempotency_key` | 同一发送者 scope 内去重 |
-| `version` | CAS 版本 |
-| `created_at/delivered_at/acknowledged_at` | 相应时间 |
+| `id/project_id` | 稳定 ID和所属 Project |
+| `kind` | `direct/group` |
+| `title` | group 必填；direct 可空 |
+| `created_by_participant_id` | 创建者 |
+| `status` | `active/archived` |
+| `version/timestamps` | CAS 和 UTC 时间 |
+
+`conversation_members` 至少保存 `conversation_id/participant_id/state/joined_at/left_at/version`。
+
+- direct 创建时恰有两个不同 active Participant；同一 Project、同一无序 Participant 对只能有一个 active direct Conversation。
+- group 创建时至少两个 active 成员；成员数量无产品级上限。
+- active 成员能读取从 Conversation 创建起的完整历史。退出/移除后仍可按审计权限读取其在籍期间历史，但不能发送或成为新 Message recipient。
+- 成员变更、归档和发送均要求 capability；Conversation 名称或创建者不产生隐式权限。
+- Conversation归档、移除成员或成员退出前，必须不存在将该Conversation或成员固定为coordination/result route且尚未回传的open child Task；否则拒绝且零副作用。
+- Conversation 不占用 Task，不存在 conversation Task、close Task 或每 Agent 一个对话 Task 的约束。
+
+### 3.6 Message 与逐接收者状态
+
+Message 正文在创建后不可变：
+
+| 字段 | 要求 |
+| --- | --- |
+| `id/project_id/conversation_id` | Conversation 必填且同 Project |
+| `task_id` | 可空；非空必须同 Project |
+| `sender_participant_id` | 普通消息必填；daemon 通知为空并带 `system_code` |
+| `reply_to_message_id/system_code/system_payload_json/body` | reply 可空；system payload只允许静态code对应的有界schema；正文 UTF-8，大文件只引用路径/URL |
+| `idempotency_key/created_at` | sender scope 内去重和稳定排序 |
+
+每个 Message 必须有一个或多个 `message_recipients`：
+
+| 字段 | 要求 |
+| --- | --- |
+| `message_id/recipient_participant_id` | 唯一接收者行；必须是创建时 active Conversation member且不是 sender |
+| `wake_requested` | 是否允许该消息单独触发 CLI Agent Run |
+| `state` | `pending/delivered/acknowledged/cancelled` |
+| `delivered_run_id` | 可空；Human 读取时为空 |
+| `delivery_count/max_deliveries/next_delivery_at/last_error` | 独立重试状态 |
+| `version/delivered_at/acknowledged_at` | CAS 与时间 |
 
 规则：
 
-- Message 必须先在 SQLite 提交，才可尝试 Inject、resume 或新 Run。
-- Agent-directed Message要求Project active且recipient Agent不是archived；否则稳定拒绝且不插入Message。Recipient为Boss的既有Task结果/错误仍可在Project error/archive前置收尾事务中产生和读取。
-- 指定 `task_id` 时，该 Task必须由接收 Agent负责，或接收者为Boss。未指定目标Task的direct Agent Message必须创建/复用接收Agent在该Project的conversation Task作为delivery Task。
-- 给Agent显式指定的Task若在同一事务已是submitted/failed/closed，不得把新Message留在该Task；Daemon必须改用recipient的delivery-capable conversation Task，并把原指定Task保存为related Task，或返回稳定`INVALID_STATE`。状态检查和Message插入必须原子。
-- `delivered` 只表示消息已进入一个真实 Run 的输入，不表示 Agent 已处理。
-- 接收者可将pending或delivered Message显式ack；这消除外部Inject/Run输入先发生而delivered事务稍后提交的竞态。
-- 承载消息的 Run terminal 而消息未 ack 时，Message 必须恢复 pending 并可再次递送；因此语义是 at-least-once。
-- 每次自动redelivery递增delivery_count并设置backoff。达到max_deliveries后保持pending但停止自动wake，在Boss状态中显示；只有显式`task wake/message retry`才重新启用，不能形成付费Run紧循环。
-- Delivery Task进入不能再接收Run的`submitted/failed/completed/cancelled`，或Project/Agent将archive时，不得留下只绑定该Task的pending/delivered Agent Message。状态转移事务必须把它重路由到recipient的delivery-capable conversation Task并以原delivery Task作为related Task；不存在此类conversation时带明确disposition转cancelled或转交Boss。failed conversation不得被当作重路由目标。
-- Recipient 为 Boss 时，正式 `message read/chat` 可将其标记 delivered 且 `delivered_run_id` 为空；显示成功或显式 ack 后进入 acknowledged。
-- 同一 Task/recipient 按 `(created_at, id)` 稳定排序；不承诺跨 Task 全局顺序。
-- 大正文应存于项目可访问文件或外部 URL，并在 body 中引用；Core 不提供 blob 上传。
+- Message 与全部 recipient 行在一个事务创建，然后才允许 Inject/Run。
+- Message 明确 recipients之外的成员不产生未读项、不被唤醒；仍能读取 Conversation 历史。
+- 一个 recipient 的 delivered/ack/cancel/retry 不得改变其他 recipient 行。
+- Human 通过 CLI/Web 读取其 pending MessageRecipient时可原子 delivered/ack，不创建 Run。
+- CLI Agent 的 `wake_requested=true` 可触发递送；false 只等待下次同 Project Run。每次 Run bootstrap 至少提供该 Participant 在 Project 内未读总数、稳定高水位、有界 Message/recipient ID 样本和不透明 inbox cursor；完整未读集合只能通过稳定分页读取，不得塞入 bootstrap。
+- 正文进入真实 Run input或 recipient主动读取后才可 delivered；Inject accepted 不是 acknowledged。
+- delivered Run terminal 且未 ack 时回 pending，保持 at-least-once。达到 max deliveries 后保持 pending但停止自动 wake，直到显式 retry。
+- optional Task只表达讨论关联和输入上下文，不决定 Conversation/recipient 生命周期，不要求 Task assignee等于 recipient。
+- Project/Conversation/Participant archive 前必须处理所有未确认 recipient：ack、cancel或由有权限 Participant 显式重定向；不得静默转给 bootstrap Human。
 
-### 3.6 Event
+### 3.7 Run
 
-Event 是关键变化的 append-only 记录。
-
-必须字段：
+Run 表示一个真实 CLI Agent 进程，terminal 后永不复活。
 
 | 字段 | 要求 |
 | --- | --- |
-| `id` | 单调可排序 ID |
-| `project_id` | 可空；Project内事件必填，全局Agent/Daemon事件使用daemon scope |
-| `entity_type/entity_id` | schema allowlist：`project`、`agent`、`task`、`run`、`message`、`daemon`、`participant`、`role`（v3 起）；绑定/凭据事件挂在 participant/role 实体上，不新增 binding/credential 实体 |
-| `kind` | 稳定事件名 |
-| `actor_kind/id` | `boss`、`agent`、`daemon` 或 `system` |
-| `run_id` | Agent/Run 产生时填写，可空 |
-| `request_id` | 幂等和追踪用，可空 |
-| `operation_id` | 外部动作intent/terminal配对使用；此类Event必填，普通观察可空 |
-| `payload_json` | 小型结构化差异、错误码或精确 SHA；不得放 secret/大日志 |
-| `created_at` | UTC 时间 |
+| `id/project_id/participant_id` | 固定归属；Participant 必须为 cli_agent |
+| `task_id` | 可空；Task Run 必填，Conversation Run为空 |
+| `conversation_id/trigger_message_ids` | Conversation wake 时填写；Message ID列表有界且可追溯 |
+| `session_scope_kind/session_scope_id` | `task|conversation` 和对应 Task/Conversation ID；决定唯一 resume scope |
+| `workspace_identity` | Task Run必填并与Task/ownership marker不变指纹一致；Conversation Run为空 |
+| `runtime_generation/task_generation` | Participant fence；Task Run另有 Task fence |
+| `resumed_from_run_id/native_session_id` | 可空 resume lineage |
+| `adapter_id/image/config_fingerprint/instructions_hash` | 创建时冻结 |
+| `state` | `starting/active/exited/failed/interrupted/cancelled/timed_out` |
+| `requested_outcome` | Task Run可空或 `wait/submit/fail`；Conversation Run必须为空 |
+| `container/runtime/cleanup/log` 字段 | 详见 `runtime.md` |
+| `version/timestamps` | CAS 与生命周期时间 |
 
-Boss/Agent mutation产生的Event必须有request ID；Daemon外部动作的requested/terminal Event必须有同一个operation ID。纯观察/heartbeat可以没有operation ID，但不得被reconciler当作动作授权。
+- 同一 CLI Agent 同时最多一个 starting/active Run，不论由 Task 还是 Conversation 触发。
+- Conversation Run 不创建或挂载项目 workspace，只使用 Participant home和私有 control socket。
+- 一个 Run 可携带同 Project 多个 Conversation 的未读消息；实际进入输入的每条 Message/recipient ID持久关联 Run，不按 session 粗粒度去重。其他未读只通过有界摘要和 cursor 发现。
+- Task outcome 只允许绑定该 Task 的 Run提交；Conversation Run不能修改 Task outcome，但可执行其 capability 允许的普通 Service operation。
 
-至少需要以下事件族：
+### 3.8 Event 与行为日志索引
 
-```text
-project.creating / project.active / project.error / project.archived
-agent.created / agent.updated / agent.paused / agent.archived
-task.created / task.claimed / task.running / task.finishing / task.waiting
-task.submit_requested / task.submitted / task.requeued
-task.completed / task.failed / task.cancelled
-run.created / run.active / run.session_recorded
-run.outcome_requested / run.stop_requested / run.resume_fallback
-run.exited / run.failed / run.interrupted / run.cancelled / run.timed_out
-message.created / message.delivered / message.acknowledged / message.redelivered / message.cancelled / message.delivery_exhausted
-message.rerouted
-git.task_ref_capture_requested / git.task_ref_captured
-git.canonical_advance_requested / git.canonical_advanced / git.canonical_stale
-runtime.reconciled / runtime.cleanup_removed / runtime.cleanup_blocked
-role.created / role.updated / role.deleted
-participant.role_bound / participant.role_unbound
-credential.added / credential.rotated / credential.revoked
-```
+Event 必须包含 `id/project_id/entity_type/entity_id/kind/actor_participant_id/run_id/request_id/operation_id/payload_json/created_at`。Daemon 发起时 `actor_participant_id` 为空并标记 `actor_type=daemon`；不得保留 `boss|agent|system` actor 枚举。
 
-新增 Event renderer/check 必须列表注册。不得把每个 CLI tool call、stdout chunk 或模型 token 写成 Event。
+至少覆盖 project、participant、role/binding、credential、task、conversation/member、message/recipient、run、git、runtime、log retention 和 bootstrap 事件族。新增 renderer/check 通过静态列表注册。
 
-### 3.7 Role
-
-Role 是能力集合的可配置数据，不是代码。`roles` 表：
-
-| 字段 | 要求 |
-| --- | --- |
-| `id` | 稳定 ID |
-| `name` | 可读名称 |
-| `description` | 可空说明 |
-| `capabilities` | capability 名 JSON 数组，全部来自静态注册表 |
-| `version` | CAS 版本 |
-| `created_at/updated_at` | 时间 |
-
-规则：
-
-- role 由 `coordplane role create/update/delete/list/show` 管理；能力集可在静态注册表内任意组合，写入未注册 capability 名稳定拒绝（`INVALID_ARGUMENT`），修改即时生效、无需重启。
-- 被项目绑定（`participant_project_role`）引用的 role 不可删除，返回 `IN_USE`。
-- 内置种子角色只有 owner 与 agent 两个（`role-owner`/`role-agent`），由 v3 迁移 seed 写入；被绑定引用的 role 不可删除（IN_USE），解绑最后一个 `participant.manage` 持有者被拒绝（最后管理员保护）。Daemon 不理解角色名，不按角色名写业务分支。
-
-### 3.8 ParticipantProjectRole
-
-项目级角色绑定表（`participant_project_role`），角色只在项目内生效：
-
-| 字段 | 要求 |
-| --- | --- |
-| `participant_id` | 绑定的 participant |
-| `project_id` | 项目作用域；`global` 为保留全局作用域 |
-| `role_id` | 绑定的角色 |
-| `version` | CAS 版本 |
-
-规则：
-
-- 同一 participant 在不同项目可有不同角色集，互不影响。
-- 管理能力（`participant.manage`/`role.manage`/`role.bind`）只经 `project_id=global` 作用域授予；全局能力也走同一角色表，不建第二套机制。
-- 绑定/解绑由 `participant bind/unbind` 管理，热生效；解绑后该 participant 在项目内立即失去相应 capability。
-
-### 3.9 Credential
-
-人类身份凭据（`credentials` 表），与 per-Run token 不同：
-
-| 字段 | 要求 |
-| --- | --- |
-| `id` | 稳定 ID |
-| `participant_id` | 所属 human participant |
-| `kind` | v1 服务只签发 `operator_token`（保存 SHA-256 hash，不存明文）；`ssh_key` 仅为 schema 预留，v1 不签发 |
-| `secret_hash` | 唯一持久化字段（hash），无明文 |
-| `status` | `active` 或 `revoked` |
-| `created_at/revoked_at` | 相应时间 |
-
-规则：
-
-- 凭据支持轮换与吊销；吊销后该 participant 的 operator 操作立即被拒（已建立的认证会话也不得再执行写操作），吊销状态持久化。
-- 人类凭据只存 hash，不存明文，不注入 Agent 容器；Run token 五元组机制不变。
-- 删除/降级最后一个持有 `participant.manage` 的 participant 被系统拒绝（最后管理员保护），防止系统失去管理员。
+每个 Run 恰有一行 `behavior_log_indexes`，作为该 Run 日志 manifest、完整性、retention 和 `long_term` 的唯一可变权威。它保存 Run ID、manifest/文件路径标识、first/last sequence、字节数、hash、截断/丢失/脱敏计数、retention 状态、`long_term`、版本和时间。Run只保存该索引ID，查询时通过关联行投影摘要；不复制路径、sequence/hash/count、retention或`long_term`。大日志留在 `runtime.md` 指定文件中。Event 与行为日志必须可用 Run ID和 sequence/offset 交叉定位，但不能互相替代。
 
 ## 4. Canonical 状态机
 
-### 4.1 Project 和 Participant 状态机
+### 4.1 Project 与 Participant
 
 ```text
-Project: creating -> active | error
-         error    -> creating | archived
-         active   -> error | archived
+Project:     creating -> active | error
+             error    -> creating | archived
+             active   -> error | archived
 
-Participant: active <-> paused       # 仅 cli_agent：暂停使该 participant 不再领取新 Task
-             active|paused -> archived   # 仅 cli_agent：archive 前置条件见 §3.2.1
+Participant: active <-> paused
+             active|paused -> archived
 ```
 
-- Project error是持久fail-closed状态；只有`project repair`重新进入creating并完成Git核验后才能active。
-- cli_agent participant 的 pause/archive 走 Agent 生命周期操作（`SetAgentStatus`/`ArchiveAgent`）并同步镜像状态；human 无 Run、无 pause/resume/archive 状态机（见 §3.2.1），v1 不提供 human 生命周期变更。archived不原地恢复，需新建对象或未来显式需求变更。
+archived 不原地恢复。Project error 是持久 fail closed；只有显式 repair 和实际 Git核验后才能 active。
 
-### 4.2 Task 状态机
+### 4.2 Task
 
 ```text
-create ordinary/wake Task ----------------------> queued
-create conversation + only wake=false Message --> waiting
-create work/child Task assigned to human -------> waiting   # 第二条例外
-queued + Run becomes active -------------------> running
-running + agent requests wait/submit/fail ------> finishing
-finishing + Run terminal + wait ----------------> waiting | queued
-finishing + Run terminal + valid capture -------> submitted
-finishing + Run terminal + fail ----------------> failed
-waiting + explicit wake/wake Message/child result -> queued  # 仅 cli_agent 任务；human wake 拒绝
-waiting + human task complete (strict) ---------> completed
-submitted work + accept + canonical包含/FF CAS -> completed
-submitted work + accept + stale ---------------> submitted + linked integration
-submitted integration + canonical再次stale ----> queued
-submitted + explicit rework --------------------> queued
-queued|running|waiting + unrecoverable failure -> failed
-failed + explicit retry ------------------------> queued
-queued|running|waiting|submitted|failed
-  + explicit cancel ----------------------------> cancelled
-conversation waiting + Boss close --------------> completed
+create ----------------------------------------> queued
+queued + Human claim --------------------------> running
+queued + CLI Run proven active ----------------> running
+running + wait --------------------------------> waiting
+waiting + explicit wake -----------------------> queued
+running + submit ------------------------------> finishing
+finishing + non-git finalize ------------------> submitted
+finishing + valid Git capture -----------------> submitted
+running + fail --------------------------------> failed
+submitted + accept non-git --------------------> completed
+submitted + accept Git FF/CAS -----------------> completed
+submitted + accept Git stale ------------------> submitted + integration Task
+submitted + rework ----------------------------> queued
+failed + retry --------------------------------> queued
+queued|running|waiting|submitted|failed + cancel -> cancelled
 ```
 
 约束：
 
-- Task 创建后默认queued。第一条例外：首次direct Agent Message显式`wake=false`且没有open conversation Task时，Message与conversation Task必须在同一事务创建，Task初始waiting，不得启动Run。
-- 第二条例外（human 任务，owner D2 批准）：assignee 为 human（`assignee_agent_id` 为空）的 work/child Task 创建即 `waiting` 且 `wait_reason=human_assigned`；operator `task create` 与 agent `task create` 子任务两条路径一致，无绕过点；agent 任务仍创建即 `queued`。human 无 Run：Scheduler/Claim 不领取（见 §6），`running` 对 human 不可达，也不经过 wait/finishing 路径。
-- human 任务唯一收敛路径是严格 `waiting → completed`（`task complete`，同事务写 `closed_at`、清 `wait_reason`、写 `evidence_type=human_confirm` 且 `head_sha` 为空）；`queued`（含存量 legacy queued human）或重复 complete 返回 `INVALID_STATE`。
-- 显式 `task wake` 只适用于 cli_agent 任务；human 任务 wake 返回 `INVALID_STATE`，避免被 CLI/API 打回永久 queued。
-- 严格模式不提供存量 legacy queued human 的自动迁移/reconciler（未发布分支不迁移）；旧行由人工处理（置为 waiting 或取消），未处理时 complete 稳定拒绝。
-- Scheduler 创建 `starting` Run 时，Task 仍保持 queued，但设置 `current_run_id`；Boss 视图可投影为 `preparing`，不得持久化第二套 Task 状态。
-- 只有 runtime 证明容器和 CLI 进程 live 后，Run 才 active，Task 才 running。
-- waiting 表示责任仍属于同一 Task/Agent，只是当前没有 active Run。
-- finishing 表示Agent outcome已持久化、token已撤销，Runtime正在结束Run或Git正在capture；它不是第二套任务语义，且不允许accept/rework/cancel等竞争mutation。
-- submitted 表示 Agent 已提交可审查结果；它不是 accepted、integrated 或 completed。
-- completed 必须由 Boss、Task 创建者/父 Task 当前 Agent显式接受，或由 Git 模块确认已成功集成后产生。
-- Agent 的 wait/submit/fail 必须在同一 SQLite事务把Task从running转finishing、保存`Run.requested_outcome`、撤销token并写Event；Runtime随后幂等结束该Run，只有terminal/capture事实成立后才转waiting/submitted/failed。
-- Submit capture可修复失败时，finishing清除pending/current Run后转queued并带backoff/Message；超过retry上限转failed。Invariant失败使Task failed、Project error。
-- failed 可由 Boss/创建者显式 retry；retry 必须递增 generation、清除旧 `current_run_id`，保留失败 Event。
-- completed/cancelled 不原地重开；需要继续时创建带 `retry_of_task_id` 的新 Task。
-- 不定义 `blocked`、`needs_input`、`repair` 状态。等待人或 Agent 的情况使用 waiting + Message。
-- `pending_action` 非空或Task finishing时，除status、reconciler和`run stop`外的竞争mutation必须返回`ACTION_IN_PROGRESS`。尤其accept-vs-rework/cancel不能并发授权同一旧结果。
-- source Task链接尚未closed的integration Task时适用同一`ACTION_IN_PROGRESS`规则；不能在integration运行期间撤销source后仍让旧结果推进canonical。
+- Human 和 CLI Agent 状态集合相同。Human claim/wait/fail直接事务收敛；submit 的 Git外部动作仍使用 finishing/pending intent。
+- CLI Agent wait/submit/fail先写 requested outcome并撤销 token，Runtime 终结 Run 后再按真实结果推进。
+- `finishing` 或 pending action期间，竞争 accept/rework/cancel 返回 `ACTION_IN_PROGRESS`。
+- completed/cancelled时清除旧 `failure_reason/wait_reason/current_run_id`；failed不得伪装 closed。
+- running CLI Task没有 structured outcome而进程退出时返回 queued/backoff或 failed，绝不能因 exit 0自动 submitted/completed。
 
-### 4.3 Run 状态机
+### 4.3 MessageRecipient
+
+```text
+pending -> delivered -> acknowledged
+pending ----------------> acknowledged
+delivered -> pending          # Run terminal且未ack
+pending|delivered -> cancelled
+```
+
+Message 本身不可变且没有聚合 delivery state。查询可投影 recipient 计数，但不得把部分 acknowledged显示为全体已读。
+
+### 4.4 Run
 
 ```text
 starting -> active
@@ -474,229 +311,102 @@ starting -> exited | failed | interrupted | cancelled | timed_out
 active   -> exited | interrupted | cancelled | timed_out
 ```
 
-- 所有 terminal Run 状态不可返回 active。
-- resume 创建新 Run，并通过 `resumed_from_run_id` 和 native session ID 关联旧 Run。
-- Daemon crash 后发现原容器仍真实运行时，可以重新监控同一 active Run；这不是 Run 状态复活。
-- 发现 active Run 的容器/进程不存在时，必须转 interrupted，不能仅凭 native session ID 保持 active。
+resume 创建新 Run并引用旧 Run。Daemon crash后重新 Attach真实仍在运行的容器是接管同一 Run，不是 terminal 状态复活。
 
-### 4.4 Run terminal 对 Task 的影响
+## 5. Task 创建、执行和反馈
 
-| Run 结果 | Task 当前状态 | 必须行为 |
-| --- | --- | --- |
-| starting时CLI快速exit | queued | 保存exit；清除current Run并按retry policy requeue/failed |
-| requested outcome=wait | finishing | 清除current Run；有pending wake则queued，否则waiting |
-| requested outcome=submit | finishing | 在静止workspace执行capture；成功submitted，失败requeue/failed |
-| requested outcome=fail | finishing | 清除current Run并转failed |
-| timeout/stop发生但已有更早requested outcome | finishing | Run保留真实终因；Task仍按wait/submit/fail规则收尾 |
-| Run 正常 exit，但 Task 仍 running | running | 记录 `NO_TASK_OUTCOME`；未超 retry 时 requeue，超限 failed |
-| Run error/interrupted | running 或 queued | 未超 retry 时带 backoff requeue，超限 failed |
-| Boss cancel | FSM允许且无pending/integration授权的open Task | Task cancelled；存在Run时stop/cleanup异步但必须收敛 |
-| timeout且无requested outcome | running | Run timed_out；Task按 retry policy requeue 或 failed |
-| starting阶段timeout | queued | Run timed_out；清除current Run，Task按retry policy requeue或failed |
+- 创建要求 Project active、creator具备 `task.create`、assignee active且同 Project可见。
+- Agent 在 Run内创建子 Task仍必须显式 assignee，并记录 parent；Human 使用同一 operation。
+- `--source-task` 只接受同 Project、已有 task ref 的 submitted/completed Task，创建时复制精确 source ref/head。
+- `--retry-of` 只接受同 Project completed/cancelled Task，只保存 lineage；base仍来自当前 actual canonical，除非另给 source Task。
+- Human 对 queued Task调用 claim；CLI Agent不得伪造 Human claim，Scheduler不得为 Human创建 Run。
+- 每个有parent的子 Task 创建时必须固定 active `coordination_conversation_id` 和该 Conversation 内的 active `result_recipient_participant_id`；parent assignee、child assignee和 result recipient 必须是成员。root Task两字段为空。不提供未定义的 subscriber 或 inbox fallback 通知路径。
+- 子 Task 首次进入 `submitted|failed|cancelled` 时，同一事务中以稳定幂等键创建 `system_code=child_result_ready`、`task_id=parent_task_id` 的 Message 和唯一 result recipient。有界 system payload 固定 child Task ID/status/version/submission ID/task ref/head SHA 摘要；Task行和实际 Git ref仍是权威，通知不是第二真相。
+- 若 parent 仍为 `waiting`、当前 assignee 就是 result recipient 且没有运行中 Run，同一事务将 parent `waiting -> queued`；CLI Agent recipient 的 recipient行设 `wake_requested=true`，Human 只获得未读。recipient在child创建后被paused时仍持久消息并可queued parent，但不启动新Run，直到恢复active或有权Human显式处置。重试/重启不得重复创建 Message。这形成“A创建B并wait -> B交付 -> A收到定向结果并恢复parent”的唯一路由。
+- waiting 只表示责任仍属于 assignee且当前无执行；wake让 Task回 queued。CLI Agent后续由 Scheduler运行，Human需重新 claim。
 
-### 4.5 Message 状态机
+## 6. 调度、消息递送和并发
 
-```text
-pending -> delivered -> acknowledged
-pending ----------------> acknowledged
-delivered -> pending   # delivered Run terminal 且未 ack
-pending|delivered -----> cancelled
-```
+### 6.1 Run 选择
 
-- Inject accepted、resume prompt 建立或新 Run prompt 建立后，才能标 delivered；接收者直接从inbox读取pending时可原子ack。
-- adapter 不支持 Inject、Inject 失败或目标 Agent busy 时保持 pending。
-- acknowledged 不自动完成 Task。
+Scheduler/Notifier 只为 active CLI Agent创建 Run，并共同遵守 Participant单 Run和全局 `max_parallel_runs`。
 
-## 5. Task 创建、父子任务和等待
+Task 候选：Project active、Task queued、assignee为active CLI Agent、无 current Run、backoff到期，且 workspace为`ready|not_needed`，按 `priority DESC, created_at ASC, id ASC`。
 
-### 5.1 创建
+Message 候选：Project/Conversation active、recipient pending、wake requested、backoff到期、recipient为active CLI Agent且无 current Run。若同一 recipient 的关联 Task正好是可运行且归其负责的 Task，可将消息合入该 Task Run；否则创建 Conversation Run。不得为投递消息修改无关 Task状态。
 
-- Boss 和当前 active Run 的 Agent都可以创建 Task。
-- 创建Task要求Project active、assignee不是archived；paused assignee可以接收queued Task但在resume前不调度。
-- assignee 为 human（`assignee_agent_id` 为空）的 work/child Task 创建即 `waiting` 并写 `wait_reason=human_assigned`；operator 创建与 agent 创建子任务两条路径都适用，agent 任务仍创建即 `queued`。
-- human 任务不创建 workspace/Run、不经 capture；由 `task complete` 严格 `waiting → completed` 收敛（见 §4.2）。
-- Agent 创建 Task 必须在同一 Project，必须给出具体 `assignee_participant_id`（可指向 human 或 cli_agent，含镜像列 `assignee_agent_id`），并自动记录当前 Task 为 parent，除非显式创建同级 Task 且 scope 允许。
-- Boss或有权读取source Task的Agent可以用`--source-task ID`创建work Task。Daemon只接受已有task ref的submitted/completed source，并在创建事务复制精确source task/run/ref/head；后续不得跟随可变状态重解析。
-- Boss使用`task create --retry-of T`时，T必须是同一Project内completed/cancelled Task；新Task记录lineage但仍按普通创建规则固定当前actual canonical为base。Open/cross-Project目标稳定拒绝且零副作用；需要使用旧代码结果时必须另显式`--source-task`，Daemon不从retry关系猜代码输入。
-- Daemon 不根据自然语言把 Message 自动转换成 Task。
-- 代码 Task 创建时必须从实际 canonical ref 读取并固定 `base_sha`；调用方可提供 expected base 进行一致性校验，但不能提供不存在的 SHA。
-- 创建和 `task.created` Event 必须同事务。
+Task handlers、Run sources、workers 和排序策略均通过静态列表注册；共用循环不按 kind/name/role写分支链。
 
-### 5.2 子任务反馈
+### 6.2 Run bootstrap 和未读提示
 
-- 子 Task submitted、completed、failed 或 cancelled 时，Daemon必须通知parent当前责任方：Project active且parent Agent未archived时按Message规则投递/重路由；parent已closed、Agent已archived、Project非active或不存在delivery-capable conversation时，必须在同一事务创建recipient=Boss的结果Message并关联parent/child。目标不可递送是确定性Boss fallback，不是业务错误；SQLite事务本身失败仍整体fail loud。
-- system Message 必须包含 child task ID、状态、result summary 以及存在时的 head SHA/task ref。
-- parent Task waiting 且Message `wake=true`时转queued；parent处于running且已有live Run时按消息递送规则处理。
-- Backend 不因子 Task 完成自动接受结果、自动完成 parent 或自动创建下一业务 Task。
+每个 Run bootstrap 至少包含：
 
-### 5.3 等待
+- Participant/Project/Run ID、runtime generation和权限摘要。
+- Task Run的完整 Task、base/source信息和workspace路径；Conversation Run明确无 Task/workspace。
+- 本次实际携带的每个 Message/recipient ID、sender、Conversation、可选 Task和受大小限制正文。
+- 同 Project 全部未确认 recipient 的总数、创建时的稳定高水位、有界 Message/recipient ID样本和不透明 inbox cursor；因数量/大小未携带的项必须可经稳定分页 inbox读取。
 
-- Agent 调用 `task wait` 必须提供可读 reason，可选列出等待的 child/message ID。
-- wait 将 Task转finishing，设置Run.requested_outcome=wait并撤销token，再请求当前Run正常结束；只有Run terminal后才转waiting，若此时已有pending wake则直接queued。
-- waiting Task只有显式 wake、目标 wake Message或子 Task反馈才回 queued。
-- 显式 `task wake` 只适用于 cli_agent 任务；human 任务（`assignee_agent_id` 为空）wake 返回 `INVALID_STATE`，waiting human 不会被 CLI/API 打回 queued。
-- human 任务不经过 wait/finishing（human 无 Run）；其等待由创建即 waiting 表达。
+bootstrap生成和 Message delivered提交必须可恢复。Run输入已经发生但数据库尚未写 delivered时，recipient 可用 ID直接 ack；重试不得生成第二份 Message。
 
-## 6. 调度和并发
+### 6.3 Inject、退出和 redelivery
 
-### 6.1 Scheduler 选择
+- 已有 active Run时可尝试 Inject；支持性和结果由 adapter 报告，Core不假定成功。
+- 只有正文实际进入 CLI输入才写 delivered；Inject失败保持 pending。
+- Run terminal时，所有由该 Run delivered但未ack的 recipient回 pending并计算独立 backoff。
+- wake=false recipient不会单独创建 Run，但 Agent下次任一同 Project Run一定知道其未读存在。
+- provider失败不得形成无界付费重试；达到 max deliveries 后停止自动 wake并显式显示 exhausted。
 
-Scheduler 只选择满足全部条件的 Task：
+## 7. Operation、权限和 transport
 
-- Project active。
-- Task status queued。
-- Assignee 为 cli_agent（`assignee_agent_id` 非空）；human 任务不参与调度，永不 claim。
-- `current_run_id` 为空。
-- `next_run_at <= now`。
-- Assignee Agent active 且没有 starting/active Run。
-- 全局 active/starting Run 数小于 `max_parallel_runs`。
+### 7.1 统一 operation registry
 
-排序固定为 `priority DESC, created_at ASC, id ASC`。Daemon 不读取 description 判断顺序，不提供通用依赖 DAG 或 stage barrier；Agent 通过何时创建子 Task 和何时 wait 表达工作顺序。
+每个 mutation/query operation以独立函数注册，descriptor 至少包含名称、所需 capability、scope解析器、输入校验、允许 transport 和是否要求幂等键。CLI、Web 和 coordlink只做编码/展示，调用同一 operation。
 
-### 6.2 Claim 事务
-
-一次 claim 必须在单个 SQLite 事务中：
-
-1. 再次检查 Task/Agent/并发条件（含 assignee 为 cli_agent；human 任务 claim 稳定拒绝，`running` 对 human 不可达）。
-2. Task generation 加一。
-3. 创建 state=starting 的 Run。
-4. Task.current_run_id 指向 Run，但 Task status 暂保持 queued。
-5. 写 `task.claimed` 和 `run.created` Event。
-
-事务提交后才允许准备 Docker/workspace。准备失败必须终结 Run、清除 current_run_id，并按 retry policy requeue/failed。
-
-### 6.3 Worker 组织
-
-Daemon worker 至少包括 scheduler、message notifier、run supervisor、reconciler 和 GC。每个 worker 是独立实现，通过静态列表注册：
+主要 capability 至少覆盖：
 
 ```text
-workers = [scheduler, notifier, supervisor, reconciler, gc]
+project.read / project.manage
+participant.read / participant.manage
+role.read / role.manage / role.bind
+task.read / task.create / task.claim / task.submit / task.accept / task.manage
+conversation.read / conversation.manage / message.send / message.ack / message.wake
+run.read / run.manage / log.read_own / log.read_project / log.export / log.retain
+git.read / git.workspace.read / git.accept / git.discard
 ```
 
-删除一个 worker 应只移除注册项和实现，不得修改共用主循环。Worker 必须支持 context cancellation，退出时不得泄漏 goroutine。
+职责不进入 capability 名。失败授权返回 `SCOPE_DENIED` 且零副作用，不泄露目标内容。
 
-周期GC worker只执行由closed/terminal事实、当前retention和全部fence确定为安全的自动清理。`gc preview`只读列出当前可删/不可删目标、原因和CAS输入：workspace返回由Task/version、ownership marker、actual HEAD和porcelain status digest组成的fingerprint；每个task/run ref分别返回Task ID、Run ID和actual SHA，ref全名仍由服务端构造且不接受用户输入。`gc run --confirm`立即调用同一组已注册安全步骤并在执行前重算全部predicate，不信任旧preview输出。
+### 7.2 认证
 
-危险放弃不复用`gc run`的宽泛flag，只允许两个单目标命令：`gc discard-workspace --task T --expected-fingerprint F --request-id R`和`gc discard-task-ref --task T --run U --expected-sha S --request-id R`。两者要求Task已completed/cancelled；task-ref命令还要求Run U属于Task T并由服务端构造唯一ref。命令重算identity/CAS和所有不可覆盖fence；expected不符零副作用，目标已absent幂等成功。显式discard只能覆盖dirty或“commit未进canonical”这一条保留原因，不能覆盖open Task、active Run、pending action、ownership不明、source/integration引用或Project error。Failed Task必须先retry保留原workspace，或cancel后再discard；cancelled Task要继续工作只能创建`retry_of_task_id`新Task。所有调用使用request dedupe；Event只记录结果，不授权重放。
+- Human 经 operator token认证；Operator CLI使用 Unix socket，Web只监听 loopback并建立短期本机会话。
+- CLI Agent 经 per-Run socket和 token认证。socket ownership 缩小可达面，但不替代 token、generation、scope和 capability。
+- operation先认证 Participant，再解析 target scope，再合并该 scope Role capabilities，最后执行 object-level membership/assignee检查。
+- Agent token可调用其 capability允许且 transport支持的 Project/global operation；不得因 `kind=cli_agent`硬编码职责限制。
+- `log.read_own` 只允许 CLI Agent 读取其自身 Run 的已脱敏日志；`log.read_project` 是敏感 Project 级权限，可读取该 Project 其他 Participant Run。Conversation 成员资格单独不授予任何行为日志访问。`log.export/log.retain` 另行检查目标 Run、Project scope 和所需 read capability。
+- `workspace_host_path` 只能由服务端生成，并只经认证 Human 使用的 Operator/Web host transport返回给 Task assignee 或同时具备 `git.workspace.read` 的 Human。coordlink、Agent bootstrap、通用状态投影、Event、日志和错误不得暴露该宿主路径；容器也不得提交宿主路径参数。
 
-## 7. Message 递送和唤醒
+### 7.3 公开入口
 
-### 7.1 创建顺序
+Operator CLI和Web UI必须覆盖 Project、Participant/Role/Credential、Task、Conversation/Message、Run/log、Git accept/integration和GC的正式操作。coordlink必须覆盖运行中 Agent实际可执行的同一结构化 operation，包括 Task、Conversation、Message、查询和其 capability允许的管理操作；不提供 raw DB、raw Git ref或任意 HTTP path。
 
-发送 Message 的事务必须先完成：
+所有入口支持稳定机器输出；Web mutation使用相同 expected version和idempotency key。自然语言 chat只创建 Message，不直接更改 Task或Git。
 
-1. 校验 sender scope、recipient 和 Task。
-2. 插入 Message state=pending。
-3. 写 `message.created` Event。
-4. 若目标 Task waiting 且 wake=true，以同事务转 queued；若Task finishing，只保存Message，等待Run terminal事务决定queued/waiting。
+## 8. 状态视图和 Web 投影
 
-事务提交后 notifier 才能尝试递送。
+`status`、Web API和Web UI从相同 query service投影，至少返回：
 
-Agent发送direct Message但未给delivery Task时，Daemon必须在同一Project创建/复用接收Agent的conversation Task；发送方当前Task写入 `related_task_id`。首次创建且wake=false时conversation按Task FSM直接waiting；wake=true时queued。该机械路由只选择消息投递上下文，不解释正文。
+- Daemon ready/degraded原因和 schema version。
+- Project actual/cached canonical SHA、pending Git动作和 retention override。
+- Participant kind/status/current Run、配置 fingerprint和有效 Role摘要。
+- Task树、assignee、状态、base/head/task ref、integration链接和原因字段。
+- Conversation成员、Message recipients逐项未读/递送状态及 exhausted项。
+- Run真实状态、resume lineage、container/cleanup事实和行为日志完整性/retention状态。
 
-### 7.2 递送顺序
+敏感字段、token、provider secret、instructions全文和未授权 Conversation/日志不得进入投影。宿主私有路径默认不进入投影；只有上节专用 workspace operation 可向授权 Human返回。
 
-Notifier 按以下固定顺序处理：
+Web 会话使用 HttpOnly、SameSite=Strict cookie（TLS时另加 Secure），不将 credential/session token存入 localStorage或输出到页面。所有 mutation 使用非 GET、会话绑定 CSRF token并校验精确 Origin/Host allowlist；CORS默认关闭。响应使用严格 CSP（默认同源，禁止 `unsafe-inline`/`unsafe-eval`）和上下文正确输出编码。SSE/WebSocket 建立时校验认证/Origin/scope，凭据吊销或权限变更后有界时间内终止越权流。
 
-1. 若接收 Agent 在目标 Task 上有真实 active Run，且 adapter 支持 Inject，则尝试 Inject。若delivery Task是该Agent的conversation Task，可选Inject到同一Agent当前其他Task的active Run，但输入必须同时标明delivery/related Task ID。
-2. Inject 成功后 Message delivered 并绑定该 Run。
-3. Inject 不支持或失败时保持 pending；只有Message.wake=true且Task waiting时才转queued；若wake=false则等待显式读取/唤醒或现有Run。Task finishing时等待旧Run收敛；Task running但没有真实Run时由reconciler先修正Task。
-4. Scheduler 创建 resume/new Run，启动 prompt 包含全部 pending Message ID 和受大小限制的正文。
-5. Run 输入建立成功后，相关 Message delivered。
-6. Agent 读取并显式 ack；未 ack 且 Run terminal 时回 pending。
-
-same-turn Inject 只是第 1 步的可选优化。系统正确性不得依赖它。
-
-当Task outcome使delivery Task变成submitted/failed/closed时，未ack消息必须在同一事务按Message规则重路由或cancel；不能等待一个永远不会再创建的Run。
-
-所有会根据Message采取副作用的mutation命令必须接受重复的`ack_message_ids`。Task创建、Message回复、wait/submit/fail、accept/rework与这些ack在同一SQLite事务提交，避免“先ack后动作丢失”或“动作成功但未ack导致重复执行”。Standalone ack只用于接收者明确确认无需其他副作用的消息。
-
-### 7.3 Boss 对话
-
-- `coordplane chat --agent A` 必须创建或复用 Boss 与 A 的delivery-capable conversation Task；存在failed conversation时稳定失败，等待Boss retry/cancel。
-- Boss 输入形成绑定该 Task 的 Message，默认 `wake=true`。
-- Agent 回复形成 recipient=人类 owner participant（Boss 显示别名）的 Message；Boss chat 按顺序显示并 ack。
-- Agent 回复后可调用 `task wait`，下一条 Boss Message 再 resume/new Run。
-- Boss 在 chat 中的自然语言不得直接改 Task、Project 或 Git 状态；结构化动作必须调用对应命令，或由 CLI Agent显式调用 coordlink。
-
-## 8. 固定命令面
-
-所有命令必须支持清晰的人类输出；查询和 mutation result 必须支持 `--output json`。失败使用非零退出码。Operator CLI、coordlink 和内部 HTTP transport 必须调用同一 operation 函数，不能复制状态逻辑。
-
-### 8.1 Boss 的 `coordplane`
-
-| 命令 | 需求 |
-| --- | --- |
-| `serve --config FILE` | 启动单 Daemon，migration/reconcile 成功后才 ready |
-| `status [--project ID]` | 顶层返回`daemon_ready`/未ready或degraded原因，并汇总 Project、Task、Agent、Run、pending Message、Git SHA 和最近错误 |
-| `project add --name N --repo LOCAL_PATH --ref refs/heads/BRANCH [--integration-agent A]` | 从本地repo的精确branch/initial SHA创建daemon-owned control repo，不修改source |
-| `project list/show/update/repair/archive` | 查询、修改默认integration Agent、修复error Project或停止新调度 |
-| `project checkout ID --dest PATH` | 从 canonical ref 创建 Boss 可用的新 checkout；目标非空时失败 |
-| `agent add/update/list/show/pause/resume/archive` | 管理 cli_agent participant 身份与配置；不提供 role/policy DSL |
-| `participant list/show/bind/unbind` | 统一参与者身份与项目级角色绑定；绑定只在项目内生效，管理能力经 `project_id=global` 作用域；human 无 pause/resume/archive 命令 |
-| `role create/update/delete/list/show` | 可配置角色（能力集合）；capability 来自静态注册表，被项目绑定引用的角色不可删除（`IN_USE`） |
-| `credential add/rotate/revoke` | 人类身份凭据（v1 只签发 `operator_token`，只存 hash）；吊销立即生效 |
-| `chat --project P --agent A [--related-task T]` | 与 cli_agent participant 对话；始终投递到该 participant 的 conversation Task，可把另一个Task只作为讨论关联。conversation Task 只在一个 cli_agent 与默认人类 owner participant 之间建立，不提供任意两个 participant 之间的通用对话 |
-| `message send/list/read/ack/retry` | 非交互消息入口；给出接收者，Task可显式指定或使用接收Agent conversation Task；retry重新启用耗尽的自动递送 |
-| `task create/list/show` | 创建和查询明确 Task；work Task可用`--source-task ID`固定待审查输入，Boss可用`--retry-of ID`引用同Project closed Task |
-| `task checkout ID --dest PATH` | 从已capture的精确task ref导出普通checkout，移除control remote；用于Boss审查未集成结果 |
-| `task accept [--integration-agent A] / rework/retry/cancel/wake/close / complete` | 显式状态动作；代码accept必须有可用integration Agent，Git行为见`git.md`。`complete` 仅 human 任务严格 `waiting → completed`；`wake` 仅 cli_agent 任务 |
-| `run list/show/logs/stop` | 查询真实 Run、跟随日志、请求停止 |
-| `events tail` | 按 project/task/agent/run 过滤关键 Event |
-| `gc preview / gc run --confirm` | preview返回原因和workspace fingerprint/ref SHA；run只清理满足`runtime.md`/`git.md`自动安全条件的资源 |
-| `gc discard-workspace --task T ... / discard-task-ref --task T --run U ...` | 单workspace或单run-ref危险放弃；必须携带preview得到的expected identity和request ID，且不能越过active/pending/ownership/source引用fence |
-
-`agent add/update` 的字段来自同一 `AgentConfigInput`：`display_name/adapter_id/image/instructions_file/instructions_text/model/subagent_model/base_url/effort`（update 另带 `version`）；`instructions_file` 与 `instructions_text` 互斥；PUT 为全量替换，CLI 与前端不发送部分字段。
-
-### 8.2 Agent 的 `coordlink`
-
-| 命令 | 需求 |
-| --- | --- |
-| `task current` | 返回 token 绑定的 Task、Run、base/head 和 unread Message 数 |
-| `task show ID` | 只读取当前、parent、child、自己创建或自己负责的 Task |
-| `task create --agent A [--participant P] [--source-task ID] ...` | 创建显式子 Task；assignee 为 cli_agent participant（`--agent`）或 human participant（`--participant`），二者互斥；source必须在当前scope可读且已有task ref |
-| `task wait --reason TEXT` | 当前Task进入finishing；Run terminal后才waiting或因pending wake直接queued |
-| `task submit --summary TEXT --expected-head SHA` | 代码Task记录submit outcome并进入finishing；Run terminal后核验expected head并capture |
-| `task fail --reason TEXT` | 记录fail outcome并进入finishing；Run terminal后Task才failed |
-| `task accept ID [--integration-agent A]` / `task rework ID` | 只允许Task创建者或parent当前Agent处理子Task结果；代码accept固定本次integrator |
-| `inbox list/read/ack` | 当前 Task/Agent scope 的 Message 操作 |
-| `message send [--task T] --to-agent A|--to-boss ...` | 发送持久 Message；接收者为 cli_agent participant（`--to-agent`）或默认人类 owner participant（`--to-boss`）；未给Task时使用接收方 conversation Task，可要求wake |
-| `progress --summary TEXT` | 写一个 progress Event；不得改变 Task状态 |
-
-coordlink 不得提供 `capability list`、`skill list/read`、通用 `call NAME`、任意 HTTP path 或 raw DB/Git ref 操作。
-
-`task cancel` 与 `run stop` 必须严格区分：
-
-- `task cancel` 取消工作责任、递增Task generation并使当前token失效；当前Run由Runtime最终置cancelled，Task不得自动重启。
-- `run stop` 只在Run行写`stop_requested_at/reason`并结束本次进程；没有requested outcome时Run置interrupted，Task按retry policy回queued或failed。
-- Runtime接管/cleanup始终比较不可变的Run generation和launch nonce，不能拿已递增的Task generation否定旧容器ownership。
-
-## 9. 身份和 scope
-
-第一版不是多用户 RBAC，但必须防止 Run 冒充其他 Agent/Task，并按项目角色限制每个操作：
-
-- 每次 operation 在 service 入口统一执行：认证（human 经 operator 凭据，cli_agent 经 Run token，见 §3.9 与 `runtime.md`）→ 解析 participant 身份 → 确定操作所属 project 或 global 作用域 → 解析该 participant 在该作用域下的角色能力集 → 检查所需 capability；缺失返回 `SCOPE_DENIED` 且零副作用，不泄露对象内容。
-- 管理能力（`participant.manage`/`role.manage`/`role.bind`）只经 `project_id=global` 作用域授予，项目级角色即使能力集合也含不了全局能力；删除/降级最后一个持有 `participant.manage` 的 participant 被系统拒绝（最后管理员保护）。
-- 人类凭据只通过凭据绑定认证 operator 操作，不得注入 Agent 容器；不得把 operator token 注入 Agent 容器。
-- Agent transport只接受`runtime.md`的per-Run Unix socket；socket归属用于缩小可达面，但不能替代Run token、generation和scope校验。
-- 每个 Run 创建独立随机 token，只在启动时注入容器；数据库只保存 hash。
-- Token 固定绑定 `project_id + agent_id + task_id + run_id + generation`，请求体中的 ID 只能做一致性校验，不能覆盖绑定值。
-- Run outcome请求、run stop、Run terminal、Task cancel或generation前进时token立即失效。
-- Agent 可读取当前 Task、parent/children、自己创建/负责的 Task 和相应 Message；不得读取其他 Agent workspace、home、token 或私有日志。
-- Agent 创建子 Task 可指定同一 Project 中 active Agent；不能创建跨 Project Task。
-- Scope 拒绝只返回稳定错误和目标对象类型，不泄露对象内容或宿主路径。
-
-## 10. 幂等和错误
-
-### 10.1 幂等
-
-- 创建 Task、发送 Message、submit、accept、cancel 和外部 Git动作必须接受 `request_id`/idempotency key。
-- wait/fail/rework和任何携带`ack_message_ids`的mutation同样必须有request ID。
-- Task/Message 创建使用 `(actor_scope, operation, idempotency_key)` 唯一约束；重复请求返回原对象。
-- 状态转移重复到相同结果时可以返回当前对象；状态或参数冲突时返回 `VERSION_CONFLICT`/`INVALID_STATE`，不能偷偷创建副本。
-- 外部动作使用确定性 Run ID、container label 和 Git ref；reconciler 能区分重试和新动作。
-
-### 10.2 稳定错误
+## 9. 稳定错误
 
 至少定义：
 
@@ -708,82 +418,46 @@ ACTION_IN_PROGRESS
 VERSION_CONFLICT
 SCOPE_DENIED
 STALE_RUN
-RUN_STARTING
-AGENT_BUSY
-RUNTIME_UNAVAILABLE
-RESUME_UNAVAILABLE
+IDEMPOTENCY_CONFLICT
+PROJECT_NOT_ACTIVE
+PARTICIPANT_NOT_ACTIVE
+CONVERSATION_NOT_ACTIVE
+NOT_CONVERSATION_MEMBER
+RECIPIENT_REQUIRED
+DELIVERY_EXHAUSTED
+INTEGRATION_PARTICIPANT_REQUIRED
+GIT_HEAD_MISMATCH
 GIT_DIRTY
-GIT_STALE
-INTEGRATION_AGENT_REQUIRED
-GIT_INVARIANT_VIOLATION
-INTERNAL
+GIT_OPERATION_IN_PROGRESS
+WORKSPACE_CHANGED
+CANONICAL_STALE
+RUNTIME_UNAVAILABLE
+LEGACY_SCHEMA_REBUILD_REQUIRED
 ```
 
-结构化错误必须包含 `code`、`message`、`retryable`，状态冲突时包含当前 `state/version`。不要求 repair hint、allowed actions 或通用 rejected-response schema。
+错误必须给调用者可行动的稳定码和安全摘要。秘密、宿主路径、Message私密正文和 provider隐藏字段不能进入错误。
 
-## 11. Boss 状态视图
+## 10. 启动、关闭和恢复
 
-`status` 和 `task show` 至少返回：
+- 启动顺序：data dir/单实例锁 -> SQLite/migration -> adapter/config校验 -> Git核验 -> pending external reconcile -> Run/container reconcile -> MessageRecipient reconcile -> behavior log index核验 -> scheduler/notifier/GC -> CLI/Web ready。
+- reconcile 未完成前所有 mutation返回 `DAEMON_NOT_READY`；只读诊断可返回有限状态。
+- 关闭先停止接收 mutation，再停新 claim/wake，等待事务，向 Runtime 请求停止或保留可接管 Run，最后关闭 SQLite/lock。
+- Daemon crash不得丢失已提交 Task、Conversation、MessageRecipient、Git intent、Run ownership或行为日志 offset/hash。
 
-- `status --output json`顶层返回`daemon_ready`；启动reconciliation完成前为false，完成且允许mutation后为true，degraded时同时返回稳定原因。
-- Task id/kind/status/version/assignee/parent。
-- 当前 Run id/state/container live truth/native session 是否存在。
-- 最近 progress Event 和时间。
-- pending/delivered Message 数。
-- base SHA、captured head SHA、task ref、实际 canonical SHA。
-- source task/head、accepted by、固定integration Agent、linked integration Task和pending action（如有）。
-- retry count、next run time、last error、cleanup state。
-- 对于 derived phase，明确标注 `derived=true`，且能追溯到 Task/Run 字段。
+## 11. Core 不变量
 
-状态视图不得：
-
-- 读取 transcript 猜任务是否完成。
-- 因 native session ID 存在而显示 Run active。
-- 因 Agent 最近输出“done”而显示 submitted/completed。
-- 暴露 control repo、workspace、home、DB 或 token 的宿主绝对路径给 Agent；Boss debug 输出可显式请求 redacted=false。
-
-## 12. 启动、关闭和恢复
-
-Daemon 启动顺序必须为：
-
-1. 独占 data directory。
-2. 验证配置和目录权限。
-3. 打开 SQLite并完成 migration：v3 建立 participants/roles/participant_project_role/credentials，并在同一事务写入四项 seed（`participant-owner` human、`role-owner`、`role-agent`、owner 的 global binding）及 Events 的 entity_type 扩充；v4 人类任务/消息并从 `agents` 回填既有 cli_agent participant；v7 Agent 运行配置列与派生回填；迁移到 v7 前的持久 Codex 状态 fail-closed，见 §2.1。
-4. 校验 Project control repo 与 actual refs。
-5. 执行 runtime/Git reconciliation。
-6. 启动静态 worker 列表。
-7. 标记 ready 并接受 mutation。
-
-reconcile 未完成前，查询可以只读开放，但不得 claim Task 或启动 Run。
-
-优雅关闭必须先停止新 claim，再让 runtime supervisor 按 `runtime.md` 处理 starting/active Run。崩溃关闭不得在内存中留下唯一状态；下一次启动必须只依赖 SQLite、Docker 和 Git 事实恢复。
-
-## 13. Core 不变量
-
-- 业务持久对象只有 Project、Participant、Task、Run、Message、Event、Role、ParticipantProjectRole、Credential（共 9 类）；加 `agents` 兼容镜像表与 schema_migrations/request_dedupes 两个内部辅助表，共 12 张表。`agents` 只是 cli_agent participant 的迁移镜像，不是独立业务状态机，但旧读取路径移除前调度/配置读取仍可读 `agents`，因此 participant 尚不是唯一权威，也不得出现 agents-only 新生产入口。
-- Task 与 Run 分离；一次 Task 可有多个不可复活的 Run。
-- 同一 Agent 最多一个 starting/active Run，同一 Task 最多一个 current Run。
-- Task running必须指向active Run。Run active表示“启动已观察、Supervisor已持有Wait监控、尚未观察到terminal”；外部进程可在事务后退出，Supervisor/reconciler必须在有界时间收敛，Inject前仍实时Inspect。
-- Task finishing必须有current Run或pending capture action，且该Run token已撤销；Scheduler不得claim。
-- Source Task链接open integration Task时其accepted授权不可被rework/cancel；integration终结必须原子完成source或释放授权。
-- Run exit 0、Agent文字或 transcript 都不能完成 Task。
-- 所有 Agent写操作受 token + generation fence 约束。
-- Message 先持久化后递送，未 ack 的消息可重复但不能丢。
-- Message自动wake有backoff/次数上限；不能再接收Run的delivery Task上的未处理Message必须cancel或显式重路由。
-- waiting 是唯一等待状态；等待人类或其他 Agent通过 Message表达。human 任务创建即 waiting、不进入 running，仅严格 `waiting → completed` 收敛（显式 wake/claim 均拒绝）。
-- Task/Message 表直接承担调度/递送队列，不建设通用 QueueItem。
-- 每次状态变化与 Event 同事务；每个外部动作都有 intent 和 reconciliation。
-- Daemon 不理解任务正文、角色名、代码或验收语义。
-- Agent 配置写入必须通过字段校验、version CAS 与 `agent.manage` 门禁；`agents`/`participants` 镜像在同一事务更新。
-- 权限检查与 token/generation/scope fence 是独立闸门，任一不过都零副作用；capability 必须静态注册，不提供动态 capability registry。
-- 人类凭据只存 hash（operator_token）；吊销后该 participant 的 operator 操作立即被拒。
-- Run 只保存 `config_fingerprint` 与 `instructions_hash`；model/base_url/instructions_text 原文不落库、不进 Event 或日志。
-- resume 仅在上一 Run 的 `config_fingerprint` 非空且与当前一致时允许；配置变化或指纹为空一律 fresh start。
-
-## 14. 未来能力与标准协议边界
-
-行业标准协议的总体定位见 `README.md` §6.1，Runtime 侧 ACP 演进合同见 `runtime.md` §7.4。本文件的对象与状态机**不因协议演进而改变**；本节只声明未来能力的边界，不新增任何持久对象、状态或命令。
-
-- **A2A（Agent2Agent）对外出口是未来能力**。若未来把 Project/Task 暴露为 A2A 端点 + 静态 AgentCard（能力/技能/安全声明），必须满足：① 对外 `tasks/send`、`tasks/get`、`tasks/cancel` 全部映射到本文件的 Task/Message 语义（submitted 对应 queued、working 对应 running、completed/failed/canceled 对应同名终态、INPUT_REQUIRED 对应 waiting），不创建第二套任务对象或状态机；② 对外身份/凭据校验独立于内部 Run token/generation fence，不得复用或暴露内部 token；③ 对外委派进来的任务与内部 Task 同表同规则（scope、幂等、Event 同事务）。该能力必须先修改本需求基线再实现。
-- **内部协作禁止任何直连协议**。多 Agent 协作只经 Daemon 的 Task/Message 机制（见 §13 不变量）；A2A 或其他 agent↔agent 点对点直连不得进入容器网络或 Run 会话。
-- **Boss 控制面不引入新协议**。`coordplane`/`coordlink`/内部 HTTP transport 调用同一 operation 函数的约束（§8）不因协议演进而放宽。
+1. Participant 是 Human/CLI Agent 唯一身份和权限主体，无 `Boss` 或 `agents` 第二真相。
+2. `kind` 只改变认证与执行介质，不改变 Task、Conversation、Message、Git或 capability语义。
+3. Task不是 Conversation；Message必须属于 Conversation且Task关联可空。
+4. Message有显式一个或多个 recipients，每个 recipient 独立未读、递送、ack和重试。
+5. 只有明确 CLI Agent recipient且 wake requested 才能触发 Run；所有 Run都提示同 Project未读。
+6. Human 与 CLI Agent 的 git Task 使用同一 workspace、capture、task ref、accept和CAS合同。
+7. 同一 CLI Agent最多一个 starting/active Run；Conversation Run无 Task也受 Participant generation fence。
+8. 角色职责完全配置化；所有入口调用同一 operation和权限检查。
+9. 状态变化、外部 intent和Event原子；Event/日志不能授权状态推进。
+10. 完整行为流与关键Event分层保存，7天默认、Project override和`long_term`语义唯一。
+11. terminal/closed成功对象不得携带旧失败原因；旧 token/Run不得覆盖新状态。
+12. 新 handler/worker/operation/parser/check通过列表注册，替换机制同变更删除旧路径。
+13. 子 Task结果只通过固定 coordination Conversation、result recipient和幂等system Message回传，可机械唤醒waiting parent。
+14. Resume不得跨 Project、Task/Conversation scope、adapter/config或Task workspace identity。
+15. 每个Run恰有一个Behavior Log index作retention/long_term真相；Conversation成员资格不隐式授权Run日志。

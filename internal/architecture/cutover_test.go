@@ -187,8 +187,16 @@ func TestProductionSourcesDoNotReintroduceLegacyRoutesOrCLI(t *testing.T) {
 	failOffenders(t, "legacy production routes or CLI tokens remain", offenders)
 }
 
-func TestNeedDirectoryAndProviderContract(t *testing.T) {
-	root := repositoryRoot()
+func TestRequirementDocumentContract(t *testing.T) {
+	for _, check := range []func(*testing.T, string){
+		checkRequirementDocumentSet,
+		checkUserRequirementSequence,
+	} {
+		check(t, repositoryRoot())
+	}
+}
+
+func checkRequirementDocumentSet(t *testing.T, root string) {
 	entries, err := os.ReadDir(filepath.Join(root, "need"))
 	requireNoError(t, err)
 	var names []string
@@ -197,14 +205,24 @@ func TestNeedDirectoryAndProviderContract(t *testing.T) {
 			names = append(names, entry.Name())
 		}
 	}
-	want := []string{"README.md", "acceptance.md", "core.md", "git.md", "runtime.md"}
+	want := []string{"README.md", "acceptance.md", "core.md", "git.md", "runtime.md", "user-requirements-verbatim.md"}
 	if strings.Join(names, "\n") != strings.Join(want, "\n") {
-		t.Fatalf("need authority set = %v, want %v", names, want)
+		t.Fatalf("need document set = %v, want five normative documents plus one provenance record %v", names, want)
 	}
-	raw, err := os.ReadFile(filepath.Join(root, "need", "README.md"))
+}
+
+func checkUserRequirementSequence(t *testing.T, root string) {
+	raw, err := os.ReadFile(filepath.Join(root, "need", "user-requirements-verbatim.md"))
 	requireNoError(t, err)
-	if docs := string(raw); strings.Contains(docs, "ANTHROPIC_API_KEY") || !strings.Contains(docs, "ANTHROPIC_AUTH_TOKEN") || !strings.Contains(docs, "ANTHROPIC_BASE_URL") || !strings.Contains(docs, "CLAUDE_CODE_EFFORT_LEVEL") || !strings.Contains(docs, "`--bare`") || !strings.Contains(docs, "~/.claude") {
-		t.Fatal("README provider credential contract is inconsistent with the Claude runtime")
+	matches := regexp.MustCompile(`(?m)^### UR-([0-9]{4})$`).FindAllSubmatch(raw, -1)
+	if len(matches) == 0 {
+		t.Fatal("user requirement provenance has no UR records")
+	}
+	for i, match := range matches {
+		id, _ := strconv.Atoi(string(match[1]))
+		if id != i+1 {
+			t.Fatalf("user requirement provenance record %d has ID UR-%04d", i+1, id)
+		}
 	}
 }
 

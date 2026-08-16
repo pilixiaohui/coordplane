@@ -1,299 +1,271 @@
-# CoordPlane 轻量需求基线
+# CoordPlane v1 需求基线
 
-状态：Draft for owner review
-版本：0.2
-日期：2026-08-15
-（本版并入统一参与者框架修订：v1 正式纳入 participant、可配置 role、项目级权限绑定与人类凭据生命周期，见 core.md/acceptance.md 相应条款）
+状态：候选冻结基线，待需求审批人复核精确 revision
+版本：1.0-rc3
+日期：2026-08-16
 
 ## 1. 文档权威
 
-本目录定义 CoordPlane 第一版的完整产品需求。经项目 owner 确认后，它应整体替换旧的范围问卷、模块设计和产品化验收合同，不能与旧模型并列作为实现依据。
+本目录包含五份规范与一份原话审计记录。五份规范共同构成 CoordPlane v1 的唯一可执行需求事实源：
 
-本目录只有五份权威文档：
+1. `README.md`：产品定位、范围、术语和全局不变量。
+2. `core.md`：持久对象、状态机、权限、任务、Conversation 与 Message。
+3. `runtime.md`：Docker Run、CLI adapter、隔离、行为日志和恢复。
+4. `git.md`：私有 workspace、task ref、接受、集成、CAS 和 Git 恢复。
+5. `acceptance.md`：可执行验收合同、分层 gate 和代码预算。
 
-1. `README.md`：产品范围、职责边界、术语和非目标。
-2. `core.md`：持久对象、状态机、Boss/Agent 入口、调度和通信。
-3. `runtime.md`：Docker 隔离、CLI adapter、resume、取消、恢复和清理。
-4. `git.md`：Git 代码真相、私有 workspace、task ref 和集成。
-5. `acceptance.md`：架构约束、合同测试、真实拓扑和产品闭环验收。
+另外，`user-requirements-verbatim.md` 是 append-only 用户需求原话与变更溯源记录，不直接定义产品行为，不能代替上述五份规范。从 UR-0008 起，用户任何新的产品、验收、开发流程或配置需求必须先追加原话记录，再归一化到规范、issue 和测试。更正或撤回也追加新记录，不回改旧原话；凭据值按该文档安全例外处理。
 
-对象和状态只能在 `core.md` 定义；运行事实只能在 `runtime.md` 补充；Git 事实只能在 `git.md` 补充；其他文档不得复制或另起同义模型。文档间出现冲突属于需求缺陷，实施者必须停止并要求修订，不能自行选择一个版本实现。
+五份规范和该原话记录必须在同一个 Git revision 上冻结，收据记录原话文档 blob SHA 和已处理的最新 `UR-NNNN`。发生冲突时不得选择性引用；先修改本需求基线并重新审批，再修改测试或实现。测试把本基线转成可执行断言，CI只重复执行这些断言，不另行定义产品需求。运行结果、当前缺陷和候选 gate 收据属于 issue/构建产物，不写入规范正文。
 
-本文使用以下规范词：
-
-- **必须**：第一版完成条件，不得省略。
-- **应当**：默认实现要求，只有记录明确理由后才能偏离。
-- **可以**：不影响第一版完成的实现选择。
-- **不得**：会破坏产品边界或真相源的禁止项。
+`acceptance.md` 指定的小说系统需求目录是外部真实开发负载，不是第六份 CoordPlane 产品需求。它用于证明通用协作机制能支撑真实项目；小说领域规则、角色职责和验收含义不得硬编码进 CoordPlane Core。
 
 ## 2. 一句话定位
 
-CoordPlane 是一个个人使用、local-first 的常驻后台服务：老板通过它与一组 CLI Agent 对话和派发任务，多个 Agent 在相互隔离的环境中并发开发同一个 Git 项目，CoordPlane 负责记录、调度、通信、唤醒和机械核验，所有需要理解、规划、审查或解决冲突的工作都交给 CLI Agent。
+CoordPlane 是本机运行的多参与者后台协调服务。它接收 Participant 创建的 Task 和 Message，按配置唤醒 Docker 内的 CLI Agent并传递上下文，管理并发 Git workspace、结果引用和 canonical 集成，保存可查询的状态与完整可观测行为日志。
 
-CoordPlane 的价值不是“启动多个进程”，而是以下闭环在并发、失败和重启后仍成立：
+CoordPlane 不理解参与者的业务职责，不按自然语言拆解工作，不判断代码是否正确，也不替参与者决定谁应实现、审查或接受结果。职责、权限、模型、提示词和协作方式均由使用者配置。
+
+标准闭环是：
 
 ```text
-Boss
-  -> 对话或显式创建 Task
-  -> Daemon 为目标 Agent 准备隔离 Run
-  -> CLI Agent 使用原生工具开发并通过 Message 协作
-  -> Daemon 捕获真实 Git HEAD 为 task ref
-  -> Boss或父/Reviewer Agent审查并接受
-  -> Daemon 以 expected-old-SHA CAS 推进 canonical ref
-  -> stale 或 conflict 变成新的 integration Task
-  -> 进度、结果和下一步回到 Boss 或原 Agent
+Participant 创建 Task / Conversation / Message
+  -> 明确 assignee 或 Message recipients
+  -> cli_agent 由 Scheduler 创建 Docker Run；human 在宿主机操作
+  -> Participant 通过 Conversation 交流，通过私有 Git workspace 并发工作
+  -> 结果捕获为不可变 task ref
+  -> 有权限的 Participant 显式 accept/rework/cancel
+  -> Git expected-old CAS 或显式 integration Task 推进 canonical
+  -> 状态、消息、Git SHA、Run 和行为日志可从 CLI/Web UI 查询
 ```
 
-## 3. 两类真相源
+## 3. 权威事实
 
-系统只有两类权威真相：
-
-| 事实 | 权威来源 | CoordPlane 数据库保存什么 |
-| --- | --- | --- |
-| 项目目标、任务责任、运行、消息、角色权限、身份凭据和关键状态变化 | CoordPlane SQLite | `Project`、`Participant`、`Task`、`Run`、`Message`、`Event`、`Role`、`ParticipantProjectRole`、`Credential` |
-| 文件内容、历史、提交和分支 | Git objects 和 refs | 精确 `base_sha`、`head_sha`、canonical ref 和 task ref 的索引 |
+| 事实 | 权威来源 |
+| --- | --- |
+| Project、Participant、Role、Task、Conversation、Message、Run 和关键状态 | CoordPlane SQLite |
+| 项目代码、提交 lineage、未集成结果和 canonical | 实际 Git object/ref |
+| 容器、进程、退出码和资源是否存在 | 实际 Docker/OS 观察 |
+| CLI Agent 可观测行为 | 每个 Run 的追加式、已脱敏行为日志及其完整性索引 |
 
 约束：
 
-- SQLite 不保存代码快照、patch 或自建 ChangeSet 作为第二份代码真相。
-- Git 不保存任务状态、消息已读状态或运行状态。
-- Prompt、CLI transcript、容器文件、PID 文件和内存队列都不是持久真相。
-- 数据库缓存的 SHA 与 Git ref 不一致时，以实际 Git ref 为准并进入显式 reconciliation；不得用数据库值静默覆盖 Git。
-- CLI Agent 的“已经完成”文字只是消息。只有结构化 Task 转移和实际 Git ref 能改变系统状态。
+- 数据库缓存 SHA 与实际 ref 不一致时，以实际 ref 为准并显式 reconcile，禁止用缓存覆盖 Git。
+- CLI 文本声称完成不是状态事实；只有结构化 Task 转移和实际 Git 结果能推进状态。
+- Event 是关键状态变化的审计事实，不替代当前对象，也不承载大体积行为流。
+- 行为日志不作为 Task 成功或 Git 集成授权，但必须足以重建 CoordPlane 可观测到的 Agent 行为顺序。
+- Prompt、容器文件、PID 文件、进程内队列和 Web 前端缓存都不是持久真相。
 
-## 4. 产品参与者和组件
+## 4. 参与者与组件
 
-| 名称 | 类型 | 职责 |
-| --- | --- | --- |
-| Boss | 默认人类 owner participant 的显示别名 | 对话、派发、查看进度、接受、返工、取消、唤醒和最终控制 |
-| Participant | 统一参与者身份行（kind：`human` 或 `cli_agent`） | 人类与 CLI Agent 共享同一身份、Task/Message 与权限框架，生命周期按 kind 分支；在项目内能做什么由该项目下的角色绑定决定 |
-| Daemon | 常驻进程，不建业务对象 | SQLite、调度、Run supervisor、消息递送、Git ref 管理和恢复 |
-| Operator CLI | `coordplane` 命令 | 人类参与者的正式入口；经凭据认证后按项目角色限权执行 |
-| coordlink | Agent 环境内的薄客户端 | 只暴露固定 Task、Message、progress 操作并转发给 Daemon |
-| Agent | `cli_agent` 类型的 participant | 绑定一个静态注册的 CLI adapter（claude/codex）、运行配置（model/subagent_model/base_url/effort）和提示词（instructions_file/text 二选一） |
-| CLI adapter | 静态注册组件 | 生成 provider 启动/恢复命令、解析协议、判断 resume 兼容性；可选支持运行中输入，容器生命周期仍由 Runtime executor 统一拥有 |
-| Role | 可配置数据（`roles` 表） | capability 集合；只在项目绑定（`participant_project_role`）内生效，全局能力经 `project_id=global` 作用域 |
-| Capability | 静态注册权限点 | 每个可调用 operation 一个权限点；代码事实，不是数据，不提供动态 registry |
-| Credential | 人类身份凭据（`credentials` 表） | v1 只签发 `operator_token`，保存 SHA-256 hash；支持轮换与吊销，吊销后该 participant 的 operator 操作立即被拒 |
-| Runtime | 第一版为 Docker | 为每次 Run 提供隔离进程、workspace 和 Agent 私有 home |
-| Git | 成熟代码协作机制 | commit、branch、merge、冲突检测、对象保存和 ref CAS |
+| 名称 | 定义 |
+| --- | --- |
+| Participant | 唯一业务身份；`kind=human|cli_agent`。Task、Conversation、Message、权限和 Git 合同统一使用 Participant ID |
+| Human | 在宿主机通过 Operator CLI 或本机 Web UI 使用服务的 Participant；不产生 Docker Run |
+| CLI Agent | 由静态 CLI adapter 配置、在 Docker Run 中执行的 Participant |
+| Role | 可配置 capability 集合；名称无内置业务含义 |
+| Capability | 每个 Service operation 对应的静态权限点；通过 Role 绑定到 Participant |
+| Credential | Human 的本机认证凭据；Agent 使用每个 Run 独立的短期 token |
+| Project | 一个协作范围和一个 daemon-owned Git canonical repository |
+| Task | 可派发、可提交、可接受的工作责任；不承载对话生命周期 |
+| Conversation | Project 内一对一或群组对话及成员关系 |
+| Message | 属于一个 Conversation、可选关联一个 Task、显式指定一个或多个接收者的不可变消息 |
+| MessageRecipient | Message 对每个接收者独立的未读、递送、确认和重试状态 |
+| Run | 一次真实 CLI Agent 进程；可由 Task 或无 Task 的 Conversation Message 触发 |
+| Event | 小型、追加式关键状态变化 |
+| Behavior Log | Run 的详细可观测行为流；与 Event 分层保存 |
 
-Manager、Developer、Reviewer、Integrator 只是 Agent 指令或显示标签，不是内置角色。内置种子角色只有 owner 与 agent 两个（`role-owner`/`role-agent`），由 v3 迁移 seed 写入，是权限集合而非业务语义；Daemon 不理解角色名，也不根据角色名写业务分支。
+`human` 与 `cli_agent` 只在认证和执行介质上不同：Human 在宿主机工作且无 Run；CLI Agent 在 Docker 内工作并由 Scheduler 唤醒。角色名、职责和业务流程不得按 `kind` 硬编码。理论上任何 Agent Task 都可派给 Human，实际是否这样使用只由配置和派发决定。
 
-## 5. 第一版必须完成的能力
+系统不得设置 Human、CLI Agent、Task 或 Conversation 的产品级数量上限。`max_parallel_runs` 只限制同时执行的 Docker Run，不限制已配置 Participant 数量。
 
-### 5.1 Boss 控制面
+## 5. v1 必须完成
 
-- 以一个 CLI 入口注册项目和 Agent。
-- 创建和编辑 Agent 配置：静态 adapter 列表（`GET /v1/adapters`）、模型/effort/base_url、提示词（file/text 互斥）；API PUT、operator CLI、前端编辑三面同一字段模型。
-- 与指定 Agent 进行持久对话；Daemon 只保存和递送文本，不解释自然语言。
-- 显式创建、查看、检出未集成结果、接受、返工、重试、取消和唤醒 Task。
-- 查看每个 Agent 当前 Task、Run、最近进度、未读消息、错误和 Git base/head。
-- 实时跟随事件和 stdout/stderr 日志。
-- 停止失控 Run，并在 Daemon 重启后继续看到真实状态。
+### 5.1 本机控制面
 
-### 5.2 Agent 团队协作
+- 单 Daemon、file-backed SQLite、每个 Project 一个 daemon-owned Git repo。
+- Human 通过本机 Unix socket 使用 Operator CLI；Web 服务只监听 loopback，必须认证并执行相同 capability 检查。
+- CLI Agent 只通过每个 Run 的私有 Unix socket 和 token 使用服务。
+- 不提供远程登录、远程 runner、多 Daemon 共同写同一 data directory 或公网监听。
+- 空库必须通过显式、仅一次的本机 bootstrap 创建首个 Participant、Credential 和可配置的全局管理 Role。完成 bootstrap 后，该 Participant 不具有特殊业务身份；任意 Participant 均可按配置取得管理 capability，并保留最后管理者保护。
 
-- Agent 可查看当前 Task、创建明确指派的子 Task、等待子任务、提交结果和请求返工。
-- Agent 可向另一个 Agent 或 Boss 发送绑定到某个 Task 的持久 Message。
-- Message 可唤醒 idle Agent；支持时可注入当前活动 Run，不支持或失败时必须通过 resume/new Run 递送。
-- Agent 可报告简短进度；进度只形成 Event，不形成独立业务对象。
-- Run 退出不能自动把 Task 标记为完成。
+### 5.2 统一 Participant 与权限
 
-### 5.3 并发和隔离
+- `participants` 是身份和 CLI Agent 配置的单一权威表；不得保留 `agents` 镜像形成双真相。
+- Participant 支持创建、读取、更新、暂停和归档。`paused` 不接收新 Task 指派或新 Conversation 成员关系，已有工作和按权限可读历史保留；CLI Agent 另外不启动新 Run，当前 Run不被静默杀死。
+- 每个 operation 在一个静态注册表中声明 capability、输入和允许的 transport；删除 operation 只需移除注册项和实现。
+- Operator CLI、Web API 和 coordlink 调用同一 Service operation，不复制状态机，不按角色名分支。
+- 传输或运行环境可以使某些参数实际不可用，例如容器不能提供宿主机 repository 路径；这不是职责限制，也不能绕过 capability。
 
-- 至少两个不同 Agent 可同时运行。
-- 每个 work/integration Task 拥有私有 Git workspace；每个 Run 使用独立容器。
-- 不同 Agent 不共享可写 home、workspace 或 Git metadata。
-- 普通 Agent 看不到 Daemon 数据库、Docker socket、其他 workspace 或 canonical repo 的可写 ref。
-- 每个 Agent 第一版同时最多一个非终态 Run；全局并发数由简单配置限制。
+### 5.3 Task 与并发执行
 
-### 5.4 Git 协作
+- work/review/integration 等业务含义不进入 Task 状态机；Task kind 只保留确有不同机械收尾规则的最小集合。
+- Task 必须指派具体 Participant。Human 与 CLI Agent 共用创建、claim、wait、submit、fail、accept、rework、retry 和 cancel 语义。
+- CLI Agent Task 由 Scheduler 创建 Docker Run；Human Task 由 Human 显式 claim，不创建 Run。
+- 每个代码 Task 都有私有 workspace。CLI Agent workspace 挂载进自己的容器；Human workspace 以受控宿主机路径提供。
+- 同一 CLI Agent 同时最多一个 starting/active Run；多个 Agent 可按 `max_parallel_runs` 并发执行。
+- Daemon 不读取 Task 文本决定顺序、角色、验收或冲突处理。
 
-- 每个代码 Task 固定精确 `base_sha`。
-- Agent 在私有 workspace 中直接使用原生 Git 命令并创建 commit。
-- Daemon 从实际 workspace HEAD 捕获提交到 daemon-owned task ref，不能信任文字上报或分支名。
-- Boss 可把精确 task ref 导出为无 control remote 的普通 checkout；Agent Reviewer 可通过显式 source Task 获得同一固定输入提交，本地 convenience ref即使可移动也不改变保存的source SHA。
-- canonical ref 只能由 Daemon 使用 expected-old SHA 进行 CAS 更新。
-- stale、非 fast-forward 或冲突交给 integration CLI Agent；Daemon 不合并文件、不判断语义、不解决冲突。
-- workspace 删除前，所有需要保留的提交必须已由 Git ref 引用。
+### 5.4 Conversation、Message 与未读
 
-### 5.5 失败恢复
+- Conversation 是正式持久对象，支持一对一和群组，成员可读取该 Conversation 的完整历史。
+- Message 必须属于一个 Conversation，可选关联一个同 Project Task，并显式指定一个或多个 Conversation 成员为接收者。
+- 每个接收者独立维护未读、delivered、acknowledged、cancelled 和重试状态；一个接收者的操作不得改变其他接收者状态。
+- 只有明确接收者能产生未读项。Conversation 非接收成员可以读取历史，但不会因此被唤醒。
+- `wake=true` 只唤醒明确指定且为 CLI Agent 的接收者；Human 永不产生 Run。
+- `wake=false` 不启动 Run，但未读消息必须持久保留。CLI Agent 下次在同 Project 启动任何 Run 时，bootstrap 必须携带未读总数、高水位、有界 ID 样本和 inbox cursor；Agent 通过分页 inbox 读取并确认全部未读，不得为了列出所有 ID 使 bootstrap 无界增长。
+- 无 Task 的 wake Message 可以创建 Conversation Run；该 Run 不挂载项目代码 workspace。
+- Message 先持久化再递送，采用逐接收者 at-least-once 语义。Inject 是优化，失败不得丢消息。
 
-- SQLite、Git refs、Run 容器和 CLI 原生 session ID 必须可以在 Daemon 重启后对账。
-- 消息先持久化再递送，进程或 adapter 失败不能丢消息。
-- 旧 Run 的 token/generation 不能覆盖新 Run 的状态。
-- 取消、超时和terminal Run必须最终停止并移除容器、per-Run socket/token等运行资源；清理失败保持可诊断和可重试。
-- DB 与 Git 跨系统操作必须使用 durable intent、确定性引用和 reconciliation 收敛，不能声明假成功。
+### 5.5 Git 协作
+
+- 每个代码 Task 创建时从 actual canonical 固定 `base_sha`，结果从实际 workspace HEAD 捕获到不可变 task ref。
+- Human 与 CLI Agent 使用相同的 `expected_head`、clean/in-progress 检查、task ref、accept、rework 和 canonical expected-old CAS。
+- Human 仅省略 Docker Run；不能用 Human 身份绕过 workspace、capture 或 Git fence。
+- 结果是否正确由有权限的 Participant 显式判断。Daemon只执行 Git 机械核验和 CAS。
+- canonical 已移动时创建显式 integration Task，指派配置的 integration Participant；该 Participant 可以是 Human 或 CLI Agent。
+- Agent 之间通过各自私有 workspace、commit/ref 和 integration Task 并发协作，不共享可写 Git metadata。
+
+### 5.6 行为日志
+
+每个 Run 必须保存两层追加式日志：
+
+1. 已脱敏原始流：尽可能保留 provider/CLI 输出帧、stdout/stderr 和未知帧。
+2. 规范化行为流：为查询和 Web UI 统一记录序号、时间、来源、类型、参数摘要、结果摘要、退出码、耗时、关联 Participant/Project/Task/Conversation/Message/Run 及原始流 offset/hash。
+
+在 provider 或 OS 实际暴露的范围内，日志必须覆盖：
+
+- CLI stdout/stderr、provider 结构化事件和 session 信息。
+- tool 调用、参数、结果、错误、退出码和耗时。
+- shell 命令及其可观测输出。
+- coordlink 请求/响应、Task/Message/progress/权限操作。
+- Run、Docker、resume、inject、cancel、timeout、cleanup 和 reconcile 生命周期。
+- Git 命令观察、操作前后 HEAD/status/task ref/canonical SHA。
+- 未知帧、解析失败、丢失区间、截断和脱敏事件。
+
+不要求也不得声称保存 provider 隐藏 chain-of-thought、加密推理、provider 内部状态或 CoordPlane 无法观察的宿主行为。凭据、token 和明确敏感内容必须在落盘前脱敏；脱敏本身留下类型和位置记录，但不保存原值。
+
+默认行为日志保留期为 7 天。Project 可覆盖该期限；每个 Run 唯一的 Behavior Log index 可显式标记 `long_term`，标记期间禁止自动删除。取消标记后，立即使用当前 Project 策略和 Run 原始 `ended_at` 重新计算，可能马上进入 GC eligible。Run 不保存第二份可变 `long_term` 值。Git 继续保存代码真相，日志引用 SHA，不复制完整代码快照。
+
+### 5.7 Web UI
+
+Web UI 是 v1 必交付的本机协调界面，至少提供：
+
+- Project、Participant、Role、CLI Agent 配置和权限范围内的管理。
+- Task 树、assignee、状态、Run、等待/失败原因及 create/claim/submit/accept/rework/retry/cancel/wake 操作。
+- 一对一/群组 Conversation、显式 recipients、未读状态和 Message 操作。
+- Run 行为日志实时跟随、历史筛选、详情、导出和 `long_term` 标记管理。
+- base/head/task ref/canonical SHA、capture 和 integration 状态的只读展示。
+
+Web UI 不提供代码编辑器、浏览器终端、任意宿主文件访问或 raw Git ref 修改。所有 mutation 使用与 CLI 相同的 Service operation、CAS、幂等键和权限检查。Web 必须对会话、CSRF、Origin/Host、CORS、CSP、Cookie、HTML/日志输出编码及 SSE/WebSocket 重新授权建立明确的本机安全边界；loopback 不是免认证或免浏览器攻击防护的理由。
 
 ## 6. 明确非目标
 
-第一版明确不建设以下能力，需求、代码、表结构和验收不得为其预留平台化框架：
+- 远程账号登录、组织/tenant、跨主机 runner、分布式队列、Kubernetes 或 HA。
+- 通用 policy DSL、动态 capability registry、角色职责语言或自动团队编排。
+- CoordPlane 内置 LLM、自动拆任务、自动选人、自动验收代码或自动解决冲突。
+- 自建 Git hosting、PR/CI/发布平台、自动远端 push 或跨仓库原子事务。
+- 代理通用 `git status/diff/add/commit/rebase/merge` API；参与者在私有 workspace 使用标准 Git。
+- Artifact/ObjectStore、长期语义记忆、向量数据库、模型成本平台或复杂运营 Dashboard。
+- Agent 之间绕过 CoordPlane 的内部点对点协议；内部交流通过 Conversation/Message。
+- 保存不可观察的模型内部推理，或以日志替代结构化状态和 Git 事实。
+- 通用 MCP/plugin/skill 平台、A2A 对外互操作或远程发现协议。
 
-- 多用户账号、组织、tenant、完整 RBAC 或通用 policy engine（capability 静态注册、role 可配置与项目级绑定是产品内权限实现，不是通用 RBAC/policy 平台）。
-- 动态 capability registry、机器 schema discovery、通用 `/call` 路由或由 schema 派生工具。
-- Skill registry、skill version store、skill binding 或 progressive disclosure 服务。
-- TeamConfig DSL、角色策略语言、通信策略语言、终止验收策略或配置版本服务。
-- 通用 tool adapter、MCP server、plugin 平台或多种机器协议；第一版只有 `coordplane`、固定 `coordlink` 和 CLI adapter。
-- universal same-turn steering、强行中断模型 turn 或 Safe Boundary 子系统。
-- 独立 validation/assessment/acceptance engine、release acceptance 数据库或项目业务判定。
-- Artifact/ObjectStore 平台；代码由 Git 保存，日志由文件保存，其他输出由 Task/Message 引用普通路径或外部 URL。
-- 对 CLI 每个 tool call 的强制完整审计、规范化行为流或永久 transcript 保存。
-- WorkContract、Assignment、Lease、Attempt、Envelope、Thread、MailboxItem、DeliveryAttempt、Evidence 等重叠业务对象。
-- ChangeSet、GitOperation、MergeAttempt、ConflictSet、RollbackPoint、durable Git lock 等自建 Git 平台对象。
-- 代理 `git status/diff/add/commit/rebase/merge` 的通用 Git API；Agent 在私有 workspace 直接使用 Git。
-- 自建 Git hosting、PR 网站、CI 平台、发布平台、远端 push 自动化或跨仓库原子事务。
-- 分布式队列、远程 runner 集群、Kubernetes、HA、多 Daemon 并行写同一 data directory。
-- 复杂 Dashboard、Autopilot、定时任务、模型成本平台、长期语义记忆或向量数据库；Web UI 只作为轻量 Agent 配置/查看面（有独立前端预算），不做平台化。
-- CoordPlane 内置 LLM、阅读自然语言后自动拆任务、自动选择角色、自动验收代码或自动解决冲突。
-- 内部 agent↔agent 点对点直连（A2A 或其他任何直连协议）；多 Agent 协作只经 Daemon 的 Task/Message 机制。
-- AGNTCY/ANP 等跨组织发现/身份/传输基础设施；第一版是单 Daemon、本地优先，不需要 agent 目录/去中心化身份/加密传输网络。
-
-未来若增加上述能力，必须先修改本需求基线，并作为可删除的独立适配层加入；不得在第一版主流程中预埋半成品接口。
-
-### 6.1 行业标准协议定位（演进合同）
-
-本小节固化第一版边界内对行业标准协议的定位，防止实现漂移。详细设计见 `docs/protocols.md`；对象/状态/Run 事实仍只由 `core.md`/`runtime.md` 定义，本小节不新增任何持久对象或状态。
-
-1. **ACP（Agent Client Protocol，协调者 ↔ CLI agent）是 adapter 层的演进目标，不是第一版合同**。第一版 adapter 仍是静态注册的 provider 私有协议（Claude 与 Codex CLI）；当 ACP 达到 1.0 稳定且目标 agent（Claude Code）提供原生或成熟 bridge 支持后，应当实现 ACP client adapter 替换私有事件解析。`runtime.md` §7.1 的 adapter 接口（BuildStartCommand/BuildResumeCommand/BuildInjectInput/ParseEvent/ResumeCompatible）与 ACP 方法（session/new、session/prompt、session/cancel、session/update、session/request_permission）的映射见 `docs/protocols.md`。**第一版不得**预埋 ACP 半成品接口或按协议名写主循环特判；adapter 注册列表保持静态。
-2. **A2A（Agent2Agent，agent↔agent）只作为未来对外互操作出口**。Boss 面未来可把 Project/Task 暴露为 A2A 端点 + 静态 AgentCard（能力/技能/安全声明，`/.well-known/agent-card.json`），用于与其他 agent 平台互派任务；但**内部多 Agent 协作必须保持 Daemon 单一协调，禁止 agent↔agent 点对点直连**（见 §6 非目标）。A2A 出口属于未来能力，必须先修改本需求基线。
-3. **AG-UI（agent↔UI）作为 Web 前端事件词汇参考，不是传输合同**。实时展示 Run 进度/工具调用时可参考 AG-UI 事件词汇（RunStart/TextMessage/ToolCall/RunComplete 等）；事件传输与增量格式由前端实现选择，不与 AG-UI 规范固定传输绑定。
-4. **MCP（Model Context Protocol）不建设平台**。见 §6 非目标（通用 tool adapter、MCP server、plugin 平台）；agent 在容器内自行连接 MCP server 属 agent 自身行为，CoordPlane 不提供平台化支持。
-5. **AGNTCY/ANP 等发现/身份/传输基础设施不进第一版**。单 Daemon、本地优先定位不匹配；仅当未来演进为多 Daemon 或对外可发现 agent 时再评估。
+Web UI、完整可观测行为日志、可配置权限和群组 Conversation 是 v1 正式范围，不得再列为平台化非目标。
 
 ## 7. 设计原则
 
-### 7.1 CoordPlane 没有智力职责
+### 7.1 机械协调
 
-任何需要理解内容的动作都由 Boss 或 CLI Agent显式发起。Daemon 只做以下机械判断：
-
-- 状态转移是否合法。
-- 调用者是否与当前 Run scope 一致，并持有操作所属项目/global 作用域下的 capability。
-- Git commit/ref/祖先关系是否真实。
-- expected version 或 expected SHA 是否仍匹配。
-- 进程、容器和 session 是否真实存在。
+Daemon只做持久化、权限判断、调度、隔离、消息递送、Git事实核验、状态恢复、日志采集和 GC。所有需要理解业务内容的动作由有权限的 Participant 显式发起。
 
 ### 7.2 Build to Delete
 
-- Worker、CLI adapter、Task kind handler、检查和清理步骤必须由独立函数通过静态列表注册。
-- 主循环不得按 adapter 名、Agent 角色或项目类型堆积 `if/else` 链。
-- 删除一种 adapter、检查或步骤时，应只删除一个注册项和所属实现。
-- 新机制替代旧机制时，调用方迁移和旧代码删除必须在同一变更中完成。
+新增 worker、Task handler、adapter、operation、Event renderer、日志 parser/normalizer、GC step 和验收场景必须是独立函数并通过静态列表注册。删除一项只移除注册项和实现，不修改共用执行器，不在循环中按名称或角色增加 if/else 链。
 
-静态列表注册是代码可维护性要求，不等于动态 capability registry。
+### 7.3 Add-Remove Balance
 
-### 7.3 Fail loud
+新机制替代旧机制时，同一变更删除旧表、旧字段、旧入口、旧 fixture 和保护旧语义的测试。不得长期保留 `Boss`、`agents` 镜像、conversation Task、Human 专用 Task FSM 或旧 Message 单接收状态作为兼容路径。
 
-- 任何持久化失败、Git CAS 失败、scope 不匹配或运行事实不明都必须返回非零错误并写入可查询状态。
-- 不允许把失败转换为空成功，不允许用 transcript 或 Agent 自报补齐缺失事实。
-- 可重试错误保持原对象和稳定错误原因；不可恢复错误进入 `failed` 或等待 Boss 决策。
+### 7.4 Fail loud
 
-### 7.4 最小持久化
+不能证明安全时停止推进并保留诊断事实。外部命令 exit 0 不是充分证据；SQLite、Git、Docker 和行为日志索引必须读取实际结果。失败不能转换为空成功，也不能用 Agent 自报或低层测试替代失败的高层 gate。
 
-- 只保存恢复和协作需要的事实。
-- `Event` 只记录关键状态变化，不记录每个 shell/tool call。
-- stdout/stderr 使用可轮转文件，不进入 SQLite blob。
-- Task/Message 表本身承担待调度和待递送语义，不再建设通用 QueueItem 平台。
+### 7.5 最小持久化
 
-### 7.5 第一版代码预算
+只为需要独立生命周期、并发控制、权限或查询的事实建对象。Conversation 和逐接收者状态因群聊、未读和唤醒需要独立持久化；日志大正文留在文件，SQLite只保存索引、hash、offset、保留状态和关键投影。
 
-代码预算是范围漂移告警，不是用短代码替代正确性的目标：
+### 7.6 真实项目循环
 
-- 第一版以两个production one-shot CLI adapter（Claude + Codex）为基线；scripted adapter只属于测试。新增第三个provider adapter必须单独增加预算，不能挤占Core、Runtime或Git恢复逻辑。
-- Owner已批准 Agent 可配置 CLI/模型/提示词 v1（D1–D7/E1–E5，2026-08-13）对应的重基线：Budgeted maintained production SLOC目标/软阈值/发布阈值为`24,000 / 24,500 / 25,000`；tests为`25,500 / 26,200 / 27,000`；build/test infrastructure为`250 / 500 / 700`；三类合计为`49,750 / 51,200 / 52,700`（E1 暂定上限，最终以 clean revision 实测锁表）。总量合格不能覆盖production超限。
-- 前端(web 面 SPA 与 web e2e)单独配置预算,不与后端核心功能共享:`handwritten_frontend` 目标/软阈值/发布阈值为 `2,000 / 2,500 / 3,000` 物理行(非空非纯注释口径,JS/CSS 沿用同一计数器);前端 Go 服务层(`internal/webserver/*`)亦计入 frontend,不计入 production。后端 production/tests/infra/total 预算不受前端影响。
-- 上述envelope替换统一参与者框架重基线的`20,000 / 21,000 / 22,600`、`21,000 / 22,000 / 23,700`和总计`41,250 / 43,400 / 47,000`，只改变预算，不删除或降级任何Core、Runtime、Git、CLI、adapter或真实多Agent边界合同。
-- 第一版候选必须在clean revision生成LOC JSON，并完成`acceptance.md`定义的真实双Agent和四Agent可靠性场景。固定硬件性能baseline、reference manifest和长时间soak不属于第一版完成条件；真实live证据能否复用按受影响文件的精确diff判断，不能因纯文档变更重复消耗provider调用。
-- LOC低于预算不代表完成；所有状态、隔离、recovery、Git CAS和真实Docker/Git验收仍必须通过。
-- 不允许通过压缩语句、超长函数、把逻辑搬进generated code/脚本/test helper或保留第二套隐藏路径规避预算。
+每个拟进入验收的 CoordPlane 候选 SHA 先通过 L1-L4，再使用同一 SHA/image 驱动指定小说系统需求的一轮真实多 Agent 开发。该轮必须有唯一小说系统不变量、固定输入 canonical/需求 manifest、真实 Task/Conversation/Message/Run/Git 证据和日志审计收据。
 
-详细模块预算、统计口径和治理规则见`acceptance.md`。
+L5 只负责暴露组合和现场问题，不作为盲目调试循环。任何 CoordPlane 产品 finding 先分类并归约成最低可重复的 L1-L4 红测试，修复后先跑低层 gate，再用新 candidate 回放原失败边界并开始下一轮真实开发。同一修复连续两轮不过同一 gate 时停止补丁，回到需求、契约、实现、provider/环境或负载任务规格归因。
 
 ## 8. 最小配置
-
-第一版只需要一份普通静态配置，不是 DSL：
 
 ```yaml
 data_dir: /path/to/coordplane-data
 operator_socket: /path/to/coordplane-data/operator.sock
+web_listen: 127.0.0.1:8090
 max_parallel_runs: 4
 
 retention:
   completed_workspace: 24h
   terminal_task_ref: 168h
-  run_log: 168h
+  behavior_log: 168h
 
 runtime:
   docker_network: coordplane
   run_timeout: 0
   shutdown_grace: 5s
   workspace_root: /path/to/coordplane-data/workspaces
-  agent_home_root: /path/to/coordplane-data/agent-homes
+  participant_home_root: /path/to/coordplane-data/participant-homes
   log_root: /path/to/coordplane-data/logs
   default_image: coordplane-agent:latest
-  provider_env_allowlist:
-    - ANTHROPIC_AUTH_TOKEN
-    - ANTHROPIC_BASE_URL
-    - ANTHROPIC_MODEL
-    - ANTHROPIC_DEFAULT_OPUS_MODEL
-    - ANTHROPIC_DEFAULT_SONNET_MODEL
-    - ANTHROPIC_DEFAULT_HAIKU_MODEL
-    - CLAUDE_CODE_SUBAGENT_MODEL
-    - CLAUDE_CODE_EFFORT_LEVEL
-    - OPENAI_API_KEY
-    - OPENAI_BASE_URL
+  provider_secret_files: {}
 ```
 
 规则：
 
-- 未知字段必须报错，不能静默忽略。
-- Boss CLI只连接本机operator Unix socket；Agent容器通过`runtime.md`定义的per-Run Unix socket连接，不要求暴露宿主TCP监听端口。
-- 配置只保存 Daemon/runtime 设置。Agent 由 `coordplane agent add/update` 写入 SQLite，不能同时由 YAML 和数据库维护。
-- per-agent 配置（adapter/image/model/subagent_model/base_url/effort/instructions_file/instructions_text）由 `coordplane agent add/update`、`PUT /v1/agents/{id}` 与前端编辑表单写入 SQLite，不进入 YAML；`adapter_id` 静态列表来自只读 `GET /v1/adapters`；`instructions_file` 与 `instructions_text` 互斥（恰有其一）；PUT 为全量替换（E5），CLI 与前端发送全量字段。
-- Adapter/image等Runtime配置修改只影响新 Run；Run 必须保存本次解析后的 adapter、image 和 instructions hash。Retention是当前GC策略，每次preview/run都用当前值计算既有closed Task/terminal Run，不改写其`closed_at/ended_at`。
-- Agent 指令可以描述 Manager/Developer/Integrator 工作方式，但 Daemon 不解析其语义。
-- Provider credentials 只通过 runtime 明确 allowlist 注入，不写入配置快照、数据库、事件或日志。
-- Claude provider 固定使用 `--bare`，并只透传上述 Claude 配置环境变量；不读取 OAuth/keychain/Boss HOME，不挂载或复制宿主 `~/.claude`。
-- Codex provider 按固定 argv 模板启动（`codex exec`/`codex exec resume`，见 `runtime.md` §7.2），容器内固定 `HOME=/home/agent`、`CODEX_HOME=/home/agent/.codex`；只透传 allowlist 凭据，不读取或挂载宿主 `~/.codex`。
-- `runtime.run_timeout` 可省略或设为 `0` 以禁用自动 deadline；正 duration 会在新 Run 启动时固化为 `deadline_at`，不追溯修改既有 Run。
-- `runtime.shutdown_grace` 可省略（默认 `5s`），显式值必须为正 duration；SIGTERM、stop/cancel/timeout 与重启对账统一使用该 grace。
-- Project 通过 Boss 命令注册，不要求写进配置文件。
-- `retention`只接受正duration或`0`；`0`表示资源满足`runtime.md`/`git.md`全部GC fence后立即eligible，不表示跳过clean、task ref、pending action或ownership检查。Boss手动安全清理使用`gc preview`后执行`gc run --confirm`。
+- 未知字段、非法 duration 和非 loopback `web_listen` 必须拒绝启动。
+- `0` retention 表示满足全部 fence 后立即 eligible，不表示跳过 active、pending、Git、ownership 或 `long_term` 检查。
+- Project 的 retention override 写入 SQLite并即时用于下一次 preview/GC；不改写历史时间。
+- CLI Agent 配置写入 Participant，不在 YAML 和数据库维护两份列表。
+- provider secret 通过受控只读 secret file 进入容器进程，不把 secret 值写入 Docker Config.Env、argv、SQLite、Event、日志或 Web API。
 
 ## 9. 唯一术语
 
 | 术语 | 定义 |
 | --- | --- |
-| Project | 一个 daemon-owned Git repo 和其 canonical ref 的协调范围 |
-| Participant | 统一参与者身份行（kind：`human` 或 `cli_agent`）；人类与 CLI Agent 共享同一身份、Task/Message 与权限框架，生命周期按 kind 分支 |
-| Agent | 一个 `cli_agent` 类型的 participant 及其 adapter/runtime 配置 |
-| Role | 可配置的 capability 集合（`roles` 表），只在项目绑定（`participant_project_role`）内生效；全局能力经 `project_id=global` 作用域 |
-| Capability | 每个可调用 operation 的静态注册权限点；代码事实，不是数据，不提供动态 registry |
-| Credential | 人类身份凭据（`credentials` 表）；v1 只签发 `operator_token`（保存 SHA-256 hash），支持轮换与吊销 |
-| Task | 明确目标、责任人和结果状态的工作或对话单元 |
-| Run | 针对一个 Task 启动的一次真实 CLI 进程执行；resume 也创建新 Run |
-| Message | 绑定 Task 的 Boss/Agent 持久消息和唤醒单元 |
-| Event | 关键状态变化的 append-only 记录 |
-| Workspace | work/integration Task 的私有 Git 目录，是 Run/Task 的资源属性，不是业务对象 |
-| canonical ref | Project 当前已集成代码的唯一 Git ref |
-| task ref | Daemon 为 Task 捕获并保护提交的 Git ref |
-| base SHA | Task 开始时固定的基线 commit |
-| head SHA | Daemon 从实际 workspace 捕获的提交 commit |
-| CLI native session ID | Codex/Claude 等 CLI 自己的 resume key；它不是 live process 证明 |
+| canonical | Project 当前已接受代码的实际 Git ref |
+| task ref | 某次 Task 结果的 daemon-owned 不可变 Git ref |
+| private workspace | 单个代码 Task 独占的可写 Git workspace |
+| Participant | Human 或 CLI Agent 的统一身份 |
+| Conversation | Project 内成员可读的一对一或群组对话 |
+| recipient | Message 明确指定且拥有独立未读/递送状态的 Participant |
+| Run | 一次不可复活的真实 CLI Agent 进程 |
+| Conversation Run | 由无 Task wake Message 触发且不挂载代码 workspace 的 Run |
+| Event | 关键状态变化的小型追加事实 |
+| Behavior Log | 一个 Run 的详细、已脱敏、可校验行为流 |
+| long_term | 保存在Run唯一Behavior Log index上、禁止该行为日志自动GC的显式标记 |
+| reference workload round | 验收驱动器基于固定外部需求 manifest 和输入 canonical 执行的一轮真实多 Agent 开发；不是 CoordPlane 持久对象 |
+| accept | Participant 对结果的显式业务决定 |
+| integrate | Participant 在 integration Task 中使用 Git 收敛 stale 结果 |
 
-除本文件“明确非目标”外，其他需求不得把被删除的旧术语重新定义为持久对象或服务。
+不得重新引入 Boss、human task、conversation Task、agents mirror、Validation、ConflictSet 或通用 policy engine 作为第二套概念。
 
-## 10. 第一版完成定义
+## 10. v1 完成定义
 
-只有同时满足以下条件，才能声明第一版完成：
+必须在同一候选 SHA 上同时满足：
 
-- 五份需求文档描述同一组对象、状态和命令，不存在第二套真相或旧协议。
-- Boss 能与 Agent 对话、派发、查看进度、收取结果、返工、取消和唤醒。
-- 人类与 CLI Agent 作为统一 participant 协作：可互相派发 Task、发送 Message、按项目角色执行；人类任务以 `human_confirm` 证据收敛，凭据轮换/吊销立即生效，最后管理员保护生效。
-- 两个 CLI Agent 能在隔离容器和私有 workspace 中真实并发。
-- 消息在 Run/Daemon 失败和 resume 后不丢失。
-- 两个 Agent 的提交都被 task ref 保存，并通过 Git CAS/integration Task 收敛到 canonical ref。
-- Daemon 重启不会产生重复 active Run、伪完成、丢提交或错误覆盖 canonical ref。
-- 两个真实CLI Agent完成端到端闭环；另有一个fresh四Agent真实场景证明4个source Run并发、Message、task ref、integration和canonical CAS能够在一次Daemon重启后继续收敛。
-- Budgeted maintained production/tests/infra/total分别不超过`25,000 / 27,000 / 700 / 52,700`，质量blocker清零；没有为省LOC弱化测试或关键恢复合同。
-- `acceptance.md` 的静态约束、合同测试、真实 Docker/Git gate 和真实 CLI gate全部通过。
+- 五份规范一致并记录冻结 SHA；同revision的原话记录已追加所有已接收新需求，收据含其blob SHA和最新记录ID。
+- SQLite migration、状态机、权限和公开 API 契约通过。
+- Human 与 CLI Agent 的统一 Task/Git 流程通过独立契约测试。
+- 群组 Conversation、逐接收者未读、定向 wake、重启恢复和未读 bootstrap 通过。
+- 真实 Docker 隔离、CLI adapter、resume、cancel、timeout、reconcile 和 cleanup 通过。
+- 行为日志完整性、脱敏、查询、导出、7 天默认/Project override/`long_term` GC 通过。
+- deterministic 双 Agent 和真实多 Agent Git/Message 收敛场景通过。
+- 指定小说系统需求的 reference workload round 在同一 candidate SHA 上通过，并有需求 manifest、输入/输出 canonical、协作证据、日志完整性审计和 finding 处置收据。
+- 本机 Web UI 的核心工作流和权限负例通过浏览器验收。
+- `acceptance.md` 的静态、单元、契约、race、真实边界和 LOC gate 全部通过。
+- 验证、审查和验收证据全部指向同一候选 SHA；失败的高层 gate 不得由低层绿色结果替代。

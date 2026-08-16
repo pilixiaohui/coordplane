@@ -1,898 +1,619 @@
-# CoordPlane 验收需求
+# CoordPlane v1 验收需求
 
-状态：Draft for owner review
-版本：0.5
-日期：2026-08-15
+状态：候选冻结基线，待需求审批人复核精确 revision
+版本：1.0-rc3
+日期：2026-08-16
 依赖：`README.md`、`core.md`、`runtime.md`、`git.md`
-（本版并入统一参与者框架修订：业务对象与 schema allowlist 扩展为九类，新增角色/权限/凭据/人类生命周期不变量；RMA-03 从 §10.3 真实 live gate 覆盖表述移除，真实人类身份验收见独立验收方案）
 
-## 1. 目标和非目标
+## 1. 目标和边界
 
-本文件定义第一版完成所需的测试和真实验收。它是一份普通工程测试合同，不是产品内的 validation/acceptance engine。
+本文件把四份产品需求转换成可执行约束。它不是CoordPlane内部的validation/acceptance业务对象，也不保存发布verdict。
 
 验收必须证明：
 
-- 九类业务对象事实（Project、Participant、Task、Run、Message、Event、Role、ParticipantProjectRole、Credential）能持久化、并发更新和恢复；schema 共 12 张表：9 类业务表 + `agents` 兼容镜像表 + schema_migrations/request dedupe 两个内部辅助表。
-- Boss/Agent 使用正式 CLI入口完成任务和通信。
-- 两个 CLI Agent 在真实隔离环境中并发。
-- Message 在 Inject、Run退出和 Daemon重启后不丢。
-- Git HEAD由控制器机械读取，commit由 task ref保护。
-- canonical ref 的并发更新不丢失，stale/conflict交给 integration CLI Agent。
-- 取消、超时、崩溃和 GC不产生伪完成、孤儿运行或代码丢失。
+- Participant是Human/CLI Agent唯一业务身份，职责完全配置化且所有入口权限一致。
+- Human与CLI Agent共用Task和Git结果合同，Human仅省略Docker Run。
+- 一对一/群组Conversation、显式多recipient、逐接收者未读和定向wake在并发/重启下不丢失。
+- Task Run和Conversation Run均受单Agent、generation、token和真实进程fence约束。
+- 子Task结果通过固定Conversation/recipient幂等回传，waiting parent可被定向唤醒并恢复同一Task session scope。
+- Git结果来自actual clean HEAD和不可变submission ref，canonical只由显式accept后的expected-old CAS推进。
+- workspace准备、integration多轮stale和Resume跨scope拒绝在崩溃/并发下保持唯一可恢复真相。
+- CLI Agent全部可观测行为形成可查询、可校验、已脱敏行为日志，并遵守7天默认、Project override和`long_term`。
+- 本机Web UI能完成协调和监控工作流，但不能编辑代码、打开宿主终端或修改raw Git ref。
+- migration、取消、超时、Daemon崩溃、capture/CAS崩溃和GC不产生伪完成、越权、消息丢失、代码丢失或日志误删。
+- 每个拟验收candidate在L1-L4通过后，都使用指定小说系统需求完成一轮真实多Agent代码开发与行为日志审计。
 
-本文件不要求：
+不要求：
 
-- 在产品数据库中保存验收 verdict、predicate、evidence bundle或 release acceptance。
-- 自建 artifact/object store。
-- 判断 Agent代码的业务质量。
-- 保存每个 tool call或完整模型行为流。
-- 用一个超大 live gate代替低层回归测试。
+- 保存provider隐藏chain-of-thought、加密推理或CoordPlane无法观察的行为。
+- 在产品数据库保存验收报告、证据bundle或release状态机。
+- 远程登录/runner、远端Git发布、自动业务验收或性能SLA。
+- 用一个巨大live gate替代低层契约测试。
 
-测试命令、退出码、标准测试报告、真实 SQLite/Git/Docker状态和必要日志就是验收依据。
+候选运行结果、当前缺陷和“已通过”状态必须写入外部收据，不得回填本规范正文。
 
-## 2. 测试设计规则
+## 2. 收敛测试规则
 
-每个重要测试必须保护一个命名不变量，并写清：
+每个重要测试必须保护一个命名不变量，并说明：
 
 ```text
 Invariant
 Risk layer
 Production entrypoint/boundary
+Red behavior against the old design
 Positive state assertion
 Forbidden side effect
 Fault or misuse case
-Mocks allowed
-Mocks forbidden
+Mocks allowed / forbidden
 Verification command
 ```
 
 要求：
 
-- 使用能覆盖风险的最低真实边界。
-- 测 public CLI/API，而不是只调用内部 helper后声称入口正确。
-- 状态测试断言 SQLite行和 Event；Git测试断言 actual refs/objects；Runtime测试断言 actual Docker mounts/processes。
-- 每个失败测试同时断言“错误副作用没有发生”。
-- 并发、取消、goroutine和共享 cache改动必须运行 race gate。
-- 真实故障先归约到可重复的低层回归测试，再重跑完整 E2E。
-- 禁止用固定 sleep证明 scheduler/reconciler已运行；等待具体 Event、状态或 Docker/Git事实，并带明确 deadline。
-- 删除旧机制时，同一变更删除旧 fixture和正向兼容测试；只保留防止旧路径回归的负向 guard。
+- 使用能覆盖风险的最低真实边界；公开合同使用正式CLI/API/Web入口。
+- SQLite状态测试回读真实file-backed数据库和Event；Git测试读取actual ref/object；Runtime测试读取真实Docker/OS事实；日志测试读取实际文件/hash/index。
+- 每个失败路径同时断言业务行、Event、ref、container、日志和recipient中不应发生的副作用。
+- 并发、取消、worker、日志writer和共享状态改动必须运行race gate。
+- live失败先归约成最低可重复测试；低层变绿后才重跑高层场景。
+- L5每轮只选一个小说系统不变量/可独立Task slice。小说需求只是负载；修复CoordPlane必须指向通用Participant/Task/Message/Run/Git/log/Web契约，禁止按项目名、小说术语、Participant名或固定Task ID特判。
+- 禁止固定sleep断言异步完成；等待具体状态/Event/ref/container/log sequence并设置deadline。
+- 新机制替换旧机制时，同一变更删除旧表/字段/入口/fixture/正向测试；保留证明旧路径不可返回的负向guard。
+- 高层gate失败不能用低层通过抵消，不同candidate SHA的证据不能拼接。
+- “每次修改后重跑”的机械边界是一个已提交、可部署、具有唯一SHA的CoordPlane candidate，不是每次编辑器保存。任何产品修复产生新SHA后，旧candidate的RMA-03不得复用为新candidate收据。
 
-SQLite startup no-side-effect signatures have one explicit sidecar rule: the main
-database and `-wal` bytes must remain identical. The `-shm` path, type, mode, and
-size are durable directory evidence, but its WAL-index and lock bytes are
-process-local SQLite state and are excluded from byte equality because a
-read-only preflight may acquire and release those slots. Tests must not treat
-that permitted index churn as a migration or startup side effect.
+SQLite startup的无副作用断言允许`-shm`内部WAL-index/lock字节变化，但主数据库、`-wal`业务内容、schema和业务行必须保持；测试不得把只读preflight产生的合法SQLite进程态误判为migration。
 
-## 3. 测试层级
+## 3. 证据层级
 
-| 层级 | 必测内容 | 必须使用的真实边界 |
-| --- | --- | --- |
-| Static guard | 对象/表 allowlist、删除的入口和包、静态注册、文档一致性 | 源码和 schema扫描 |
-| Pure logic | FSM、排序、GC predicate、错误分类、ref名和状态投影 | 表驱动纯函数 |
-| Adapter conformance | Claude 与 Codex 两个 production adapter（静态注册 `[Claude{}, Codex{}]`）的协议事件、session ID、exit、resume、声明能力与 effort 元数据 | 真实协议 frame/golden transcript；外部 provider可 fake |
-| Public contract | `coordplane`、`coordlink`、scope、幂等、错误和 durable副作用 | 正式 CLI + 本地 Daemon/API |
-| Storage/state | claim、generation fencing、Message redelivery、migration、restart | file-backed真实 SQLite |
-| Git component | private clone、bundle/import、task ref、CAS、stale、GC | 真实临时 Git repo和git进程 |
-| Runtime integration | mount、process、token、cancel、resume、cleanup | 真实 Docker daemon |
-| Deterministic E2E | Boss到两个Agent到Git收敛 | 真实Daemon/SQLite/Git/Docker + scripted CLI |
-| Performance | 四Agent饱和、控制面延迟、Docker/Git阶段、恢复和资源泄漏 | 真实Daemon/SQLite/Git/Docker +固定fixture/scripted CLI |
-| Real CLI E2E | 最终 provider接线和真实Agent并发 | 真实Daemon/Docker/Codex或Claude |
+| 层 | 目的 | 必须使用的边界 | 失败规则 |
+| --- | --- | --- | --- |
+| L1 Static/lint | 删除旧模型、注册结构、格式和schema形状 | 源码/SQL/文档扫描、gofmt、vet | 不过即停 |
+| L2 Contract | 冻结Participant/Task/Conversation/Message/log/Git不变量 | 真实SQLite、公开Service/CLI、临时Git、adapter transcript | 不过即锁未开 |
+| L3 Full/race | 防共享逻辑回归 | `go test ./...`、`go test -race ./...` | 不过即停 |
+| L4 Deterministic real boundary | 证明SQLite+Docker+Git+Web组合不变量 | 真实Daemon/Docker/browser，scripted adapter | 不过即停 |
+| L5 Real CLI/reference workload | 证明production adapter、多Agent组合闭环和持续真实项目开发 | 真实Claude/Codex CLI、Docker、固定外部需求manifest和项目Git | 新问题先分类，产品finding转最低层红测试 |
 
-不得 mock 被验收的边界：
+Mock只允许位于被测边界之外。禁止用内存map验证SQLite claim、字符串变量验证Git CAS、fake Docker验证mount/kill、handler直调冒充CLI/Web、notifier mock冒充Message durability或构造日志行冒充真实CLI采集。
 
-- 验 SQLite claim不能用内存 map。
-- 验 Git CAS不能用字符串变量。
-- 验 Docker mount/kill不能 mock `docker run`。
-- 验正式 CLI命令不能只调 operation helper。
-- 验 Message durability不能只检查 notifier被调用。
+## 4. 静态和架构约束
 
-## 4. 架构静态约束
+### 4.1 文档一致性
 
-### 4.1 文档和术语
+- `need/`可执行权威集合精确为`README.md/core.md/runtime.md/git.md/acceptance.md`五份规范，均有相同版本、日期和候选状态。目录另有且只有一份`user-requirements-verbatim.md`溯源记录，它不是第六份产品行为规范。
+- 原话记录的`UR-NNNN`单调、唯一且无缺号；从首次冻结后，旧前缀必须字节级不变，新记录只能在`后续追加区`末尾增加。需求规范有变更时，diff/issue/收据必须引用本轮新增`UR-NNNN`。
+- 原话记录进入常规secret scanner；凭据仅允许`[敏感凭据未入库]`、脱敏原因和不可逆摘要，不允许可恢复原值。
+- 对象/FSM只在`core.md`定义；Runtime/Git只扩展外部字段和边界。
+- 文档不得把SQLite称为代码真相、把Git称为消息真相、把行为日志称为Task授权。
+- 静态guard禁止生产语义出现 `Boss`、`participant-owner`、`role-owner`、`role-agent`、Human专用Task FSM、`conversation Task`、`evidence_type=human_confirm`和`agents`镜像。
+- 旧词仅可出现在migration拒绝错误、负向fixture或“禁止重新引入”的说明中。
+- 不允许未在五份规范内定义的产品决策编号、可变“当前工作”、历史PASS或candidate执行结果。`UR-NNNN`只是原话溯源ID，不是产品决策或业务对象。
 
-- 权威需求目录只能包含五份文档，根索引必须只链接这五份。
-- 对象/状态定义只能出现在 `core.md`；runtime/git文档只能扩展相应字段和外部事实。
-- same-turn/Inject只能描述为可选优化，任何正确性断言必须有 durable Message + resume/new Run路径。
-- SQLite不能被描述为代码真相，Git不能被描述为任务/消息真相。
+### 4.2 Schema exact-set
 
-### 4.2 Schema allowlist
-
-产品业务表只允许：
+空库migration后的表精确为：
 
 ```text
 projects
 participants
-tasks
-runs
-messages
-events
 roles
-participant_project_role
+participant_project_roles
 credentials
+tasks
+conversations
+conversation_members
+messages
+message_recipients
+runs
+events
+behavior_log_indexes
+schema_migrations
+request_dedupes
 ```
 
-`agents` 表自 v3 引入 `participants` 后保留为 cli_agent participant 的兼容镜像：v3 在同一事务建立 `participants`/`roles`/`participant_project_role`/`credentials` 并写入四项 seed（`participant-owner` human、`role-owner`、`role-agent`、owner 的 global binding），v4 增加人类任务/消息并从 `agents` 回填既有 cli_agent participant，v7 只为 agents/participants 增加 Agent 运行配置列并派生回填；镜像行与 `participants` 同一 SQLite 事务同步写，任何一方 CAS 失败整体回滚。镜像不是独立业务状态机；旧读取路径移除前调度/配置读取仍可读 `agents`，不得出现 agents-only 生产入口或新 writer。允许少量纯基础设施表，例如 `schema_migrations` 和 request dedupe，但它们不得有独立业务状态机或公开 API。新增业务表必须先修改本需求。
+禁止`agents`、conversation task辅助表、DeliveryAttempt业务状态机、Validation、ConflictSet、GitOperation、Artifact或第二套权限表。`conversation_members`、`message_recipients`和`behavior_log_indexes`分别是正式关系/索引事实，不得退化为Message JSON blob或内存状态。
 
 ### 4.3 删除旧入口
 
-静态 guard 必须阻止以下路径重新成为生产入口：
+静态guard必须阻止：
 
-- 通用 `/call`、`/capabilities`、`/skills`。
-- `coordlink capability ...`、`coordlink skill ...`、`coordlink call NAME`。
-- 动态 capability/skill registry、TeamConfig parser/policy服务。
-- Validation/assessment/release acceptance/object store服务。
-- 通用 QueueItem/DeliveryAttempt/Mailbox状态机。
-- Backend Agent-facing `git.status/diff/commit/rebase/merge/resolve/rollback` wrapper。
-- ChangeSet/GitOperation/MergeAttempt/ConflictSet/RollbackPoint业务表或服务。
-- 以 transcript/Agent文本写 Task completed的代码路径。
+- 通用`/call`、动态capability/skill registry、TeamConfig/职责策略DSL。
+- `coordlink call NAME`、raw DB、raw Git ref和Agent-facing通用Git wrapper。
+- 通过CLI文本、Event、日志或Human确认字段直接写Task completed。
+- 单recipient字段作为群组Message权威，或一个Message聚合state覆盖逐recipient状态。
+- Run只允许task_id非空的旧假设，以及用conversation Task唤醒Agent。
+- provider secret值进入Docker Config.Env/argv/labels、SQLite、Event、日志或Web响应。
+- Web代码编辑器、浏览器终端、任意宿主文件读取和raw ref mutation入口。
 
-旧术语可以出现在 migration删除说明和负向测试数据中，但不得有生产 writer、handler或正向 fixture。
+### 4.4 Build to Delete和Continuous GC
 
-### 4.4 Build to Delete
+以下组件必须由独立函数和静态列表注册：
 
-静态/合同测试必须证明：
+- Service operations及capability descriptor。
+- workers、Run source、Task kind handlers。
+- CLI adapters、behavior parsers/normalizers/redactors。
+- Runtime prepare/cleanup、Git capture/recovery、GC steps。
+- acceptance scenarios和Web导航/fixture清单。
 
-- Workers来自一个静态注册列表。
-- CLI adapters来自一个静态注册列表。
-- Runtime prepare/cleanup步骤来自列表。
-- Task kind hook来自列表。
-- 删除一个 adapter/步骤/检查不需要修改主循环或添加名称特判。
+删除一个组件只移除注册项和实现。静态质量gate同时检查未使用import/function、生产单函数和单文件阈值；本轮直接影响的超长函数必须拆分，禁止新增TODO债务或保留旧兼容writer。
 
 ## 5. 命名不变量
 
 | ID | 不变量 |
 | --- | --- |
-| INV-01 | SQLite只保存协调事实，Git refs/objects只保存代码事实，prompt/log不是真相 |
-| INV-02 | 业务对象只有 Project、Participant、Task、Run、Message、Event、Role、ParticipantProjectRole、Credential；`agents` 只是 `participants`(kind=cli_agent) 的兼容镜像（v3 引入 participants 后保留，同一事务同步写、CAS 失败回滚），不是独立业务状态机，且旧读取路径移除前不得声称 participant 是唯一权威 |
-| INV-03 | Task和Run分离；outcome先进入finishing，Run terminal/capture后才改变结果；旧Run受generation fence阻止 |
-| INV-04 | 同一Agent和同一Task最多一个starting/active Run，claim不重复 |
-| INV-05 | Message先持久化、至少一次递送、pending/delivered可原子ack、有限重投；Inject失败不丢消息 |
-| INV-06 | 每个Docker Run只看到自己的workspace/home/token，不能写control repo |
-| INV-07 | live process和resumable native session分离；resume创建新Run |
-| INV-08 | cancel/timeout/restart最终收敛Run和container，不伪完成Task |
-| INV-09 | 代码结果来自实际clean workspace HEAD，并先由不可变task ref保护 |
-| INV-10 | canonical只用fast-forward expected-old CAS推进，竞争更新不丢失 |
-| INV-11 | stale/non-FF/conflict由integration CLI Agent处理，Daemon不做智能Git决策 |
-| INV-12 | Capture/CAS/Run cleanup由业务行窄pending字段和operation ID恢复；closed资源GC只用可重算fence，Event不充当隐藏Operation |
-| INV-13 | active、dirty、可恢复或未捕获的workspace/ref不能被GC |
-| INV-14 | Boss能从正式入口看到责任、真实Run、消息、base/head、错误和最终SHA |
-| INV-15 | 第一版没有动态registry、TeamConfig DSL、验收引擎、artifact平台或per-tool审计 |
-| INV-16 | 四Agent负载下控制面不成为瓶颈，Daemon崩溃后在有界时间恢复且无重复/泄漏 |
-| INV-17 | 第一版production维护面保持在已声明SLOC预算内，超预算不能靠隐藏/压缩路径规避 |
-| INV-18 | 第一版不引入行业协议半成品接口：adapter 保持静态注册的 provider 私有协议（README.md §6.1）；ACP client adapter 只按 runtime.md §7.4 的采用前置条件实现，不按协议名写主循环特判 |
-| INV-19 | 内部多 Agent 协作只经 Daemon 的 Task/Message 机制；任何 agent↔agent 直连协议（含 A2A）不得出现在容器网络/Run 会话或生产入口（core.md §14） |
-| INV-20 | Agent 配置（`model/subagent_model/base_url/effort/instructions_text` + 提示词来源）写入必须通过字段校验、`agent.manage` 门禁与 version CAS，`agents`/`participants` 同事务镜像；Run 只保存 `config_fingerprint` 与 `instructions_hash`，model/base_url/instructions_text 原文不落库、不进 Event/run.log |
-| INV-21 | resume 仅在上一 Run `config_fingerprint` 非空且与当前一致时发生；配置变化或指纹为空一律 fresh start，不得把旧配置的 session 交给新配置 |
-| INV-22 | `GET /v1/adapters` 只读返回静态 descriptor（含 AllowedEfforts），不暴露 executable/argv/宿主路径/secret；POST/PUT/CLI/前端共用同一 `AgentConfigInput`，PUT 为全量替换（E5） |
-| INV-23 | human Task 创建即 `waiting`（`wait_reason=human_assigned`），`running` 对 human 不可达（Scheduler/Claim 不领取）；仅 `task complete` 严格 `waiting → completed`，同事务写 `closed_at`、清 `wait_reason`、`evidence_type=human_confirm` 且 `head_sha` 为空；human `task wake` 返回 `INVALID_STATE`；legacy queued human 无自动迁移，complete 稳定拒绝（core.md §4.2/§5.1；合同：`internal/core/rp07_task_complete_contract_test.go` RP-07、`rp08_dispatch_contract_test.go` RP-08） |
-| INV-24 | capability 是静态注册代码事实（非动态 registry），role 是数据（`roles` 表）且只在项目绑定内生效（`participant_project_role`）；每次 operation 在 service 入口统一做认证→身份→项目（或 global）作用域→角色→capability 解析，缺失返回 `SCOPE_DENIED` 且零副作用；全局管理能力只经 `project_id=global` 作用域授予，项目级角色即使全能力也不含全局能力（core.md §3/§9；合同：`internal/core/participant_roles_contract_test.go` RP-01/RP-01b/RP-02/RP-03/RP-04/RP-06） |
-| INV-25 | 人类凭据（`credentials` 表）只存 hash（operator_token），不存明文；吊销后该 participant 的 operator 操作立即被拒、轮换后旧凭据失效且吊销在 Daemon 重启后保持；删除/降级最后一个持有 `participant.manage` 的 participant 被系统拒绝且状态零变化（core.md §3/§9；合同：`internal/core/rp05_credential_contract_test.go` RP-05、`participant_roles_contract_test.go` RP-06） |
+| INV-01 | SQLite保存协调事实，actual Git保存代码事实，Docker/OS保存运行事实，Behavior Log保存可观测行为；四者不能互相伪造 |
+| INV-02 | Participant是Human/CLI Agent唯一身份和Agent配置权威；不存在Boss或agents镜像双真相 |
+| INV-03 | kind只改变认证和执行介质；Task、Conversation、Message、Role和Git合同不按kind或职责分叉 |
+| INV-04 | Role名称无语义；所有入口通过同一operation registry、scope和capability检查，拒绝零副作用 |
+| INV-05 | Task与Run分离；Human无Run，CLI Agent由真实Run claim；两者结果都先submitted再显式accept |
+| INV-06 | 同一CLI Agent最多一个starting/active Run；Task Run与Conversation Run共同受Participant generation fence |
+| INV-07 | Conversation独立于Task，支持direct/group；Message必须属于Conversation且Task关联可空 |
+| INV-08 | Message显式一个或多个recipient，各自独立未读/delivered/ack/cancel/retry；非recipient不被唤醒 |
+| INV-09 | wake=false不创建Run但下次同Project Run必须通过count/high-watermark/有界样本/cursor知道并可分页读取未读；wake=true只为明确CLI Agent recipient创建/合入Run |
+| INV-10 | Message先durable后递送，Inject失败/Run退出/Daemon重启不丢失，逐recipient至少一次 |
+| INV-11 | Conversation Run无Task和代码workspace；Message关联Task不隐式授权代码访问 |
+| INV-12 | Resume创建新Run且不跨Participant/Project/Task或Conversation scope/adapter/config/workspace identity；terminal Run不复活，旧token/generation不能写新状态 |
+| INV-13 | 每个git Task有唯一私有workspace identity和可恢复`pending/ready/blocked/removed`；Human宿主路径与Agent容器挂载保护同一base/source/ownership |
+| INV-14 | Git结果来自actual expected HEAD和clean状态；Human双fingerprint变化时不能捕获 |
+| INV-15 | 每个成功submit产生不可变submission ref；Event、summary或日志不能替代ref |
+| INV-16 | canonical只由显式accept后的fast-forward expected-old CAS推进；竞争stale不覆盖 |
+| INV-17 | integration Participant可为Human或CLI Agent；source/accept version/initial canonical不可变，再次stale只单调更新expected canonical/round并保留已有工作 |
+| INV-18 | pending operation和actual外部事实驱动capture/CAS/Run恢复；Event不充当隐藏Operation |
+| INV-19 | active、dirty、唯一未捕获、被source引用、ownership不明或long_term资源不得GC |
+| INV-20 | 每个Run从首字节记录raw redacted和normalized行为流；未知/gap/truncate/redaction显式可见 |
+| INV-21 | 行为日志覆盖provider暴露的tool/shell/coordlink/Run/Git事实，不声称记录隐藏推理，不推进业务状态 |
+| INV-22 | 每Run唯一Behavior Log index是retention/long_term真相；默认168h，Project可覆盖，取消long_term后按原ended_at和当前策略重算 |
+| INV-23 | secret落盘前脱敏，Docker inspect/argv/SQLite/Event/log/Web均无secret值；日志hash/index可恢复 |
+| INV-24 | Web只监听loopback、必须认证、复用Service operation，对CSRF/Origin/Host/CORS/CSP/Cookie/XSS/SSE-WebSocket失效安全，并覆盖Task/Conversation/Run/log/Git状态工作流 |
+| INV-25 | Participant/Task/Conversation数量无产品级上限；max_parallel_runs只限制Docker并发 |
+| INV-26 | terminal成功状态清除旧failure/wait原因；CLI exit 0、文本完成或低层green不能伪造完成 |
+| INV-27 | 子Task结果通过固定coordination Conversation/result recipient和唯一system Message回传，waiting parent的定向wake与通知同事务且重启幂等 |
+| INV-28 | 行为日志只按log.read_own/log.read_project授权；Conversation成员资格不授予混合Run日志 |
+| INV-29 | 每个验收candidate均以固定需求manifest和输入canonical完成一轮reference workload；L5 finding先归约低层再修复 |
 
-## 6. Core 合同场景
+## 6. Core合同场景
 
-### CT-01 Migration 和重启
+### CT-01 Migration、bootstrap和重启
 
-Boundary：真实 file-backed SQLite + Daemon启动入口。
-覆盖：INV-01、INV-02、INV-12。
-
-必须断言：
-
-- 空库 migration成功并只产生允许的表。
-- 二次 migration幂等。
-- 创建 Project/Participant/Task/Message后重启，行、version和Event保持。
-- migration中断不会产生部分可用 schema或开始调度。
-- 数据库损坏/不可写时 Daemon拒绝 ready。
-
-禁止副作用：创建旧业务表、使用内存状态补齐缺失行。
-
-### CT-02 Claim 竞争
-
-Boundary：真实 SQLite事务 + 两个并发 scheduler worker。
-覆盖：INV-03、INV-04。
+Boundary：真实file-backed SQLite + 正式启动/bootstrap入口。覆盖INV-01/02/18。
 
 必须断言：
 
-- 对同一 queued Task并发 claim，恰好一个 Run创建成功。
-- 同一 Agent有两个 queued Task时，恰好一个获得 current Run。
-- generation只递增一次，Task.current_run_id与Run一致。
-- 失败 claim无 Run/Event/容器副作用。
-- 排序为 priority DESC、created/id ASC。
+- 空库产生4.2 exact-set，无`agents`或默认owner/agent seed。
+- 非本机、已有Participant或Daemon已开放mutation时bootstrap拒绝且零副作用。
+- 首次bootstrap创建一个普通Human、Credential、可配置管理Role/binding；之后可将管理capability配置给另一Human或CLI Agent。
+- 删除/降级最后管理者拒绝；增加第二管理者后可变更首个，证明无特殊身份。
+- 二次migration幂等；旧不可判定schema稳定返回`LEGACY_SCHEMA_REBUILD_REQUIRED`，不启动scheduler/Web mutation。
+- 创建全部对象后重启，row/version/Event/recipient/log index保持；migration中断不产生半schema。
 
-并发测试必须在 `-race` 下重复运行。
+### CT-02 Participant、Role和transport一致性
 
-### CT-03 Run fencing
+Boundary：Service + Operator CLI + coordlink + Web API。覆盖INV-02/03/04/25。
 
-Boundary：正式 coordlink写入口 + 真实 SQLite。
-覆盖：INV-03。
+- 创建多个Human/CLI Agent，不存在硬数量上限或按名称分支。
+- 同一Role/capability对Human和CLI Agent调用同一operation得到相同授权结果；kind只影响Run/host path物理前置。
+- 项目scope、global scope、跨Project、非Conversation member、错误assignee均有负例并断言零行/Event变化。
+- CLI、Web、coordlink的成功结果和错误码一致；不得有某入口绕过expected version/idempotency。
+- paused不接收新Task指派或Conversation成员关系，已有Task/成员关系/历史保留；Human可继续已有工作，CLI不启动新Run且当前Run不被静默停止。archived不认证/接收，历史仍按权限可读。
 
-流程：创建 Run-1，终结并创建 generation更高的 Run-2，再用Run-1 token调用 progress/message/submit。
+### CT-03 统一Task FSM
 
-必须断言：所有请求返回 `STALE_RUN`，Task/Message/head/version/Event数量均不改变；Run-2正常请求成功。
+Boundary：真实SQLite + Service公开入口。覆盖INV-03/05/26。
 
-### CT-04 Exit 不是完成
+- 同样的work Task分别指派Human和CLI Agent，初始都queued。
+- Human显式claim后running且`current_run_id=null`；Scheduler不能为Human创建Run。
+- CLI Agent只有Run真实active后Task才running；claim竞争只创建一个Run。
+- Human与Agent均可wait->waiting->wake->queued、fail->failed->retry、submit->submitted、accept->completed。
+- 不存在Human `waiting->completed`/`human_confirm`旁路；旧操作稳定拒绝且不写Event。
+- completed清旧failure/wait字段；exit 0或Message正文“完成”不能改变Task结果。
 
-Boundary：Runner supervisor + scripted adapter。
-覆盖：INV-03、INV-08。
+### CT-04 群组Conversation和逐recipient未读
 
-- CLI exit 0但未调用 wait/submit/fail：Run exited，Task记录 `NO_TASK_OUTCOME`并按retry policy requeue/failed。
-- CLI输出“done/completed”不能改变结果。
-- 非零退出不能提交/完成Task。
-- Agent调用wait/submit/fail后，Task先finishing、Run保存requested outcome、token立即失效；Run仍live时不得提前waiting/submitted/failed。
-- Submit Run terminal后由静止workspace capture成功，Task才submitted；exit处理不得重复转移。
-- starting one-shot在active事务前快速退出时Run可直接exited，Task不被卡在queued+current Run。
-- finishing/pending capture期间Boss accept/rework/cancel必须返回`ACTION_IN_PROGRESS`；`run stop`可以促使进程收敛，但不得丢失已保存outcome。
+Boundary：真实SQLite + CLI/API。覆盖INV-07/08/10。
 
-### CT-05 父子任务
+- direct恰有两成员且无序pair唯一；group至少两成员并支持增加/移除。
+- paused/archived Participant不能成为新Conversation成员；暂停时已有成员仍按权限可读历史且不产生新Run。
+- 一个group Message显式发给B/C，不发给D：创建一个Message、两个recipient行；B ack不改变C，D无未读且不被wake。
+- Task关联为空和非空均可；cross-Project Task、非成员recipient、零recipient和sender自收稳定拒绝且零副作用。
+- 成员都可按权限读取历史；离开后不能发新消息或成为recipient。
+- recipient在delivered Run退出未ack后回pending；Daemon重启后count/order/retry不变。
+- Project/Conversation/Participant archive前未处置recipient必须显式ack/cancel/redirect，不得回退到固定Human。
 
-Boundary：coordlink `task create/wait/submit/accept/rework`。
-覆盖：INV-03、INV-05、INV-14。
+### CT-05 未读提示和定向wake
 
-- Agent显式创建指定 assignee的child Task，然后parent waiting。
-- Child submitted产生绑定parent的system Message并唤醒parent。
-- Boss可把child精确task ref导出checkout；parent/Reviewer可创建带source Task的work Task并在private workspace读取同一head，不需要control repo权限。
-- Backend不自动接受child、不自动完成parent、不自动创建下一任务。
-- Parent Agent accept/rework使用当前Run scope；重复操作幂等或稳定冲突。
+Boundary：真实SQLite + scheduler/notifier + scripted adapter。覆盖INV-06/09/10/11。
 
-### CT-06 Message at-least-once
+- wake=false不创建Run；Agent下一次同Project Task Run bootstrap含未读count、高水位、有界Message/recipient ID样本和cursor。创建超过bootstrap上限的未读，断言bootstrap大小不增长为全量，通过稳定分页可无漏无重读到高水位。
+- wake=true只为明确CLI Agent recipients启动/合入Run；Human和group非recipient不产生Run。
+- 无Task wake创建`task_id=null` Conversation Run且bootstrap含Conversation/Message；容器无workspace mount。
+- Agent busy时不创建第二Run；Inject失败保持pending，terminal后Conversation Run再投递。
+- 多消息合入仍逐recipient ack，达到max deliveries停止自动wake但保持未读可查询。
 
-Boundary：coordplane/coordlink Message入口 + notifier + SQLite。
-覆盖：INV-05、INV-07。
+### CT-06 Run fencing
 
-- Message row/Event提交后才调用adapter。
-- Inject unsupported/failed时保持pending。
-- Resume Run输入包含全部pending Message ID；建立输入后delivered。
-- Run在ack前terminal，Message回pending并产生redelivered Event。
-- pending或delivered Message都可由接收者ack；Inject先发生、delivered事务稍后提交的竞态不导致ack失败。
-- 同一Message可重复递送但只ack一次；两个不同Message不能被route级去重吞掉。
-- 自动redelivery达到上限后保持可查询但停止auto wake；显式retry才能继续，不能无限创建Run。
-- Delivery Task进入submitted/failed/completed/cancelled时，未处理Agent Message在同一事务转到recipient conversation/Boss或cancel，不等待不存在的下一Run且不永久阻止GC。
-- 创建Message时若显式delivery Task已经submitted/failed/closed，必须在同一事务改投recipient conversation并保留related Task，或稳定拒绝；不得先插入一个永远无法递送的pending行。
-- 首次direct Message显式wake=false时，conversation Task与Message原子创建且Task初始waiting；Scheduler不得启动Run，直到显式wake或后续wake Message。
-- failed conversation不能作为direct Message复用/重路由目标；调用稳定失败或消息转Boss/cancel，不能留下pending。Child terminal遇Project error、closed parent或archived parent Agent时仍成功终结，并把结果Message交给Boss。
-- acknowledged不自动改变Task状态。
-- `task create/message send或reply/wait/submit/fail/accept/rework`携带`ack_message_ids`时，动作和ack同事务；在“动作后、响应前”kill client不会重复业务副作用。
-- 在wait已写finishing、旧Run尚未terminal时创建wake Message：不得立刻创建第二Run或形成waiting+active；旧Run terminal事务恰好一次转queued，之后才创建新Run。wake=false在同一窗口不得自行queue。
+Boundary：真实SQLite + per-Run API。覆盖INV-05/06/12。
 
-### CT-07 Boss chat
+- Task Run和Conversation Run均递增Participant runtime generation并占用唯一current Run。
+- 旧token、错Participant/Project/Run/runtime generation拒绝所有mutation。
+- Task outcome另校验task ID/generation；Conversation Run不能提交Task outcome。
+- cancel/stop/terminal立即撤销token；迟到ack/outcome不得覆盖新Run，但可按Message idempotency安全返回已ack结果。
 
-Boundary：正式 `coordplane chat` 命令。
-覆盖：INV-05、INV-14。
+### CT-07 接受、rework和取消竞态
 
-- 首次chat创建conversation Task，后续chat复用。
-- conversation上的submit/accept/rework以及work/integration上的close返回`INVALID_STATE`且零副作用。
-- Boss文本只产生Message，不直接创建work Task或改Git。
-- Agent回复可见并ack，Agent wait后下一条Boss消息创建新Run；兼容时Resume，不兼容/unsupported时fresh Start，绝不复活旧Run。
-- Daemon重启后conversation和消息顺序保持。
+Boundary：真实SQLite + Git operation fake仅位于外部CAS边界。覆盖INV-16/17/18。
 
-### CT-08 Accept 与撤销竞态
+- 同一submitted Task并发accept/rework/cancel只有一个CAS胜出。
+- accept固定接受者和integration Participant；后续Project默认变化不改写。
+- source链接open integration后第二accept/rework/cancel返回`ACTION_IN_PROGRESS`。
+- 取消integration原子释放source授权；任意失败不留下半link/accepted/pending Event。
 
-Boundary：正式`task accept/rework/cancel` +真实SQLite +可阻塞Git executor。
-覆盖：INV-03、INV-10、INV-12。
+### CT-08 Agent配置和adapter descriptor
 
-- Accept获胜时必须原子写accepted字段和`pending_action=advance`；并发rework/cancel返回`ACTION_IN_PROGRESS`，不能撤销授权后仍推进canonical。
-- Accept必须把显式/Project默认解析出的active integration Agent精确写入source Task；重启或Project默认变化后仍使用该ID。pending advance期间该Agent archive失败；之后pause只使新integration Task等待，不得静默改派。
-- Rework/cancel先获胜时，accept返回`INVALID_STATE`且零Git side effect。
-- Advance terminal事务再次匹配operation ID、pending version、target head和accepted授权。
-- Stale创建integration Task后，source的rework/cancel/第二accept继续返回`ACTION_IN_PROGRESS`；integration capture和最终CAS都必须匹配source accepted version/link/head/ref。
-- 显式cancel无pending action的integration Task必须原子释放source link/accepted授权；与integration submit/CAS并发时只能一方获胜。
-- 相同request ID重放返回同一结果，不创建第二个integration Task或第二次CAS。
+Boundary：POST/PUT、CLI、Web、coordlink和静态adapter registry。覆盖INV-02/04/23。
 
-### CT-09 Project/Agent 生命周期
+- `adapter_id/image/instructions来源/model/subagent_model/base_url/effort`写读更新一致，完整替换语义明确。
+- instructions恰一来源、大小限制、安全token、HTTPS URL和AllowedEfforts负例零副作用。
+- config变化只影响新Run，fingerprint不同禁止Resume；旧Run保留原hash。
+- descriptor不泄露executable/argv/path/secret，adapter增删只改注册项。
 
-Boundary：正式project/agent命令 +真实SQLite。
-覆盖：INV-04、INV-12、INV-14。
+### CT-09 子Task结果回传
 
-- Project creating/error/active/archived状态和Agent active/paused/archived转移符合Core FSM。
-- Project error重启后保持fail-closed，不调度、不集成；只有`project repair`核验成功才能active。
-- 有starting/active Run、Project/Task pending action或open Task时Project archive失败且零副作用。
-- 有starting/active Run或open assigned Task时Agent archive失败；pause不静默kill当前Run。
-- Agent被open source Task固定为accepted integration Agent时archive失败，直到source直接完成或linked integration完成/取消并释放授权。
-- 没有accepted引用时Agent archive可原子清除Project默认integrator；后续accept必须选择另一个active Agent，不能复用archived默认值。
-- archived Project/Agent拒绝新Task和Agent-directed Message且不产生孤立pending行；Project error中的错误结果仍能由Boss读取。
+Boundary：真实SQLite + Service + scheduler/notifier + scripted adapter。覆盖INV-10/12/27。
 
-### CT-10 Agent 配置契约与三面入口
+- A的parent Task在running时通过正式operation为B创建child，固定coordination Conversation和result recipient=A，然后parent wait。
+- B首次submitted时与唯一`child_result_ready` Message/recipient同事务持久；parent仍waiting时同事务转queued，A可在新Run中收到该Message并Resume同parent scope。
+- 在child terminal事务前后和parent wake后注入Daemon crash，重启后仍恰有一条Message/recipient，不丢wake、不重复Run，不跨scope Resume。
+- 缺Conversation/result recipient、跨Project、非成员或paused recipient的child创建拒绝且零副作用；不存在subscriber/inbox fallback或固定Human路由。
+- open child存在时归档coordination Conversation、移除route成员、归档result recipient或将parent改派使route失效均拒绝。child创建后recipient被paused时结果Message仍唯一durable且parent可queued，但不创建新Run；恢复active后可继续。
 
-Boundary：正式 `coordplane agent add/update` + `POST/PUT /v1/agents` + `GET /v1/adapters` + 前端编辑表单 + 真实 SQLite。
-覆盖：INV-02、INV-20、INV-22。
-
-必须断言：
-
-- `model/subagent_model/base_url/effort/instructions_text` 五个字段写入、读取、更新一致；`adapter_id` 必须来自静态 registry（v1 为 `claude`/`codex`）；`effort` 只接受该 adapter descriptor 的 `AllowedEfforts` 值（E2），未知值稳定拒绝且零副作用。
-- `instructions_file`/`instructions_text` 必须恰有其一：同时提供或同时为空稳定拒绝；file 必须 daemon 宿主绝对路径且 `filepath.Clean` 后不变；text 超过 1 MiB 拒绝。
-- `base_url` 带 userinfo/query/fragment 或非 `https://` 拒绝；`model`/`subagent_model` 非法 token 拒绝。
-- `UpdateAgent` 与 `AddAgent` 共用校验；同一 SQLite 事务写 `agents`/`participants` 镜像；旧 version 返回 `VERSION_CONFLICT` 且无部分写入。
-- PUT 是完整配置替换（E5）：body 缺失/省略字段按空处理并重新校验，不得保留旧值残留；CLI `agent update` 先 GET 当前值，overlay 显式出现的 flag 后全量 PUT；前端编辑提交全量字段。重复 `request_id` 幂等。
-- `GET /v1/adapters` 只读返回 descriptor 列表（Name/ExecutionModel/SupportsResume/SupportsInject/AllowedEfforts），不返回 executable/argv/宿主路径/secret。
-- `agent.updated` Event 只含版本与变化的字段名，不出现配置值或提示词原文；无 `agent.manage` 权限调用 update 返回 `SCOPE_DENIED` 且零副作用。
-
-### CT-11 v7 迁移、配置指纹与 resume 判定
-
-Boundary：真实 file-backed SQLite v6→v7 + Daemon 启动入口 + 纯函数指纹。
-覆盖：INV-20、INV-21。
-
-必须断言：
-
-- 迁移加列成功：`agents`/`participants` 五列默认空，`runs.config_fingerprint` 默认空；对 `kind='cli_agent'` 且与 `agents.id` 相同的 participants 行回填五字段，human 行保持空。
-- 旧 terminal Run 若已有 `adapter_id/image/instructions_hash`，按同一 canonical fingerprint 规则回填；启动中或 hash 为空留空（视为不可 resume）；迁移只写派生指纹、不额外造 Event，失败整体回滚。
-- 迁移版本 <7 且存在旧 `codex` 行（`agents.adapter_id='codex'` 或 `runs.adapter_id='codex'`）时 Daemon 启动预检拒绝并返回 `LEGACY_SCHEMA_REBUILD_REQUIRED`（E3 fail-closed），不导入旧 session；v7 起 Codex 才是受支持 adapter。
-- `RuntimeConfigFingerprint` 对 trim/normalize 幂等；不含 provider secret；同配置同指纹、不同配置不同指纹。
-- `BeginRunLaunch` 同事务写 fingerprint；`selectLaunchMode`：同 adapter/Agent/Task/workspace + 旧指纹非空且相等 + adapter `ResumeCompatible` 才 resume，否则 fresh start。
-- Daemon SIGKILL 重启后配置与 fingerprint 从 SQLite 恢复；旧 Agent 不改配置时行为不变。
-
-### CT-12 统一参与者框架（Participant/Role/Credential）
-
-Boundary：真实 file-backed SQLite + Service 入口 + Store/Service 重启。
-覆盖：INV-02、INV-23、INV-24、INV-25。
-
-必须断言：
-
-- 空库 migration 后恰好产生 12 张允许表（exact-set：`projects`/`agents`/`tasks`/`runs`/`messages`/`events`/`schema_migrations`/`request_dedupes`/`participants`/`roles`/`participant_project_role`/`credentials`），无多余业务表（`internal/store/store_test.go` `TestCT01FileMigrationIsExactAndIdempotent`）。
-- v3 seed 精确存在且唯一：`participant-owner`（human）、`role-owner`、`role-agent`、`participant-owner ↔ global ↔ role-owner` binding；v4 从 `agents` 回填既有 cli_agent participant，镜像行与 `participants` 同事务一致（`internal/store/store.go` migrate、`internal/store/schema.go` v4）。
-- RP-01…RP-08 全部映射到本场景（`internal/core/*`）：
-  - RP-01/RP-01b：capability registry 完整封闭；`role-owner` 携带全部 capability、`role-agent` 只携带最小 CLI agent 集合（`participant_roles_contract_test.go`）。
-  - RP-02：role CRUD 与 binding 删除 guard（仍被绑定的 role 不得删除）。
-  - RP-03：项目级 scope 只解析项目 + global 绑定，其他项目绑定不泄漏。
-  - RP-04：global scope 与项目级隔离；项目级全能力角色不含全局能力。
-  - RP-05：credentials 只存 hash；错误/缺失 secret 拒绝；轮换后旧凭据立即失效；吊销后 Store/Service 重启仍拒绝（`rp05_credential_contract_test.go`）。
-  - RP-06：最后 `participant.manage` 持有者不可被剥离；失败 unbind 后 `participant_project_role` 与 `events` 表零变化（直接回读两张表）。
-  - RP-07：human task 创建即 `waiting`、`running` 不可达、仅 `waiting → completed` 收敛且 `evidence_type=human_confirm`（`rp07_task_complete_contract_test.go`）。
-  - RP-08：Agent 可向 human participant 显式派发 child Task（`rp08_dispatch_contract_test.go`）。
-
-禁止副作用：任何失败操作不得留下部分绑定、变更行或新 Event。
-
-## 7. Runtime 场景
+## 7. Runtime与日志场景
 
 ### RT-01 真实隔离
 
-Boundary：真实Docker。
-覆盖：INV-06。
+Boundary：真实Docker。覆盖INV-06/11/13/23。
 
-同时启动Agent A/B，断言：
+- 同时启动A/B Task Run，container/workspace/.git/home/token/socket/log目录全部不同。
+- A不能读写B资源、DB、Docker socket、control repo、operator socket或宿主home。
+- Conversation Run无`/workspace`；Task Run只挂当前Task workspace。
+- non-root、无额外capability、无published port；Agent修改private refs不能改变canonical。
 
-- container ID、workspace、`.git`、home和token文件不同。
-- per-Run API socket/control目录不同，A不能连接B socket，也看不到operator socket。
-- A不能读取/修改B workspace/home/token。
-- 两者都看不到DB、Docker socket、control repo或Boss HOME。
-- 容器使用非root、无额外capabilities、无published port。
-- Agent修改自己private clone的`main`/refs不能改变actual canonical。
+### RT-02 Active truth和快速退出
 
-禁止用fake Docker替代。
+Boundary：真实Docker + one-shot scripted adapter。覆盖INV-05/06/12/20/26。
 
-### RT-02 Active truth
+- create前Run starting；container和CLI进程可证live后才active/Task running。
+- start前日志writer/Attach已就绪；立即输出并exit的首字节、session、exit均存在。
+- session存在但进程消失时Run interrupted，不保持active。
+- exit 0无structured outcome时Task只requeue/failed，不submitted/completed。
 
-Boundary：真实Docker + one-shot scripted adapter。
-覆盖：INV-03、INV-07。
+### RT-03 Resume、Inject、cancel和timeout
 
-- Workspace/home/coordlink/CLI未准备完时Run不是active、Task不是running。
-- `prepareWorkspace`在任何Run到达`start_issued`前失败且workspace absent时，修复环境后的failed retry可按不可变base/source首次物化；若历史Run已到`start_issued`，外部删除workspace后retry必须fail loud且不得新建container/clone来掩盖可能丢失的Agent修改。
-- `launch_phase`按intent/created/start_issued/process_observed单调持久化；Docker Start与active事务间崩溃能仅凭Run行和Docker事实判定failed或保守interrupted。
-- Docker start前已attach日志或可从offset 0 replay；快速one-shot的session/exit事件不丢。
-- Process启动已观察、Supervisor持有Wait且尚未观察terminal后才写active/running；启动窗口的coordlink自动重试`RUN_STARTING`。
-- native session ID在process退出前写入。
-- Process退出后Run立即terminal；即使session可resume也不能Inject。
-- 新Message创建新Resume Run而不是复活旧Run。
-- Daemon重启后使用durable RuntimeRef Attach同一container、重放日志并继续Wait，不依赖旧内存handle。
-- Daemon重启在同一bind-mounted control目录重建per-Run API socket，既有coordlink经有界重试重新连接；错误Run token仍被scope fence拒绝。
-- Adapter只构造provider Inject输入，真实process I/O由Executor执行；任一路径都不能绕过live RuntimeRef/nonce检查。
+Boundary：真实Docker + adapter transcript。覆盖INV-09/10/12/18。
 
-### RT-03 Resume fallback
+- Resume兼容时创建新Run并引用旧Run；fingerprint变化/未知时fresh。
+- 同Participant的其他Project、其他Task、Conversation scope、不同workspace identity或较旧session均不可被Resume；选择结果只能fresh或精确同scope最新session。
+- session-not-found终结当前Run，recipient回pending，后续fresh Run；一个Run不启动第二CLI。
+- Inject前Inspect live；accepted只delivered不ack；unsupported/failure保持pending。
+- cancel/timeout先durable intent和token撤销，再真实stop/kill/remove；Task与Conversation Run收尾各自正确。
+- stop/cancel竞态、迟到exit和迟到outcome不伪完成。
 
-Boundary：adapter conformance +真实Run状态。
-覆盖：INV-05、INV-07。
+### RT-04 Daemon crash/reconcile
 
-- Resume success使用相同Task workspace/home、新Run/token，并引用旧Run。
-- 静态unsupported/incompatible直接创建launch_mode=start的Run，不先启动Resume进程。
-- session-not-found使Resume Run terminal并写`RESUME_UNAVAILABLE`；Message回pending，随后另一个generation更高的fresh Start Run包含durable Task/Message。
-- fresh Start不宣称恢复原模型上下文。
-- 不支持resume的adapter从一开始走Start，不进入无限retry。
-- Resume只选择同Task/Agent最新兼容terminal Run，不把旧adapter session交给新adapter，也不静默跳回更旧历史。
-- Resume 判定前先比较上一 Run 与当前配置指纹：不同或旧指纹为空直接 fresh start（INV-21）。
+Boundary：真实SQLite + Docker，在create/start/active/terminal/cleanup阶段kill Daemon。覆盖INV-06/10/12/18/20。
 
-### RT-04 Cancel 和 timeout
+- matching container按launch phase接管且不重复create/start；nonce/label/generation不匹配不接管不删除。
+- 日志hash/offset先恢复，再开放消息递送和mutation；接管期间输出无静默gap。
+- delivered未ack recipient恢复pending；同Participant不出现第二active Run。
+- terminal container/control资源最终removed；Docker不可达保持blocked并可重试。
 
-Boundary：正式Boss命令 +真实Docker长进程。
-覆盖：INV-08、INV-13。
+### RT-05 行为日志完整性
 
-- Task cancel intent先持久化、generation前进并使旧token失效；Task不再自动调度。
-- Graceful stop超时后kill完整容器/process tree。
-- 已取消context不妨碍独立cleanup context remove容器。
-- Run分别收敛cancelled/timed_out；Task不completed。
-- Dirty workspace不被reset/clean/delete。
-- `run stop`只终结本Run为interrupted；没有requested outcome时Task按retry policy恢复，不等同task cancel。
-- `run stop`发生在wait/submit/fail outcome已经durable之后时，Run仍按该outcome完成finishing收尾，不能把它降级成普通interrupted并丢失结果。
-- timeout发生在requested outcome之后时同样保留wait/submit/fail收尾；timeout先发生时迟到outcome被撤销token拒绝，Task只走runtime retry/failed。
+Boundary：真实scripted CLI进程 + adapter +文件+SQLite index。覆盖INV-20/21/22。
 
-### RT-05 Daemon crash/reconcile
+一个Run必须实际产生并验证：stdout、stderr、provider frame、tool call/result、shell command/output/exit/duration、coordlink请求/响应、权限拒绝、Task/Message操作、Docker生命周期、Git前后SHA、unknown frame和redaction记录。
 
-Boundary：真实SQLite +真实Docker，进程级fault injection。
-覆盖：INV-08、INV-12。
+- raw与normalized sequence/offset/hash可交叉定位，manifest首尾/hash/计数匹配。
+- adapter不支持的observability在descriptor声明，不能伪造；未知frame保留redacted raw并规范化parse_error。
+- 强制单记录/总量上限产生truncation行；模拟writer中断产生显式gap或可证明无gap。
+- SQLite index不得领先文件；落后时重启补齐。篡改hash使日志`corrupt`且不覆盖原文件。
+- Event数量不随stdout chunk/tool call线性膨胀，证明两层分离。
+- 同一Run携带两个Conversation消息时，Conversation member但非Run owner且无`log.read_project`者不能读/follow/export日志；Run owner的`log.read_own`和敏感Project级访问分别有正负例。
 
-分别在以下点kill Daemon：
+### RT-06 Retention和secret
 
-1. Run intent已写、container未create。
-2. Container已create、Run尚未active。
-3. Run active且CLI仍运行。
-4. CLI已exit、DB尚未终结Run。
-5. Run terminal、container尚未remove。
+Boundary：可控时钟 +真实文件/SQLite/Docker inspect。覆盖INV-19/22/23。
 
-重启后必须使用Run ID/generation/launch nonce/launch phase收敛，不重复启动、不猜成功、不误删nonce不匹配容器。另覆盖create成功但container ID尚未落库、matching Docker state=created、container ID已落库但NotFound；依次证明按确定性name/nonce采用并落ID、只start一次、按phase终结旧Run且不为同一Run create第二个CLI。容器必须`AutoRemove=false/RestartPolicy=no`，terminal事实落库后才remove。
+- 无override使用168h；Project override即时用于历史Run，`age < retention`不删、`age ==` eligible。
+- 每Run只有一个Behavior Log index；Run行无可独立更新的long_term/retention副本。index long_term阻止过期日志GC；无权限设置拒绝。取消后不改ended_at，按当前策略可能立即eligible。
+- active writer、未核验manifest、进行中export/reader lease、corrupt待处置日志不得删。
+- 删除后保留Run终态、manifest摘要/hash/计数和Event。
+- 已知secret在SQLite、Event、raw/normalized/stdout/stderr、错误、Web响应、argv、labels和raw `docker inspect` Config.Env中均不存在；entrypoint仍能从secret file启动provider。
 
-每个崩溃点还要分别带requested outcome和stop/cancel/timeout intent重跑：重启必须优先幂等Stop并继续对应outcome，不得仅因container仍running就恢复普通业务执行。
+### RT-07 Production adapter conformance
 
-Docker API不可达场景必须进入degraded并停止新调度，不能把所有Run标lost或cleanup removed。Container NotFound但per-Run socket/token/control目录仍存在时cleanup保持pending/blocked；只有所有Run-owned runtime资源absent才removed。
+Claude与Codex分别使用真实协议frame/golden transcript验证Start/Resume、session、usage、tool/shell事件、unknown/error、exit、redaction和ObservableEventKinds。fixture必须来自真实协议形状但移除secret/private正文；不能用同一个手写parser fake同时冒充两个adapter。
 
-SIGTERM测试必须证明Daemon先停止claim，grace到期后写`daemon_shutdown` stop intent并终结starting/active Run；已有outcome继续对应收尾，第一版不留下故意detach的无人监控container。无Run row的orphan container只能quarantine/manual，不能凭label猜nonce后删除。
+## 8. Git场景
 
-### RT-06 Codex adapter 真实启动与事件解析
+### GT-00 Project注册恢复
 
-Boundary：真实 Docker + 固定 digest 镜像 + golden JSONL frame。
-覆盖：INV-06、INV-07、INV-20。
+Boundary：真实临时Git repo + file-backed SQLite。覆盖INV-01/18。
 
-必须断言：
+- dirty source不被修改；branch移动后initial SHA仍固定。
+- 在intent、repo create、object import、ref create、terminal事务各阶段故障，重启只得到一个正确control repo或明确Project error。
+- actual canonical与cache不一致时不reset actual；repair核验后才active。
+- 在workspace prepare intent、目录创建、marker、object checkout和ready CAS各阶段崩溃；重启只能得到原identity的ready workspace或blocked，不重读移动canonical、不创建第二目录、不在ready前claim。
 
-- 容器 argv/env 完全来自所选 adapter 的 `ProviderConfig` 映射（`-m`/`-c` override、`HOME=/home/agent`、`CODEX_HOME=/home/agent/.codex`、凭据经 allowlist 注入），无 shell 拼接、无任意命令字符串；镜像缺 codex 时 Run 以可诊断错误失败。
-- stdout 每行恰一个 JSON 对象；坏帧 fail-closed；未知但语法合法的事件类型忽略；reasoning/signature/encrypted_content/usage 不进入 `Event.Raw`。
-- 第一个稳定 thread/session ID 映射 `NativeSessionID`；同一 Run 冲突 ID 视为协议错误；明确 session/thread not found 按 golden fixture 固定词映射 `RESUME_UNAVAILABLE`。
-- Docker inspect 与 run.log 中不出现 secret、URL userinfo、`instructions_text` 原文；`run.instructions_hash` 等于有效提示词 hash。
+### GT-01 Human/Agent workspace等价
 
-## 8. Git 场景
+Boundary：真实Git workspace + Operator CLI + Docker。覆盖INV-03/13。
 
-### GT-00 Project 注册恢复
+- 相同base的Human/Agent git Task拥有不同workspace和`.git`，初始HEAD一致。
+- Human只从授权宿主入口获得自己的路径；Agent只看到`/workspace`且不知道宿主路径。
+- 两者都不能写control repo/canonical；标准Git提交后走同一submit/capture代码路径。
+- `workspace_mode=none`不创建workspace；integration必须git。
 
-Boundary：正式`project add/repair` +真实本地Git +SQLite fault injection。
-覆盖：INV-01、INV-12。
+### GT-02 Agent capture
 
-分别在creating行提交、临时bare导入、canonical ref创建、最终rename、Project active提交前kill Daemon。intent后移动source branch，重启仍必须使用Project行固定的initial SHA/operation ID确定性继续或转error；不得留下active但无repo、无Project行却被自动采用的repo，且source working tree/ref/config零修改。Project error重启后持续停止调度/集成。
+Boundary：真实Git + terminal Docker Run。覆盖INV-14/15/18。
 
-### GT-01 Private clone
+- dirty/untracked、中间态、expected mismatch、oversize/corrupt bundle稳定失败且不建submission ref。
+- writer停止、clean HEAD匹配后quarantine/fsck/create-only ref成功，Task submitted并记录run/submission/ref/head。
+- hook/global config/alternates/replace refs/危险环境不能影响受信helper。
 
-Boundary：真实临时bare repo +真实Docker workspace。
-覆盖：INV-06、INV-09。
+### GT-03 Human稳定快照
 
-必须断言：
+Boundary：真实宿主workspace + 并发writer + Service submit。覆盖INV-14/15。
 
-- clone使用精确base SHA。
-- `.git`私有，无alternates、shared object/common git dir。
-- control repo不在mount内，origin不可写且不泄露host path。
-- A/B从同base创建不同workspace/branch，commit互不影响。
-- `task checkout`导出的HEAD精确等于未集成Task.head_sha且无control remote；带source Task的review work clone通过受限bundle得到同一commit的convenience ref，篡改该ref不改变保存的source SHA。
-- linked worktree实现不能通过此测试。
+- F1/F2稳定时Human提交成功，`head_run_id=null`但submission ID/ref存在。
+- 在HEAD读取、bundle生成、第二次status各窗口并发修改/commit，返回`WORKSPACE_CHANGED`或`GIT_HEAD_MISMATCH`，Task回running、canonical不变、无授权ref。
+- 快照后新commit不被静默纳入旧submission，workspace保留可再次提交。
+- Human不能使用旧complete/evidence入口绕过capture。
 
-### GT-02 真实HEAD和clean gate
+### GT-04 Capture crash matrix
 
-Boundary：正式 `coordlink task submit` +真实Git。
-覆盖：INV-09。
+Boundary：真实Git + failpoints +重启。覆盖INV-15/18。
 
-- Agent上报错误expected head时，第一事务仍只durable写finishing/outcome；Run terminal后的helper发现mismatch并requeue/failed，且不得创建task ref、写head或导入可达control ref。
-- Submit请求先使Task finishing、Run outcome/token冻结；Run仍live时不得capture或submitted。
-- Run terminal、workspace无writer后，受信只读helper发现dirty/untracked或Git中间态时requeue/failed并保留workspace。
-- Helper和controller bare都读取actual HEAD并校验base ancestor，关闭replace/grafts。
-- 通过后创建不可变task/run ref，最终operation/version/generation fence通过后才把Task转submitted。
-- 修改private branch名不能欺骗captured SHA。
-- Agent篡改workspace source ref、`refs/replace/*`或grafts不能欺骗controller lineage。
+- pending无ref只在Task/version/operation/head匹配时重试。
+- ref已有且DB未写只在相同fence下补submitted；Task cancel/rework/generation变化后旧ref不推进状态。
+- ref SHA冲突使Project error且不覆盖/删除。
+- Agent与Human capture均覆盖；`git fsck`始终通过。
 
-### GT-03 Capture crash matrix
+### GT-05 Canonical CAS竞争
 
-Boundary：真实Git bundle/import + SQLite fault injection。
-覆盖：INV-09、INV-12。
+Boundary：真实Git `update-ref expected-old` +真实SQLite。覆盖INV-16/18。
 
-分别在以下点kill Daemon：
+- 两个相同base结果并发accept，最多一个直接推进；另一个保留submission并stale。
+- CAS成功/SQLite提交前crash，重启核验actual target后幂等完成。
+- actual为第三SHA时不reset，创建integration；非fast-forward不由Daemon merge。
 
-1. Task finishing/pending capture已写，Run尚未terminal。
-2. Run terminal，handoff未ready。
-3. handoff ready，尚未import。
-4. object已import，task ref尚未create。
-5. task ref已create，DB head/status尚未写。
-6. DB submitted已写，临时handoff尚未clean。
+### GT-06 Integration Participant等价
 
-重启后必须幂等完成或保持可恢复错误；不得生成两个业务提交、移动错误ref、丢唯一commit或把partial文件当成功。
+Boundary：真实Git +Human和CLI Agent两种assignee。覆盖INV-03/17。
 
-另需在task ref创建后模拟Task cancel/retry/new generation或pending action ID/version不匹配，断言旧ref可保留诊断但绝不能补写Task submitted。Corrupt、oversized和超对象数bundle必须fail loud、Project/Task按错误分类收敛且control repo仍`git fsck`通过。
-
-### GT-04 Canonical CAS竞态
-
-Boundary：真实bare repo +多个并发`git update-ref`调用。
-覆盖：INV-10。
-
-创建同一current的两个不同descendant head，同时请求accept：
-
-- 恰好一个expected-old CAS直接成功。
-- 另一个得到actual stale并保留task ref。
-- canonical始终指向有效commit，赢家不被覆盖。
-- 没有依赖进程内业务lock的正确性。
-- `git fsck`通过。
-
-额外覆盖：
-
-- intended head已经是actual canonical祖先时直接确认already integrated，不创建integration Task。
-- `update-ref`成功、DB未完成时kill Daemon，再让canonical前进到head后代；恢复必须识别已包含并补齐completed/final SHA。
-- accept与rework/cancel竞态遵守CT-08，旧授权不能推进ref。
-
-该测试必须并发重复并在race gate运行相关Go代码。
-
-### GT-05 Integration Task
-
-Boundary：真实Git + scripted integration CLI。
-覆盖：INV-10、INV-11。
-
-- Source Task先被Boss/parent显式accept。
-- non-FF后只创建一个去重integration Task，Daemon不运行merge/rebase/cherry-pick。
-- Source Task链接integration后保持accepted锁定；source version/link/head/ref任一不匹配都使integration capture/final CAS fail loud且canonical不变。
-- Integration workspace基于actual canonical并包含source input ref。
-- CLI生成同时以canonical/source head为祖先的clean head。
-- Agent篡改private convenience source ref或replace ref时，Daemon仍以Task保存的source SHA在controller bare复核并拒绝伪lineage。
-- Daemon捕获其task ref并fast-forward CAS。
-- 成功后source和integration Task均completed，canonical包含两者lineage。
-- Cancel integration时原子释放source授权；cancel与submit/CAS barrier竞态只能产生“已取消且canonical不变”或“已集成且双方completed”之一。
-
-### GT-06 冲突和再次stale
-
-Boundary：真实Git同行冲突 +可恢复integration Run。
-覆盖：INV-11、INV-12。
-
-- 两个head修改同一行时，integration CLI的普通Git产生真实冲突。
-- canonical不变，source task ref和dirty/conflict workspace保留。
-- 冲突通过progress/Message可见，不产生ConflictSet业务对象。
-- CLI Agent解决、测试、commit后才能重新submit。
-- 若期间canonical再次前进，CAS失败，integration Task rework/queued并收到new SHA；不得覆盖赢家。
-- 再次stale必须requeue同一个integration Task，不创建嵌套integration；source accepted link在最终成功或显式cancel前保持。
-- Rework Run启动前必须把new canonical object通过受限bundle导入private workspace；不得挂载control repo或只更新一个不可解析的SHA文本。
+- stale source分别指派Human/Agent integration，输入字段、workspace、lineage、capture和CAS断言相同。
+- result必须同时包含source head和当轮integration expected canonical ancestor；squash/cherry-pick丢lineage拒绝。
+- 冲突保留在private workspace并通过Task/Message可见；不创建ConflictSet。
+- source/accept version/initial canonical创建后不变。连续两次stale都机械requeue同一integration Task，每次expected canonical更新为actual且round恰好+1；不嵌套Task、不换人、不丢source/已提交修复。
+- integration完成原子完成source并写同一final canonical；取消原子释放source授权。
 
 ### GT-07 Git GC
 
-Boundary：真实Git ref/reachability + workspace filesystem。
-覆盖：INV-13。
+Boundary：可控时钟 +真实Git/workspace。覆盖INV-13/15/19。
 
-- Active/waiting/recoverable/dirty workspace不删。
-- 未完成Task.pending action或任何work/integration source引用的task ref不删；已有terminal配对的历史Event不永久阻止GC。
-- 用barrier并发执行`task create --source-task`/`task checkout`与task-ref GC，断言共同per-Project维护锁使“新引用提交”和“expected-old删除+prune”只能串行；不能创建指向刚被删ref的Task。
-- 未集成唯一commit在显式discard前不被prune。
-- Cleanup与capture/resume并发时cleanup退出。
-- 删除ref后再次检查引用，维护锁内`git gc`，最终`git fsck`通过。
-- Config/public contract拒绝负duration和非法retention，接受`0`；使用可控时钟证明`age < retention`不删、`age == retention`开始eligible，且起点分别是Task `closed_at`和Run `ended_at`。
-- 修改retention配置并重启Daemon后不改写历史时间；下一次`gc preview`/`gc run --confirm`对既有closed Task/terminal Run使用当前配置。`0`仍须满足全部clean/ref/pending/ownership fence，不能直接删除active或不确定资源。
-- 在workspace删除和expected-old task-ref删除后分别注入崩溃；重启重算predicate并把actual absent视为幂等完成，不新增GC pending/operation业务对象，也不依赖terminal Event授权。
-- `gc run --confirm`不能删除dirty workspace或未进canonical的唯一ref。两个discard命令缺Task、expected identity或request ID时拒绝；preview后workspace/ref变化使expected CAS失败且零副作用，重复同request或actual已absent幂等成功。
-- 同一Task准备两个不同Run ref及两个指向同SHA的ref；`discard-task-ref`缺Run ID、Run不属于Task或expected SHA错误时零副作用，合法命令只删除指定Task+Run ref，其他ref保持。
-- Failed Task的discard命令必须拒绝且零副作用；原地retry按RT-02复用workspace或只在从未`start_issued`时完成首次物化。Boss先cancel后才能discard，后续工作必须创建`retry_of_task_id`新Task；曾到`start_issued`的workspace意外absent时retry要fail loud，不能伪装成已授权重建。
-- `task create --retry-of`只接受同Project completed/cancelled Task并保存lineage；open/cross-Project目标拒绝。新Task base来自当前actual canonical，除非Boss另给合法`--source-task`，不得从retry关系猜旧ref。
-- 用合法integration取消流程产生两个不同`closed_at`：integration先cancel、source后cancel。在`integration.closed_at + retention`已到但`source.closed_at + retention`未到时ref仍保留，达到两者较晚边界后才eligible。
+- open/running/finishing、dirty、中间态、source引用、pending、唯一未捕获commit和ownership不明均阻止删除。
+- completed/cancelled、clean、已由canonical包含且达到期限后才自动删workspace/ref。
+- 未集成唯一submission只有单目标expected-SHA discard可删；wrong Task/submission/SHA零副作用。
+- ref删除后再次reachability检查再prune；与并发source Task创建互斥，`git fsck`通过。
 
-## 9. Deterministic 双 Agent E2E
+## 9. Web UI验收
 
-该 gate使用真实Daemon、file-backed SQLite、真实Git、真实Docker和确定性的scripted CLI。它用于日常回归，不依赖模型随机性。
+Boundary：真实Daemon +真实浏览器自动化，至少桌面1440x900和移动390x844。覆盖INV-04/08/20/22/24。
 
-### 9.1 Fixture
+### WT-01 本机和认证
 
-- 初始化本地Git Project，canonical=`C0`。
-- 配置Agent A、Agent B，并发度至少2。
-- Scripted CLI必须通过正式coordlink入口操作，不能直接写DB/control repo。
-- A/B分别修改不同fixture文件并commit。
+- 服务只绑定配置的loopback地址；配置非loopback拒绝启动。
+- 未认证、吊销Credential、缺capability、跨Project/Conversation访问均拒绝且不泄露摘要。
+- Web mutation与CLI使用相同operation、version、idempotency和Event；刷新/重启后状态一致。
+- 会话cookie为HttpOnly/SameSite=Strict（TLS时Secure），token不进localStorage/DOM/URL/日志；登出或Credential吊销使旧会话失效。
+- 每个mutation拒绝缺失/错误CSRF、错Origin、错Host、simple cross-origin form与预检CORS，且零业务副作用；安全同源请求正常通过。
+- CSP禁止非预期源、inline script和`eval`；Task/Message/日志内的HTML/script/URL payload显示为文本且不执行。SSE/WebSocket使用错Origin/无scope不能建立，权限吊销后在有界时间内断开并不再泄露新事件。
 
-### 9.2 流程
+### WT-02 协调工作流
 
-1. Boss创建两个work Task，明确指派A/B；两者base_sha都为C0。
-2. Scheduler同时创建两个Docker Run。
-3. 使用Docker live事实证明两个container/process存在重叠时间窗口。
-4. A向B发送direct Message，delivery使用B的conversation Task、related Task使用A当前Task；scripted adapter可Inject到B当前work Run，失败时后续conversation Resume仍必须读取并ack。
-5. A/B分别progress、运行fixture test、commit并调用task submit；两者先进入finishing并终结Run。
-6. Daemon从静止actual workspace捕获两个不同task refs/heads，最终fence后两Task才submitted。
-7. Boss先用`task checkout`读取并验证A的精确未集成head，再接受A，canonical以CAS从C0前进到CA。
-8. 接受B时直接CAS失败为stale，只创建一个integration Task。
-9. Integration CLI在新private workspace合并CA和B source head，运行测试并commit。
-10. Daemon捕获integration head，以expected-old CAS推进canonical。
-11. Boss从status/task/events看到两个结果、所有Run、Message和最终SHA。
-12. 重启Daemon后再次查询；执行cleanup preview/run并检查保留条件。
+- 查看Project/Participant/Role/Agent配置，创建并派发Task，执行claim/submit/accept/rework/retry/cancel/wake。
+- 查看Task树、assignee、Run真实状态、原因、base/head/submission ref/canonical和integration链接。
+- 不存在代码编辑器、终端、任意文件路径输入或raw ref修改控件/route。
 
-### 9.3 必须断言
+### WT-03 Conversation和未读
 
-- 两个Agent真实并发，不是先后运行的时间戳模拟。
-- Workspace/home/token/container完全不同且互不可读写。
-- Message durable，ack前Run退出会再次递送。
-- Run exit不替代Task submit/accept。
-- 两个原始task ref在workspace清理后仍存在。
-- 第一个CAS成功，第二个不覆盖第一个。
-- Integration最终head来自integration Run的task ref；Daemon Git executor静态/运行记录只允许import、ancestry、fsck和update-ref，不包含merge/rebase/cherry-pick。
-- 最终canonical包含C0、A head、B head的祖先lineage，fixture test和`git fsck`通过。
-- 无remote push、PR、artifact或validation service参与。
+- 创建direct/group、管理成员、显式选择多个recipients、分别显示未读/delivered/ack/exhausted。
+- 非recipient不出现未读badge；一个recipient ack后其他状态不变化。
+- Message可选关联Task，历史按稳定顺序显示；定向wake只影响选中CLI Agent。
 
-### 9.4 配置矩阵与迁移/resume 负例
+### WT-04 行为日志
 
-同一确定性 gate 追加：
+- 实时follow和历史分页按Project/Participant/Task/Conversation/Message/Run/kind/error筛选。
+- tool/shell/coordlink/Docker/Git/unknown/truncate/redaction行可查看完整已脱敏详情和sequence关联。
+- 导出包含manifest/hash并无secret；有权限用户可设置/取消long_term并立即看到effective retention/eligible时间。
 
-- 用 scripted CLI 跑 claude 与 codex 两 adapter 启动矩阵，断言容器内 argv/env 事实来自所选 adapter。
-- 相同配置的后续 Run `launch_mode=resume`；修改 model/effort/base_url 或有效提示词后 fresh start；session-not-found 产生 `run.resume_fallback`。
-- v6→v7 迁移往返、agents/participants 镜像、Daemon 重启后配置与 fingerprint 恢复；旧 Agent 不改配置时行为不变。
-- redaction 专项：SQLite、Event、run.log、Docker inspect 中 grep 已知 secret/URL userinfo/`instructions_text` 原文，均不得出现。
+### WT-05 可用性
 
-## 10. 真实 CLI E2E
+- browser console无未处理错误，网络请求无意外4xx/5xx。
+- 桌面/移动均无文字溢出、控件遮挡、不可达操作或横向破版；动态日志不会改变工具栏/状态布局。
+- 真实截图和关键页面像素检查证明非空、正确渲染；浏览器E2E必须实际点击公开界面，不能只测HTTP handler。
 
-### 10.1 Adapter smoke
+## 10. Deterministic组合E2E
 
-每个第一版production adapter至少通过一次真实Docker smoke：
+使用真实Daemon、file-backed SQLite、真实Git、真实Docker、scripted adapter和浏览器，不调用外部provider。
 
-- Start真实CLI并获得live process。
-- 在退出前记录native session ID（provider支持时）。
-- CLI通过coordlink读取当前Task、发progress/Message并wait。
-- 新Message触发Resume新Run并复用同一Task workspace/Agent home。
-- 取消能停止真实CLI容器。
+### 10.1 Fixture
 
-### 10.2 两个真实 Agent并发闭环
+- Human H，CLI Agent A/B/C；配置Role证明名称不决定职责。
+- 一个Project，canonical C0；一个group Conversation包含H/A/B/C。
+- `max_parallel_runs >= 2`，adapter可控输出、message/tool/shell/Git和故障点。
 
-RMA-01 继续要求至少一个 production adapter 的两个真实实例完成第9节等价闭环；另按 E4，Claude 与 Codex 各自必须至少一次真实 work Task（Claude 证据可复用 RMA-01，Codex 另跑一次真实任务）。不要求 claude+codex 混合双 Agent 同 Project 收敛（未获授权，本轮不做）。
+### 10.2 流程
 
-要求：
+1. H创建两个相同base的git Task指派A/B，两Run真实重叠。
+2. A在group向B/C发Message但不发H；B wake=true、C wake=false。H是成员但无未读。
+3. B active时Inject失败，recipient保持pending；B后续Run bootstrap知道未读并ack。C不因消息启动Run，但下一次Task Run知道未读。
+4. A/B各自提交不同commit，行为日志包含tool/shell/coordlink/Git和Docker事实。
+5. H从Web/CLI检查submission refs，accept A直接CAS到CA；accept B变stale并创建integration Task。
+6. integration分别用一次CLI Agent fixture完成并使canonical包含A/B lineage。
+7. 创建一个Human git Task，H在宿主workspace提交，模拟一次并发变化失败后稳定重提并走相同accept/CAS。
+8. 发送无Task wake Message给A，创建无workspace Conversation Run并ack。
+9. 在至少一个Run live和一个recipient pending时kill/restart Daemon，验证接管、未读和日志hash恢复。
+10. Web执行Conversation/Task/log查询、导出和long_term切换；最后cleanup/GC preview。
 
-- 两个真实CLI Agent在两个Docker容器中有可证明的live重叠。
-- 两者从同一C0修改不同文件、使用coordlink通信、commit和submit。
-- 一个直接CAS，另一个由真实integration CLI Agent处理stale并提交merge结果。
-- 最终canonical、task refs、SQLite状态和Boss查询一致。
+### 10.3 断言
 
-为降低模型随机性，同一行冲突解决放在GT-06确定性测试，不要求真实LLM gate每次制造并解决冲突。
+- Human/Agent Task FSM和Git结果结构除Run字段外一致；不存在旧Human完成旁路。
+- recipient状态精确，非recipient未读/wake为零，重启后不丢不重复业务行。
+- 同CLI Agent无重叠Run，Conversation Run无workspace。
+- 每个提交有不可变submission ref；canonical lineage、SQLite投影和`git fsck`一致。
+- 日志sequence/hash/manifest/index一致，全部要求行为种类可查且无secret。
+- Web、CLI和coordlink读到同一状态；拒绝操作零副作用。
+- 结束后无starting/active Run、owned orphan container、未解释pending action或误删ref/log。
 
-真实CLI gate需要provider凭据或网络时可以在普通CI标记SKIP，但任何SKIP结果只能声明“自动测试通过，live未验收”，不能声明产品完成。
+## 11. 真实CLI E2E
 
-### 10.3 真实 live gate 运行流程(已实测通过)
+真实provider调用不得自动连续重试。每次运行需要明确授权，结果分类为产品、provider/环境或Task specification；只有产品问题先落最低层回归并修复。
 
-`scripts/e2e-real-cli.sh` 要求显式不可变镜像(sha256 digest)+ `ANTHROPIC_AUTH_TOKEN`(经 provider env allowlist 注入容器)。两步运行流程：
+### RMA-01 Production adapter smoke
 
-1. 构建不可变真实 Claude 镜像(固定 Claude Code 2.1.126 + Go 1.22.5 + glibc 基座):
-   `digest=$(./tests/e2e/testdata/real-claude/build.sh)`(输出 `sha256:...`;无网络时 SKIP 77);
-2. 运行完整 live gate:
-   `E2E_RUNTIME_IMAGE="$digest" E2E_DOCKER_NETWORK=host|bridge ./scripts/e2e-real-cli.sh`
-   (网络能直连 provider 时用 bridge;需经本机代理时用 host)。
+Claude和Codex各至少一次真实Task Run：读取Task/未读摘要，发progress/Message，执行至少一个可观测tool或shell操作，提交结构化outcome并terminal。验证session、resume/fresh判定、行为日志、redaction和cleanup。任一adapter SKIP不算v1 PASS。
 
-覆盖:RMA-01 adapter smoke、RMA-02 双 Agent 收敛。SKIP 语义同上。
+### RMA-02 四Agent恢复与收敛
 
-## 11. 第一版真实多 Agent 可靠性验收
+只定义一个fresh四CLI Agent场景：
 
-### 11.1 目标和边界
+1. 四个git source Task从同一canonical创建，四个Run在时间线上真实重叠。
+2. 使用group Conversation发送至少一条多recipient Message和一条只定向单Agent的Message，验证非recipient不wake。
+3. 至少两个source Run仍live且已有durable行为/Message时受控重启一次Daemon；原Run接管或按正式合同终结，不重复active。
+4. 恢复后完成四个source Task；一个允许直接CAS，其余通过真实integration Task收敛，不能Daemon后台merge。
+5. 至少一次Message通过下一Run未读bootstrap而不是Inject完成ack；至少一次无Task Conversation Run。
+6. 最终canonical包含所有accepted source lineage，SQLite/ref/日志/Web投影一致。
+7. 完全停止并重启后复查，再执行正式cleanup/GC；无orphan、pending不明或日志完整性错误。
 
-第一版验收关注CoordPlane在真实使用方式下能否让多个CLI Agent可靠协作并收敛，不建立跨机器性能SLA，也不要求专用benchmark runner或人工冻结性能baseline。
+### RMA-03 小说系统持续真实开发
 
-正式live边界必须包含production adapter、真实provider/CLI、真实Daemon、file-backed SQLite、真实Docker、真实private clone和原生Git。Scripted adapter只用于第9节确定性回归，不能替代真实Agent证据；真实Agent的模型等待时间是端到端体验的一部分，必须报告但不设置固定耗时门槛。
-
-第一版可靠性由“少量真实live场景 + 完整确定性故障矩阵”共同证明。不得用大量重复provider调用代替低层回归，也不得因为某台机器较慢就把正确结果判为产品失败。
-
-### 11.2 环境和结果分类
-
-真实live场景可以在项目日常开发使用的原生Linux主机执行，不设置8 CPU、16 GiB、精确磁盘容量、特定Docker storage driver或独占Docker daemon要求。执行前必须记录但不据此自动拒绝：
-
-- implementation revision、worktree clean状态和Agent image digest；
-- logical CPU、可用内存、可用磁盘、filesystem、kernel以及Docker/Git/Go/CLI版本；
-- 当前运行容器和其他明显负载；
-- production adapter名称以及安全的provider/model标识，不记录凭据、请求正文或私有reasoning。
-
-环境只需满足本次场景可启动：Docker daemon可用、固定image可用、provider凭据和网络可用、数据目录可写且剩余空间足以完成fixture。结果固定为：
-
-- `PASS_REAL_MULTI_AGENT_LOCAL`：第11.5节全部不变量在已记录环境中成立；只声明该环境上的第一版可靠性，不外推跨机器吞吐或延迟。
-- `FAIL_REAL_MULTI_AGENT`：真实产品边界发生重复Run、消息丢失、伪完成、提交丢失、错误CAS、恢复不收敛、隔离/secret泄漏或其他不变量失败。
-- `INVALID_ENVIRONMENT`：Docker、provider、凭据、网络、磁盘或测试fixture在产品场景开始前不可用，无法形成产品结论。
-
-不得因CPU数量、总内存、磁盘总容量、`overlay2`/`overlayfs`名称或存在无关轻负载容器单独返回`INVALID_ENVIRONMENT`。资源不足只有在实际阻止Run启动或导致可归因的系统失败时才属于环境阻塞。
-
-### 11.3 必须执行的真实场景
-
-`RMA-01`复用第10.2节两个真实Agent并发闭环，证明production adapter、Message、task ref、stale integration、canonical CAS和cleanup可以端到端工作。
-
-`RMA-02`只执行一个fresh四Agent场景：
-
-1. 使用fresh data directory、fresh Project和同一初始`C0`，配置4个真实CLI Agent与`max_parallel_runs=4`。
-2. 创建4个范围独立、结果可由离线测试机械验证的work Task；任务必须产生不同文件或不冲突修改，不能依赖模型猜测隐藏验收文本。
-3. 证明4个source Run存在真实live重叠；每个Agent至少读取当前Task、报告一次progress、使用一次coordlink协作入口、运行fixture test、commit并submit。
-4. 至少发送一条跨Agent direct Message并在接收方形成durable ack；完整正文不进入公开报告。
-5. 在至少2个source Run仍live且已有durable progress或Message后受控重启一次Daemon。原Run/container必须被接管或按正式恢复合同明确终结，不能为同一attempt创建重复active Run。
-6. 恢复后继续完成4个source Task。Boss依次accept结果；一个允许直接CAS，其余stale结果通过真实integration Task收敛，不能由Daemon后台merge。
-7. 最终canonical必须包含4个被接受source head的lineage；运行fixture test和`git fsck --full --strict`。
-8. 完全停止并重启Daemon后重新查询Task、Run、Message、task ref和canonical SHA，随后走正式cleanup/GC并验证资源收敛。
-
-同一candidate只要求`RMA-01`和`RMA-02`各有一份有效PASS证据。provider调用失败后不得自动连续重试；先分类为产品、provider/环境或Task spec问题。只有产品问题需要增加最低层回归并修复，新一次真实provider调用必须得到单独授权。
-
-### 11.4 证据和观测
-
-每个真实场景至少保存以下安全证据：
-
-- 命令、起止时间、退出码、revision、image digest和第11.2节环境事实；
-- Project、Agent、Task和Run ID，以及4个source Run的live重叠事实；
-- Message创建/ack、Task状态、Run状态和关键Event计数；
-- initial/candidate/task/integration/final canonical SHA及ancestry、`git fsck`和fixture test结果；
-- Daemon重启前后的ownership、pending action、listener和`daemon_ready`事实；
-- 验收结束时starting/active Run、owned container、control socket、blocked cleanup和pending Git action计数；
-- 整体耗时、各Run耗时、CPU/内存/磁盘峰值的观察值，以及provider等待或限流对结果的影响。
-
-耗时和资源值用于发现明显卡死、泄漏和后续趋势，不是第一版硬SLA。watchdog只用于终止无界等待；触发后必须依据最后的durable状态和Docker/provider事实分类，不能一律归咎于CoordPlane。
-
-报告不得保存token、认证环境变量、完整provider请求/响应、Message私密正文、thinking或signature。真实CLI transcript必须继续服从Runtime的redaction和保留合同。
-
-### 11.5 通过不变量
-
-`RMA-01`和`RMA-02`都必须满足适用项，任一失败均不能用较快耗时抵消：
-
-- 没有重复active Run、重复submit副作用、伪完成或无法解释的terminal状态。
-- 不同Agent的container、workspace、home和token保持隔离。
-- Message在ack前durable，Daemon重启后不丢失且最多一次形成acknowledged状态转移/Event。
-- Run退出不替代Task submit；每个已提交结果都有可解析且不可变的task ref。
-- actual workspace HEAD被捕获；canonical只通过ancestry核验和expected-old CAS推进。
-- stale结果只通过普通integration Task处理，Daemon不执行隐藏merge/rebase/cherry-pick。
-- Daemon重启后Run ownership、socket/listener、pending action和Git事实先对账，再开放mutation。
-- 最终canonical lineage、SQLite投影、Boss查询、fixture test和`git fsck`一致。
-- 日志、Event和公开证据不泄漏credential、thinking、signature、其他Agent token或宿主私有路径。
-- 验收结束后没有starting/active Run、owned orphan container、blocked cleanup、未知control目录或未解释pending Git action。
-
-### 11.6 当前第一版收敛范围
-
-当前已有的有效`RMA-01`证据可以继续使用，只要候选revision相对已验证revision仅修改需求文档或其他不影响production/runtime/fixture的文件，并提供精确diff证明；文档修订本身不强制再次消耗provider调用。
-
-当前剩余工作按以下顺序收敛：
-
-1. 盘点旧PF harness中的正确性断言；仍未被Core/Runtime/Git低层故障矩阵覆盖的断言先迁移到对应owner测试。
-2. 删除仅服务于固定runner、`PF01_REFERENCE_MANIFEST`、长波次统计、性能baseline和`BASELINE_BOOTSTRAP`的脚本、observer、validator及调用方；不得保留与新Gate竞争的release入口。
-3. 将`RMA-02`作为独立场景函数加入静态场景列表，并提供一个薄的`scripts/e2e-real-multi-agent.sh`入口；执行器不得按角色、provider或场景名称增加`if/else`特判。
-4. 在获得一次明确provider授权后执行一个fresh `RMA-02`，失败时按11.3节先分类和归约，不自动重试。
-5. `RMA-02`通过后，在同一候选上重跑第13节非provider Gate和LOC检查，形成第一版本轮可靠性结论。
-
-第一版live工作只新增上述一次`RMA-02`。原`PF-01`固定环境、20波release/soak、绝对性能阈值和人工冻结baseline不再属于完成条件；如未来需要可重复性能SLA，必须作为独立性能项目重新提出需求，不能恢复为本轮隐性门禁。
-
-## 12. 第一版代码行数预算
-
-### 12.1 预算基线
-
-预算以两个production one-shot adapter（Claude + Codex，D1）、一个scripted test adapter、Docker-only runtime、local-Git-only（每Project一个repo）和两个薄CLI为基线。产品仍可管理多个Project，第一版真实可靠性验收只使用一个Project。不包含TUI/Web平台化、host/external runtime、remote Git、Inject必选实现或平台化预留。
-
-SLOC是规划和架构漂移信号，不是质量分数。低于预算仍必须满足全部不变量；超过预算先检查重复边界和范围偏移，不能删除错误处理、recovery或测试来换取数字。
-
-Owner已批准保留上述完整产品范围和本节非空、非纯注释物理行统计口径，并按 E1 用以下envelope透明替换旧预算（E1 为暂定上限，最终以 clean revision 实测值锁表）；本次重基线不构成范围删除、统计排除或测试豁免：
-
-| bucket | 旧目标/软阈值/发布或审查阈值 | 批准的目标/软阈值/发布或审查阈值 | 逐项增量 |
-| --- | ---: | ---: | ---: |
-| Production | `20,000 / 21,000 / 22,600` | `24,000 / 24,500 / 25,000` | `+4,000 / +3,500 / +2,400` |
-| Tests | `21,000 / 22,000 / 23,700` | `25,500 / 26,200 / 27,000` | `+4,500 / +4,200 / +3,300` |
-| Build/test infra | `250 / 400 / 600` | `250 / 500 / 700` | `0 / +100 / +100` |
-| Budgeted total | `41,250 / 43,400 / 47,000` | `49,750 / 51,200 / 52,700` | `+8,500 / +7,800 / +5,700` |
-
-**前端独立预算(Owner 已批准,2026-08-04;2026-08-13 按 E1 改为三档)**:web 前端 SPA、`internal/webserver/*` 服务层与 web e2e(`tests/e2e/web_test.go`)计入独立的 `handwritten_frontend` 桶，目标/软阈值/发布阈值为 `2,000 / 2,500 / 3,000` 物理行，不与后端核心 production/tests/infra/total 共享；后端预算包络不变。
-
-Production和Tests新增空间先以透明、未分配的重基线reserve列入下表，保留原模块/测试边界审查值以持续暴露重复和owner漂移。第一版候选按12.6节报告实际模块分布；reserve不是忽略模块超限或弱化合同的授权。
-
-### 12.2 Budgeted maintained production预算
-
-| 所有边界 | 目标 | 软阈值 | 模块审查阈值 |
-| --- | ---: | ---: | ---: |
-| `cmd`：coordplane/coordlink参数解析和渲染 | 700 | 900 | 1,100 |
-| `transport`：operator/per-Run socket、JSON、scope/token middleware | 650 | 850 | 1,000 |
-| `core`：九类业务对象、FSM、operations、scheduler/notifier/status | 2,300 | 2,700 | 3,100 |
-| `store`：SQLite transaction/CAS/dedupe/migration | 1,500 | 1,800 | 2,100 |
-| `runtime`：Docker、launch、supervisor、resume、stop/cleanup/reconcile/log | 2,200 | 2,500 | 2,900 |
-| `git`：Project、private clone、capture、task ref、CAS、integration/GC | 1,900 | 2,250 | 2,600 |
-| `adapter`：静态接口/registry 与 production adapters（Claude+Codex） | 550 | 700 | 850 |
-| `daemon/config/shared`：wiring、file lock、worker registry、config、clock/ID/error/redaction | 700 | 850 | 1,000 |
-| Owner批准的未分配重基线reserve | 13,500 | 11,950 | 10,350 |
-| **Production合计** | **24,000** | **24,500** | **25,000** |
-
-模块超过软阈值可以在production总软阈值内小幅调剂，但必须在变更说明中列出净增量、所属不变量和删除/合并计划。任一模块超过模块审查阈值时必须复核owner边界和重复实现，不能靠把语义搬到其他目录消除命中；只要production总量仍`<=25,000`、12.6节候选证据审查已完成且复核未发现范围漂移，模块命中本身不阻断发布。Production总量严格`>25,000`时阻断第一版发布，直到删除旧/重复路径，或owner先显式修改需求和预算。
-
-v1 已批准 Claude+Codex 两个 production adapter（D1），其增量已并入上述 E1 重基线，不再单列“第二 adapter”增量预算。模块行沿用旧边界作为审查参考；Codex 引入的实际模块分布按 12.6 节在 clean revision LOC JSON 中列示，E1 数值为暂定上限，最终以实测锁表。
-
-### 12.3 测试和基础设施预算
-
-| 测试边界 | 目标 | 软阈值 | 重复性审查阈值 |
-| --- | ---: | ---: | ---: |
-| Static guard + pure/FSM | 1,000 | 1,250 | 1,500 |
-| Core/store/public CLI contract | 3,500 | 4,200 | 5,000 |
-| Adapter conformance | 800 | 1,000 | 1,200 |
-| 真实Git component/fault matrix | 2,500 | 3,200 | 4,000 |
-| 真实Docker runtime/fault matrix | 2,200 | 2,800 | 3,500 |
-| Deterministic + real CLI E2E harness | 1,500 | 1,900 | 2,300 |
-| 多Agent可靠性观测、故障编排和安全报告 | 800 | 1,100 | 1,500 |
-| Owner批准的未分配重基线reserve | 13,200 | 10,750 | 8,000 |
-| **Tests合计** | **25,500** | **26,200** | **27,000** |
-
-测试超过审查阈值只触发重复fixture/helper和边界重叠审查，不得仅因LOC删除测试。测试能否删除只由对应不变量已删除或已由更低、更真实边界完整替代决定。
-
-多Agent可靠性harness必须复用既有public CLI、Docker/Git fixture helper和状态断言；它只新增场景编排、环境观测和安全报告，不得复制Core/Runtime/Git实现，也不得把角色或provider特判写入主执行器。
-
-Budgeted build/test infrastructure（shell、Dockerfile、Makefile、手写YAML及语义型generated输入/输出）目标250、软阈值500、审查阈值700 SLOC。Budgeted maintained surface目标/软/审查为`49,750/51,200/52,700`；该总数包含语义型generated SLOC，不含机械generated输出和静态fixture，不能覆盖production超限，也不是减少测试的理由。
-
-### 12.4 统一统计口径
-
-实现仓库必须提供一个固定`scripts/loc-budget.sh --output json`，按gofmt后“非空、非纯注释物理行”统计maintained SLOC，并同时输出每模块和本次Git diff：
-
-- 所有第一方、非generated生产源都按owner边界1:1计入production，包括`.go`、migration/queries SQL、`.proto`/OpenAPI、状态或命令template、embedded JSON/YAML规则和runtime shell；不能把语义搬到非Go文件逃预算。Owner path manifest未识别的第一方语义源默认计入`first_party_source_total`并使`--check`失败，直到明确归入production/test/infra，不能默认排除。
-- `*_test.go`、test helper和test-only生成输入一律计tests；只在test/perf build tag编译且可由production build证明不可达的普通Go源（phase observer、failpoint、scripted adapter等）也计`budgeted_tests`，production binary内保留的no-op hook/wiring计`budgeted_production`。不能把production实现藏进helper或build tag。Migration SQL计入store，建议包含在store内的目标/软/审查子预算为250/400/550。
-- Generated输出只有同时具备标准`Code generated ... DO NOT EDIT.`标记、`generated-manifest.json`中的output allowlist、owner、mechanical kind、generator版本/命令、全部输入和hash，并且CI从clean tree重新生成后`git diff --exit-code`为空，才不计主预算；无法机械复现、未登记或path未allowlist时默认按handwritten计入。
-- Generated SLOC必须单列；1,500触发warning，超过3,000触发审查。Generator、schema、template和其他生成输入本身1:1计入所属production或test。
-- Allowlist只接受机械展开的wire/DB binding/mock等输出。包含FSM、SQL业务决策、权限、recovery或provider特判的generated控制流即使可复现仍按1:1回算owner模块；该语义分类由manifest和静态审查锁定，`loc-budget.sh`不得假装能从文本可靠推断。
-- Vendor、第三方源码、`go.sum`、文档和纯静态protocol/golden数据不计SLOC；禁止提交vendor隐藏规模。
-- Fixture静态数据按体积治理：256 KiB warning、超过1 MiB审查。可执行fixture、generator、embedded shell/SQL按test/infra或所属源文件计算；Git repo必须测试时程序化生成，不提交`.git`或大二进制。
-
-LOC JSON先输出互斥原子桶`handwritten_production/tests/infra`、`generated_semantic_production/tests/infra`和`generated_mechanical_excluded`，再按以下固定公式输出派生值：
+RMA-03是每个拟验收CoordPlane candidate都必须重新执行的reference workload，不是只在发布前跑一次的demo。它的当前本机需求源为：
 
 ```text
-budgeted_production = handwritten_production + generated_semantic_production
-budgeted_tests      = handwritten_tests + generated_semantic_tests
-budgeted_infra      = handwritten_infra + generated_semantic_infra
-budgeted_total      = budgeted_production + budgeted_tests + budgeted_infra
-generated_total     = generated_semantic_production + generated_semantic_tests
-                    + generated_semantic_infra + generated_mechanical_excluded
-first_party_source_total = 所有上述源码物理行集合去重后的总数
+/home/zxh/multica_workspaces/用于检验coordplane的小说系统软件测试需求文档
 ```
 
-三张预算表和所有Gate只使用`budgeted_*`；`generated_total`是有意重叠的可见性指标，不再参与`budgeted_total`加总。JSON另输出`fixture_bytes`，避免用预算排除项低报实际维护体积。所有阈值统一按严格`>`触发，等于阈值仍在该档内。
+该目录当前是需求文档集而不是Git repository。验收驱动器不得将它直接注册为CoordPlane Project，也不得修改原目录。
 
-### 12.5 超预算治理
+#### 11.3.1 输入冻结与开发代码库
 
-超预算时按以下顺序收敛：
+1. 每轮开始前，验收驱动器只读枚举需求目录下全部regular files，拒绝symlink/device/socket，对排序后的relative path、size和SHA-256生成`requirements_manifest.json`和总hash。结束时重算，任一变化使该轮`INVALID_INPUT_CHANGED`，不能拼接证据。
+2. 小说系统代码使用单独、持续的Git负载代码库。首轮的`workload_base_sha`为空项目，后续轮为上一PASS轮的accepted workload canonical。每轮都在隔离seed repo中从base开始，用当前manifest精确替换驱动器拥有的`requirements/`快照；若tree变化，使用固定author/message/时间规则生成可重现requirements snapshot commit。该结果才是本轮`workload_input_sha`，因此Agent在workspace所见文档与收据manifest始终一致。
+3. 每轮从固定`workload_input_sha`创建全新的CoordPlane data dir、Project、workspace和Run，不复用上轮SQLite、container、provider session或工作树证据。只有该轮整体PASS后，才能把`workload_output_sha`发布为下轮base；FAIL/INVALID轮不移动持续负载代码库基线，下次从原base和同一requirements manifest可重建input。
+4. 需求目录路径只是验收驱动器参数和收据字段，不得出现在CoordPlane产品调度、handler、prompt特判或schema中。
 
-1. 删除已被替代的旧路径、重复DTO/renderer/store wrapper和第二套CLI/transport逻辑。
-2. 删除第一版非目标或可选项：Inject实现、第三adapter、TUI/fancy formatter、host runtime、remote/平台化预留。
-3. 将真正新增的产品能力移出第一版，先修改需求再实现。
-4. 只有无法通过上述方式收敛时，由owner基于实际模块报告调整预算；调整必须先更新本节，不能在代码中加ignore名单。
+#### 11.3.2 每轮唯一开发锁
 
-无论是否超预算，以下内容不得因LOC删减：version/generation/token/nonce fence、pending action/operation ID、durable Message ack/redelivery、finishing两阶段submit、actual HEAD capture、expected-old CAS、Runtime attach/stop/cleanup/reconcile、Project fail-closed及对应SQLite/Git/Docker crash/race测试。
+每轮必须从需求manifest和当前负载canonical选一个尚未实现或最近失败的小说系统不变量，收据固定其requirement citation、范围/非范围、可证伪验收项、项目自有验证命令和预期产物。输入在轮内不得增加第二个不变量；新需求放入下轮backlog。
 
-禁止通过一行多个语句、超长函数、大switch、删除有价值错误上下文或把逻辑搬进脚本/generated/test helper降LOC。Production单文件500/800 SLOC、单函数80/140 SLOC分别触发warning/阻断审查；拆分仍必须按静态注册和owner边界，不得制造无意义薄文件。
+验收配置至少有四个真实CLI Agent Participant，职责只由Role/instructions/Task配置，并执行：
 
-### 12.6 第一版候选证据审查
+1. A领取parent Task，经coordlink为B/C创建至少两个不共享可写文件的child git Task，固定coordination group Conversation/result recipient，发送显式recipient Message后wait。
+2. B/C的Docker Run时间线真实重叠，只在各自private workspace使用标准Git，通过Message询问/回答，执行项目测试并产生不可变submission ref。
+3. 第一个child结果使A的waiting parent被幂等唤醒；A创建新Run且Resume精确parent session scope，经分页inbox读取所有未读，不跨Task/Conversation污染。
+4. D通过普通git review/test Task独立复核输出，不使用日志或Agent自报代替代码/测试证据。有权Participant通过正式accept推进canonical，至少一个并发结果经显式integration Task收敛。
+5. 在至少一个Run active、parent waiting或recipient pending时受控重启Daemon，继续同一Run或按契约终结/新Run Resume，不重复Task、Message、submission或active Run。
+6. 最终在actual workload canonical上执行该轮锁定的项目契约测试和相关全量测试。只有它们PASS、输出canonical包含全部accepted lineage且独立复核通过，才认为小说系统本轮交付完成。
 
-第一版完成要求对精确候选revision `R`保留可复核证据，不要求人工创建环境manifest或批准性能baseline：
+#### 11.3.3 行为日志审计
 
-1. 冻结一个clean候选revision `R`，运行第13节全部非provider Gate和`scripts/loc-budget.sh --check --output loc-budget.json`。
-2. LOC JSON必须记录并匹配`R`，保留全部原子桶、`budgeted_production/tests/infra/total`、每模块实际值、generated/fixture可见性、Git diff以及unknown path、file/function和gofmt质量blocker；不得只报告四个合计数。
-3. 第11节真实live报告必须记录其已验证revision。若候选`R`只比该revision多需求文档或其他不影响production/runtime/fixture的变更，可以通过精确diff复用证据；任何相关代码、测试fixture、image或adapter配置变化都必须重跑受影响的真实场景。
-4. 只有LOC四个发布值分别`<=25,000/27,000/700/52,700`、质量blocker清零、第11节真实场景通过且第14节不变量全部满足，第一版Gate才完成。
-5. 若要扩大envelope、排除源码或删减产品/测试合同，必须在实现前显式修改五份need；不得在脚本、报告或评论中暗改。
+本轮必须从实际Docker/OS wait、provider raw frame、coordlink请求结果、SQLite Event/业务行和Git ref/object构建外部观察集，再与每Run Behavior Log对账，不用日志自证完整。至少审计：
 
-## 13. 验证命令和Gate
+- Run从create/attach前到terminal/cleanup的时序，session/resume/inject决策和Daemon重启接管。
+- provider已暴露的text/tool/shell/file/Git/usage/error，coordlink Task/Conversation/Message/progress/权限允许与拒绝。
+- 每条行为与Project/Participant/Task/Conversation/Message/recipient/Run、raw offset/hash和Git before/after的可追溯关联。
+- unknown/gap/truncation/redaction数量、manifest/hash chain/index和Web/CLI筛选/导出一致性，以及secret/XSS负例。
 
-实现仓库必须提供等价命令；推荐：
+任一已观察行为无日志或无gap/truncation说明、日志凭空生成行为、关联错Task/Conversation/Run、日志推进业务状态或未授权读取，均是CoordPlane finding。隐藏chain-of-thought和CoordPlane不可观察的宿主Human行为不在对账分母。
+
+#### 11.3.4 Finding和下一轮
+
+RMA-03失败先写收据并只选一类：`F1_REQUIREMENT`、`F2_CONTRACT_GAP`、`F3_PRODUCT_IMPLEMENTATION`、`F4_PROVIDER_ENVIRONMENT`、`F5_SECURITY_RELIABILITY`、`F6_WORKLOAD_TASK`或`F7_OBSERVATION`。收据必须含复现、期望/实际、影响、对应通用不变量和证据ID；不得用“Agent说失败”代替。
+
+- F1先改需求基线并重新审批；不直接补产品代码。
+- F2/F3/F5停止当前candidate，先在最低真实边界增加能在旧行为上变红的契约测试，每轮只修一个不变量；L1-L4通过后以新candidate回放原失败边界并重新完整执行RMA-03。
+- F4报告`INVALID_ENVIRONMENT(reason)`，保留收据且不宣称产品PASS；F6在同一小说系统Task/rework流中修复，不因业务代码问题修改CoordPlane；F7保持open直到证据可归类。
+- 同一CoordPlane修复连续两轮未过同一gate时停止叠加补丁，回到不变量owner和失败分类。
+
+RMA-03只在本轮小说系统Task交付、CoordPlane组合状态收敛、日志对账通过且无未处置F2/F3/F5 finding时PASS。每个新CoordPlane candidate都需要新收据，不得用前一candidate的真实负载结果豁免。
+
+### 11.4 收据
+
+每个真实场景记录candidate SHA、image digest、adapter/CLI版本、开始结束时间、Task/Run/Message/recipient ID、最终SHA、日志manifest/hash、重启前后事实和脱敏后的失败分类。RMA-03另外记录需求目录、前后requirements manifest hash、workload input/output SHA、本轮唯一不变量/引用、项目测试命令、行为日志对账统计、finding和是否发布下轮负载基线。公开收据不保存Credential/token/secret、Message私密正文、instructions全文、provider隐藏thinking/signature或未脱敏response。
+
+RMA-01、RMA-02和RMA-03名称与含义唯一；不得在其他章节用RMA-02指代双Agent场景，或用RMA-03指代deterministic fixture。
+
+## 12. 代码预算
+
+预算是架构漂移和重复实现警报，不授权删减fencing、recovery、日志完整性、Web权限或测试。唯一数值事实源是本节，其他文档只能引用。
+
+当前候选需求审批前必须在精确实现基线SHA上产生可复算LOC报告，同时列出为删除旧Boss/agents/conversation Task/Human旁路预计减少的代码、为当前候选新契约必须增加的代码/测试和模块归属。若尚未实现新范围前已超下表发布阈值，当前候选不得冻结；只能选择带可验证删除量的Add-Remove计划保持阈值，或由需求审批人显式修改本表。禁止预计未来会删除就先声称当前可行，也禁止为达数值删除有效契约测试。
+
+| bucket | 目标 | 软阈值 | 发布阈值 |
+| --- | ---: | ---: | ---: |
+| Budgeted production | 24,000 | 24,500 | 25,000 |
+| Budgeted tests | 25,500 | 26,200 | 27,000 |
+| Build/test infrastructure | 250 | 500 | 700 |
+| 后端合计 | 49,750 | 51,200 | 52,700 |
+| Handwritten frontend（SPA、webserver、browser e2e） | 2,000 | 2,500 | 3,000 |
+
+统计规则：
+
+- 非空、非纯注释物理行；第一方非generated语义源按其真实bucket 1:1计入。
+- `*_test.go`、test helper、scripted adapter/failpoint和仅测试build tag源码计tests；运行脚本、Dockerfile和测试工具计infra。
+- generated只有标准标记、manifest allowlist、owner、generator命令/版本、输入/hash齐全且clean重生成无diff才排除；包含业务FSM/权限/recovery/provider特判仍回算所属bucket。
+- fixture正文可单列可见但不能藏实现；unknown path使`--check`失败。
+- production单文件500行warning/800阻断，单函数80行warning/140阻断；禁止压缩语句、大switch、删除错误上下文或搬到脚本/generated逃预算。
+- 超软阈值必须列净增量、所属不变量和删除/合并计划；超发布阈值阻断，调整预算必须先显式修改本需求，不得在脚本/report暗改。
+
+候选LOC JSON必须记录candidate SHA、全部bucket/模块、unknown/generated/fixture、Git diff、gofmt、file/function blocker。当前工作树数值和历史候选结果不属于需求正文。
+
+## 13. Gate和验证命令
+
+实现仓库必须提供以下或严格等价入口：
 
 ```bash
+gofmt -l <go-files>
+go vet ./...
 go test ./... -count=1
 go test -race ./... -count=1
-go vet ./...
 go test -tags=docker ./... -count=1
 go test ./internal/store -run '^TestCT01' -count=1
-go test ./internal/core -run '^TestRP0[1-8]' -count=1
+go test ./internal/core -run '^TestCT0[1-9]' -count=1
+go test ./tests/e2e -run '^TestWeb' -count=1
 scripts/e2e-deterministic.sh
 scripts/loc-budget.sh --check --output loc-budget.json
 scripts/e2e-real-cli.sh
 scripts/e2e-real-multi-agent.sh
+scripts/e2e-reference-workload.sh \
+  --requirements-dir '/home/zxh/multica_workspaces/用于检验coordplane的小说系统软件测试需求文档' \
+  --workload-repo '/home/zxh/multica_workspaces/coordplane_reference_workloads/novel-system.git'
 ```
 
-Gate顺序：
+Gate顺序：L1 static/vet -> L2 narrow contracts -> L3 full/race -> L4 Docker/deterministic/Web/LOC -> L5 RMA-01/RMA-02/RMA-03。脚本必须输出`PASS/FAIL/INVALID_INPUT_CHANGED(reason)/INVALID_ENVIRONMENT(reason)/SKIP(reason)`；exit 0但SKIP/INVALID不能伪装PASS。RMA-03每个拟验收candidate必须新跑，无diff豁免。
 
-1. Static guard。
-2. Pure/adapter/public contract。
-3. Storage和Git component。
-4. Full Go和race。
-5. Docker integration。
-6. Deterministic双Agent E2E。
-7. LOC预算和12.6节候选证据审查。
-8. `RMA-01`真实双Agent E2E。
-9. `RMA-02`真实四Agent恢复与收敛E2E。
-
-E2E失败后不得直接反复改E2E脚本或prompt。必须先分类到Core、Runtime、Git、环境/provider或Task spec，并增加最低层可复现测试。
-
-所有外部gate输出明确的`PASS`、`FAIL`、`INVALID_ENVIRONMENT(reason)`或`SKIP(reason)`。脚本exit 0但内部SKIP不能伪装PASS。真实provider Gate禁止自动重试；每次新调用必须有明确授权。
+每轮实现交付声明本地candidate commit SHA。测试审核、代码审查、浏览器验收、L4和L5证据必须基于同一SHA；不同SHA必须重跑受影响层。RMA-01/RMA-02只可在精确diff证明未影响production/runtime/adapter/fixture/image时复用；RMA-03对每个新candidate都必须生成新收据，不适用此豁免。
 
 ## 14. 完成判定
 
-只有全部满足才能声明第一版完成：
+只有以下全部成立才可冻结v1：
 
-- Static guard确认旧对象、旧入口和平台化服务没有生产实现。
-- Core/Runtime/Git全部命名不变量有最低真实边界测试。
-- 全量Go、race和vet通过。
-- 真实SQLite migration/restart通过。
-- 真实Git capture/CAS/crash/GC测试通过且`git fsck`成功。
-- 真实Docker隔离、取消、resume、reconcile和cleanup通过。
-- Deterministic双Agent E2E通过。
-- `RMA-01`真实双Agent E2E通过且未SKIP；production adapter、Message、task ref、integration和canonical CAS形成完整证据。
-- `RMA-02`真实四Agent场景通过且未SKIP；4个source Run真实重叠，并在一次Daemon重启后继续收敛。
-- `budgeted_production/tests/infra/total <= 25,000/27,000/700/52,700`，质量blocker清零，测试未因LOC被弱化。
-- 验收结束后没有starting/active Run、owned orphan container、未解释capture/CAS intent或误删的task ref。
-- Boss能从正式命令读取最终Task、Run、Message、base/head和canonical SHA。
-- Boss和Reviewer能从正式入口实际读取、检出和测试精确未集成task head，而不获得control repo写权限。
-- 验收没有依赖remote Git平台、动态registry、TeamConfig、validation engine、artifact平台或per-tool-call审计。
+- 五份规范与原话记录同revision，不存在旧模型冲突或未归一化的新需求；冻结SHA、原话记录blob SHA和已处理的最新`UR-NNNN`写入独立只读release receipt。
+- L1-L4全部PASS，full/race/vet、SQLite、Git、Docker、行为日志和真实浏览器测试无SKIP。
+- RMA-01两个production adapter、唯一RMA-02四Agent场景和RMA-03小说系统reference workload全部PASS且指向同candidate。
+- Human/CLI Agent统一Task/Git、群组逐recipient未读、Conversation Run、Web和日志retention均有独立复核。
+- 本节预算已经精确基线/删增分析后审批，且`production/tests/infra/total <= 25,000/27,000/700/52,700`，frontend `<=3,000`，质量blocker为零。
+- `git fsck`通过；无starting/active Run、owned orphan container、未解释capture/CAS intent、丢失submission ref、未处置recipient或错误删除的long_term日志。
+- 最终收据列出谁验证了什么、命令、candidate SHA、问题处置、发布状态和剩余风险。
 
-若真实CLI、四Agent或Docker gate未运行，报告必须明确剩余runtime风险，只能声明已实际通过的较窄范围；不得用更多mock测试替代。第一版完成不包含跨机器吞吐、延迟、容量或长期soak声明。
+任一真实CLI、四Agent、小说reference workload、Docker或浏览器gate未运行，只能报告已证明的较窄范围，不能声明v1完成。连续两轮同一修复未过同一gate时停止补丁并回到需求/契约/实现/provider或环境/负载Task规格归因。
